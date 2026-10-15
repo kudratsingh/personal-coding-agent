@@ -18,6 +18,8 @@ Training deduplicates chunks with weights. Pair counts and chunk-location sets u
 
 No production tokenizer has been trained or frozen. Large-corpus throughput and held-out compression are separate measurements.
 
+`FastEncoder` uses learned pair ranks to visit only merges present in a chunk and caches repeated chunks. `encode_many` can distribute documents to spawn-based workers while preserving order. Reference/fast identity and worker ordering are tested; `tools/benchmark_tokenizer.py` reports synthetic throughput and checks identity over the requested byte count. Synthetic repetition benefits caching and must not be represented as real-corpus throughput.
+
 ## Questions
 
 - Why bytes? Every valid UTF-8 string is representable without unknown tokens.
