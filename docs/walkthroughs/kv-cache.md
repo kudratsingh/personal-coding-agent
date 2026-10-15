@@ -1,0 +1,11 @@
+# Generation and the key-value cache
+
+For a prompt, every transformer layer computes keys and values `[B,H,T,D]`. Subsequent tokens need new queries, keys, and values only for their own positions. Cache the earlier keys/values, append the new ones, and rotate the new query/key at the correct absolute offset. Mask against absolute positions, not a fresh triangle starting at zero.
+
+For a length-five prompt followed by one token, the new query is `[B,H,1,D]`; cached keys/values grow to `[B,H,6,D]`. Its score row can see all six positions. Tests compare every cached logit with a full-sequence forward pass.
+
+Temperature zero chooses the largest logit. Positive temperature scales logits before top-k and nucleus filtering; seeded categorical sampling then chooses an allowed token. Batched stop tokens finish each row independently. Generation stops at the context boundary rather than silently dropping positional history.
+
+Answer scoring sums only continuation-token log probabilities. A padded batch is safe because causal attention prevents later padding from changing earlier scores. A slow per-prefix reference verifies this indexing.
+
+Questions: why cache keys/values but not earlier queries (new tokens do not use them); why offset rotary positions (preserve absolute relative geometry); why sum answer log probabilities (sequence likelihood); why deterministic greedy batch parity (detect hidden batch dependence); why context limits (cache growth is bounded by the configured model).
