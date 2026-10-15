@@ -7,3 +7,5 @@ Use the [walkthrough template](TEMPLATE.md): start with a small worked example, 
 Planned topics include tokenization, transformer layers, optimization, training and resume, sampling and key-value caching, isolated execution, and policy updates.
 
 Implemented: [byte-level BPE](tokenizer.md).
+
+Implemented: [decoder-only transformer](transformer.md).
