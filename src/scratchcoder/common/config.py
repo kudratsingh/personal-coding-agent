@@ -1,10 +1,40 @@
 """Typed, strictly validated local experiment configuration."""
 
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+
+def finite_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number")
+    try:
+        result = float(value)
+    except OverflowError as error:
+        raise ValueError(f"{name} must be finite") from error
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+class ConfigLoader(yaml.SafeLoader):
+    """Safe YAML that also rejects ambiguous duplicate configuration keys."""
+
+
+def unique_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node)
+        if not isinstance(key, str) or key in result:
+            raise ValueError("configuration keys must be unique strings")
+        result[key] = loader.construct_object(value_node)
+    return result
+
+
+ConfigLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
 
 
 @dataclass(frozen=True)
@@ -37,6 +67,10 @@ class TrainConfig:
     weight_decay: float = 0.1
     gradient_clip: float = 1.0
     accumulation_steps: int = 1
+    beta1: float = 0.9
+    beta2: float = 0.95
+    adam_epsilon: float = 1e-8
+    precision: str = "float32"
 
     def __post_init__(self) -> None:
         for name in ("steps", "batch_size", "sequence_length", "accumulation_steps"):
@@ -46,12 +80,19 @@ class TrainConfig:
             raise ValueError("seed must be a nonnegative integer")
         if type(self.warmup_steps) is not int or not 0 <= self.warmup_steps <= self.steps:
             raise ValueError("warmup_steps must be between zero and steps")
-        for name in ("learning_rate", "gradient_clip"):
-            value = getattr(self, name)
-            if not isinstance(value, (int, float)) or not 0 < value < float("inf"):
+        for name in ("learning_rate", "gradient_clip", "adam_epsilon"):
+            value = finite_number(getattr(self, name), name)
+            if value <= 0:
                 raise ValueError(f"train.{name} must be finite and positive")
-        if not 0 <= self.min_lr_ratio <= 1 or not 0 <= self.weight_decay < float("inf"):
+        if (
+            not 0 <= finite_number(self.min_lr_ratio, "min_lr_ratio") <= 1
+            or finite_number(self.weight_decay, "weight_decay") < 0
+        ):
             raise ValueError("invalid decay settings")
+        if not all(0 <= finite_number(value, "beta") < 1 for value in (self.beta1, self.beta2)):
+            raise ValueError("Adam betas must be in [0,1)")
+        if self.precision not in {"float32", "bfloat16"}:
+            raise ValueError("precision must be float32 or bfloat16")
 
 
 @dataclass(frozen=True)
@@ -62,16 +103,34 @@ class RunConfig:
     parent_checkpoint: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.model, ModelConfig) or not isinstance(self.train, TrainConfig):
+            raise ValueError("model and train must be typed configurations")
         if self.train.sequence_length > self.model.context:
             raise ValueError("sequence_length exceeds model context")
-        if not self.data_mix or any(not 0 < weight <= 1 for weight in self.data_mix.values()):
+        if (
+            not isinstance(self.data_mix, dict)
+            or not self.data_mix
+            or any(
+                not isinstance(name, str)
+                or not name
+                or not 0 < finite_number(weight, "source share") <= 1
+                for name, weight in self.data_mix.items()
+            )
+        ):
             raise ValueError("data_mix shares must be positive")
         if abs(sum(self.data_mix.values()) - 1.0) > 1e-8:
             raise ValueError("data_mix shares must sum to one")
+        if self.parent_checkpoint is not None and (
+            not isinstance(self.parent_checkpoint, str) or not self.parent_checkpoint.strip()
+        ):
+            raise ValueError("parent_checkpoint must be a nonempty path or null")
 
     @classmethod
     def load(cls, path: Path) -> "RunConfig":
-        raw: Any = yaml.safe_load(path.read_text(encoding="utf-8"))
+        try:
+            raw: Any = yaml.load(path.read_text(encoding="utf-8"), Loader=ConfigLoader)
+        except yaml.YAMLError as error:
+            raise ValueError("invalid or unsafe YAML configuration") from error
         if not isinstance(raw, dict):
             raise ValueError("configuration must be a mapping")
         raw = dict(raw)

@@ -55,3 +55,36 @@ def test_invalid_configuration_is_rejected(tmp_path: Path) -> None:
     path.write_text("unexpected: 1\n")
     with pytest.raises(ValueError):
         RunConfig.load(path)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "train:\n  seed: 1\n  seed: 2\n",
+        "data_mix: {web: true}\n",
+        "train: {learning_rate: true}\n",
+        "train: {beta1: 1.0}\n",
+        "parent_checkpoint: ''\n",
+    ],
+)
+def test_ambiguous_or_mistyped_configuration_is_rejected(tmp_path: Path, text: str) -> None:
+    path = tmp_path / "bad.yaml"
+    path.write_text(text)
+    with pytest.raises(ValueError):
+        RunConfig.load(path)
+
+
+def test_mutated_record_and_symlink_escape_are_rejected(tmp_path: Path) -> None:
+    record = RunRecord.start("safe", RunConfig(), "fixture", "fixture")
+    record.run_id = "../escape"
+    with pytest.raises(ValueError):
+        record.save(tmp_path / "root")
+    record.run_id = "safe"
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (root / "safe").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError):
+        record.save(root)
+    assert not list(outside.iterdir())

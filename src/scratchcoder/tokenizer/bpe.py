@@ -46,7 +46,13 @@ class ByteBPE:
         known = set(range(256))
         seen: set[tuple[int, int]] = set()
         for index, pair in enumerate(self.merges):
-            if len(pair) != 2 or pair[0] not in known or pair[1] not in known or pair in seen:
+            if (
+                len(pair) != 2
+                or any(type(value) is not int for value in pair)
+                or pair[0] not in known
+                or pair[1] not in known
+                or pair in seen
+            ):
                 raise ValueError("invalid merge table")
             seen.add(pair)
             known.add(FIRST_MERGE + index)
@@ -88,6 +94,8 @@ class ByteBPE:
         tokens = self.byte_tokens()
         output = bytearray()
         for token_id in ids:
+            if type(token_id) is not int:
+                raise ValueError("token IDs must be integers")
             if 256 <= token_id < FIRST_MERGE:
                 if not skip_special:
                     output.extend(SPECIAL_TOKENS[token_id - 256].encode())
@@ -115,13 +123,26 @@ class ByteBPE:
     @classmethod
     def load(cls, path: Path) -> "ByteBPE":
         raw = json.loads(path.read_text(encoding="utf-8"))
-        if raw.get("version") != 1 or raw.get("specials") != list(SPECIAL_TOKENS):
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"version", "specials", "merges"}
+            or type(raw["version"]) is not int
+            or raw["version"] != 1
+            or raw["specials"] != list(SPECIAL_TOKENS)
+        ):
             raise ValueError("unsupported tokenizer format")
+        if not isinstance(raw["merges"], list) or any(
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or any(type(value) is not int for value in pair)
+            for pair in raw["merges"]
+        ):
+            raise ValueError("invalid merge table structure")
         return cls(tuple((pair[0], pair[1]) for pair in raw["merges"]))
 
     @classmethod
     def train(cls, corpus: Iterable[str], vocab_size: int) -> "ByteBPE":
-        if not FIRST_MERGE <= vocab_size <= 65536:
+        if type(vocab_size) is not int or not FIRST_MERGE <= vocab_size <= 65536:
             raise ValueError("vocabulary must include byte/special tokens and fit uint16")
         chunks: Counter[str] = Counter()
         for text in corpus:

@@ -69,3 +69,16 @@ def test_hosted_adapter_can_be_tested_without_network(monkeypatch: pytest.Monkey
     tracker.finish()
     module.init.assert_called_once_with(project="test", id="id", mode="online")
     module.init.return_value.log.assert_called_once_with({"loss": 1.0}, step=0)
+
+
+def test_tracker_finish_failure_is_local_and_permissions_are_tightened(tmp_path: Path) -> None:
+    tracker = Mock()
+    tracker.finish.side_effect = RuntimeError("sensitive-provider-message")
+    path = tmp_path / "existing.jsonl"
+    path.touch(mode=0o644)
+    with EventLogger(path, "fixture", tracker) as logger:
+        logger.metrics({"loss": 1.0}, step=0)
+    text = path.read_text()
+    assert "sensitive-provider-message" not in text
+    assert json.loads(text.splitlines()[-1])["fields"]["phase"] == "finish"
+    assert path.stat().st_mode & 0o077 == 0

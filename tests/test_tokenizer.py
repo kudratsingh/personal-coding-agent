@@ -1,3 +1,4 @@
+import json
 import random
 from collections import Counter
 from pathlib import Path
@@ -75,3 +76,13 @@ def test_invalid_merge_and_unknown_token_rejected() -> None:
         ByteBPE(((9999, 1),))
     with pytest.raises(ValueError):
         ByteBPE().decode([100000])
+
+
+def test_tokenizer_loader_rejects_extra_or_mistyped_merge_values(tmp_path: Path) -> None:
+    raw = json.loads(ByteBPE().serialized())
+    path = tmp_path / "bad.json"
+    for merges in ([[1, 2, 3]], [[True, 2]], [[1]], "not-a-list"):
+        raw["merges"] = merges
+        path.write_text(json.dumps(raw))
+        with pytest.raises(ValueError):
+            ByteBPE.load(path)

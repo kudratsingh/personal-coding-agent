@@ -28,6 +28,9 @@ def write_shard(
     if not 257 <= vocab_size <= 65536 or not 0 <= bos_id < vocab_size:
         raise ValueError("shards require a uint16 vocabulary and valid BOS")
     path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = path.with_suffix(path.suffix + ".json")
+    if manifest.exists():
+        raise FileExistsError(manifest)
     # Exclusive creation avoids silently overwriting an existing shard/manifest pair.
     offsets: list[tuple[int, int]] = []
     offset = 0
@@ -40,12 +43,15 @@ def write_shard(
                 stream.write(struct.pack(f"<{len(tokens)}H", *tokens))
                 offsets.append((offset, len(tokens)))
                 offset += len(tokens)
+            stream.flush()
+            import os
+
+            os.fsync(stream.fileno())
     except FileExistsError:
         raise
     except BaseException:
         path.unlink(missing_ok=True)
         raise
-    manifest = path.with_suffix(path.suffix + ".json")
     atomic_json(
         manifest,
         {
@@ -77,6 +83,13 @@ class TokenShard:
             offset < 0 or length < 1 or offset + length > size for offset, length in self.offsets
         ):
             raise ValueError("invalid document offsets")
+        expected = 0
+        for offset, length in self.offsets:
+            if type(offset) is not int or type(length) is not int or offset != expected:
+                raise ValueError("shard documents must cover tokens contiguously without overlap")
+            expected += length
+        if expected != size:
+            raise ValueError("shard metadata does not cover all token bytes")
 
     def __len__(self) -> int:
         return len(self.offsets)

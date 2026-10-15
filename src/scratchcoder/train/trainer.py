@@ -12,9 +12,9 @@ import torch.distributed as dist
 from torch import Tensor
 
 from scratchcoder.common.config import RunConfig
-from scratchcoder.common.logging import EventLogger
+from scratchcoder.common.logging import EventLogger, debug_logger
 from scratchcoder.common.records import RunRecord
-from scratchcoder.data.loader import MixedLoader
+from scratchcoder.data.loader import BatchSource
 from scratchcoder.model.gpt import GPT
 from scratchcoder.optim.adamw import AdamW, clip_gradients, cross_entropy, learning_rate
 
@@ -23,7 +23,7 @@ class Trainer:
     def __init__(
         self,
         config: RunConfig,
-        loader: MixedLoader,
+        loader: BatchSource,
         *,
         run_id: str,
         run_root: Path,
@@ -50,6 +50,8 @@ class Trainer:
         self.optimizer = AdamW(
             [parameter for _, parameter in named],
             learning_rate=config.train.learning_rate,
+            betas=(config.train.beta1, config.train.beta2),
+            eps=config.train.adam_epsilon,
             weight_decay=config.train.weight_decay,
             decay_mask=[
                 parameter.ndim >= 2 and name != "embedding.weight" for name, parameter in named
@@ -81,7 +83,7 @@ class Trainer:
                         with torch.autocast(
                             device_type=self.device.type,
                             dtype=torch.bfloat16,
-                            enabled=self.device.type == "cuda",
+                            enabled=options.precision == "bfloat16",
                         ):
                             loss = cross_entropy(self.model(x), y) / options.accumulation_steps
                         if not bool(torch.isfinite(loss)):
@@ -125,6 +127,12 @@ class Trainer:
                     self.record.finish(success=True)
             except Exception as error:
                 logger.event("training_failed", error_type=type(error).__name__, step=self.step)
+                diagnostic = debug_logger(log_path.with_name(f"debug-rank{self.rank}.jsonl"))
+                try:
+                    diagnostic.exception("Training aborted at step %s", self.step)
+                finally:
+                    for handler in diagnostic.handlers:
+                        handler.close()
                 self.record.finish(success=False)
                 raise
             finally:

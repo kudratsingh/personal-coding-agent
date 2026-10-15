@@ -1,6 +1,8 @@
+import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 import torch
 
 from scratchcoder.common.config import ModelConfig, RunConfig, TrainConfig
@@ -104,3 +106,51 @@ def test_tiny_model_learns_repeating_toy_corpus(tmp_path: Path) -> None:
     assert generate(trainer.model, torch.tensor([[97]]), max_new_tokens=8).tolist() == [
         [97, 98, 99] * 3
     ]
+
+
+def test_nano_configuration_learns_toy_corpus(tmp_path: Path) -> None:
+    original = RunConfig.load(Path("configs/nano.yaml"))
+    config = replace(
+        original,
+        train=replace(
+            original.train, steps=60, sequence_length=12, batch_size=2, learning_rate=0.003
+        ),
+    )
+    loader = MixedLoader(
+        {"web": [[97, 98, 99] * 20]},
+        {"web": 1.0},
+        sequence_length=12,
+        batch_size=2,
+        seed=config.train.seed,
+    )
+    trainer = Trainer(
+        config,
+        loader,
+        run_id="nano-toy",
+        run_root=tmp_path,
+        data_hash="synthetic",
+        tokenizer_hash="bytes",
+    )
+    losses = trainer.train()
+    assert losses[-1] < 0.1
+    assert generate(trainer.model, torch.tensor([[97]]), max_new_tokens=8).tolist() == [
+        [97, 98, 99] * 3
+    ]
+
+
+def test_training_failure_records_traceback_and_failed_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = make_trainer(tiny_config(), tmp_path, "failure")
+
+    def fail() -> None:
+        raise RuntimeError("Bearer synthetic-secret")
+
+    monkeypatch.setattr(trainer.optimizer, "step", fail)
+    with pytest.raises(RuntimeError):
+        trainer.train()
+    record = json.loads((tmp_path / "failure/record.json").read_text())
+    trace = (tmp_path / "failure/debug-rank0.jsonl").read_text()
+    assert record["status"] == "failed"
+    assert "RuntimeError" in trace
+    assert "synthetic-secret" not in trace
