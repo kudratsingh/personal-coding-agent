@@ -1,0 +1,29 @@
+name: Reference benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: Number of HumanEval tasks (164 for full validation)
+        required: true
+        default: "164"
+
+permissions:
+  contents: read
+
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+      - run: uv sync --locked --extra baseline
+      - run: docker pull --platform linux/amd64 python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe
+      - name: Validate pinned reference model through isolated tests
+        env:
+          TASK_LIMIT: ${{ inputs.limit }}
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+        run: uv run --locked --extra baseline python tools/baselines/humaneval.py --output runs/reference --limit "$TASK_LIMIT"

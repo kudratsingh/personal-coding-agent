@@ -11,6 +11,7 @@ Start with the [project README](../README.md), [current status](status.md), and 
 | [Compute](compute.md) | Estimate two-stage compute from supplied assumptions. |
 | [Data policy](data.md) | Record provenance, licensing, splits, and contamination controls. |
 | [Evaluation policy](evaluation.md) | Interpret future results and their evidence. |
+| [Reference evaluation](reference-evaluation.md) | Understand the optional pinned comparison track. |
 | [Sandbox](sandbox.md) | Understand requirements for executing generated programs. |
 | [Walkthroughs](walkthroughs/README.md) | Document core components as they land. |
 | [Decision records](adr/README.md) | Publish technical decisions safe for contributors to see. |
