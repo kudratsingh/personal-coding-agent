@@ -55,13 +55,30 @@ class Attention(nn.Module):
         self.output = nn.Linear(config.width, config.width, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
+        return self.forward_cached(x, None)[0]
+
+    def forward_cached(
+        self, x: Tensor, cache: tuple[Tensor, Tensor] | None
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         batch, time, width = x.shape
+        offset = 0 if cache is None else cache[0].shape[-2]
         q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q = rotary(q.view(batch, time, self.heads, width // self.heads).transpose(1, 2))
-        k = rotary(k.view(batch, time, self.heads, width // self.heads).transpose(1, 2))
+        q = rotary(
+            q.view(batch, time, self.heads, width // self.heads).transpose(1, 2), offset=offset
+        )
+        k = rotary(
+            k.view(batch, time, self.heads, width // self.heads).transpose(1, 2), offset=offset
+        )
         v = v.view(batch, time, self.heads, width // self.heads).transpose(1, 2)
-        attended = causal_attention(q, k, v).transpose(1, 2).contiguous().view(batch, time, width)
-        return cast(Tensor, self.output(attended))
+        if cache is not None:
+            k, v = torch.cat((cache[0], k), dim=-2), torch.cat((cache[1], v), dim=-2)
+        attended = (
+            causal_attention(q, k, v, offset=offset)
+            .transpose(1, 2)
+            .contiguous()
+            .view(batch, time, width)
+        )
+        return cast(Tensor, self.output(attended)), (k, v)
 
 
 class Block(nn.Module):
@@ -74,11 +91,17 @@ class Block(nn.Module):
         self.down = nn.Linear(4 * config.width, config.width, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = x + self.attention(self.norm1(x))
+        return self.forward_cached(x, None)[0]
+
+    def forward_cached(
+        self, x: Tensor, cache: tuple[Tensor, Tensor] | None
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        attended, updated = self.attention.forward_cached(self.norm1(x), cache)
+        x = x + attended
         hidden = self.up(self.norm2(x))
         # Exact GELU expressed with erf rather than a ready-made transformer component.
         activated = hidden * 0.5 * (1 + torch.erf(hidden / math.sqrt(2)))
-        return cast(Tensor, x + self.down(activated))
+        return cast(Tensor, x + self.down(activated)), updated
 
 
 class GPT(nn.Module):
@@ -103,6 +126,28 @@ class GPT(nn.Module):
 
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
+
+    def forward_cached(
+        self, ids: Tensor, cache: list[tuple[Tensor, Tensor]] | None = None
+    ) -> tuple[Tensor, list[tuple[Tensor, Tensor]]]:
+        if ids.ndim != 2 or ids.shape[1] == 0:
+            raise ValueError("tokens must be nonempty [batch,time]")
+        if cache is not None and len(cache) != self.config.layers:
+            raise ValueError("cache layer count differs")
+        offset = 0 if cache is None else cache[0][0].shape[-2]
+        if offset + ids.shape[1] > self.config.context:
+            raise ValueError("cached sequence exceeds context")
+        if cache is not None and any(
+            key.shape[-2] != offset or key.shape[0] != ids.shape[0] or value.shape != key.shape
+            for key, value in cache
+        ):
+            raise ValueError("inconsistent cache dimensions")
+        x = self.embedding(ids)
+        updated: list[tuple[Tensor, Tensor]] = []
+        for index, block in enumerate(self.blocks):
+            x, layer = cast(Block, block).forward_cached(x, None if cache is None else cache[index])
+            updated.append(layer)
+        return cast(Tensor, self.norm(x) @ self.embedding.weight.T), updated
 
 
 def expected_parameters(config: ModelConfig) -> int:
