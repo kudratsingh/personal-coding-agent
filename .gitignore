@@ -1,0 +1,59 @@
+# Private project material: never commit these directories or their contents.
+private/
+docs/internal/
+plans/
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+.env.local
+.env.*.local
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+.aws/
+.ssh/
+credentials*.json
+*.log
+*.zip
+CLAUDE.local.md
+AGENTS.local.md
+.claude/settings.local.json
+.codex/
+.idea/
+.vscode/
+
+# Python and tooling
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Data, model weights, run outputs, and local artifacts
+data/raw/
+data/processed/
+data/shards/
+checkpoints/
+artifacts/
+runs/*/artifacts/
+runs/
+wandb/
+mlruns/
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.bin
+
+# Node and operating-system files
+node_modules/
+dist/
+build/
+.DS_Store
