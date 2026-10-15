@@ -9,3 +9,5 @@ Keep benchmark prompts, reference solutions, hidden tests, and held-out tasks ou
 Raw corpora, tokenized shards, and credentials remain outside Git. Publish a data card listing the sources actually used when a training milestone is released. No production training dataset is currently included or approved by this starter.
 
 The [current data card](data-card.md) records the synthetic-only development state. The manifest downloader fails closed on missing approval, unpinned revisions, disallowed training licenses, absent gated terms acceptance, or mismatched bytes.
+
+Filtering records a primary rejection reason per source for length, code shape, generated markers, exact duplicates, and held-out n-gram matches. The default contamination index uses normalized 13-word sequences from supplied held-out text. This catches planted verbatim spans, not every paraphrase; real corpora still need further review and near-duplicate analysis. Document hash splits are deterministic and keep stage-1, stage-2, and validation web material separate.
