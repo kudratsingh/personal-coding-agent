@@ -2,11 +2,11 @@
 
 An open, from-scratch learning project for building a small coding agent: tokenizer and model foundations, training and evaluation tooling, safe code execution, and an iterative repair loop.
 
-This repository currently contains the public project charter and contribution scaffold. Implementation and benchmark claims will be added only as they are reproducible.
+This repository contains the public project charter and a tested Python development scaffold. Model implementation and benchmark claims will be added as they become reproducible.
 
 ## Current status
 
-Pre-implementation. The first public milestone is a minimal, locally reproducible development scaffold.
+Foundation tooling. Core model and training components are forthcoming.
 
 See [the public status page](docs/status.md), [roadmap](docs/roadmap.md), and [architecture overview](docs/architecture.md).
 
@@ -25,10 +25,11 @@ See [the public status page](docs/status.md), [roadmap](docs/roadmap.md), and [a
 3. Choose a small, well-scoped issue or the next milestone in [the roadmap](docs/roadmap.md).
 4. Open a pull request with tests and documentation for the change.
 
-To check the starter documentation with Python 3.11 or newer:
+Install uv, then run the local checks:
 
 ```sh
-python3 tools/check_docs.py
+make setup
+make check
 ```
 
 The owner's local planning entry point is `private/START_HERE.md`. It is intentionally absent from public clones; contributors can work from the public roadmap and issues.
