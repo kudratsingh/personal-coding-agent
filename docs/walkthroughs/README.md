@@ -11,3 +11,5 @@ Implemented: [byte-level BPE](tokenizer.md).
 Implemented: [decoder-only transformer](transformer.md).
 
 Implemented: [loss and optimization](optimizer.md).
+
+Implemented: [training and resume](training-loop.md).
