@@ -13,7 +13,9 @@ make check
 
 `make lint`, `make typecheck`, `make test`, and `make docs-check` run independently; `make check` runs all four. CPU CI uses the same commands on Linux and macOS.
 
-`make smoke` currently exits nonzero and lists missing pipeline stages. Tests verify that this command fails honestly and creates no artifacts. The future training, data, evaluation, serving, and paid-operation make targets also fail explicitly until implemented. No cloud resources are created by this scaffold.
+`make smoke` runs a complete offline synthetic fixture pipeline: tokenizer/data preparation, two tiny pretraining stages, checkpoints, sampling, and held-out token validation for both domains. Artifacts stay in ignored `runs/smoke-*`. The supplied `configs/smoke.yaml` is intentionally tiny; this check does not establish benchmark capability or security of generated-code execution. It never executes generated code.
+
+For individual local commands, use `uv run --locked scratchcoder --help` or `make <target> ARGS='...'`. Tokenizer training accepts explicit local UTF-8 corpus files. `data-build --synthetic --output runs/fixture` builds only synthetic material, never downloads gated data. Training requires a config, tokenizer, source-shard JSON map, and run ID. Evaluation, serving, and paid commands remain unavailable until implemented.
 
 For now, use `.env.example` only as a template for local configuration; never commit the resulting `.env` file.
 

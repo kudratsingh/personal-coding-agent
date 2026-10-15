@@ -5,6 +5,7 @@ import torch
 
 from scratchcoder.common.config import ModelConfig, RunConfig, TrainConfig
 from scratchcoder.data.loader import MixedLoader
+from scratchcoder.engine.generation import generate
 from scratchcoder.train.trainer import Trainer
 
 
@@ -62,3 +63,44 @@ def test_stage_two_loads_weights_but_resets_optimizer_and_schedule(tmp_path: Pat
     assert second.step == 0
     assert set(second.optimizer.steps) == {0}
     assert second.record.parent_run_id == "first"
+
+
+def test_one_batch_can_be_memorized(tmp_path: Path) -> None:
+    config = replace(
+        tiny_config(), train=replace(tiny_config().train, steps=100, learning_rate=0.02)
+    )
+    loader = MixedLoader({"web": [[1] * 32]}, {"web": 1.0}, sequence_length=8, batch_size=2, seed=0)
+    trainer = Trainer(
+        config,
+        loader,
+        run_id="memorize",
+        run_root=tmp_path,
+        data_hash="synthetic",
+        tokenizer_hash="synthetic",
+    )
+    losses = trainer.train()
+    assert losses[-1] < 0.05
+    assert losses[-1] < losses[0] / 50
+
+
+def test_tiny_model_learns_repeating_toy_corpus(tmp_path: Path) -> None:
+    config = RunConfig(
+        model=ModelConfig(vocab_size=272, width=32, layers=1, heads=4, context=32),
+        train=TrainConfig(steps=120, sequence_length=12, batch_size=2, learning_rate=0.01),
+    )
+    loader = MixedLoader(
+        {"web": [[97, 98, 99] * 20]}, {"web": 1.0}, sequence_length=12, batch_size=2, seed=0
+    )
+    trainer = Trainer(
+        config,
+        loader,
+        run_id="toy",
+        run_root=tmp_path,
+        data_hash="synthetic",
+        tokenizer_hash="bytes",
+    )
+    losses = trainer.train()
+    assert losses[-1] < 0.1
+    assert generate(trainer.model, torch.tensor([[97]]), max_new_tokens=8).tolist() == [
+        [97, 98, 99] * 3
+    ]

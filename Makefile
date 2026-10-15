@@ -24,7 +24,16 @@ docs-check:
 smoke:
 	$(UV) run --locked scratchcoder smoke
 
-tok-train data-build train eval serve:
+tok-train:
+	$(UV) run --locked scratchcoder tok-train $(ARGS)
+
+data-build:
+	$(UV) run --locked scratchcoder data-build $(ARGS)
+
+train:
+	$(UV) run --locked scratchcoder train $(ARGS)
+
+eval serve:
 	@echo "$@ is not implemented yet. See docs/status.md." >&2
 	@exit 2
 
