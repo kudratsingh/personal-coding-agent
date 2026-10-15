@@ -8,22 +8,26 @@ import pytest
 
 
 @pytest.mark.parametrize("entrypoint", [[sys.executable, "-m", "scratchcoder"], ["scratchcoder"]])
-def test_smoke_fails_explicitly(entrypoint: list[str], tmp_path: Path) -> None:
+def test_smoke_runs_complete_synthetic_pipeline(entrypoint: list[str], tmp_path: Path) -> None:
+    config = Path(__file__).resolve().parents[1] / "configs/smoke.yaml"
     result = subprocess.run(
-        [*entrypoint, "smoke"], cwd=tmp_path, capture_output=True, text=True, check=False
+        [*entrypoint, "smoke", "--config", str(config), "--output", str(tmp_path / "smoke")],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
     )
-    assert result.returncode == 2
-    assert not result.stdout
-    assert "Smoke pipeline is incomplete" in result.stderr
-    assert "pretraining stage 1" in result.stderr
-    assert "pretraining stage 2" in result.stderr
-    assert "No training or evaluation was run" in result.stderr
-    assert not list(tmp_path.iterdir())
+    assert result.returncode == 0, result.stderr
+    assert "Synthetic smoke passed" in result.stdout
+    assert (tmp_path / "smoke/stage1.pt").exists()
+    assert (tmp_path / "smoke/stage2.pt").exists()
+    assert (tmp_path / "smoke/summary.json").exists()
 
 
 def test_unknown_command_cannot_report_success() -> None:
     result = subprocess.run(
-        [sys.executable, "-m", "scratchcoder", "train"],
+        [sys.executable, "-m", "scratchcoder", "not-a-command"],
         capture_output=True,
         text=True,
         check=False,

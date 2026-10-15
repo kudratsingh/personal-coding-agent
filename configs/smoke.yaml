@@ -1,0 +1,15 @@
+model:
+  vocab_size: 512
+  width: 32
+  layers: 2
+  heads: 4
+  context: 64
+train:
+  seed: 7
+  steps: 4
+  batch_size: 2
+  sequence_length: 16
+  learning_rate: 0.003
+  warmup_steps: 1
+data_mix:
+  web: 1.0

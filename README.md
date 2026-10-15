@@ -6,7 +6,7 @@ This repository contains the public project charter and a tested Python developm
 
 ## Current status
 
-Foundation tooling. Core model and training components are forthcoming.
+Local foundations, data/tokenizer tooling, a compact transformer, resumable training, and generation are implemented. External-corpus training and benchmark validation remain pending.
 
 See [the public status page](docs/status.md), [roadmap](docs/roadmap.md), and [architecture overview](docs/architecture.md).
 
@@ -30,6 +30,7 @@ Install uv, then run the local checks:
 ```sh
 make setup
 make check
+make smoke
 ```
 
 The owner's local planning entry point is `private/START_HERE.md`. It is intentionally absent from public clones; contributors can work from the public roadmap and issues.

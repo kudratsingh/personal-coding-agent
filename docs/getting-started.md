@@ -7,7 +7,7 @@
 3. Install uv, then run `make setup && make check` from the repository root.
 4. Discuss a focused implementation task in an issue before a substantial change.
 
-The development package is scaffolded, but model and training functionality have not been implemented yet. `make smoke` deliberately fails until the full pipeline is ready.
+Run `make smoke` for the offline synthetic pipeline. It builds a tokenizer and shards, runs two tiny training stages, saves checkpoints, samples text, and validates held-out token loss. It does not download external data or execute generated programs.
 
 ## Owner checkout
 

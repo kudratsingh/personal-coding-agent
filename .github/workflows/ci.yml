@@ -22,3 +22,5 @@ jobs:
         run: make setup
       - name: Lint, typecheck, test, and check docs
         run: make check
+      - name: Synthetic two-stage smoke
+        run: make smoke
