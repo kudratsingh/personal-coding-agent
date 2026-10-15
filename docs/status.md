@@ -2,19 +2,20 @@
 
 **Stage:** Foundation
 
-The public starter documentation and agent instructions are prepared. There is no model, training result, benchmark score, hosted service, or released weight to report yet.
+The Python package scaffold, locked development environment, checks, and CPU CI are implemented. There is no model, training result, benchmark score, hosted service, or released weight to report yet.
 
 ## Completed starter work
 
 - Public roadmap, architecture, development, data, evaluation, and sandbox guides.
 - Shared coding-agent entry points and contributor templates.
 - Documentation link check and a matching CI workflow.
+- Python 3.12.13, uv dependency lock, component namespaces, lint, types, tests, and Linux/macOS CPU CI.
 
-**Starter verification:** `python3 tools/check_docs.py` passes locally.
+**Verification:** `make check` passes locally. Smoke deliberately exits nonzero while stages are missing.
 
 ## Next public milestone
 
-Create a minimal development scaffold with a reproducible local check, test harness, and documented project layout.
+Add typed configuration and reproducible run records, then logging infrastructure before the data and tokenizer milestone.
 
 ## Reporting policy
 

@@ -4,10 +4,10 @@
 
 1. Clone `https://github.com/kudratsingh/personal-coding-agent.git`.
 2. Read the root `AGENTS.md`, [status](status.md), and [roadmap](roadmap.md).
-3. Run `python3 tools/check_docs.py` from the repository root with Python 3.11 or newer.
+3. Install uv, then run `make setup && make check` from the repository root.
 4. Discuss a focused implementation task in an issue before a substantial change.
 
-The model and training package have not been implemented yet. The first implementation milestone will add the runtime and dependency setup; do not assume training commands already exist.
+The development package is scaffolded, but model and training functionality have not been implemented yet. `make smoke` deliberately fails until the full pipeline is ready.
 
 ## Owner checkout
 

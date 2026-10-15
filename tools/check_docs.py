@@ -1,9 +1,8 @@
 """Check relative Markdown file links in the public starter documentation."""
 
-from pathlib import Path
 import re
+from pathlib import Path
 from urllib.parse import unquote, urlsplit
-
 
 ROOT = Path(__file__).resolve().parents[1]
 LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
