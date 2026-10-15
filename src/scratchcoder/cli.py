@@ -30,6 +30,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     train.add_argument("--output", type=Path, default=Path("runs"))
     train.add_argument("--run-id", required=True)
     train.add_argument("--resume", type=Path)
+    evaluation = subparsers.add_parser("eval")
+    evaluation.add_argument("--checkpoint", type=Path, required=True)
+    evaluation.add_argument("--tokenizer", type=Path, required=True)
+    evaluation.add_argument("--tasks", type=Path, required=True)
+    evaluation.add_argument("--output", type=Path, required=True)
+    evaluation.add_argument("--scorecard", type=Path, default=Path("runs/scorecard.jsonl"))
+    evaluation.add_argument("--samples", type=int, default=1)
+    evaluation.add_argument("--seed", type=int, default=0)
+    evaluation.add_argument("--max-new-tokens", type=int, default=128)
+    evaluation.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args(argv)
     if args.command == "smoke":
         return run_smoke(sys.stdout, config_path=args.config, output_root=args.output)
@@ -46,6 +56,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         ByteBPE.train(
             (path.read_text(encoding="utf-8") for path in args.corpus), args.vocab_size
         ).save(args.output)
+        return 0
+    if args.command == "eval":
+        from scratchcoder.eval.command import evaluate_checkpoint
+        from scratchcoder.eval.harness import EvaluationConfig
+
+        evaluate_checkpoint(
+            checkpoint=args.checkpoint,
+            tokenizer_path=args.tokenizer,
+            tasks_path=args.tasks,
+            output=args.output,
+            scorecard=args.scorecard,
+            config=EvaluationConfig(
+                samples=args.samples,
+                seed=args.seed,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+            ),
+        )
         return 0
     from scratchcoder.train.command import train_from_files
 

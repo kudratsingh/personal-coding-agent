@@ -22,4 +22,4 @@ jobs:
       - name: Containment and abuse tests
         env:
           SCRATCHCODER_SANDBOX_TESTS: "1"
-        run: uv run --locked pytest tests/test_sandbox.py -v
+        run: uv run --locked pytest tests/test_sandbox.py tests/test_evaluation_integration.py -v
