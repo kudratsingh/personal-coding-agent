@@ -10,12 +10,13 @@ The Python package scaffold, locked development environment, checks, and CPU CI 
 - Shared coding-agent entry points and contributor templates.
 - Documentation link check and a matching CI workflow.
 - Python 3.12.13, uv dependency lock, component namespaces, lint, types, tests, and Linux/macOS CPU CI.
+- Validated YAML configuration and atomic, schema-tested run records with provenance and parent lineage.
 
 **Verification:** `make check` passes locally. Smoke deliberately exits nonzero while stages are missing.
 
 ## Next public milestone
 
-Add typed configuration and reproducible run records, then logging infrastructure before the data and tokenizer milestone.
+Add logging infrastructure before the data and tokenizer milestone.
 
 ## Reporting policy
 
