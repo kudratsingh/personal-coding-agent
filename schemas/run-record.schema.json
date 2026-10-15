@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Run record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "config", "git_commit", "dirty", "seed", "data_manifest_hash", "tokenizer_hash", "parent_run_id", "hardware", "started_at", "ended_at", "estimated_cost_usd", "actual_cost_usd", "artifact_uri", "status", "schema_version"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
+    "config": {"type": "object"},
+    "git_commit": {"type": ["string", "null"]},
+    "dirty": {"type": "boolean"},
+    "seed": {"type": "integer", "minimum": 0},
+    "data_manifest_hash": {"type": "string"},
+    "tokenizer_hash": {"type": "string"},
+    "parent_run_id": {"type": ["string", "null"]},
+    "hardware": {"type": "object", "additionalProperties": {"type": "string"}},
+    "started_at": {"type": "string", "format": "date-time"},
+    "ended_at": {"type": ["string", "null"], "format": "date-time"},
+    "estimated_cost_usd": {"type": "number", "minimum": 0},
+    "actual_cost_usd": {"type": ["number", "null"], "minimum": 0},
+    "artifact_uri": {"type": ["string", "null"]},
+    "status": {"enum": ["running", "completed", "failed"]}
+  }
+}
