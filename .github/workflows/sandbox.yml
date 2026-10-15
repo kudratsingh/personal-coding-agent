@@ -1,0 +1,25 @@
+name: Sandbox containment
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  containment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+      - run: make setup
+      - name: Prepare pinned isolated runtime
+        run: docker pull --platform linux/amd64 python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe
+      - name: Containment and abuse tests
+        env:
+          SCRATCHCODER_SANDBOX_TESTS: "1"
+        run: uv run --locked pytest tests/test_sandbox.py -v
