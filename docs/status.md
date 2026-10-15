@@ -12,6 +12,7 @@ The Python package scaffold, locked development environment, checks, and CPU CI 
 - Python 3.12.13, uv dependency lock, component namespaces, lint, types, tests, and Linux/macOS CPU CI.
 - Validated YAML configuration and atomic, schema-tested run records with provenance and parent lineage.
 - Local JSONL metrics, an opt-in tracker adapter, and structured debug logs with tracebacks.
+- Manifest validation, deterministic filtering/splits, and a byte-level BPE implementation with reference tests.
 
 **Verification:** `make check` passes locally. Smoke deliberately exits nonzero while stages are missing.
 

@@ -5,3 +5,5 @@ Each core component ships with a reference test and a walkthrough in the same pu
 Use the [walkthrough template](TEMPLATE.md): start with a small worked example, show tensor shapes at each step, explain design choices and failure cases, then identify verification evidence.
 
 Planned topics include tokenization, transformer layers, optimization, training and resume, sampling and key-value caching, isolated execution, and policy updates.
+
+Implemented: [byte-level BPE](tokenizer.md).

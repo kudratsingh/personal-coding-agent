@@ -1,0 +1,77 @@
+import random
+from collections import Counter
+from pathlib import Path
+
+import pytest
+
+from scratchcoder.tokenizer.bpe import CHUNKS, FIRST_MERGE, ByteBPE
+
+
+def slow_reference(corpus: list[str], merges: int) -> tuple[tuple[int, int], ...]:
+    """Recount the whole corpus each iteration; intentionally slow and independent."""
+    sequences = [list(chunk.encode()) for text in corpus for chunk in CHUNKS.findall(text)]
+    result: list[tuple[int, int]] = []
+    for number in range(merges):
+        counts: Counter[tuple[int, int]] = Counter()
+        for ids in sequences:
+            counts.update(zip(ids, ids[1:], strict=False))
+        if not counts:
+            break
+        pair = min(counts, key=lambda value: (-counts[value], value))
+        result.append(pair)
+        for index, ids in enumerate(sequences):
+            rebuilt: list[int] = []
+            offset = 0
+            while offset < len(ids):
+                if ids[offset : offset + 2] == list(pair):
+                    rebuilt.append(FIRST_MERGE + number)
+                    offset += 2
+                else:
+                    rebuilt.append(ids[offset])
+                    offset += 1
+            sequences[index] = rebuilt
+    return tuple(result)
+
+
+def test_incremental_training_matches_slow_reference() -> None:
+    rng = random.Random(4)
+    for _ in range(15):
+        corpus = ["".join(rng.choice("abcc \n") for _ in range(100)) for _ in range(5)]
+        actual = ByteBPE.train(corpus, FIRST_MERGE + 25)
+        assert actual.merges == slow_reference(corpus, 25)
+        assert actual.sha256 == ByteBPE.train(reversed(corpus), FIRST_MERGE + 25).sha256
+
+
+def test_unicode_and_code_roundtrip_and_save(tmp_path: Path) -> None:
+    corpus = ["def add(a, b):\n    return a + b\n", "English prose and emoji 🐍 café 中文"]
+    tokenizer = ByteBPE.train(corpus, 350)
+    rng = random.Random(17)
+    examples = corpus + ["", "\t  \n\n", "<|bos|>"]
+    for _ in range(100):
+        examples.append(
+            "".join(
+                chr(rng.choice([rng.randrange(0xD800), rng.randrange(0xE000, 0x110000)]))
+                for _ in range(20)
+            )
+        )
+    for example in examples:
+        assert tokenizer.decode(tokenizer.encode(example)) == example
+    path = tmp_path / "tokenizer.json"
+    tokenizer.save(path)
+    loaded = ByteBPE.load(path)
+    assert loaded == tokenizer
+    assert loaded.sha256 == tokenizer.sha256
+
+
+def test_special_tokens_require_explicit_opt_in() -> None:
+    tokenizer = ByteBPE()
+    assert tokenizer.bos_id not in tokenizer.encode("<|bos|>")
+    assert tokenizer.encode("<|bos|>", allow_special=True) == [tokenizer.bos_id]
+    assert tokenizer.decode([tokenizer.bos_id], skip_special=True) == ""
+
+
+def test_invalid_merge_and_unknown_token_rejected() -> None:
+    with pytest.raises(ValueError):
+        ByteBPE(((9999, 1),))
+    with pytest.raises(ValueError):
+        ByteBPE().decode([100000])
