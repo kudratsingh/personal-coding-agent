@@ -1,6 +1,8 @@
 """Normalized task records and explicit source-field mapping."""
 
 import json
+import keyword
+import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,8 +22,35 @@ class Task:
     mode: str = "function"
     entry_point: str | None = None
     solution: str | None = None
+    source_revision: str | None = None
 
     def __post_init__(self) -> None:
+        strings = (
+            self.id,
+            self.prompt,
+            self.public_tests,
+            self.hidden_tests,
+            self.source,
+            self.license,
+            self.written_by,
+            self.split,
+            self.mode,
+        )
+        if any(not isinstance(value, str) or not value.strip() for value in strings):
+            raise ValueError("task text and provenance fields must be nonempty strings")
+        if self.solution is not None and not isinstance(self.solution, str):
+            raise ValueError("reference solution must be text or null")
+        if self.entry_point is not None and (
+            not isinstance(self.entry_point, str)
+            or not self.entry_point.isidentifier()
+            or keyword.iskeyword(self.entry_point)
+        ):
+            raise ValueError("entry point must be a Python identifier")
+        if self.source_revision is not None and (
+            not isinstance(self.source_revision, str)
+            or not re.fullmatch(r"[0-9a-f]{40,64}", self.source_revision)
+        ):
+            raise ValueError("source revision must be immutable")
         if not all(
             (self.id, self.prompt, self.public_tests, self.hidden_tests, self.source, self.license)
         ):
