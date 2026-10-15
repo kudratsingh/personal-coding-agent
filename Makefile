@@ -33,7 +33,10 @@ data-build:
 train:
 	$(UV) run --locked scratchcoder train $(ARGS)
 
-eval serve:
+eval:
+	$(UV) run --locked scratchcoder eval $(ARGS)
+
+serve:
 	@echo "$@ is not implemented yet. See docs/status.md." >&2
 	@exit 2
 
