@@ -61,3 +61,13 @@ def test_loader_rejects_incompatible_resume() -> None:
     )
     with pytest.raises(ValueError):
         changed.load_state_dict(first.state_dict())
+
+
+def test_overlapping_document_metadata_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "sample.bin"
+    manifest = write_shard(path, [[1, 2], [3, 4]], vocab_size=300, tokenizer_hash="t")
+    raw = json.loads(manifest.read_text())
+    raw["documents"][1][0] = 0
+    manifest.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="contiguously"):
+        TokenShard(path, tokenizer_hash="t")

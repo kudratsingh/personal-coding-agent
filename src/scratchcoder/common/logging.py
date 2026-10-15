@@ -59,6 +59,7 @@ class EventLogger:
     def __init__(self, path: Path, run_id: str, tracker: Tracker | None = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        os.fchmod(descriptor, 0o600)
         self._stream = os.fdopen(descriptor, "a", encoding="utf-8")
         self.run_id = run_id
         self.tracker = tracker
@@ -87,7 +88,10 @@ class EventLogger:
             return
         try:
             if self.tracker is not None:
-                self.tracker.finish()
+                try:
+                    self.tracker.finish()
+                except Exception as error:
+                    self.event("tracker_error", phase="finish", error_type=type(error).__name__)
         finally:
             self._stream.close()
 
@@ -116,6 +120,7 @@ def debug_logger(path: Path, *, name: str = "scratchcoder") -> logging.Logger:
     """Create an isolated JSONL debug logger without modifying root handlers."""
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    os.fchmod(descriptor, 0o600)
     os.close(descriptor)
     logger = logging.Logger(name, level=logging.DEBUG)
     handler = logging.FileHandler(path, encoding="utf-8")

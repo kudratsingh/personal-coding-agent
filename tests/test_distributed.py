@@ -1,6 +1,7 @@
 from dataclasses import replace
 from multiprocessing import get_context
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -26,7 +27,7 @@ def train_rank(rank: int, root: str) -> None:
     try:
         options = config(1)
         loader = MixedLoader(
-            {"web": [[1] * 16, [1] * 16]},
+            {"web": [[1] * 16, [2] * 16]},
             {"web": 1.0},
             sequence_length=4,
             batch_size=1,
@@ -65,9 +66,7 @@ def test_two_cpu_processes_match_effective_batch(tmp_path: Path) -> None:
                 process.terminate()
                 process.join(timeout=5)
     options = config(2)
-    loader = MixedLoader(
-        {"web": [[1] * 16, [1] * 16]}, {"web": 1.0}, sequence_length=4, batch_size=2, seed=0
-    )
+    loader = CombinedRankBatches()
     trainer = Trainer(
         options,
         loader,
@@ -81,6 +80,35 @@ def test_two_cpu_processes_match_effective_batch(tmp_path: Path) -> None:
     assert len(saved["rank_states"]) == 2
     for key, value in trainer.model.state_dict().items():
         torch.testing.assert_close(value, saved["model"][key], atol=1e-6, rtol=1e-5)
+
+
+class CombinedRankBatches:
+    """Serial reference consumes the exact union of two different rank batches."""
+
+    def __init__(self) -> None:
+        self.loaders = [
+            MixedLoader(
+                {"web": [[1] * 16, [2] * 16]},
+                {"web": 1.0},
+                sequence_length=4,
+                batch_size=1,
+                seed=0,
+                rank=rank,
+                world_size=2,
+            )
+            for rank in range(2)
+        ]
+
+    def next_batch(self) -> tuple[list[list[int]], list[list[int]], list[str]]:
+        first, second = [loader.next_batch() for loader in self.loaders]
+        return first[0] + second[0], first[1] + second[1], first[2] + second[2]
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"loaders": [loader.state_dict() for loader in self.loaders]}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        for loader, saved in zip(self.loaders, state["loaders"], strict=True):
+            loader.load_state_dict(saved)
 
 
 def test_gradient_accumulation_matches_effective_batch(tmp_path: Path) -> None:

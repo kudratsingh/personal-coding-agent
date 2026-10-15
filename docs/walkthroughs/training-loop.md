@@ -2,7 +2,7 @@
 
 The loader supplies input and one-position-shifted target arrays `[B,T]`. The model produces `[B,T,V]` logits; loss averages the target negative log probabilities. Accumulated minibatch losses are scaled before backpropagation so their sum equals one effective-batch mean. Distributed ranks average gradients before clipping and stepping.
 
-A run configuration supplies every hyperparameter. AdamW excludes embedding and normalization parameters from decay. CUDA uses bfloat16 autocast; the reference CPU path uses float32. Each step records loss, rate, gradient norm, and throughput to local JSONL.
+A run configuration supplies the learning rate, Adam betas/epsilon, decay, clipping, accumulation, and precision. AdamW excludes embedding and normalization parameters from decay. Bfloat16 autocast is explicit in configuration; reference checks use float32. Each step records loss, rate, gradient norm, and throughput to local JSONL.
 
 A resume checkpoint includes weights, optimizer moments/counters, step, loader buffers/positions/RNG, CPU/CUDA RNG state per rank, configuration, and input identities. Writes are atomic. Exact resume requires the same configuration, data/tokenizer identity, and world size.
 

@@ -64,6 +64,23 @@ class RunRecord:
     status: str = "running"
     schema_version: int = 1
 
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", self.run_id):
+            raise ValueError("run_id must be a safe path component")
+        if self.status not in {"running", "completed", "failed"} or self.schema_version != 1:
+            raise ValueError("invalid record status or schema version")
+        if type(self.seed) is not int or self.seed < 0:
+            raise ValueError("seed must be a nonnegative integer")
+        if (
+            not 0 <= self.estimated_cost_usd < float("inf")
+            or self.actual_cost_usd is not None
+            and not 0 <= self.actual_cost_usd < float("inf")
+        ):
+            raise ValueError("record costs must be finite and nonnegative")
+
     @classmethod
     def start(
         cls,
@@ -90,7 +107,11 @@ class RunRecord:
         )
 
     def save(self, root: Path) -> Path:
+        self.validate()
+        root = root.resolve()
         path = root / self.run_id / "record.json"
+        if not path.resolve().is_relative_to(root):
+            raise ValueError("run record path escapes its root through a symlink")
         atomic_json(path, asdict(self))
         return path
 
