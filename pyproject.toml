@@ -15,6 +15,11 @@ dependencies = [
 [project.scripts]
 scratchcoder = "scratchcoder.cli:main"
 
+[project.optional-dependencies]
+tracking = [
+    "wandb>=0.20,<1",
+]
+
 [dependency-groups]
 dev = [
     "jsonschema>=4,<5",

@@ -7,6 +7,7 @@ Start with the [project README](../README.md), [current status](status.md), and 
 | [Getting started](getting-started.md) | Navigate the starter and choose a first task. |
 | [Architecture](architecture.md) | Understand the intended component boundaries. |
 | [Development](development.md) | Run the starter checks and understand the implementation milestone. |
+| [Logging](logging.md) | Record local events, metrics, and diagnostic tracebacks. |
 | [Data policy](data.md) | Record provenance, licensing, splits, and contamination controls. |
 | [Evaluation policy](evaluation.md) | Interpret future results and their evidence. |
 | [Sandbox](sandbox.md) | Understand requirements for executing generated programs. |
