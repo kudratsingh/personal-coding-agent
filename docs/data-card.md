@@ -4,7 +4,7 @@ No external training corpus has been ingested. Ordinary tests use synthetic stri
 
 `data/manifest.json` intentionally contains no approved sources. External sources require a pinned immutable revision, a verified license and attribution, SHA-256, exact byte count, declared purpose, and owner terms acceptance where applicable. An unverified or incomplete entry fails before a network request.
 
-The [OpenCodeInstruct component pilot](opencode-pilot.md) has separately hash/schema-verified one 133,476,478-byte shard for evaluation-only inspection of its first 200 ordered rows. This is not a representative sample, training admission or full-source build. The guide records explicit governing terms, source credit, artifact identity, observed schema and isolation boundaries; reference execution remains pending. No source program has run on the host or entered tokenizer/training data.
+The [OpenCodeInstruct component pilot](opencode-pilot.md) separately hash/schema-verified one 133,476,478-byte shard for evaluation-only inspection of its first 200 ordered rows. Actual isolated execution retained 60 references passing both partitions after 35 unsupported-schema, 13 contamination/duplicate and 92 failing-reference rejections. This is not a representative sample, training admission or full-source build. The guide records explicit governing terms, source credit, artifact identity, observed schema, fixed runtime profile and limitations. No source program has run on the host or entered tokenizer/training data.
 
 The downloader verifies size and hash before atomically replacing the target. Test fixtures verify deterministic bytes, rejected licenses, absent terms acceptance, corruption, truncation, and oversized downloads.
 
