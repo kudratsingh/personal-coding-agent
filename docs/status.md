@@ -22,6 +22,7 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 - Standalone held-out checkpoint loss/bits-per-byte reports, restricted TACO I/O conversion, per-source pool drop counters, and split authorship summaries.
 - Independently trained third-party BPE merge/encoding comparison, restricted to reference tooling and a dedicated CI job.
 - Hash-bound evaluation-only EvalPlus OriginFmt intake, a locked NumPy runtime, full canonical preflight and optional project-checkpoint workflow. A failing preflight blocks scoring; no oracle correction is enabled.
+- Real MBPP+ canonical validation passed 378/378; a synthetic-only nano checkpoint completed the suite with 0/378, including 156 explicit context limits. HumanEval+ remains blocked by the unchanged standalone task-32 oracle (163/164 canonical passes). See [evidence](evalplus.md).
 
 **Verification:** Latest local suite with the optional reference installed: 131 passed, 16 explicitly skipped disposable-runtime tests; strict types, lint and public links pass. Linux/macOS CPU CI, independent tokenizer reference CI, legacy isolation and the new NumPy runtime checks pass separately. A previous fresh public clone passed setup/check/smoke without private files; detailed evidence is recorded in the relevant PRs. Local skips are not evidence of isolation. See [EvalPlus validation](evalplus.md) for real-suite outcomes and blockers, rather than treating loader/unit tests as benchmark acceptance.
 
