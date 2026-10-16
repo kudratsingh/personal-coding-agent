@@ -15,6 +15,7 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 - Validated YAML configuration and atomic, schema-tested run records with provenance and parent lineage.
 - Local JSONL metrics, an opt-in tracker adapter, and structured debug logs with tracebacks.
 - Manifest validation, deterministic filtering/splits, and a byte-level BPE implementation with reference tests.
+- Strict manifest field types and canonical acceptance dates are checked before download I/O; malformed review flags cannot become truthy approvals. Source/license review remains a separate human responsibility.
 - Shards, exact-resume training, CPU distributed checks, cached sampling, and a synthetic two-stage smoke path.
 - Fail-closed pinned development sandbox with disposable Linux containment and end-to-end evaluation checks.
 - Normalized tasks, conservative provenance-gated source adapters, reference-verified pool admission, metrics, code evaluation reports, and local scorecards.
@@ -29,7 +30,7 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 - Loader resume-state validation rejects malformed source maps, counters, buffers and RNG state before changing the live loader; native/JSON exact continuation remains reference-tested.
 - Complete evaluation-only [original MBPP source audit](mbpp-audit.md): all 974 rows accounted for; 519 retained references passed both test partitions after benchmark-ID/schema/contamination checks. No training admission, full-pool approval or phase closure is implied.
 
-**Verification:** Latest owner-checkout suite with reference/evaluation extras: 240 passed, 18 explicitly skipped disposable-runtime tests; strict types, lint, publication-path checks and 44 public Markdown checks pass. A fresh public clone at `e6420c1` passed setup/check/smoke without private files: 165 passed, 31 explicit runtime/parser/reference skips. Dedicated CI exercises optional parsing/reference and actual isolation separately. Local skips are not evidence of isolation. See [EvalPlus validation](evalplus.md) for real-suite outcomes and blockers, rather than treating loader/unit tests as benchmark acceptance.
+**Verification:** Latest owner-checkout suite with reference/evaluation extras: 279 passed, 18 explicitly skipped disposable-runtime tests; strict types, lint, publication-path checks and 44 public Markdown checks pass. A fresh public clone at `fdd3755` passed setup/check/smoke without private files: 226 passed, 31 explicit runtime/parser/reference skips. Dedicated CI exercises optional parsing/reference and actual isolation separately. Local skips are not evidence of isolation. See [EvalPlus validation](evalplus.md) for real-suite outcomes and blockers, rather than treating loader/unit tests as benchmark acceptance.
 
 ## Phase acceptance
 
