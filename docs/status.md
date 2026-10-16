@@ -19,8 +19,10 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 - Normalized tasks, conservative provenance-gated source adapters, reference-verified pool admission, metrics, code evaluation reports, and local scorecards.
 - Held-out multiple-choice checkpoint scoring, with an explicit label-likelihood protocol and synthetic end-to-end tests.
 - Periodic per-domain training validation, raw-byte-accurate bits per byte, and validation identity checks on exact resume.
+- Standalone held-out checkpoint loss/bits-per-byte reports, restricted TACO I/O conversion, per-source pool drop counters, and split authorship summaries.
+- Independently trained third-party BPE merge/encoding comparison, restricted to reference tooling and a dedicated CI job.
 
-**Verification:** Latest combined local `make check`: 109 passed, 10 explicitly skipped disposable-container tests; lint, strict types, and documentation links pass. `make smoke` passes. CPU CI checks Linux/macOS; dedicated Linux CI runs actual containment and evaluation integration tests. Local skips are not evidence of isolation.
+**Verification:** A fresh public clone passed `make setup`, `make check` (121 passed, 12 explicit skips), and `make smoke`, without private files. The base environment skips optional library-reference tests and disposable-container tests. Installing the locked `baseline` extra ran the independent tokenizer reference: 2 passed. In the owner's environment with that extra installed, the combined suite passed 123 tests with 11 explicit container skips. Lint, strict types, and documentation links pass. CPU CI checks Linux/macOS; dedicated Linux CI runs the optional reference and actual containment/evaluation integration tests. Local skips are not evidence of isolation.
 
 ## Phase acceptance
 
@@ -35,7 +37,7 @@ These are implementation milestones, not closed phase gates. Synthetic fixtures 
 
 ## Next public milestone
 
-Complete reviewed source/suite integration and reconcile the reference benchmark before making capability claims. The [initial model comparison](reference-evaluation.md) passed 1/164 HumanEval tasks (0.61%), not the card's 7.84%; a separate canonical check passed 164/164. GPU work and gated-data acceptance remain separately approval-gated.
+Complete reviewed source/suite integration and reconcile the reference benchmark before making capability claims. The [model comparison and diagnostic rerun](reference-evaluation.md) each passed 1/164 HumanEval tasks (0.61%), not the card's 7.84%; canonical checks passed 164/164. The gap is repeatable but unexplained. GPU work and gated-data acceptance remain separately approval-gated.
 
 ## Reporting policy
 
