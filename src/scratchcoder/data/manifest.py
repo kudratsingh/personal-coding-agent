@@ -5,10 +5,13 @@ import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import date
+from http.client import HTTPMessage
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import IO
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 TRAINING_LICENSES = frozenset(
     {
@@ -22,6 +25,43 @@ TRAINING_LICENSES = frozenset(
         "CDLA-Permissive-2.0",
     }
 )
+
+
+def _require_https_url(url: str) -> None:
+    try:
+        parsed = urlsplit(url)
+        valid = (
+            parsed.scheme == "https"
+            and bool(parsed.hostname)
+            and parsed.username is None
+            and parsed.password is None
+            and not any(character.isspace() for character in url)
+        )
+        _ = parsed.port
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("download URL requires HTTPS, a host, and no inline credentials")
+
+
+class HTTPSOnlyRedirectHandler(HTTPRedirectHandler):
+    """Keep the manifest's transport restriction across every redirect hop."""
+
+    def redirect_request(
+        self,
+        req: Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> Request | None:
+        try:
+            _require_https_url(newurl)
+        except ValueError:
+            fp.close()
+            raise
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 @dataclass(frozen=True)
@@ -58,20 +98,7 @@ class ManifestEntry:
             raise ValueError("expected byte size must be a nonnegative integer")
         if not self.source or not re.fullmatch(r"[0-9a-f]{40,64}", self.revision):
             raise ValueError("source and immutable revision are required")
-        try:
-            parsed = urlsplit(self.url)
-            valid_url = (
-                parsed.scheme == "https"
-                and bool(parsed.hostname)
-                and parsed.username is None
-                and parsed.password is None
-                and not any(character.isspace() for character in self.url)
-            )
-            _ = parsed.port  # Reject malformed/out-of-range ports before network access.
-        except ValueError:
-            valid_url = False
-        if not valid_url:
-            raise ValueError("download URL requires HTTPS, a host, and no inline credentials")
+        _require_https_url(self.url)
         if not self.license_verified or not self.license or not self.attribution:
             raise ValueError("license verification and attribution are required")
         if self.purpose not in {"train", "eval"}:
@@ -92,7 +119,14 @@ class ManifestEntry:
 
 
 def _network_chunks(url: str) -> Iterator[bytes]:
-    with urlopen(url, timeout=30) as response:
+    _require_https_url(url)
+    opener = build_opener(HTTPSOnlyRedirectHandler())
+    try:
+        response = opener.open(url, timeout=30)
+    except HTTPError as error:
+        error.close()
+        raise
+    with response:
         while chunk := response.read(1024 * 1024):
             yield chunk
 
