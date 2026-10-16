@@ -17,3 +17,5 @@ Implemented: [training and resume](training-loop.md).
 Implemented: [cached generation](kv-cache.md).
 
 Implemented: [evaluation metrics](metrics.md).
+
+Implemented: [multiple-choice evaluation](multiple-choice.md).
