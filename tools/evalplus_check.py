@@ -21,12 +21,13 @@ def main() -> int:
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--tokenizer", type=Path)
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--memory-mb", type=int, default=4096)
     args = parser.parse_args()
     if args.output.exists():
         parser.error("output must be a new directory")
     specification = release(args.suite)
     runtime = Runtime(args.image_id, True)
-    limits = Limits(timeout_seconds=60, memory_mb=1024, input_bytes=2 * 1024 * 1024)
+    limits = Limits(timeout_seconds=60, memory_mb=args.memory_mb, input_bytes=2 * 1024 * 1024)
     if args.download:
         download(specification.manifest, args.release_path)
     tasks = read_release(args.release_path, specification)

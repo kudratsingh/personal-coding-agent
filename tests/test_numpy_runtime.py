@@ -27,6 +27,15 @@ integration = pytest.mark.skipif(
 )
 
 
+def test_explicit_benchmark_memory_bound_does_not_change_default() -> None:
+    assert Limits().memory_mb == 128
+    args = command("scratchcoder-benchmark", Limits(memory_mb=4096))
+    assert args[args.index("--memory") + 1] == "4096m"
+    assert args[args.index("--memory-swap") + 1] == "4096m"
+    with pytest.raises(ValueError, match="memory"):
+        Limits(memory_mb=4097)
+
+
 @integration
 def test_numpy_runtime_correctness_and_bounded_large_test_script() -> None:
     runtime = Runtime(os.environ["SCRATCHCODER_NUMPY_IMAGE"], True)
