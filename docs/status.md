@@ -17,6 +17,7 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 - Explicit schema-2 exact-resume checkpoint identity and failed-resume status/debug records, distinct from stage-parent lineage; legacy schema-1 record serialization and numerical checkpoint format 1 remain supported. See [ADR 0009](adr/0009-resume-provenance.md).
 - Local JSONL metrics, an opt-in tracker adapter, and structured debug logs with tracebacks.
 - Manifest validation, deterministic filtering/splits, and a byte-level BPE implementation with reference tests.
+- Tokenizer merge tables are defensively owned and immutable, preventing caller mutation from changing hashes or diverging from cached encoders; valid format-1 identities remain unchanged.
 - Strict manifest field types and canonical acceptance dates are checked before download I/O; malformed review flags cannot become truthy approvals. Source/license review remains a separate human responsibility.
 - Shards, exact-resume training, CPU distributed checks, cached sampling, and a synthetic two-stage smoke path.
 - Fail-closed pinned development sandbox with disposable Linux containment and end-to-end evaluation checks.
@@ -35,7 +36,7 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 - Complete evaluation-only [original MBPP source audit](mbpp-audit.md): all 974 rows accounted for; 519 retained references passed both test partitions after benchmark-ID/schema/contamination checks. No training admission, full-pool approval or phase closure is implied.
 - Bounded evaluation-only [OpenCodeInstruct prefix pilot](opencode-pilot.md) completed on a clean isolated worker: all 200 rows accounted for, 60 references passed both partitions after 35 schema, 13 contamination/duplicate and 92 reference-failure rejections. This is not a representative/full-source estimate, training admission or a model benchmark.
 
-**Verification:** Latest owner-checkout suite with reference/evaluation extras: 397 passed, 18 explicitly skipped disposable-runtime tests; strict types, lint, workflow/publication checks and 46 public Markdown checks pass. A fresh public clone at `9cd8b3d` passed setup/check/smoke without private files: 373 passed, 41 explicit runtime/parser/reference skips; the optional parser/BPE checks separately passed all 30 cases. Dedicated CI exercises optional parsing/reference and actual isolation separately. Local skips are not evidence of isolation. See [EvalPlus validation](evalplus.md) for real-suite outcomes and blockers, rather than treating loader/unit tests as benchmark acceptance.
+**Verification:** Latest owner-checkout suite with reference/evaluation extras: 425 passed, 18 explicitly skipped disposable-runtime tests; strict types, lint, workflow/publication checks and 46 public Markdown checks pass. A fresh public clone at `9cd8b3d` passed setup/check/smoke without private files: 373 passed, 41 explicit runtime/parser/reference skips; the optional parser/BPE checks separately passed all 30 cases. Dedicated CI exercises optional parsing/reference and actual isolation separately. Local skips are not evidence of isolation. See [EvalPlus validation](evalplus.md) for real-suite outcomes and blockers, rather than treating loader/unit tests as benchmark acceptance.
 
 ## Phase acceptance
 
