@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 
+from scratchcoder.data.adapters import canonical_id
 from scratchcoder.data.filters import ContaminationIndex, words
 from scratchcoder.eval.tasks import Task
 from scratchcoder.sandbox.runner import Result
@@ -62,7 +63,7 @@ def build_pool(
         for task in protected
         for part in (task.prompt, task.solution or "", task.public_tests, task.hidden_tests)
     )
-    benchmark_ids = {task.id for task in protected}
+    benchmark_ids = {canonical_id(task.id) for task in protected}
     report: Counter[str] = Counter()
     kept = []
     seen_ids: set[str] = set()
@@ -74,7 +75,7 @@ def build_pool(
             raise ValueError("duplicate task IDs before pool split")
         seen_ids.add(task.id)
         if (
-            task.id in benchmark_ids
+            canonical_id(task.id) in benchmark_ids
             or index.contains(task.prompt)
             or any(
                 contamination.contains(part)
