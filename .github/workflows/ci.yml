@@ -41,4 +41,4 @@ jobs:
         with:
           version: "0.11.28"
       - name: Locked Parquet intake tests on authored fixtures only
-        run: uv run --locked --extra evaluation pytest tests/test_arc.py
+        run: uv run --locked --extra evaluation pytest tests/test_arc.py tests/test_opencode.py
