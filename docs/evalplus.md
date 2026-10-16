@@ -13,10 +13,18 @@ Sources: [HumanEval+ release](https://github.com/evalplus/humanevalplus_release/
 
 Intake verifies compressed size/hash, bounds gzip expansion, requires exact reviewed schemas and unique original IDs/counts, and retains source revision and attribution. MBPP+ IDs retain their original integer numbering so the same MBPP examples can be excluded from training pools. Plus tests and canonical solutions never enter model-visible prompts. Benchmark tasks remain evaluation-only.
 
-The loader only parses source text; it never executes it. Legacy `base_input`/`plus_input` schemas are rejected rather than approximating their deserialization and special oracles. All actual canonical/candidate execution must use an explicitly provisioned development sandbox. The existing stdlib-only sandbox does not supply NumPy, which the release tests require. A compatible runtime and canonical validation are separate acceptance work; parsing alone does not establish suite equivalence or a benchmark result.
+The loader only parses source text; it never executes it. Legacy `base_input`/`plus_input` schemas are rejected rather than approximating their deserialization and special oracles. All actual canonical/candidate execution must use the explicit dependency sandbox. The stdlib-only default does not supply NumPy. The [dependency runtime](adr/0006-evaluation-runtime.md) passed its separate CI checks; complete real-suite canonical validation remains required. Parsing alone does not establish suite equivalence or a benchmark result.
 
 ## Attribution and terms
 
 The release repositories declare Apache-2.0. HumanEval+ also retains OpenAI HumanEval's MIT conditions, explicitly noted in its release license. MBPP derives from Google Research's dataset, whose [repository policy](https://github.com/google-research/google-research#readme) declares CC-BY-4.0 for datasets, separately from source-code licensing. Keep both upstream and release attribution; an aggregate dataset label does not replace these component conditions. Our manifest records the combined conditions and originators. No benchmark files, generated code, or weights are committed here, and this does not select the project's own code/weight license.
 
 Tests in `tests/test_evalplus.py` use synthetic rows to check oracle-byte preservation, public/hidden separation, original IDs, purpose guards, bounded decoding, hash/count failures and duplicates. No external dataset is downloaded by ordinary tests.
+
+## Explicit validation command
+
+`tools/evalplus_check.py` takes a suite, a local release path, an immutable locally built NumPy image ID, and a new output directory. Only `--download` opts into fetching that suite's pinned bytes. It requires every canonical solution to pass before scoring an optional own-project `--checkpoint` with its `--tokenizer`. A failed canonical run preserves its report but blocks model scoring. Reports retain source, runtime ID, limits, prompt policy and hashes; raw programs/tests/weights are not printed or uploaded.
+
+The manual **EvalPlus canonical validation** workflow builds the dependency runtime on a standard disposable public CPU runner and performs this preflight. Optional nano mode trains only on repository-authored synthetic web/code fixtures before evaluating; benchmark text is never training/tokenizer input. These nano numbers test integration, not useful coding capability.
+
+Our declared limits are one global 60-second budget per task, 1 GiB memory, 16 processes, bounded output, and a 2 MiB code/test input cap. This is not EvalPlus's original per-input time calibration/resource policy, and reports explicitly mark that difference. Do not call these runs a reproduction of official leaderboard settings. Missing isolation aborts; oversized model prompts count as context limits rather than being silently truncated.
