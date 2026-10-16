@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Any
 
 import jsonschema
 import pytest
@@ -88,3 +89,65 @@ def test_mutated_record_and_symlink_escape_are_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         record.save(root)
     assert not list(outside.iterdir())
+
+
+def test_v1_records_keep_original_shape_and_new_records_are_v2(tmp_path: Path) -> None:
+    record = RunRecord.start("compatibility", RunConfig(), "fixture", "fixture")
+    path = record.save(tmp_path)
+    current = json.loads(Path("schemas/run-record.schema.json").read_text())
+    legacy = json.loads(Path("tests/fixtures/run-record-v1.schema.json").read_text())
+    new = json.loads(path.read_text())
+    assert new["schema_version"] == 2 and new["resume_checkpoint"] is None
+    jsonschema.validate(new, current)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(new, legacy)
+    record.schema_version = 1
+    record.save(tmp_path)
+    old = json.loads(path.read_text())
+    assert "resume_checkpoint" not in old
+    jsonschema.validate(old, legacy)
+    jsonschema.validate(old, current)
+    RunRecord(**old).save(tmp_path)
+    assert json.loads(path.read_text()) == old
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"sha256": "bad"},
+        {"sha256": None},
+        {"source_run_id": "../escape"},
+        {"source_run_id": None},
+        {"step": True},
+        {"step": -1},
+        {"step": 1.5},
+        {"extra": "not-allowed"},
+    ],
+)
+def test_resume_metadata_is_strict_before_record_io(tmp_path: Path, change: dict[str, Any]) -> None:
+    record = RunRecord.start("resume-meta", RunConfig(), "fixture", "fixture")
+    record.resume_checkpoint = {"sha256": "a" * 64, "source_run_id": "source", "step": 3}
+    record.resume_checkpoint.update(change)
+    with pytest.raises(ValueError):
+        record.save(tmp_path)
+    assert not list(tmp_path.iterdir())
+
+
+def test_v2_resume_metadata_schema_and_v1_field_rejection(tmp_path: Path) -> None:
+    record = RunRecord.start("resumed", RunConfig(), "fixture", "fixture", "stage-parent")
+    record.resume_checkpoint = {"sha256": "a" * 64, "source_run_id": "same-stage", "step": 3}
+    path = record.save(tmp_path)
+    value = json.loads(path.read_text())
+    schema = json.loads(Path("schemas/run-record.schema.json").read_text())
+    jsonschema.validate(value, schema)
+    assert value["parent_run_id"] == "stage-parent"
+    record.schema_version = 1
+    with pytest.raises(ValueError, match="schema 2"):
+        record.save(tmp_path)
+    value["schema_version"] = 1
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(value, schema)
+    value["schema_version"] = 2
+    del value["resume_checkpoint"]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(value, schema)

@@ -10,6 +10,10 @@ The CPU precision tests also compare uninterrupted and interrupted/resumed losse
 
 A resume checkpoint includes weights, optimizer moments/counters, step, loader buffers/positions/RNG, CPU/CUDA RNG state per rank, configuration, and input identities. Writes are atomic. Exact resume requires the same configuration, data/tokenizer identity, and world size.
 
+On successful resume, a schema-2 run record additionally stores `resume_checkpoint`: the exact file SHA-256, its source run ID and saved step, persisted before training continues. This is distinct from `parent_run_id`, which names a fresh stage's weight source. The same open file is hashed and read; checkpoint files must remain immutable during loading. Existing numerical checkpoint format 1 is unchanged. Older JSON run records remain schema 1 when loaded/saved, with no new field; current schema validation accepts both record versions. New v2 records need updated strict validators. See [ADR 0009](../adr/0009-resume-provenance.md).
+
+An unsuccessful `resume` marks its instantiated run failed and emits `resume_failed` with a safe error type and attempted file hash when available, plus the normal sanitized debug trace. It does not store the raw checkpoint path in resume metadata. Early source-ID/step/configuration/input checks precede weight changes, but a later component failure may leave partially restored training state. Abort/discard that trainer; component-level loader/optimizer transactions do not imply whole-Trainer rollback. Hash identity is not checkpoint authentication or proof of durable backup.
+
 Starting a new stage is different: a parent checkpoint supplies only weights and lineage. Its optimizer, schedule, loader state, and step counter are fresh. This lets the same trainer continue on a new data mix without pretending to resume the previous optimization path.
 
 Tests stop a tiny run halfway, serialize it, resume it, and compare every later loss and final parameter exactly with an uninterrupted CPU run. Stage-two tests compare step-zero validation and fresh counters. Actual rented GPU throughput, durable uploads, and watchdog behavior remain separate gates.

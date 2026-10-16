@@ -1,3 +1,4 @@
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -154,3 +155,93 @@ def test_training_failure_records_traceback_and_failed_state(
     assert record["status"] == "failed"
     assert "RuntimeError" in trace
     assert "synthetic-secret" not in trace
+
+
+def test_resume_persists_checkpoint_identity_before_training(tmp_path: Path) -> None:
+    source = make_trainer(tiny_config(), tmp_path, "source")
+    source.train(stop_after=3)
+    checkpoint = tmp_path / "source.pt"
+    source.checkpoint(checkpoint)
+    resumed = make_trainer(tiny_config(), tmp_path, "resumed-identity")
+    resumed.resume(checkpoint)
+    raw = json.loads((tmp_path / "resumed-identity/record.json").read_text())
+    assert raw["resume_checkpoint"] == {
+        "sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+        "source_run_id": "source",
+        "step": 3,
+    }
+    assert raw["parent_run_id"] is None
+
+
+def test_failed_resume_is_recorded_as_failed(tmp_path: Path) -> None:
+    instance = make_trainer(tiny_config(), tmp_path, "bad-resume")
+    with pytest.raises(FileNotFoundError):
+        instance.resume(tmp_path / "missing.pt")
+    raw = json.loads((tmp_path / "bad-resume/record.json").read_text())
+    assert raw["status"] == "failed" and raw["ended_at"] is not None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "negative-step",
+        "boolean-step",
+        "excess-step",
+        "source-id",
+        "config",
+        "data",
+        "loader",
+        "boolean-version",
+    ],
+)
+def test_resume_rejection_records_safe_failure(tmp_path: Path, change: str) -> None:
+    source = make_trainer(tiny_config(), tmp_path, "origin")
+    source.train(stop_after=3)
+    checkpoint = tmp_path / "original.pt"
+    source.checkpoint(checkpoint)
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    if change == "negative-step":
+        state["step"] = -1
+    elif change == "boolean-step":
+        state["step"] = True
+    elif change == "excess-step":
+        state["step"] = 1000
+    elif change == "source-id":
+        state["run_id"] = "../private"
+    elif change == "config":
+        state["config"]["train"]["learning_rate"] = 0.5
+    elif change == "data":
+        state["data_hash"] = "changed"
+    elif change == "loader":
+        state["rank_states"][0]["loader"]["positions"]["web"] = -1
+    else:
+        state["version"] = True
+    changed = tmp_path / "changed.pt"
+    torch.save(state, changed)
+    target = make_trainer(tiny_config(), tmp_path, "rejected")
+    before = [parameter.detach().clone() for parameter in target.model.parameters()]
+    with pytest.raises(ValueError):
+        target.resume(changed)
+    raw = json.loads((tmp_path / "rejected/record.json").read_text())
+    assert raw["status"] == "failed" and raw["resume_checkpoint"] is None
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "rejected/events-rank0.jsonl").read_text().splitlines()
+    ]
+    assert events[-1]["event"] == "resume_failed"
+    assert (
+        events[-1]["fields"]["checkpoint_sha256"]
+        == hashlib.sha256(changed.read_bytes()).hexdigest()
+    )
+    assert events[-1]["fields"]["error_type"] == "ValueError"
+    if change != "loader":  # No whole-Trainer rollback claim for late component failures.
+        for parameter, original in zip(target.model.parameters(), before, strict=True):
+            torch.testing.assert_close(parameter, original, atol=0, rtol=0)
+
+
+def test_failed_resume_debug_trace_does_not_leak_secret(tmp_path: Path) -> None:
+    target = make_trainer(tiny_config(), tmp_path, "private-error")
+    with pytest.raises(FileNotFoundError):
+        target.resume(tmp_path / "Bearer synthetic-secret")
+    trace = (tmp_path / "private-error/debug-rank0.jsonl").read_text()
+    assert "FileNotFoundError" in trace and "synthetic-secret" not in trace

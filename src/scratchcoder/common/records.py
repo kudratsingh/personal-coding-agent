@@ -13,6 +13,22 @@ from typing import Any
 
 from scratchcoder.common.config import RunConfig
 
+RUN_ID = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
+
+
+def validate_resume_details(value: Any) -> None:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"sha256", "source_run_id", "step"}
+        or not isinstance(value["sha256"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])
+        or not isinstance(value["source_run_id"], str)
+        or not re.fullmatch(RUN_ID, value["source_run_id"])
+        or type(value["step"]) is not int
+        or value["step"] < 0
+    ):
+        raise ValueError("invalid resume checkpoint identity")
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -62,16 +78,23 @@ class RunRecord:
     actual_cost_usd: float | None = None
     artifact_uri: str | None = None
     status: str = "running"
-    schema_version: int = 1
+    schema_version: int = 2
+    resume_checkpoint: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.validate()
 
     def validate(self) -> None:
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", self.run_id):
+        if not isinstance(self.run_id, str) or not re.fullmatch(RUN_ID, self.run_id):
             raise ValueError("run_id must be a safe path component")
-        if self.status not in {"running", "completed", "failed"} or self.schema_version != 1:
+        if self.status not in {"running", "completed", "failed"} or (
+            type(self.schema_version) is not int or self.schema_version not in {1, 2}
+        ):
             raise ValueError("invalid record status or schema version")
+        if self.resume_checkpoint is not None:
+            if self.schema_version != 2:
+                raise ValueError("resume checkpoint metadata requires run-record schema 2")
+            validate_resume_details(self.resume_checkpoint)
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("seed must be a nonnegative integer")
         if (
@@ -90,7 +113,7 @@ class RunRecord:
         tokenizer_hash: str,
         parent_run_id: str | None = None,
     ) -> "RunRecord":
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", run_id):
+        if not isinstance(run_id, str) or not re.fullmatch(RUN_ID, run_id):
             raise ValueError("run_id must be a safe path component")
         commit, dirty = git_state()
         return cls(
@@ -112,7 +135,10 @@ class RunRecord:
         path = root / self.run_id / "record.json"
         if not path.resolve().is_relative_to(root):
             raise ValueError("run record path escapes its root through a symlink")
-        atomic_json(path, asdict(self))
+        value = asdict(self)
+        if self.schema_version == 1:
+            value.pop("resume_checkpoint")  # Preserve the original strict v1 shape.
+        atomic_json(path, value)
         return path
 
     def finish(self, *, success: bool, actual_cost_usd: float = 0.0) -> None:
