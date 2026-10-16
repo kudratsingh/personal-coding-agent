@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 from dataclasses import asdict
 
 from scratchcoder.common.cost import estimate
@@ -31,17 +32,19 @@ def main() -> int:
             )
             for tokens in (args.stage1_tokens, args.stage2_tokens)
         ]
+        total = {key: sum(asdict(item)[key] for item in stages) for key in asdict(stages[0])}
+        if any(not math.isfinite(value) for value in total.values()):
+            raise ValueError("combined estimate must be finite and representable")
     except ValueError as error:
         parser.error(str(error))
     print(
         json.dumps(
             {
                 "stages": [asdict(item) for item in stages],
-                "total": {
-                    key: sum(asdict(item)[key] for item in stages) for key in asdict(stages[0])
-                },
+                "total": total,
             },
             indent=2,
+            allow_nan=False,
         )
     )
     return 0
