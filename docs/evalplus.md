@@ -28,3 +28,17 @@ Tests in `tests/test_evalplus.py` use synthetic rows to check oracle-byte preser
 The manual **EvalPlus canonical validation** workflow builds the dependency runtime on a standard disposable public CPU runner and performs this preflight. Optional nano mode trains only on repository-authored synthetic web/code fixtures before evaluating; benchmark text is never training/tokenizer input. These nano numbers test integration, not useful coding capability.
 
 The benchmark command declares one global 60-second budget per task, 4 GiB memory by default (explicitly overridable within the bound), 16 processes, bounded output, and a 2 MiB code/test input cap. The general sandbox default remains 128 MiB. Initial 1 GiB preflight evidence is retained separately; MBPP/255's large materialized candidate/reference outputs require a larger bound. This is not EvalPlus's original per-input time calibration/resource policy, and reports explicitly mark that difference. Do not call these runs a reproduction of official leaderboard settings. Missing isolation aborts; oversized model prompts count as context limits rather than being silently truncated.
+
+## Observed initial preflights
+
+| Run | Suite | Canonical result | Project scoring |
+| --- | --- | --- | --- |
+| [Initial HumanEval+](https://github.com/kudratsingh/personal-coding-agent/actions/runs/38879134729) | 164 tasks, 1 GiB cap | 163/164; task 32 failed | Blocked |
+| [Initial MBPP+](https://github.com/kudratsingh/personal-coding-agent/actions/runs/38879138709) | 378 tasks, 1 GiB cap | 377/378; task 255 failed | Blocked |
+| [Diagnostic HumanEval+](https://github.com/kudratsingh/personal-coding-agent/actions/runs/38880458614) | 164 tasks, 4 GiB cap, unchanged tests | 163/164; task 32 reports `TypeError` | Blocked |
+
+HumanEval/32's standalone script attempts to unpack the scalar root returned by its candidate into the polynomial helper. The [pinned official framework](https://github.com/evalplus/evalplus/blob/26d6d00bb1fd0fa37f39c99d5290da67891d1c5e/evalplus/eval/__init__.py) instead uses an absolute polynomial-residual check. No correction has been enabled; any change requires an explicit recorded protocol and review, not a silent claim that the original tests passed.
+
+This standalone-release defect is separate from the [original HumanEval reference-model discrepancy](reference-evaluation.md), which used OpenAI's original tests, not this plus release. It does not explain that earlier low model score.
+
+MBPP/255 contains an input with 1,663,740 length-77 combinations materialized for both the candidate and inline reference. The initial 1 GiB record is retained; a separately recorded 4 GiB rerun uses the same tests on the same standard free CPU runner. These are canonical validation results, not model capability scores. Complete safe reports are preserved locally; the raw workflow log archive retains large report lines that some CLI log views omit.

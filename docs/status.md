@@ -21,9 +21,9 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 - Periodic per-domain training validation, raw-byte-accurate bits per byte, and validation identity checks on exact resume.
 - Standalone held-out checkpoint loss/bits-per-byte reports, restricted TACO I/O conversion, per-source pool drop counters, and split authorship summaries.
 - Independently trained third-party BPE merge/encoding comparison, restricted to reference tooling and a dedicated CI job.
-- Hash-bound evaluation-only EvalPlus OriginFmt intake that preserves upstream executable test scripts; compatible runtime/canonical validation remains pending.
+- Hash-bound evaluation-only EvalPlus OriginFmt intake, a locked NumPy runtime, full canonical preflight and optional project-checkpoint workflow. A failing preflight blocks scoring; no oracle correction is enabled.
 
-**Verification:** A fresh public clone passed `make setup`, `make check` (121 passed, 12 explicit skips), and `make smoke`, without private files. The base environment skips optional library-reference tests and disposable-container tests. Installing the locked `baseline` extra ran the independent tokenizer reference: 2 passed. In the owner's environment with that extra installed, the combined suite passed 123 tests with 11 explicit container skips. Lint, strict types, and documentation links pass. CPU CI checks Linux/macOS; dedicated Linux CI runs the optional reference and actual containment/evaluation integration tests. Local skips are not evidence of isolation.
+**Verification:** Latest local suite with the optional reference installed: 131 passed, 16 explicitly skipped disposable-runtime tests; strict types, lint and public links pass. Linux/macOS CPU CI, independent tokenizer reference CI, legacy isolation and the new NumPy runtime checks pass separately. A previous fresh public clone passed setup/check/smoke without private files; detailed evidence is recorded in the relevant PRs. Local skips are not evidence of isolation. See [EvalPlus validation](evalplus.md) for real-suite outcomes and blockers, rather than treating loader/unit tests as benchmark acceptance.
 
 ## Phase acceptance
 
