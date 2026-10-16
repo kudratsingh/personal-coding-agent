@@ -5,7 +5,6 @@ import gzip
 import hashlib
 import importlib
 import json
-import re
 import sys
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -20,6 +19,7 @@ from scratchcoder.common.records import atomic_json
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.harness import EvaluationConfig, evaluate, save_report
 from scratchcoder.eval.tasks import Task
+from scratchcoder.sandbox.diagnostics import failure_category as failure_category
 from scratchcoder.sandbox.runner import Result, run
 
 MODEL = "bigcode/tiny_starcoder_py"
@@ -55,16 +55,6 @@ def normalize(rows: list[dict[str, Any]]) -> list[Task]:
 def truncate_completion(text: str) -> str:
     offsets = [text.find(stop) for stop in STOPS if stop in text]
     return text[: min(offsets)] if offsets else text
-
-
-def failure_category(result: Result) -> str:
-    """Return an allowlisted category, never candidate output or hidden test text."""
-    if result.status != "failed":
-        return result.status
-    for name in ("SyntaxError", "IndentationError", "AssertionError", "NameError", "TypeError"):
-        if re.search(r"(?m)^" + name + r"(?::|$)", result.stdout):
-            return name
-    return "other_failure"
 
 
 def validate_references(

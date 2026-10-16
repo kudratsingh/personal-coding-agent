@@ -11,6 +11,7 @@ from scratchcoder.eval.checkpoint import load_checkpoint
 from scratchcoder.eval.command import checkpoint_generator
 from scratchcoder.eval.harness import EvaluationConfig, evaluate, save_report
 from scratchcoder.eval.tasks import Task
+from scratchcoder.sandbox.diagnostics import failure_category
 from scratchcoder.sandbox.runner import Limits, Result, Runtime
 
 
@@ -47,14 +48,26 @@ def evaluate_suite(
         "upstream_resource_policy_equivalent": False,
         "oracle_policy": "unmodified-OriginFmt-tests",
     }
+    categories: list[str] = []
+
+    def check_reference(code: str, tests: str, mode: str) -> Result:
+        result = execute(code, tests, mode)
+        categories.append(failure_category(result))
+        return result
+
     canonical = evaluate(
         tasks,
         lambda task, _: cast(str, task.solution),
         config=EvaluationConfig(),
         checkpoint_hash="canonical:" + specification.manifest.sha256,
         tokenizer_hash="not-applicable:canonical-source",
-        execute=execute,
+        execute=check_reference,
     )
+    canonical["canonical_diagnostics"] = {
+        row["id"]: category
+        for row, category in zip(canonical["per_task"], categories, strict=True)
+        if category != "passed"
+    }
     canonical["benchmark"] = dict(metadata, kind="canonical-preflight")
     save_report(canonical, output / "canonical", scorecard=output / "scorecard.jsonl")
     if canonical["metrics"]["greedy_pass_at_1"] != 1.0:

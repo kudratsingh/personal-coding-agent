@@ -39,7 +39,7 @@ def test_canonical_suite_preserves_oracles_and_records_profile(tmp_path: Path) -
         evaluate_suite(
             [task],
             spec,
-            execute=lambda *_: Result("failed"),
+            execute=lambda *_: Result("failed", "TypeError: private-test-secret"),
             runtime=profile,
             limits=Limits(),
             output=tmp_path / "failed",
@@ -47,6 +47,9 @@ def test_canonical_suite_preserves_oracles_and_records_profile(tmp_path: Path) -
             tokenizer_path=tmp_path / "never-opened.json",
         )
     assert (tmp_path / "failed/canonical/report.json").exists()
+    failure = json.loads((tmp_path / "failed/canonical/report.json").read_text())
+    assert failure["canonical_diagnostics"] == {"humaneval/0": "TypeError"}
+    assert "private-test-secret" not in json.dumps(failure)
     assert not (tmp_path / "failed/checkpoint").exists()
 
 
