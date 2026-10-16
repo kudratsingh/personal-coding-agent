@@ -1,0 +1,21 @@
+name: OpenCodeInstruct prefix reference pilot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+      - run: uv sync --locked --extra evaluation
+      - run: docker --host unix:///var/run/docker.sock pull --platform linux/amd64 python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe
+      - name: Evaluation-only first 200 rows, no training export
+        run: uv run --locked --extra evaluation python tools/opencode_audit.py --data-directory runs/opencode-audit-data --download --output runs/opencode-audit/report.json
