@@ -94,3 +94,28 @@ def test_evalplus_command_routes_explicit_limits_and_mode(
         ],
     )
     assert evalplus_check.main() == 0
+
+
+def test_evalplus_command_rejects_correction_for_wrong_suite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evalplus_check",
+            "--suite",
+            "mbpp-plus",
+            "--release-path",
+            str(tmp_path / "must-not-open.gz"),
+            "--image-id",
+            "sha256:" + "a" * 64,
+            "--output",
+            str(tmp_path / "must-not-create"),
+            "--correct-find-zero-oracle",
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        evalplus_check.main()
+    assert error.value.code == 2
+    assert not (tmp_path / "must-not-create").exists()

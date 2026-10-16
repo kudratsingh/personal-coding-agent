@@ -13,6 +13,10 @@ on:
         description: Also run a synthetic-trained project nano checkpoint after preflight
         type: boolean
         default: false
+      correct_find_zero_oracle:
+        description: Opt into the recorded HumanEval/32 residual-oracle correction (HumanEval+ only)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -35,7 +39,9 @@ jobs:
         env:
           SUITE: ${{ inputs.suite }}
           NANO: ${{ inputs.nano }}
+          CORRECT_FIND_ZERO: ${{ inputs.correct_find_zero_oracle }}
         run: |
           args=()
+          if [ "$CORRECT_FIND_ZERO" = "true" ]; then args+=(--correct-find-zero-oracle); fi
           if [ "$NANO" = "true" ]; then args+=(--checkpoint runs/eval-nano/train/checkpoint.pt --tokenizer runs/eval-nano/data/tokenizer.json); fi
           uv run --locked python tools/evalplus_check.py --suite "$SUITE" --release-path "runs/data/$SUITE.jsonl.gz" --download --image-id "$(cat /tmp/scratchcoder-evalplus-image)" --output "runs/$SUITE-check" "${args[@]}"

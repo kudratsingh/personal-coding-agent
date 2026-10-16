@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from scratchcoder.data.evalplus import EvalPlusRelease
+from scratchcoder.data.evalplus_corrections import correct_find_zero
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.checkpoint import load_checkpoint
 from scratchcoder.eval.command import checkpoint_generator
@@ -26,6 +27,7 @@ def evaluate_suite(
     checkpoint: Path | None = None,
     tokenizer_path: Path | None = None,
     config: EvaluationConfig | None = None,
+    correct_find_zero_oracle: bool = False,
 ) -> dict[str, Any]:
     specification.validate()
     if output.exists():
@@ -40,13 +42,20 @@ def evaluate_suite(
         raise ValueError("complete held-out canonical suite required")
     if (checkpoint is None) != (tokenizer_path is None):
         raise ValueError("checkpoint and tokenizer must be supplied together")
+    corrections = []
+    if correct_find_zero_oracle:
+        tasks, correction = correct_find_zero(tasks, specification)
+        corrections.append(correction)
     metadata = {
         "suite": specification.suite,
         "data_manifest": asdict(specification.manifest),
         "runtime": asdict(runtime),
         "limits": asdict(limits),
         "upstream_resource_policy_equivalent": False,
-        "oracle_policy": "unmodified-OriginFmt-tests",
+        "oracle_policy": (
+            "OriginFmt-with-find-zero-residual-v1" if corrections else "unmodified-OriginFmt-tests"
+        ),
+        "oracle_corrections": corrections,
     }
     categories: list[str] = []
 

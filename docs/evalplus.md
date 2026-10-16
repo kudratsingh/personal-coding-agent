@@ -38,10 +38,18 @@ The benchmark command declares one global 60-second budget per task, 4 GiB memor
 | [Diagnostic HumanEval+](https://github.com/kudratsingh/personal-coding-agent/actions/runs/38880458614) | 164 tasks, 4 GiB cap, unchanged tests | 163/164; task 32 reports `TypeError` | Blocked |
 | [MBPP+ rerun](https://github.com/kudratsingh/personal-coding-agent/actions/runs/38880455583) | 378 tasks, 4 GiB cap, unchanged tests | 378/378 | Synthetic-trained nano: 0/378 |
 
-HumanEval/32's standalone script attempts to unpack the scalar root returned by its candidate into the polynomial helper. The [pinned official framework](https://github.com/evalplus/evalplus/blob/26d6d00bb1fd0fa37f39c99d5290da67891d1c5e/evalplus/eval/__init__.py) instead uses an absolute polynomial-residual check. No correction has been enabled; any change requires an explicit recorded protocol and review, not a silent claim that the original tests passed.
+HumanEval/32's standalone script attempts to unpack the scalar root returned by its candidate into the polynomial helper. The [pinned official framework](https://github.com/evalplus/evalplus/blob/26d6d00bb1fd0fa37f39c99d5290da67891d1c5e/evalplus/eval/__init__.py) instead uses an absolute polynomial-residual check. An explicit reviewed correction is available as described below; the original failed runs remain unchanged.
 
 This standalone-release defect is separate from the [original HumanEval reference-model discrepancy](reference-evaluation.md), which used OpenAI's original tests, not this plus release. It does not explain that earlier low model score.
 
 MBPP/255 contains an input with 1,663,740 length-77 combinations materialized for both the candidate and inline reference. The initial 1 GiB record is retained; a separately recorded 4 GiB rerun uses the same tests on the same standard free CPU runner. These are canonical validation results, not model capability scores. Complete safe reports are preserved locally; the raw workflow log archive retains large report lines that some CLI log views omit.
 
 The completed MBPP+ rerun passed all 378 canonical solutions and then evaluated the synthetic-only nano checkpoint. Its result was **0/378**: 156 complete prompts exceeded the 256-token model context and counted as failures; the other 222 generated candidates failed the tests. This demonstrates the recorded integration path, not useful coding capability or real-corpus training. No prompts were shortened, tasks removed, or benchmark material used to fit the tokenizer/model.
+
+## Opt-in task-32 correction walkthrough
+
+[ADR 0007](adr/0007-find-zero-oracle-correction.md) defines `find-zero-residual-v1`. The default loader and command still use unmodified OriginFmt tests. Only the explicit `--correct-find-zero-oracle` flag (or matching manual-workflow boolean, default false) enables the correction, and only for the exact pinned HumanEval+ release.
+
+The correction hashes task 32's normalized hidden script, including the appended `check(find_zero)` invocation. It requires original SHA-256 `41ab5c51c15d24d07317ba9153761d568c3c249234f3442223c3f4511b88fd01` and exactly one reviewed expression. It changes scalar argument handling and checks the absolute residual, preserving every input and the original `0.0001` threshold. A changed release, script, task provenance, absent/duplicate task, or wrong suite is rejected before execution. No canonical output is substituted as an expected root.
+
+Both canonical and checkpoint reports identify the original release hash, policy/version, patched task ID, original/effective hidden-script hashes, effective individual task hash, and reference evaluator revision. The aggregate report task hash changes too. No source text is included in those correction records. The workflow still requires a complete canonical pass before scoring the optional synthetic-only nano checkpoint. Corrected full-suite validation is pending; no passing result is inferred from fixture tests.
