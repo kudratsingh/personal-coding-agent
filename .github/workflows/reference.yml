@@ -7,6 +7,13 @@ on:
         description: Number of HumanEval tasks (164 for full validation)
         required: true
         default: "164"
+      canonical_only:
+        description: Validate canonical answers without loading the model
+        type: boolean
+        default: false
+      max_new_tokens:
+        description: Explicit completion token budget
+        default: "256"
 
 permissions:
   contents: read
@@ -25,5 +32,10 @@ jobs:
       - name: Validate pinned reference model through isolated tests
         env:
           TASK_LIMIT: ${{ inputs.limit }}
+          CANONICAL_ONLY: ${{ inputs.canonical_only }}
+          MAX_NEW_TOKENS: ${{ inputs.max_new_tokens }}
           HF_HUB_DISABLE_PROGRESS_BARS: "1"
-        run: uv run --locked --extra baseline python tools/baselines/humaneval.py --output runs/reference --limit "$TASK_LIMIT"
+        run: |
+          args=()
+          if [ "$CANONICAL_ONLY" = "true" ]; then args+=(--canonical-only); fi
+          uv run --locked --extra baseline python tools/baselines/humaneval.py --output runs/reference --limit "$TASK_LIMIT" --max-new-tokens "$MAX_NEW_TOKENS" "${args[@]}"
