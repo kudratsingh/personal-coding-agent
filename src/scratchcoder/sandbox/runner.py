@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 import selectors
 import shutil
 import subprocess
@@ -22,12 +23,27 @@ class Limits:
     memory_mb: int = 128
     processes: int = 16
     output_bytes: int = 65536
+    input_bytes: int = 128000
 
     def __post_init__(self) -> None:
         if not 0.1 <= self.timeout_seconds <= 60 or not 64 <= self.memory_mb <= 1024:
             raise ValueError("invalid timeout or memory limit")
         if not 4 <= self.processes <= 64 or not 1024 <= self.output_bytes <= 1024 * 1024:
             raise ValueError("invalid process or output limit")
+        if type(self.input_bytes) is not int or not 1024 <= self.input_bytes <= 8 * 1024 * 1024:
+            raise ValueError("invalid input byte limit")
+
+
+@dataclass(frozen=True)
+class Runtime:
+    image: str = IMAGE
+    site_packages: bool = False
+
+    def __post_init__(self) -> None:
+        if self.image != IMAGE and not re.fullmatch(r"sha256:[0-9a-f]{64}", self.image):
+            raise ValueError("runtime must use the default digest or an immutable local image ID")
+        if type(self.site_packages) is not bool:
+            raise ValueError("site_packages must be an explicit boolean")
 
 
 @dataclass(frozen=True)
@@ -42,7 +58,11 @@ class Result:
         return self.status == "passed"
 
 
-def command(name: str, limits: Limits, *, docker: str = "docker") -> list[str]:
+def command(
+    name: str, limits: Limits, *, docker: str = "docker", runtime: Runtime | None = None
+) -> list[str]:
+    runtime = runtime or Runtime()
+    file_bytes = max(1048576, limits.input_bytes + 4096)
     supervisor = Path(__file__).with_name("program.py").read_text(encoding="utf-8")
     return [
         docker,
@@ -72,7 +92,7 @@ def command(name: str, limits: Limits, *, docker: str = "docker") -> list[str]:
         "--ulimit",
         f"cpu={math.ceil(limits.timeout_seconds)}:{math.ceil(limits.timeout_seconds)}",
         "--ulimit",
-        "fsize=1048576:1048576",
+        f"fsize={file_bytes}:{file_bytes}",
         "--ulimit",
         "nofile=64:64",
         "--tmpfs",
@@ -81,7 +101,7 @@ def command(name: str, limits: Limits, *, docker: str = "docker") -> list[str]:
         "/tmp",
         "--log-driver=none",
         "-i",
-        IMAGE,
+        runtime.image,
         "python",
         "-I",
         "-S",
@@ -90,9 +110,21 @@ def command(name: str, limits: Limits, *, docker: str = "docker") -> list[str]:
     ]
 
 
-def run(code: str, tests: str, limits: Limits | None = None, *, mode: str = "function") -> Result:
+def run(
+    code: str,
+    tests: str,
+    limits: Limits | None = None,
+    *,
+    mode: str = "function",
+    runtime: Runtime | None = None,
+) -> Result:
     limits = limits or Limits()
-    if mode not in {"function", "io"} or not tests.strip() or len((code + tests).encode()) > 128000:
+    runtime = runtime or Runtime()
+    if (
+        mode not in {"function", "io"}
+        or not tests.strip()
+        or len((code + tests).encode()) > limits.input_bytes
+    ):
         raise ValueError("invalid test mode, missing tests, or oversized input")
     if mode == "io":
         cases = json.loads(tests)
@@ -118,6 +150,7 @@ def run(code: str, tests: str, limits: Limits | None = None, *, mode: str = "fun
             "mode": mode,
             "timeout": limits.timeout_seconds,
             "output_bytes": limits.output_bytes,
+            "site_packages": runtime.site_packages,
         }
     ).encode()
     started = time.monotonic()
@@ -129,7 +162,7 @@ def run(code: str, tests: str, limits: Limits | None = None, *, mode: str = "fun
             input_stream.write(payload)
             input_stream.seek(0)
             process = subprocess.Popen(
-                command(name, limits, docker=docker),
+                command(name, limits, docker=docker, runtime=runtime),
                 stdin=input_stream,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

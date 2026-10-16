@@ -30,11 +30,21 @@ def supervise(payload: dict[str, Any]) -> dict[str, Any]:
             input_stream.write(case["input"].encode())
             input_stream.seek(0)
             process = subprocess.Popen(
-                [sys.executable, "-I", "-S", "/tmp/candidate.py"],
+                [
+                    sys.executable,
+                    "-I",
+                    *([] if payload["site_packages"] else ["-S"]),
+                    "/tmp/candidate.py",
+                ],
                 stdin=input_stream,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                env={"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"},
+                env={
+                    "PATH": "/usr/local/bin:/usr/bin:/bin",
+                    "LANG": "C.UTF-8",
+                    "OPENBLAS_NUM_THREADS": "1",
+                    "OMP_NUM_THREADS": "1",
+                },
             )
             assert process.stdout is not None
             selector = selectors.DefaultSelector()
