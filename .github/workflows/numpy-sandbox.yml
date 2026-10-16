@@ -20,4 +20,4 @@ jobs:
       - name: Build locked dependency runtime in dedicated context
         run: docker --host unix:///var/run/docker.sock build --platform linux/amd64 --iidfile /tmp/scratchcoder-numpy-image sandbox/evalplus
       - name: NumPy correctness and isolation regression tests
-        run: SCRATCHCODER_NUMPY_IMAGE="$(cat /tmp/scratchcoder-numpy-image)" uv run --locked pytest tests/test_numpy_runtime.py -v
+        run: SCRATCHCODER_NUMPY_IMAGE="$(cat /tmp/scratchcoder-numpy-image)" uv run --locked pytest tests/test_numpy_runtime.py tests/test_evalplus_corrections.py -v

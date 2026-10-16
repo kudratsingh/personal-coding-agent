@@ -22,7 +22,14 @@ def main() -> int:
     parser.add_argument("--tokenizer", type=Path)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--memory-mb", type=int, default=4096)
+    parser.add_argument(
+        "--correct-find-zero-oracle",
+        action="store_true",
+        help="Explicitly opt into the versioned, fingerprint-bound HumanEval/32 correction",
+    )
     args = parser.parse_args()
+    if args.correct_find_zero_oracle and args.suite != "humaneval-plus":
+        parser.error("find-zero correction is only available for HumanEval+")
     if args.output.exists():
         parser.error("output must be a new directory")
     specification = release(args.suite)
@@ -42,6 +49,7 @@ def main() -> int:
             checkpoint=args.checkpoint,
             tokenizer_path=args.tokenizer,
             config=EvaluationConfig(max_new_tokens=args.max_new_tokens),
+            correct_find_zero_oracle=args.correct_find_zero_oracle,
         )
     finally:
         # Preserve safe completed records even when canonical correctness blocks model scoring.
