@@ -20,6 +20,8 @@ Tests stop a tiny run halfway, serialize it, resume it, and compare every later 
 
 `tests/test_distributed_resume.py` extends this to actual two-process Gloo restarts, separately in float32 and CPU bfloat16 with gradient accumulation. Uninterrupted training is the reference for an independently started partial run followed by a completely new worker group. Each rank has different source partitions and an intentionally different Torch RNG position; resume must replace a deliberately scrambled fresh-process RNG. Losses, weights, moments/counters, per-rank loader state, saved RNG and next random draws must match exactly. The test also checks persisted checkpoint provenance and rejection of a changed world size. Worker rendezvous and joins have explicit timeouts and cleanup. This tiny CPU test does not establish multi-GPU correctness or distributed fault recovery.
 
+The optional [bounded CPU checkpoint tool](../cpu-resume-check.md) makes the single-process comparison reproducible at tiny or full-context nano shape on authored token IDs, saving local reports/checkpoint identities. CI tests its tiny preset only. A larger local run is still development evidence, not a substitute for real-corpus, GPU or durable-storage acceptance.
+
 Questions: why save loader buffers (avoid skipped/repeated tokens); why save RNG (reproduce stochastic state); why reject changed data (same counters can mean different examples); why reset stage-two moments (new optimization phase); why gather per-rank state (each rank consumed different data).
 
 ## Periodic held-out validation

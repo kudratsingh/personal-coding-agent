@@ -9,6 +9,7 @@ Start with the [project README](../README.md), [current status](status.md), and 
 | [Development](development.md) | Run the starter checks and understand the implementation milestone. |
 | [Logging](logging.md) | Record local events, metrics, and diagnostic tracebacks. |
 | [Compute](compute.md) | Estimate two-stage compute from supplied assumptions. |
+| [CPU checkpoint reference](cpu-resume-check.md) | Compare bounded authored-fixture training and exact resume without paid compute. |
 | [Data policy](data.md) | Record provenance, licensing, splits, and contamination controls. |
 | [Evaluation policy](evaluation.md) | Run local evaluators and interpret results and limitations. |
 | [Reference evaluation](reference-evaluation.md) | Understand the optional pinned comparison track. |
