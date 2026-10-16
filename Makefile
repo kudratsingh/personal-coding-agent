@@ -2,6 +2,7 @@ UV ?= uv
 
 .PHONY: setup lint typecheck test check docs-check privacy-check smoke tok-train data-build train eval serve
 .PHONY: paid-up paid-sync paid-train paid-eval paid-status paid-down
+.PHONY: workflow-check
 
 setup:
 	$(UV) sync --locked
@@ -16,7 +17,10 @@ typecheck:
 test:
 	$(UV) run --locked pytest
 
-check: privacy-check lint typecheck test docs-check
+check: workflow-check privacy-check lint typecheck test docs-check
+
+workflow-check:
+	$(UV) run --locked python -m tools.check_workflows
 
 privacy-check:
 	$(UV) run --locked python -m tools.check_public_tree
