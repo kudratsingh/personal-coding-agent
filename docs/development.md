@@ -17,7 +17,9 @@ make check
 
 For individual local commands, use `uv run --locked scratchcoder --help` or `make <target> ARGS='...'`. Tokenizer training accepts explicit local UTF-8 corpus files. `data-build --synthetic --output runs/fixture` builds only synthetic material, never downloads gated data. Training requires a config, tokenizer, source-shard JSON map, and run ID. Optional `--validation` supplies a separate held-out domain shard map when `train.validation_interval` is enabled; see the [training walkthrough](walkthroughs/training-loop.md).
 
-`scratchcoder eval` evaluates code-task JSONL through isolation; `scratchcoder eval-choice` scores local choice-task JSONL without executing code. Both require explicit checkpoint/tokenizer/task/output paths and record local reports/scorecards. See [evaluation](evaluation.md). Serving and paid commands remain explicit unavailable placeholders; no paid compute is authorized without permission for the specific run.
+`scratchcoder eval` evaluates code-task JSONL through isolation; `scratchcoder eval-choice` scores local choice-task JSONL without executing code; `scratchcoder eval-validation` reports held-out domain loss/bits per byte from local shards. All require explicit checkpoint/tokenizer/input/output paths and record local reports/scorecards. See [evaluation](evaluation.md). Serving and paid commands remain explicit unavailable placeholders; no paid compute is authorized without permission for the specific run.
+
+The optional independent tokenizer reference runs with `uv run --locked --extra baseline pytest tests/test_tokenizer_external.py`. It trains only on synthetic fixtures, never downloads a pretrained model or corpus, and does not become part of the core path. A dedicated CI job runs it; the base environment explicitly skips it when the extra is absent.
 
 For now, use `.env.example` only as a template for local configuration; never commit the resulting `.env` file.
 
