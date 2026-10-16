@@ -71,11 +71,21 @@ class TrainConfig:
     beta2: float = 0.95
     adam_epsilon: float = 1e-8
     precision: str = "float32"
+    validation_interval: int = 0
+    validation_documents: int = 2
 
     def __post_init__(self) -> None:
-        for name in ("steps", "batch_size", "sequence_length", "accumulation_steps"):
+        for name in (
+            "steps",
+            "batch_size",
+            "sequence_length",
+            "accumulation_steps",
+            "validation_documents",
+        ):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"train.{name} must be a positive integer")
+        if type(self.validation_interval) is not int or self.validation_interval < 0:
+            raise ValueError("train.validation_interval must be a nonnegative integer")
         if type(self.seed) is not int or self.seed < 0:
             raise ValueError("seed must be a nonnegative integer")
         if type(self.warmup_steps) is not int or not 0 <= self.warmup_steps <= self.steps:

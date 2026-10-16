@@ -11,3 +11,11 @@ Starting a new stage is different: a parent checkpoint supplies only weights and
 Tests stop a tiny run halfway, serialize it, resume it, and compare every later loss and final parameter exactly with an uninterrupted CPU run. Stage-two tests compare step-zero validation and fresh counters. Actual rented GPU throughput, durable uploads, and watchdog behavior remain separate gates.
 
 Questions: why save loader buffers (avoid skipped/repeated tokens); why save RNG (reproduce stochastic state); why reject changed data (same counters can mean different examples); why reset stage-two moments (new optimization phase); why gather per-rank state (each rank consumed different data).
+
+## Periodic held-out validation
+
+Set `train.validation_interval` to a positive step count and supply `train --validation path/to/domains.json`, a map from domain names to local held-out shard paths relative to that JSON file. `train.validation_documents` limits the number of fixed document-prefix windows per domain; each window has at most `sequence_length` targets. This is a bounded diagnostic sample, not a full-corpus estimate. The caller must supply genuinely held-out shards.
+
+Rank zero records per-domain validation at step zero, each interval, and the final step. The token-weighted mean loss is total negative log likelihood divided by target tokens. Bits per byte divides the same NLL by `log(2)` and the raw target byte count. Byte counts come directly from the tokenizer's byte table: decoding a partial UTF-8 sequence to a replacement character would give an incorrect denominator. Special tokens contribute no raw text bytes.
+
+Validation uses no gradients, restores the previous model mode, and never advances the training loader or optimizer. Fixed windows and byte counts have a checkpoint identity; exact resume rejects changed validation inputs. `tests/test_validation.py` checks uniform-logit reference arithmetic, partial UTF-8 bytes, unchanged weights/RNG/loader/training losses, configured logging steps, and changed-input rejection. The explicit training CLI test supplies separate synthetic web and Python validation shards.

@@ -14,9 +14,17 @@ def test_explicit_fixture_training_writes_checkpoint_and_record(tmp_path: Path) 
     data = tmp_path / "data"
     tokenizer, _, metadata = prepare_fixture(data, vocab_size=512)
     original = RunConfig.load(Path("configs/smoke.yaml"))
-    config = replace(original, model=replace(original.model, vocab_size=tokenizer.vocab_size))
+    config = replace(
+        original,
+        model=replace(original.model, vocab_size=tokenizer.vocab_size),
+        train=replace(original.train, validation_interval=2),
+    )
     config_path = tmp_path / "config.yaml"
     config.save(config_path)
+    validation = data / "validation.json"
+    validation.write_text(
+        json.dumps({"web": "web-validation.bin", "python": "python-validation.bin"})
+    )
     run = partial(
         train_from_files,
         config_path=config_path,
@@ -24,6 +32,7 @@ def test_explicit_fixture_training_writes_checkpoint_and_record(tmp_path: Path) 
         tokenizer_path=data / "tokenizer.json",
         output_root=tmp_path / "runs",
         run_id="explicit",
+        validation_path=validation,
     )
     run()
     assert (tmp_path / "runs/explicit/checkpoint.pt").exists()

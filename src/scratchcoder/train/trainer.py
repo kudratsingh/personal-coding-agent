@@ -1,5 +1,7 @@
 """One training path for initial pretraining, continuation, and exact resume."""
 
+import hashlib
+import json
 import os
 import time
 from dataclasses import asdict
@@ -17,6 +19,7 @@ from scratchcoder.common.records import RunRecord
 from scratchcoder.data.loader import BatchSource
 from scratchcoder.model.gpt import GPT
 from scratchcoder.optim.adamw import AdamW, clip_gradients, cross_entropy, learning_rate
+from scratchcoder.train.validation import ValidationWindow, validate
 
 
 class Trainer:
@@ -30,8 +33,23 @@ class Trainer:
         data_hash: str,
         tokenizer_hash: str,
         device: str = "cpu",
+        validation: dict[str, tuple[ValidationWindow, ...]] | None = None,
     ) -> None:
         self.config, self.loader = config, loader
+        self.validation = dict(validation or {})
+        if bool(self.validation) != bool(config.train.validation_interval):
+            raise ValueError("validation windows and a positive interval must be supplied together")
+        if any(not name or not windows for name, windows in self.validation.items()):
+            raise ValueError("validation domains and windows must be nonempty")
+        self.validation_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    name: [asdict(window) for window in windows]
+                    for name, windows in self.validation.items()
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
         self.device = torch.device(device)
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -72,6 +90,8 @@ class Trainer:
         log_path = self.run_root / self.record.run_id / f"events-rank{self.rank}.jsonl"
         with EventLogger(log_path, self.record.run_id) as logger:
             try:
+                if self.step == 0:
+                    self._log_validation(logger)
                 while self.step < target:
                     started = time.perf_counter()
                     self.optimizer.zero_grad()
@@ -123,6 +143,10 @@ class Trainer:
                         },
                         step=self.step,
                     )
+                    if options.validation_interval and (
+                        self.step % options.validation_interval == 0 or self.step == options.steps
+                    ):
+                        self._log_validation(logger)
                 if self.step == options.steps:
                     self.record.finish(success=True)
             except Exception as error:
@@ -139,6 +163,17 @@ class Trainer:
                 if self.rank == 0:
                     self.record.save(self.run_root)
         return losses
+
+    def _log_validation(self, logger: EventLogger) -> None:
+        if self.rank == 0 and self.validation:
+            metrics = {
+                f"validation/{name}/{metric}": value
+                for name, windows in self.validation.items()
+                for metric, value in validate(self.model, windows).items()
+            }
+            logger.event(
+                "validation", step=self.step, validation_hash=self.validation_hash, metrics=metrics
+            )
 
     @torch.no_grad()
     def validation_loss(self, inputs: Tensor, targets: Tensor) -> float:
@@ -162,6 +197,7 @@ class Trainer:
                 "run_id": self.record.run_id,
                 "data_hash": self.record.data_manifest_hash,
                 "tokenizer_hash": self.record.tokenizer_hash,
+                "validation_hash": self.validation_hash,
                 "model": self.model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "step": self.step,
@@ -190,6 +226,8 @@ class Trainer:
             or state["tokenizer_hash"] != self.record.tokenizer_hash
         ):
             raise ValueError("checkpoint input identity differs")
+        if state.get("validation_hash", hashlib.sha256(b"{}").hexdigest()) != self.validation_hash:
+            raise ValueError("checkpoint validation identity differs")
         if len(state["rank_states"]) != self.world_size:
             raise ValueError("exact resume requires the same world size")
         local = state["rank_states"][self.rank]

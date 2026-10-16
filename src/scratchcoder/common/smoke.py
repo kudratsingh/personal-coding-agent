@@ -69,7 +69,8 @@ def run_smoke(
             shard = TokenShard(paths[f"{domain}-validation"], tokenizer_hash=tokenizer.sha256)
             ids = shard[0][: options.train.sequence_length + 1]
             loss = trainer.validation_loss(torch.tensor([ids[:-1]]), torch.tensor([ids[1:]]))
-            byte_count = len(tokenizer.decode(ids[1:]).encode())
+            byte_tokens = tokenizer.byte_tokens()
+            byte_count = sum(len(byte_tokens.get(token, b"")) for token in ids[1:])
             metrics[f"{domain}_validation_loss"] = loss
             metrics[f"{domain}_bits_per_byte"] = loss * (len(ids) - 1) / math.log(2) / byte_count
         if not all(math.isfinite(value) for value in metrics.values()):

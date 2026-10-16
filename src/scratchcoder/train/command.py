@@ -11,6 +11,7 @@ from scratchcoder.data.loader import MixedLoader
 from scratchcoder.data.shards import TokenShard
 from scratchcoder.tokenizer.bpe import ByteBPE
 from scratchcoder.train.trainer import Trainer
+from scratchcoder.train.validation import shard_windows
 
 
 def train_from_files(
@@ -21,6 +22,7 @@ def train_from_files(
     output_root: Path,
     run_id: str,
     resume: Path | None = None,
+    validation_path: Path | None = None,
 ) -> None:
     config = RunConfig.load(config_path)
     tokenizer = ByteBPE.load(tokenizer_path)
@@ -53,6 +55,17 @@ def train_from_files(
         run_root=output_root,
         data_hash=identity,
         tokenizer_hash=tokenizer.sha256,
+        validation=None
+        if validation_path is None
+        else {
+            name: shard_windows(
+                TokenShard(validation_path.parent / path, tokenizer_hash=tokenizer.sha256),
+                tokenizer,
+                documents=config.train.validation_documents,
+                sequence_length=config.train.sequence_length,
+            )
+            for name, path in json.loads(validation_path.read_text()).items()
+        },
     )
     if resume is not None:
         trainer.resume(resume)
