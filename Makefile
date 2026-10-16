@@ -1,6 +1,6 @@
 UV ?= uv
 
-.PHONY: setup lint typecheck test check docs-check smoke tok-train data-build train eval serve
+.PHONY: setup lint typecheck test check docs-check privacy-check smoke tok-train data-build train eval serve
 .PHONY: paid-up paid-sync paid-train paid-eval paid-status paid-down
 
 setup:
@@ -16,10 +16,13 @@ typecheck:
 test:
 	$(UV) run --locked pytest
 
-check: lint typecheck test docs-check
+check: privacy-check lint typecheck test docs-check
+
+privacy-check:
+	$(UV) run --locked python -m tools.check_public_tree
 
 docs-check:
-	$(UV) run --locked python tools/check_docs.py
+	$(UV) run --locked python -m tools.check_docs
 
 smoke:
 	$(UV) run --locked scratchcoder smoke

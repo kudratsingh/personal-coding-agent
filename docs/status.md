@@ -10,6 +10,7 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 - Public roadmap, architecture, development, data, evaluation, and sandbox guides.
 - Shared coding-agent entry points and contributor templates.
 - Documentation link check and a matching CI workflow.
+- Read-only publication checks reject tracked paths protected by repository ignore rules; public documentation checks exclude ignored local notes and reject symlink documents. These are path checks, not secret detection.
 - Python 3.12.13, uv dependency lock, component namespaces, lint, types, tests, and Linux/macOS CPU CI.
 - Validated YAML configuration and atomic, schema-tested run records with provenance and parent lineage.
 - Local JSONL metrics, an opt-in tracker adapter, and structured debug logs with tracebacks.
@@ -27,7 +28,7 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 - Shard header/vocabulary/BOS integrity guards, with explicit tokenizer expectations in training/validation and unchanged legacy shard identities. See the [walkthrough](walkthroughs/shards.md).
 - Complete evaluation-only [original MBPP source audit](mbpp-audit.md): all 974 rows accounted for; 519 retained references passed both test partitions after benchmark-ID/schema/contamination checks. No training admission, full-pool approval or phase closure is implied.
 
-**Verification:** Latest owner-checkout suite with reference/evaluation extras: 191 passed, 18 explicitly skipped disposable-runtime tests; strict types, lint and 44 public Markdown checks pass. A fresh public clone at `e6420c1` passed setup/check/smoke without private files: 165 passed, 31 explicit runtime/parser/reference skips. Dedicated CI exercises optional parsing/reference and actual isolation separately. Local skips are not evidence of isolation. See [EvalPlus validation](evalplus.md) for real-suite outcomes and blockers, rather than treating loader/unit tests as benchmark acceptance.
+**Verification:** Latest owner-checkout suite with reference/evaluation extras: 202 passed, 18 explicitly skipped disposable-runtime tests; strict types, lint, publication-path checks and 44 public Markdown checks pass. A fresh public clone at `e6420c1` passed setup/check/smoke without private files: 165 passed, 31 explicit runtime/parser/reference skips. Dedicated CI exercises optional parsing/reference and actual isolation separately. Local skips are not evidence of isolation. See [EvalPlus validation](evalplus.md) for real-suite outcomes and blockers, rather than treating loader/unit tests as benchmark acceptance.
 
 ## Phase acceptance
 
