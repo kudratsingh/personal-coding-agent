@@ -9,3 +9,4 @@ Owner budgets, detailed work orders, private experiments, and account details be
 - [ADR 0003: structured logging](0003-logging.md)
 - [ADR 0004: development sandbox](0004-development-sandbox.md)
 - [ADR 0005: choice scoring](0005-choice-scoring.md)
+- [ADR 0006: evaluation dependency runtime](0006-evaluation-runtime.md)

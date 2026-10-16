@@ -1,0 +1,23 @@
+name: NumPy sandbox
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  containment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+      - run: make setup
+      - name: Build locked dependency runtime in dedicated context
+        run: docker --host unix:///var/run/docker.sock build --platform linux/amd64 --iidfile /tmp/scratchcoder-numpy-image sandbox/evalplus
+      - name: NumPy correctness and isolation regression tests
+        run: SCRATCHCODER_NUMPY_IMAGE="$(cat /tmp/scratchcoder-numpy-image)" uv run --locked pytest tests/test_numpy_runtime.py -v
