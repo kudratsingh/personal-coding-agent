@@ -88,3 +88,40 @@ def test_shared_checkpoint_loader_rejects_identity_and_vocabulary_mismatch(tmp_p
     torch.save(saved, checkpoint)
     with pytest.raises(ValueError, match="vocabulary"):
         load_checkpoint(checkpoint, tokenizer_path)
+
+
+@pytest.mark.parametrize("vocab_size,bos_id", [(273, 256), (272, 257)])
+def test_validation_rejects_semantic_shard_mismatch_before_report(
+    tmp_path: Path, vocab_size: int, bos_id: int
+) -> None:
+    checkpoint, tokenizer_path, _ = checkpoint_fixture(tmp_path)
+    tokenizer = ByteBPE.load(tokenizer_path)
+    write_shard(
+        tmp_path / "fixture.bin",
+        [[97, 98]],
+        vocab_size=vocab_size,
+        bos_id=bos_id,
+        tokenizer_hash=tokenizer.sha256,
+    )
+    sources = tmp_path / "sources.json"
+    sources.write_text(json.dumps({"web": "fixture.bin"}))
+    output = tmp_path / "evaluation"
+    with pytest.raises(ValueError, match="tokenizer"):
+        main(
+            [
+                "eval-validation",
+                "--checkpoint",
+                str(checkpoint),
+                "--tokenizer",
+                str(tokenizer_path),
+                "--sources",
+                str(sources),
+                "--output",
+                str(output),
+                "--scorecard",
+                str(tmp_path / "scores.jsonl"),
+                "--documents",
+                "1",
+            ]
+        )
+    assert not output.exists()

@@ -8,6 +8,8 @@ Planned topics include tokenization, transformer layers, optimization, training 
 
 Implemented: [byte-level BPE](tokenizer.md).
 
+Implemented: [token shards and integrity](shards.md).
+
 Implemented: [decoder-only transformer](transformer.md).
 
 Implemented: [loss and optimization](optimizer.md).

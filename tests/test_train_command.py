@@ -44,3 +44,25 @@ def test_explicit_fixture_training_writes_checkpoint_and_record(tmp_path: Path) 
     ids = metadata["split_document_ids"]
     assert set(ids["web-stage1"]).isdisjoint(ids["web-stage2"])
     assert set(ids["web-stage1"]).isdisjoint(ids["web-validation"])
+
+
+def test_training_rejects_shard_vocabulary_before_creating_run(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    tokenizer, paths, _ = prepare_fixture(data, vocab_size=512)
+    original = RunConfig.load(Path("configs/smoke.yaml"))
+    config = replace(original, model=replace(original.model, vocab_size=tokenizer.vocab_size))
+    config_path = tmp_path / "config.yaml"
+    config.save(config_path)
+    manifest = paths["web-stage1"].with_suffix(".bin.json")
+    metadata = json.loads(manifest.read_text())
+    metadata["vocab_size"] = tokenizer.vocab_size + 1
+    manifest.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="vocabulary"):
+        train_from_files(
+            config_path=config_path,
+            sources_path=data / "stage1-sources.json",
+            tokenizer_path=data / "tokenizer.json",
+            output_root=tmp_path / "runs",
+            run_id="invalid",
+        )
+    assert not (tmp_path / "runs").exists()
