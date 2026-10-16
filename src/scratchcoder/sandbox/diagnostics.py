@@ -19,6 +19,14 @@ def failure_category(result: Result) -> str:
         "MemoryError",
         "OverflowError",
         "ZeroDivisionError",
+        "ModuleNotFoundError",
+        "ImportError",
+        "AttributeError",
+        "IndexError",
+        "KeyError",
+        "ValueError",
+        "RecursionError",
+        "RuntimeError",
     ):
         if re.search(r"(?m)^" + name + r"(?::|$)", result.stdout):
             return name
