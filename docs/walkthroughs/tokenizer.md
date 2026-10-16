@@ -18,6 +18,10 @@ Training deduplicates chunks with weights. Pair counts and chunk-location sets u
 
 No production tokenizer has been trained or frozen. Large-corpus throughput and held-out compression are separate measurements.
 
+An additional reference-only check independently trains Hugging Face Tokenizers BPE on the same synthetic byte chunks, comparing learned merge order/bytes and encoded IDs. Run `uv run --locked --extra baseline pytest tests/test_tokenizer_external.py`; dedicated CPU CI installs the locked extra so this check actually runs. No pretrained model/tokenizer or dataset is downloaded. The core implementation does not depend on the library.
+
+The adapter represents each raw byte as one Latin-1 code point and supplies our chunk boundaries explicitly, with no library normalizer/pretokenizer. The reference trainer receives all 256 initial symbols and minimum pair frequency one, as documented in the [reference trainer API](https://huggingface.co/docs/tokenizers/v0.22.2/api/trainers). It reserves no special IDs, so its merge IDs are shifted by sixteen for comparison. Random tie-heavy corpora, Unicode/code, whitespace, and unseen bytes exercise both independent training and encoding. This validates the BPE algorithm under matched preprocessing, not identity with an unrelated pretrained tokenizer.
+
 `FastEncoder` uses learned pair ranks to visit only merges present in a chunk and caches repeated chunks. `encode_many` can distribute documents to spawn-based workers while preserving order. Reference/fast identity and worker ordering are tested; `tools/benchmark_tokenizer.py` reports synthetic throughput and checks identity over the requested byte count. Synthetic repetition benefits caching and must not be represented as real-corpus throughput.
 
 ## Questions
