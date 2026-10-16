@@ -29,4 +29,8 @@ The manual **OpenCodeInstruct prefix reference pilot** workflow uses the reviewe
 
 ## Current evidence
 
-Local hash/schema verification confirmed the pinned shard and first 200 rows, containing 2,000 JSON test statements. This parsing did not execute source programs. Reference retention is pending a real isolated worker run; no passing result is inferred from fixtures.
+The [completed clean standard-CPU worker](https://github.com/kudratsingh/personal-coding-agent/actions/runs/38898993575), revision `6a695ffc324c1a2f33441e3cc9a576e5db85b668`, accounted for all **200 prefix rows**: 35 unsupported assertion schemas; 165 entering pool checks, of which 13 were contamination/duplicates, 92 failed at least one reference partition and **60 passed both**. All retained tasks remain evaluation-only. The source prefix contains 2,000 JSON test statements; supported lists were preserved through normalization rather than stripped to manufacture passes.
+
+There were 304 partition executions: 170 passed, 75 assertion failures, six name errors, 52 other failures and one output-limit result. Partition passes are not task passes. Failures reflect the fixed stdlib/2-second/128-MiB profile and test/schema limitations, not necessarily mathematical incorrectness. Missing final TACO/pool coverage still blocks training admission; this nonrepresentative prefix is not a full-source quality estimate or model capability result.
+
+Protection included 542 pinned code tasks and 2,376 ARC-Easy test questions/public options. Retained-task hash: `23cb766986a1a5070d698ef08628ec1f583be1a521d5f4d9ec1627bb77d2f9cf`. Driver peak RSS was 700,588,032 bytes, excluding sandbox containers. The run did not train a model, export raw tasks, alter tests or authorize a full build.
