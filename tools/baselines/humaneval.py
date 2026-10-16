@@ -1,10 +1,12 @@
 """Pinned, CPU-only reference check using the project's isolated evaluation harness."""
 
 import argparse
+import ast
 import gzip
 import hashlib
 import importlib
 import json
+import platform
 import sys
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -55,6 +57,48 @@ def normalize(rows: list[dict[str, Any]]) -> list[Task]:
 def truncate_completion(text: str) -> str:
     offsets = [text.find(stop) for stop in STOPS if stop in text]
     return text[: min(offsets)] if offsets else text
+
+
+def completion_diagnostics(
+    prompt: str,
+    completion: str,
+    generated_tokens: Sequence[int],
+    *,
+    budget: int,
+    eos_token_id: int | None,
+) -> dict[str, Any]:
+    """Observe the existing candidate without executing or returning its source text."""
+    if (
+        type(budget) is not int
+        or budget < 1
+        or len(generated_tokens) > budget
+        or any(type(token) is not int or token < 0 for token in generated_tokens)
+        or eos_token_id is not None
+        and (type(eos_token_id) is not int or eos_token_id < 0)
+    ):
+        raise ValueError("valid generation counts and token IDs required")
+    kept = truncate_completion(completion)
+    matches = [
+        (completion.index(stop), index) for index, stop in enumerate(STOPS) if stop in completion
+    ]
+    stop_index = min(matches)[1] if matches else None
+    try:
+        ast.parse(prompt + kept)
+        syntax_valid = True
+    except (SyntaxError, ValueError, RecursionError):
+        syntax_valid = False
+    eos_seen = eos_token_id is not None and eos_token_id in generated_tokens
+    return {
+        "generated_tokens": len(generated_tokens),
+        "budget_reached": len(generated_tokens) == budget,
+        "budget_without_eos": len(generated_tokens) == budget and not eos_seen,
+        "eos_seen": eos_seen,
+        "stop_index": stop_index,
+        "decoded_characters": len(completion),
+        "retained_characters": len(kept),
+        "empty_retained_completion": not kept.strip(),
+        "candidate_syntax_valid": syntax_valid,
+    }
 
 
 def validate_references(
@@ -141,6 +185,7 @@ def main() -> int:
     )
     tokenizer_hash = hashlib.sha256(tokenizer.backend_tokenizer.to_str().encode()).hexdigest()
     counter = 0
+    generation_rows: dict[str, dict[str, Any]] = {}
 
     def candidate(task: Task, seed: int) -> str:
         nonlocal counter
@@ -158,6 +203,13 @@ def main() -> int:
             tokenizer.decode(
                 generated[0, encoded["input_ids"].shape[1] :], skip_special_tokens=True
             )
+        )
+        generation_rows[task.id] = completion_diagnostics(
+            task.prompt,
+            completion,
+            cast(list[int], generated[0, encoded["input_ids"].shape[1] :].tolist()),
+            budget=args.max_new_tokens,
+            eos_token_id=tokenizer.eos_token_id,
         )
         counter += 1
         print(f"Generated reference candidate {counter}/{len(tasks)}", file=sys.stderr, flush=True)
@@ -192,8 +244,33 @@ def main() -> int:
         "model_license": "BigCode OpenRAIL-M v1",
         "device": "cpu",
         "threads": args.threads,
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+        "transformers_version": str(transformers.__version__),
+        "model_dtype": str(model.dtype),
+        "model_class": type(model).__name__,
+        "tokenizer_class": type(tokenizer).__name__,
         "canonical_passed": canonical["task_count"],
         "outcome_categories": dict(categories),
+        "generation_diagnostics": {
+            "policy": "observational-only-no-decoding-change",
+            "task_count": len(generation_rows),
+            "budget_reached": sum(row["budget_reached"] for row in generation_rows.values()),
+            "budget_without_eos": sum(
+                row["budget_without_eos"] for row in generation_rows.values()
+            ),
+            "eos_seen": sum(row["eos_seen"] for row in generation_rows.values()),
+            "empty_retained_completions": sum(
+                row["empty_retained_completion"] for row in generation_rows.values()
+            ),
+            "syntactically_valid_candidates": sum(
+                row["candidate_syntax_valid"] for row in generation_rows.values()
+            ),
+            "stop_counts": dict(
+                Counter(str(row["stop_index"]) for row in generation_rows.values())
+            ),
+            "per_task": generation_rows,
+        },
     }
     save_report(report, args.output / "evaluation", scorecard=args.output / "scorecard.jsonl")
     # These records contain only public benchmark settings, hashes, and outcome statuses.
