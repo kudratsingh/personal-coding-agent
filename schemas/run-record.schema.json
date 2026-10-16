@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Run record v1",
+  "title": "Run record v1/v2",
   "type": "object",
   "additionalProperties": false,
   "required": ["run_id", "config", "git_commit", "dirty", "seed", "data_manifest_hash", "tokenizer_hash", "parent_run_id", "hardware", "started_at", "ended_at", "estimated_cost_usd", "actual_cost_usd", "artifact_uri", "status", "schema_version"],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"enum": [1, 2]},
     "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
     "config": {"type": "object"},
     "git_commit": {"type": ["string", "null"]},
@@ -20,6 +20,23 @@
     "estimated_cost_usd": {"type": "number", "minimum": 0},
     "actual_cost_usd": {"type": ["number", "null"], "minimum": 0},
     "artifact_uri": {"type": ["string", "null"]},
-    "status": {"enum": ["running", "completed", "failed"]}
-  }
+    "status": {"enum": ["running", "completed", "failed"]},
+    "resume_checkpoint": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["sha256", "source_run_id", "step"],
+          "properties": {
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "source_run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
+            "step": {"type": "integer", "minimum": 0}
+          }
+        }
+      ]
+    }
+  },
+  "if": {"properties": {"schema_version": {"const": 1}}},
+  "then": {"not": {"required": ["resume_checkpoint"]}},
+  "else": {"required": ["resume_checkpoint"]}
 }

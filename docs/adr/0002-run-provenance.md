@@ -14,3 +14,5 @@ Write JSON run records atomically with source revision, dirty state, seed, input
 Interrupted writes preserve the previous valid file. A committed JSON Schema describes the record shape. Tests round-trip YAML, validate a completed dummy record against the schema, reject unsafe run identifiers, and inject a failed JSON write.
 
 The schema establishes record structure, not proof of data licensing, artifact durability, or successful training.
+
+[ADR 0009](0009-resume-provenance.md) introduces explicit schema-2 resume lineage and failure recording while preserving legacy schema-1 record serialization. Numerical checkpoint format remains separate.

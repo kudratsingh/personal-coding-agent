@@ -15,7 +15,7 @@ from torch import Tensor
 
 from scratchcoder.common.config import RunConfig
 from scratchcoder.common.logging import EventLogger, debug_logger
-from scratchcoder.common.records import RunRecord
+from scratchcoder.common.records import RunRecord, validate_resume_details
 from scratchcoder.data.loader import BatchSource
 from scratchcoder.model.gpt import GPT
 from scratchcoder.optim.adamw import AdamW, clip_gradients, cross_entropy, learning_rate
@@ -218,8 +218,40 @@ class Trainer:
             dist.barrier()
 
     def resume(self, path: Path) -> None:
-        state = torch.load(path, map_location="cpu", weights_only=True)
-        if state["version"] != 1 or state["config"] != asdict(self.config):
+        checkpoint_hash: str | None = None
+        try:
+            with path.open("rb") as stream:
+                checkpoint_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+                stream.seek(0)
+                state = torch.load(stream, map_location="cpu", weights_only=True)
+            self._restore_checkpoint(state, checkpoint_hash)
+        except Exception as error:
+            self.record.finish(success=False)
+            if self.rank == 0:
+                self.record.save(self.run_root)
+            log_path = self.run_root / self.record.run_id / f"events-rank{self.rank}.jsonl"
+            with EventLogger(log_path, self.record.run_id) as logger:
+                logger.event(
+                    "resume_failed",
+                    error_type=type(error).__name__,
+                    step=self.step,
+                    checkpoint_sha256=checkpoint_hash,
+                )
+            diagnostic = debug_logger(log_path.with_name(f"debug-rank{self.rank}.jsonl"))
+            try:
+                diagnostic.exception("Checkpoint resume aborted")
+            finally:
+                for handler in diagnostic.handlers:
+                    handler.close()
+            raise
+
+    def _restore_checkpoint(self, state: dict[str, Any], checkpoint_hash: str) -> None:
+        if (
+            not isinstance(state, dict)
+            or type(state.get("version")) is not int
+            or state["version"] != 1
+            or state.get("config") != asdict(self.config)
+        ):
             raise ValueError("checkpoint configuration differs")
         if (
             state["data_hash"] != self.record.data_manifest_hash
@@ -230,6 +262,14 @@ class Trainer:
             raise ValueError("checkpoint validation identity differs")
         if len(state["rank_states"]) != self.world_size:
             raise ValueError("exact resume requires the same world size")
+        details = {
+            "sha256": checkpoint_hash,
+            "source_run_id": state["run_id"],
+            "step": state["step"],
+        }
+        validate_resume_details(details)
+        if state["step"] > self.config.train.steps:
+            raise ValueError("checkpoint step exceeds configured training")
         local = state["rank_states"][self.rank]
         self.model.load_state_dict(state["model"])
         self.optimizer.load_state_dict(state["optimizer"])
@@ -238,3 +278,10 @@ class Trainer:
         if self.device.type == "cuda":
             torch.cuda.set_rng_state_all(local["rng_cuda"])
         self.step = state["step"]
+        self.record.schema_version = 2
+        self.record.resume_checkpoint = details
+        self.record.status = "running"
+        self.record.ended_at = None
+        self.record.actual_cost_usd = None
+        if self.rank == 0:
+            self.record.save(self.run_root)
