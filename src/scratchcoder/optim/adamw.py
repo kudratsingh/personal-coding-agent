@@ -8,6 +8,15 @@ import torch
 from torch import Tensor
 
 
+def _finite_real(value: Any) -> bool:
+    if type(value) not in {int, float}:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
     """Stable mean next-token loss without delegating to a loss framework."""
     if logits.shape[:-1] != targets.shape or targets.numel() == 0:
@@ -99,32 +108,58 @@ class AdamW:
             "betas": self.betas,
             "eps": self.eps,
             "weight_decay": self.weight_decay,
-            "decay_mask": self.decay_mask,
+            "decay_mask": list(self.decay_mask),
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        if (
-            len(state["m"]) != len(self.parameters)
-            or len(state["v"]) != len(self.parameters)
-            or len(state["steps"]) != len(self.parameters)
+        fields = {"m", "v", "steps", "lr", "betas", "eps", "weight_decay", "decay_mask"}
+        if not isinstance(state, dict) or set(state) != fields:
+            raise ValueError("invalid optimizer state fields")
+        if any(
+            not isinstance(state[name], list) or len(state[name]) != len(self.parameters)
+            for name in ("m", "v", "steps", "decay_mask")
         ):
             raise ValueError("optimizer parameter count mismatch")
+        if any(type(step) is not int or step < 0 for step in state["steps"]):
+            raise ValueError("optimizer counters must be nonnegative integers")
+        if any(type(flag) is not bool for flag in state["decay_mask"]):
+            raise ValueError("optimizer decay mask must contain booleans")
+        betas = state["betas"]
+        if (
+            not _finite_real(state["lr"])
+            or state["lr"] < 0
+            or not _finite_real(state["eps"])
+            or state["eps"] <= 0
+            or not _finite_real(state["weight_decay"])
+            or state["weight_decay"] < 0
+            or not isinstance(betas, (list, tuple))
+            or len(betas) != 2
+            or any(not _finite_real(beta) or not 0 <= beta < 1 for beta in betas)
+        ):
+            raise ValueError("invalid optimizer hyperparameters")
         for name in ("m", "v"):
-            values = state[name]
             if any(
-                value.shape != parameter.shape
-                for value, parameter in zip(values, self.parameters, strict=True)
+                not isinstance(value, Tensor)
+                or value.layout != torch.strided
+                or value.is_meta
+                or not value.is_floating_point()
+                or value.shape != parameter.shape
+                or value.dtype != parameter.dtype
+                or not bool(torch.isfinite(value).all())
+                or (name == "v" and bool((value < 0).any()))
+                for value, parameter in zip(state[name], self.parameters, strict=True)
             ):
-                raise ValueError("optimizer state shape mismatch")
-            setattr(
-                self,
-                name,
-                [
-                    value.to(parameter.device).clone()
-                    for value, parameter in zip(values, self.parameters, strict=True)
-                ],
-            )
-        self.steps = list(state["steps"])
-        self.lr, self.betas = state["lr"], tuple(state["betas"])
+                raise ValueError("optimizer moments require matching finite dense tensors; v >= 0")
+        # Finish every copy/transfer before committing any live field.
+        moments = {
+            name: [
+                value.detach().to(parameter.device).clone()
+                for value, parameter in zip(state[name], self.parameters, strict=True)
+            ]
+            for name in ("m", "v")
+        }
+        steps, mask = list(state["steps"]), list(state["decay_mask"])
+        new_betas = tuple(betas)
+        self.m, self.v, self.steps, self.decay_mask = moments["m"], moments["v"], steps, mask
+        self.lr, self.betas = state["lr"], new_betas
         self.eps, self.weight_decay = state["eps"], state["weight_decay"]
-        self.decay_mask = list(state["decay_mask"])
