@@ -32,7 +32,12 @@ def train_from_files(
         raise ValueError("run already exists; use a new run ID or explicit resume")
     raw = json.loads(sources_path.read_text())
     sources = {
-        name: TokenShard(sources_path.parent / path, tokenizer_hash=tokenizer.sha256)
+        name: TokenShard(
+            sources_path.parent / path,
+            tokenizer_hash=tokenizer.sha256,
+            vocab_size=tokenizer.vocab_size,
+            bos_id=tokenizer.bos_id,
+        )
         for name, path in raw.items()
     }
     identity = hashlib.sha256(
@@ -59,7 +64,12 @@ def train_from_files(
         if validation_path is None
         else {
             name: shard_windows(
-                TokenShard(validation_path.parent / path, tokenizer_hash=tokenizer.sha256),
+                TokenShard(
+                    validation_path.parent / path,
+                    tokenizer_hash=tokenizer.sha256,
+                    vocab_size=tokenizer.vocab_size,
+                    bos_id=tokenizer.bos_id,
+                ),
                 tokenizer,
                 documents=config.train.validation_documents,
                 sequence_length=config.train.sequence_length,

@@ -11,3 +11,4 @@ Owner budgets, detailed work orders, private experiments, and account details be
 - [ADR 0005: choice scoring](0005-choice-scoring.md)
 - [ADR 0006: evaluation dependency runtime](0006-evaluation-runtime.md)
 - [ADR 0007: explicit find-zero oracle correction](0007-find-zero-oracle-correction.md)
+- [ADR 0008: shard semantic integrity](0008-shard-semantic-integrity.md)

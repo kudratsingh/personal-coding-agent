@@ -38,7 +38,12 @@ def evaluate_validation_checkpoint(
     ):
         raise ValueError("nonempty domain-to-shard-path map required")
     shards = {
-        name: TokenShard(sources_path.parent / path, tokenizer_hash=tokenizer.sha256)
+        name: TokenShard(
+            sources_path.parent / path,
+            tokenizer_hash=tokenizer.sha256,
+            vocab_size=tokenizer.vocab_size,
+            bos_id=tokenizer.bos_id,
+        )
         for name, path in sources.items()
     }
     metrics = {}
