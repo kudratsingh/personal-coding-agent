@@ -1,0 +1,21 @@
+name: MBPP source reference audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+      - run: uv sync --locked --extra evaluation
+      - run: docker --host unix:///var/run/docker.sock pull --platform linux/amd64 python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe
+      - name: Evaluation-only source audit, no training-pool export
+        run: uv run --locked --extra evaluation python tools/mbpp_audit.py --data-directory runs/mbpp-audit-data --download --output runs/mbpp-audit/report.json
