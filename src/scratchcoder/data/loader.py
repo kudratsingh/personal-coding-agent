@@ -42,6 +42,9 @@ class MixedLoader:
         rank: int = 0,
         world_size: int = 1,
     ) -> None:
+        # Own configuration mappings; source document objects/files stay immutable by contract.
+        sources = dict(sources)
+        shares = dict(shares)
         if sequence_length < 1 or batch_size < 1 or not 0 <= rank < world_size:
             raise ValueError("invalid loader dimensions/rank")
         if (
