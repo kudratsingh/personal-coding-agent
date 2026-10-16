@@ -48,6 +48,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     choices.add_argument("--output", type=Path, required=True)
     choices.add_argument("--scorecard", type=Path, default=Path("runs/scorecard.jsonl"))
     choices.add_argument("--seed", type=int, default=0)
+    validation = subparsers.add_parser("eval-validation")
+    validation.add_argument("--checkpoint", type=Path, required=True)
+    validation.add_argument("--tokenizer", type=Path, required=True)
+    validation.add_argument("--sources", type=Path, required=True)
+    validation.add_argument("--output", type=Path, required=True)
+    validation.add_argument("--scorecard", type=Path, default=Path("runs/scorecard.jsonl"))
+    validation.add_argument("--documents", type=int, required=True)
+    validation.add_argument("--sequence-length", type=int)
     args = parser.parse_args(argv)
     if args.command == "smoke":
         return run_smoke(sys.stdout, config_path=args.config, output_root=args.output)
@@ -64,6 +72,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         ByteBPE.train(
             (path.read_text(encoding="utf-8") for path in args.corpus), args.vocab_size
         ).save(args.output)
+        return 0
+    if args.command == "eval-validation":
+        from scratchcoder.eval.validation_command import evaluate_validation_checkpoint
+
+        evaluate_validation_checkpoint(
+            checkpoint=args.checkpoint,
+            tokenizer_path=args.tokenizer,
+            sources_path=args.sources,
+            output=args.output,
+            scorecard=args.scorecard,
+            documents=args.documents,
+            sequence_length=args.sequence_length,
+        )
         return 0
     if args.command == "eval-choice":
         from scratchcoder.eval.choice_command import evaluate_choice_checkpoint
