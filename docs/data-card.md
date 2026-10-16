@@ -13,3 +13,5 @@ The downloader verifies size and hash before atomically replacing the target. Te
 - The optional reference model is `bigcode/tiny_starcoder_py`, revision `8547527bef0bc927268c1653cce6948c5c242dd1`, under BigCode OpenRAIL-M v1. Its weights are comparison-only, not project model weights or a project training dependency. Caches, weights and generated programs are not committed or uploaded as workflow artifacts.
 
 See [reference evaluation](reference-evaluation.md) for observed outcomes. Real-source adapters and schema tests do not mean the corresponding corpora have been downloaded, rights-cleared, or admitted to training.
+
+The pinned [HumanEval+/MBPP+ releases](evalplus.md) have additionally been read for schema, dependency, and source-term review, not used for training or reported model scoring. Their gzip fingerprints and component attributions are recorded in that guide. Actual isolated canonical validation remains separate work; ordinary CI uses synthetic loader fixtures.

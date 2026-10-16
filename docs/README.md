@@ -12,6 +12,7 @@ Start with the [project README](../README.md), [current status](status.md), and 
 | [Data policy](data.md) | Record provenance, licensing, splits, and contamination controls. |
 | [Evaluation policy](evaluation.md) | Run local evaluators and interpret results and limitations. |
 | [Reference evaluation](reference-evaluation.md) | Understand the optional pinned comparison track. |
+| [EvalPlus intake](evalplus.md) | Preserve official standalone test releases and source attribution. |
 | [Sandbox](sandbox.md) | Understand requirements for executing generated programs. |
 | [Walkthroughs](walkthroughs/README.md) | Document core components as they land. |
 | [Decision records](adr/README.md) | Publish technical decisions safe for contributors to see. |
