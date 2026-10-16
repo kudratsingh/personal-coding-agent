@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 TRAINING_LICENSES = frozenset(
@@ -38,19 +39,52 @@ class ManifestEntry:
     terms_accepted_on: str | None = None
 
     def validate(self) -> None:
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in (
+                self.source,
+                self.revision,
+                self.url,
+                self.license,
+                self.attribution,
+                self.sha256,
+                self.purpose,
+            )
+        ):
+            raise ValueError("manifest provenance fields must be nonempty strings")
+        if type(self.license_verified) is not bool or type(self.terms_required) is not bool:
+            raise ValueError("manifest review and terms flags must be booleans")
+        if type(self.size_bytes) is not int or self.size_bytes < 0:
+            raise ValueError("expected byte size must be a nonnegative integer")
         if not self.source or not re.fullmatch(r"[0-9a-f]{40,64}", self.revision):
             raise ValueError("source and immutable revision are required")
-        if not self.url.startswith("https://"):
-            raise ValueError("download URL must use HTTPS")
+        try:
+            parsed = urlsplit(self.url)
+            valid_url = (
+                parsed.scheme == "https"
+                and bool(parsed.hostname)
+                and parsed.username is None
+                and parsed.password is None
+                and not any(character.isspace() for character in self.url)
+            )
+            _ = parsed.port  # Reject malformed/out-of-range ports before network access.
+        except ValueError:
+            valid_url = False
+        if not valid_url:
+            raise ValueError("download URL requires HTTPS, a host, and no inline credentials")
         if not self.license_verified or not self.license or not self.attribution:
             raise ValueError("license verification and attribution are required")
         if self.purpose not in {"train", "eval"}:
             raise ValueError("purpose must be train or eval")
         if self.purpose == "train" and self.license not in TRAINING_LICENSES:
             raise ValueError("training license is not allowlisted")
-        if self.terms_required:
-            if self.terms_accepted_on is None:
-                raise ValueError("owner must accept source terms before download")
+        if self.terms_required and self.terms_accepted_on is None:
+            raise ValueError("owner must accept source terms before download")
+        if self.terms_accepted_on is not None:
+            if not isinstance(self.terms_accepted_on, str) or not re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}", self.terms_accepted_on
+            ):
+                raise ValueError("terms acceptance must be a YYYY-MM-DD date")
             if date.fromisoformat(self.terms_accepted_on) > date.today():
                 raise ValueError("terms acceptance cannot be in the future")
         if not re.fullmatch(r"[0-9a-f]{64}", self.sha256) or self.size_bytes < 0:
