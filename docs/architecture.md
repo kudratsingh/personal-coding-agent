@@ -16,4 +16,4 @@ task evaluation <- isolated code runner <- agent repair loop <- generation engin
 - **Data boundary:** evaluation material is separated from training material; data provenance and licensing are recorded before use.
 - **Reporting boundary:** reported numbers come from a documented harness and include enough context to interpret them.
 
-Implementation details will be added as the corresponding components are built and reviewed.
+Data/tokenizer, model/optimizer/trainer, generation, code evaluation, and the development sandbox are implemented; the agent repair loop in the diagram remains future work. Multiple-choice evaluation branches directly from checkpoint answer scoring and never executes a program. See the [component walkthroughs](walkthroughs/README.md) and [status](status.md) for tested behavior and acceptance gaps.

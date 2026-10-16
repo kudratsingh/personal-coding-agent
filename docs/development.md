@@ -15,7 +15,9 @@ make check
 
 `make smoke` runs a complete offline synthetic fixture pipeline: tokenizer/data preparation, two tiny pretraining stages, checkpoints, sampling, and held-out token validation for both domains. Artifacts stay in ignored `runs/smoke-*`. The supplied `configs/smoke.yaml` is intentionally tiny; this check does not establish benchmark capability or security of generated-code execution. It never executes generated code.
 
-For individual local commands, use `uv run --locked scratchcoder --help` or `make <target> ARGS='...'`. Tokenizer training accepts explicit local UTF-8 corpus files. `data-build --synthetic --output runs/fixture` builds only synthetic material, never downloads gated data. Training requires a config, tokenizer, source-shard JSON map, and run ID. Evaluation, serving, and paid commands remain unavailable until implemented.
+For individual local commands, use `uv run --locked scratchcoder --help` or `make <target> ARGS='...'`. Tokenizer training accepts explicit local UTF-8 corpus files. `data-build --synthetic --output runs/fixture` builds only synthetic material, never downloads gated data. Training requires a config, tokenizer, source-shard JSON map, and run ID. Optional `--validation` supplies a separate held-out domain shard map when `train.validation_interval` is enabled; see the [training walkthrough](walkthroughs/training-loop.md).
+
+`scratchcoder eval` evaluates code-task JSONL through isolation; `scratchcoder eval-choice` scores local choice-task JSONL without executing code. Both require explicit checkpoint/tokenizer/task/output paths and record local reports/scorecards. See [evaluation](evaluation.md). Serving and paid commands remain explicit unavailable placeholders; no paid compute is authorized without permission for the specific run.
 
 For now, use `.env.example` only as a template for local configuration; never commit the resulting `.env` file.
 
@@ -30,7 +32,7 @@ docs/          public documentation
 private/       ignored owner-only material
 ```
 
-Core component namespaces are placeholders; their presence does not imply implemented models, tokenizers, or code isolation.
+Tokenizer, data, model, optimizer, training, engine, evaluation, and development sandbox modules are implemented. Agent repair-loop, serving, and RL namespaces remain future work. Consult [status](status.md) for acceptance gaps rather than inferring completion from a package name.
 
 ## Reproducibility expectations
 
