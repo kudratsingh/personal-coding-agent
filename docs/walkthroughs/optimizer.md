@@ -6,6 +6,8 @@ AdamW maintains first and second moment tensors with the same shape as each para
 
 Training excludes embeddings and normalization gains from decay. The optimizer itself accepts a per-parameter mask. Warmup raises the rate linearly; cosine decay then reaches a configured minimum. Gradient clipping measures the global norm and rescales all gradients together, rejecting nonfinite norms.
 
+Construction and checkpoint loading share hyperparameter validation: finite real values (not booleans), nonnegative learning rate/decay, positive epsilon and exactly two betas in `[0,1)`. Construction requires one actual boolean mask value per parameter and owns a copy of that mask and the beta pair. Later edits to caller-owned lists cannot change weight decay or momentum behavior. Empty parameter lists and zero learning rate remain supported. `tests/test_optimizer_constructor.py` checks this ownership, rejects malformed settings and verifies exact state/next-update round trips for valid float32/float64 configurations; the update formula is unchanged.
+
 For a gradient `[3,4]`, the norm is five. Clipping to one multiplies both coordinates by approximately one fifth, preserving direction.
 
 `tests/test_optimizer.py` compares 100 float64 updates with PyTorch AdamW, checks loss/gradient equivalence, and verifies schedule points and clipping by hand. Optimizer state is serializable for exact-resume testing in the training component.

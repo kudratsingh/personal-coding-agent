@@ -17,6 +17,21 @@ def _finite_real(value: Any) -> bool:
         return False
 
 
+def _validate_hyperparameters(lr: Any, betas: Any, eps: Any, weight_decay: Any) -> None:
+    if (
+        not _finite_real(lr)
+        or lr < 0
+        or not _finite_real(eps)
+        or eps <= 0
+        or not _finite_real(weight_decay)
+        or weight_decay < 0
+        or not isinstance(betas, (list, tuple))
+        or len(betas) != 2
+        or any(not _finite_real(beta) or not 0 <= beta < 1 for beta in betas)
+    ):
+        raise ValueError("invalid optimizer hyperparameters")
+
+
 def cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
     """Stable mean next-token loss without delegating to a loss framework."""
     if logits.shape[:-1] != targets.shape or targets.numel() == 0:
@@ -64,15 +79,18 @@ class AdamW:
         weight_decay: float = 0.1,
         decay_mask: list[bool] | None = None,
     ) -> None:
-        if not 0 <= learning_rate < float("inf") or not 0 < eps < float("inf"):
-            raise ValueError("invalid optimizer rate/epsilon")
-        if not all(0 <= beta < 1 for beta in betas) or not 0 <= weight_decay < float("inf"):
-            raise ValueError("invalid optimizer decay/betas")
+        _validate_hyperparameters(learning_rate, betas, eps, weight_decay)
         self.parameters = list(parameters)
-        self.lr, self.betas, self.eps, self.weight_decay = learning_rate, betas, eps, weight_decay
-        self.decay_mask = decay_mask if decay_mask is not None else [True] * len(self.parameters)
-        if len(self.decay_mask) != len(self.parameters):
-            raise ValueError("decay mask must match parameters")
+        mask = decay_mask if decay_mask is not None else [True] * len(self.parameters)
+        if (
+            not isinstance(mask, (list, tuple))
+            or len(mask) != len(self.parameters)
+            or any(type(flag) is not bool for flag in mask)
+        ):
+            raise ValueError("decay mask must contain one boolean per parameter")
+        self.lr, self.eps, self.weight_decay = learning_rate, eps, weight_decay
+        self.betas = (betas[0], betas[1])
+        self.decay_mask = list(mask)
         self.m = [torch.zeros_like(parameter) for parameter in self.parameters]
         self.v = [torch.zeros_like(parameter) for parameter in self.parameters]
         self.steps = [0] * len(self.parameters)
@@ -125,18 +143,7 @@ class AdamW:
         if any(type(flag) is not bool for flag in state["decay_mask"]):
             raise ValueError("optimizer decay mask must contain booleans")
         betas = state["betas"]
-        if (
-            not _finite_real(state["lr"])
-            or state["lr"] < 0
-            or not _finite_real(state["eps"])
-            or state["eps"] <= 0
-            or not _finite_real(state["weight_decay"])
-            or state["weight_decay"] < 0
-            or not isinstance(betas, (list, tuple))
-            or len(betas) != 2
-            or any(not _finite_real(beta) or not 0 <= beta < 1 for beta in betas)
-        ):
-            raise ValueError("invalid optimizer hyperparameters")
+        _validate_hyperparameters(state["lr"], betas, state["eps"], state["weight_decay"])
         for name in ("m", "v"):
             if any(
                 not isinstance(value, Tensor)
