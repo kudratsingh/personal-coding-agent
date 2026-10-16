@@ -1,7 +1,8 @@
 """Cached rank-based encoding and optional process-parallel tokenization."""
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Generator, Iterable
 from functools import lru_cache
+from itertools import islice
 from multiprocessing import get_context
 
 from scratchcoder.tokenizer.bpe import CHUNKS, FIRST_MERGE, ByteBPE, merge_pair
@@ -46,15 +47,22 @@ def _encode(text: str) -> list[int]:
 
 def encode_many(
     tokenizer: ByteBPE, texts: Iterable[str], *, workers: int = 1
-) -> Iterator[list[int]]:
-    """Yield ordered documents with bounded work queues and no special-token injection."""
-    if workers < 1:
-        raise ValueError("workers must be positive")
+) -> Generator[list[int], None, None]:
+    """Yield ordered documents, prefetching at most 16 per worker; no special injection."""
+    if type(workers) is not int or workers < 1:
+        raise ValueError("workers must be a positive integer")
     if workers == 1:
         encoder = FastEncoder(tokenizer)
         yield from map(encoder.encode, texts)
     else:
+        documents = iter(texts)
+        window = list(islice(documents, workers * 16))
+        if not window:
+            return
         with get_context("spawn").Pool(
             workers, initializer=_initialize, initargs=(tokenizer,)
         ) as pool:
-            yield from pool.imap(_encode, texts, chunksize=16)
+            while window:
+                # imap alone can cache unbounded completed results behind a slow consumer.
+                yield from pool.imap(_encode, window, chunksize=16)
+                window = list(islice(documents, workers * 16))

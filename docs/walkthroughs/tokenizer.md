@@ -26,6 +26,8 @@ The adapter represents each raw byte as one Latin-1 code point and supplies our 
 
 `FastEncoder` uses learned pair ranks to visit only merges present in a chunk and caches repeated chunks. `encode_many` can distribute documents to spawn-based workers while preserving order. Reference/fast identity and worker ordering are tested; `tools/benchmark_tokenizer.py` reports synthetic throughput and checks identity over the requested byte count. Synthetic repetition benefits caching and must not be represented as real-corpus throughput.
 
+The serial iterator consumes one document at a time. Parallel encoding feeds windows of at most 16 documents per worker to the existing 16-document chunks, exhausting each ordered window before reading the next. Using an unrestricted `Pool.imap` directly would let the producer run ahead and completed results accumulate behind a paused consumer. This window bounds document-count prefetch, not bytes/RSS: callers must still bound individual documents and their own retained outputs. A source error aborts the current window; no crash-recovery or partial-output transaction is promised. Close the returned generator when stopping early so its worker pool is terminated. `tests/test_bulk_prefetch.py` checks producer consumption, boundaries/order, short/empty inputs, strict worker counts and cleanup after early close or producer/worker errors.
+
 ## Questions
 
 - Why bytes? Every valid UTF-8 string is representable without unknown tokens.
