@@ -1,10 +1,9 @@
 """Sampling, cached generation, and batched continuation scoring."""
 
-import math
-
 import torch
 from torch import Tensor
 
+from scratchcoder.common.config import finite_number
 from scratchcoder.model.gpt import GPT
 
 
@@ -16,15 +15,34 @@ def sample(
     top_p: float = 1.0,
     generator: torch.Generator | None = None,
 ) -> Tensor:
-    if not math.isfinite(temperature) or temperature < 0 or not 0 < top_p <= 1:
+    temperature = finite_number(temperature, "temperature")
+    top_p = finite_number(top_p, "top_p")
+    if temperature < 0 or not 0 < top_p <= 1:
         raise ValueError("invalid temperature/top_p")
-    if top_k is not None and top_k < 1:
-        raise ValueError("top_k must be positive")
+    if top_k is not None and (type(top_k) is not int or top_k < 1):
+        raise ValueError("top_k must be a positive integer")
+    if (
+        logits.layout != torch.strided
+        or logits.dtype not in {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+        or logits.ndim not in {1, 2}
+        or logits.numel() == 0
+    ):
+        raise ValueError("sampling logits must be nonempty dense floating [vocab] or [batch,vocab]")
     if not bool(torch.isfinite(logits).all()):
         raise ValueError("sampling logits must be finite")
     if temperature == 0:
         return logits.argmax(dim=-1, keepdim=True)
     filtered = logits.float() / temperature
+    if not bool(torch.isfinite(filtered).all()):
+        # Keep ordinary seeded draws unchanged. Only extreme scaling takes this path.
+        wide = logits.double()
+        if temperature >= 1:
+            # Divide first so opposite finite extremes do not overflow on subtraction.
+            wide = wide / temperature
+            filtered = wide - wide.amax(dim=-1, keepdim=True)
+        else:
+            # Center first so the maximum remains zero even at subnormal temperatures.
+            filtered = (wide - wide.amax(dim=-1, keepdim=True)) / temperature
     if top_k is not None:
         values, indices = filtered.topk(min(top_k, filtered.shape[-1]), dim=-1)
         filtered = torch.full_like(filtered, float("-inf")).scatter(-1, indices, values)
