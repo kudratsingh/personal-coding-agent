@@ -1,6 +1,7 @@
 """Conservative reviewed-schema adapters requiring declared source provenance."""
 
 import ast
+import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -8,6 +9,74 @@ from typing import Any
 
 from scratchcoder.data.manifest import ManifestEntry
 from scratchcoder.eval.tasks import Task
+
+
+def adapt_taco_io_row(
+    row: Mapping[str, Any],
+    provenance: ManifestEntry,
+    *,
+    upstream_split: str,
+    split: str,
+    public_count: int = 1,
+) -> Task:
+    """Conservative EASY stdin/stdout subset; no execution or metadata eval."""
+    provenance.validate()
+    if provenance.source != "BAAI/TACO" or upstream_split not in {"train", "test"}:
+        raise ValueError("TACO provenance and explicit original split are required")
+    if provenance.purpose == "eval" and split == "train":
+        raise ValueError("evaluation-only provenance cannot become training data")
+    if upstream_split == "test" and split == "train":
+        raise ValueError("upstream TACO test tasks cannot become training data")
+    if (
+        row["difficulty"] != "EASY"
+        or row["starter_code"]
+        or str(row.get("picture_num", "0")) != "0"
+    ):
+        raise ValueError("only EASY standalone text I/O tasks are supported")
+    cases = json.loads(row["input_output"])
+    solutions = json.loads(row["solutions"])
+    if (
+        not isinstance(cases, dict)
+        or cases.get("fn_name")
+        or set(cases) - {"inputs", "outputs", "fn_name"}
+        or not isinstance(cases.get("inputs"), list)
+        or not isinstance(cases.get("outputs"), list)
+        or len(cases["inputs"]) != len(cases["outputs"])
+        or not 2 <= len(cases["inputs"]) <= 100
+        or not all(isinstance(value, str) for value in [*cases["inputs"], *cases["outputs"]])
+    ):
+        raise ValueError("unsupported TACO I/O tests")
+    if (
+        not isinstance(solutions, list)
+        or not solutions
+        or any(not isinstance(code, str) or not code.strip() for code in solutions)
+    ):
+        raise ValueError("TACO needs nonempty reference solution strings")
+    unique: dict[str, str] = {}
+    for given, expected in zip(cases["inputs"], cases["outputs"], strict=True):
+        if given in unique and unique[given].strip() != expected.strip():
+            raise ValueError("conflicting outputs for identical TACO input")
+        unique[given] = expected
+    items = [{"input": given, "output": expected} for given, expected in unique.items()]
+    if type(public_count) is not int or not 1 <= public_count < len(items):
+        raise ValueError("distinct public and hidden I/O cases required")
+    question = row["question"]
+    if not isinstance(question, str) or not isinstance(row["url"], str):
+        raise ValueError("TACO question and stable source URL must be strings")
+    identity = hashlib.sha256((row["url"] + "\n" + question).encode()).hexdigest()
+    return Task(
+        id="BAAI/TACO/" + identity,
+        prompt=question,
+        public_tests=json.dumps(items[:public_count]),
+        hidden_tests=json.dumps(items[public_count:]),
+        source=provenance.source,
+        source_revision=provenance.revision,
+        license=provenance.license,
+        written_by="human",
+        split=split,
+        mode="io",
+        solution=solutions[0],
+    )
 
 
 def canonical_id(identifier: str) -> str:
@@ -78,6 +147,8 @@ def adapt_row(
     provenance.validate()
     if provenance.source != source:
         raise ValueError("source and provenance differ")
+    if provenance.purpose == "eval" and split == "train":
+        raise ValueError("evaluation-only provenance cannot become training data")
     setup = ""
     solution: str | None
     if source == "nvidia/OpenCodeInstruct":

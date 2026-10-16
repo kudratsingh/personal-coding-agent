@@ -65,12 +65,17 @@ def build_pool(
     )
     benchmark_ids = {canonical_id(task.id) for task in protected}
     report: Counter[str] = Counter()
+
+    def count(task: Task, reason: str) -> None:
+        report[reason] += 1
+        report[f"source:{task.source}:{reason}"] += 1
+
     kept = []
     seen_ids: set[str] = set()
     # Priority for explicitly held-out source tasks; never let train copies displace them.
     ordered = sorted(tasks, key=lambda item: (item.split == "train", item.source, item.id))
     for task in ordered:
-        report["seen"] += 1
+        count(task, "seen")
         if task.id in seen_ids:
             raise ValueError("duplicate task IDs before pool split")
         seen_ids.add(task.id)
@@ -82,38 +87,49 @@ def build_pool(
                 for part in (task.prompt, task.solution or "", task.public_tests, task.hidden_tests)
             )
         ):
-            report["contamination_or_duplicate"] += 1
+            count(task, "contamination_or_duplicate")
             continue
         if task.solution is None:
-            report["missing_solution"] += 1
+            count(task, "missing_solution")
             continue
         public = execute(task.solution, task.public_tests, task.mode)
         hidden = execute(task.solution, task.hidden_tests, task.mode)
-        if public.status in {"unavailable", "infrastructure_error"} or hidden.status in {
-            "unavailable",
-            "infrastructure_error",
-        }:
+        allowed = {"passed", "failed", "timeout", "output_limit", "resource_limit"}
+        if public.status not in allowed or hidden.status not in allowed:
             raise RuntimeError("cannot verify tasks without working isolation")
         if not public.passed or not hidden.passed:
-            report["invalid_solution"] += 1
+            count(task, "invalid_solution")
             continue
         index.add(task.prompt)
         # Explicit held-out tasks retain their split. Hash allocation never changes it to train.
         kept.append(task)
-        report["kept"] += 1
-        report[f"source:{task.source}:kept"] += 1
+        count(task, "kept")
         report[f"authorship:{task.written_by}:kept"] += 1
     return kept, dict(report)
 
 
+def split_summary(tasks: Iterable[Task]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for task in tasks:
+        counts[f"split:{task.split}:total"] += 1
+        counts[f"split:{task.split}:authorship:{task.written_by}"] += 1
+        counts[f"split:{task.split}:source:{task.source}"] += 1
+    return dict(counts)
+
+
 def assign_splits(tasks: Iterable[Task], *, dev_size: int, test_size: int) -> list[Task]:
     """Allocate exact local pool sizes after deduplication, preserving fixed holdouts."""
-    if min(dev_size, test_size) < 0:
-        raise ValueError("split sizes must be nonnegative")
+    if any(type(size) is not int or size < 0 for size in (dev_size, test_size)):
+        raise ValueError("split sizes must be nonnegative integers")
     items = list(tasks)
     if len({task.id for task in items}) != len(items):
         raise ValueError("task IDs must be unique")
     fixed = [task for task in items if task.split != "train"]
+    if (
+        sum(task.split == "dev" for task in fixed) > dev_size
+        or sum(task.split == "test" for task in fixed) > test_size
+    ):
+        raise ValueError("fixed holdouts exceed requested exact split sizes")
     candidates = sorted((task for task in items if task.split == "train"), key=lambda task: task.id)
     # Use a content-independent stable identifier hash for deterministic selection.
     import hashlib

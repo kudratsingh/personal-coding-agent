@@ -1,9 +1,10 @@
+import random
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from scratchcoder.data.pool import SimilarityIndex, assign_splits, build_pool
+from scratchcoder.data.pool import SimilarityIndex, assign_splits, build_pool, shingles
 from scratchcoder.eval.tasks import Task, load_tasks, map_source_row, save_tasks
 from scratchcoder.sandbox.runner import Result
 
@@ -70,3 +71,31 @@ def test_exact_split_sizes_stable_order_and_fixed_holdouts() -> None:
     assert sum(task.split == "dev" for task in first) == 2
     assert sum(task.split == "test" for task in first) == 3
     assert next(task for task in first if task.id == "fixed").split == "test"
+    with pytest.raises(ValueError, match="exceed"):
+        assign_splits([replace(fixture_task(), split="test")], dev_size=0, test_size=0)
+    with pytest.raises(ValueError, match="integer"):
+        assign_splits(tasks, dev_size=True, test_size=1)
+
+
+def test_similarity_prefix_filter_matches_brute_force_reference() -> None:
+    rng = random.Random(8)
+    for threshold in (0.5, 0.85, 1.0):
+        prompts = [
+            " ".join(rng.choices(["alpha", "beta", "gamma", "delta", "epsilon"], k=20))
+            for _ in range(30)
+        ]
+        index = SimilarityIndex(threshold)
+        seen: list[frozenset[tuple[str, ...]]] = []
+        for prompt in prompts + prompts:
+            target = shingles(prompt)
+            expected = any(
+                len(target & item) / max(len(target | item), 1) >= threshold for item in seen
+            )
+            assert index.contains(prompt) == expected
+            index.add(prompt)
+            seen.append(target)
+
+
+def test_unknown_isolation_outcome_aborts_pool() -> None:
+    with pytest.raises(RuntimeError, match="isolation"):
+        build_pool([fixture_task()], [], execute=lambda *_: Result("unknown"))
