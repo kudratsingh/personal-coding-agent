@@ -22,6 +22,7 @@ SPECIAL_TOKENS = (
     *(f"<|reserved_{i}|>" for i in range(7)),
 )
 FIRST_MERGE = 256 + len(SPECIAL_TOKENS)
+MAX_VOCAB_SIZE = 65536
 CHUNKS = re.compile(r"[^\S\n]+|\n+|[^\s]+")
 
 
@@ -43,19 +44,30 @@ class ByteBPE:
     merges: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.merges, (tuple, list)):
+            raise ValueError("invalid merge table structure")
+        if FIRST_MERGE + len(self.merges) > MAX_VOCAB_SIZE:
+            raise ValueError("tokenizer vocabulary must fit uint16")
         known = set(range(256))
         seen: set[tuple[int, int]] = set()
+        owned: list[tuple[int, int]] = []
         for index, pair in enumerate(self.merges):
             if (
-                len(pair) != 2
+                not isinstance(pair, (tuple, list))
+                or len(pair) != 2
                 or any(type(value) is not int for value in pair)
                 or pair[0] not in known
                 or pair[1] not in known
-                or pair in seen
             ):
                 raise ValueError("invalid merge table")
-            seen.add(pair)
+            canonical = (pair[0], pair[1])
+            if canonical in seen:
+                raise ValueError("invalid merge table: duplicate pair")
+            seen.add(canonical)
+            owned.append(canonical)
             known.add(FIRST_MERGE + index)
+        # frozen=True protects attributes, not mutable containers supplied by callers.
+        object.__setattr__(self, "merges", tuple(owned))
 
     @property
     def vocab_size(self) -> int:
@@ -142,7 +154,7 @@ class ByteBPE:
 
     @classmethod
     def train(cls, corpus: Iterable[str], vocab_size: int) -> "ByteBPE":
-        if type(vocab_size) is not int or not FIRST_MERGE <= vocab_size <= 65536:
+        if type(vocab_size) is not int or not FIRST_MERGE <= vocab_size <= MAX_VOCAB_SIZE:
             raise ValueError("vocabulary must include byte/special tokens and fit uint16")
         chunks: Counter[str] = Counter()
         for text in corpus:
