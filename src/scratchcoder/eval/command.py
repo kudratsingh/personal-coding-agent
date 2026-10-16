@@ -5,13 +5,11 @@ from pathlib import Path
 
 import torch
 
-from scratchcoder.common.config import ModelConfig
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.engine.generation import generate
+from scratchcoder.eval.checkpoint import load_checkpoint
 from scratchcoder.eval.harness import ContextLimitError, EvaluationConfig, evaluate, save_report
 from scratchcoder.eval.tasks import Task, load_tasks
-from scratchcoder.model.gpt import GPT
-from scratchcoder.tokenizer.bpe import ByteBPE
 
 
 def evaluate_checkpoint(
@@ -23,14 +21,7 @@ def evaluate_checkpoint(
     scorecard: Path,
     config: EvaluationConfig,
 ) -> None:
-    tokenizer = ByteBPE.load(tokenizer_path)
-    saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    if saved["tokenizer_hash"] != tokenizer.sha256:
-        raise ValueError("checkpoint and tokenizer identities differ")
-    model = GPT(ModelConfig(**saved["config"]["model"]))
-    model.load_state_dict(saved["model"])
-    model.eval()
-    torch.set_num_threads(1)
+    model, tokenizer = load_checkpoint(checkpoint, tokenizer_path)
 
     def candidate(task: Task, seed: int) -> str:
         prompt = tokenizer.encode(task.public_prompt())
