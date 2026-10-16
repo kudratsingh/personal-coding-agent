@@ -26,7 +26,7 @@ class Limits:
     input_bytes: int = 128000
 
     def __post_init__(self) -> None:
-        if not 0.1 <= self.timeout_seconds <= 60 or not 64 <= self.memory_mb <= 1024:
+        if not 0.1 <= self.timeout_seconds <= 60 or not 64 <= self.memory_mb <= 4096:
             raise ValueError("invalid timeout or memory limit")
         if not 4 <= self.processes <= 64 or not 1024 <= self.output_bytes <= 1024 * 1024:
             raise ValueError("invalid process or output limit")
