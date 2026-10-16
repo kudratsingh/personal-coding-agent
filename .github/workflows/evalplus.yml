@@ -1,0 +1,41 @@
+name: EvalPlus canonical validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        type: choice
+        options:
+          - humaneval-plus
+          - mbpp-plus
+        required: true
+      nano:
+        description: Also run a synthetic-trained project nano checkpoint after preflight
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+      - run: make setup
+      - run: docker --host unix:///var/run/docker.sock build --platform linux/amd64 --iidfile /tmp/scratchcoder-evalplus-image sandbox/evalplus
+      - name: Optional synthetic-only nano preparation
+        if: inputs.nano
+        run: uv run --locked python tools/prepare_eval_nano.py --output runs/eval-nano
+      - name: Validate complete official canonical suite before project scoring
+        env:
+          SUITE: ${{ inputs.suite }}
+          NANO: ${{ inputs.nano }}
+        run: |
+          args=()
+          if [ "$NANO" = "true" ]; then args+=(--checkpoint runs/eval-nano/train/checkpoint.pt --tokenizer runs/eval-nano/data/tokenizer.json); fi
+          uv run --locked python tools/evalplus_check.py --suite "$SUITE" --release-path "runs/data/$SUITE.jsonl.gz" --download --image-id "$(cat /tmp/scratchcoder-evalplus-image)" --output "runs/$SUITE-check" "${args[@]}"

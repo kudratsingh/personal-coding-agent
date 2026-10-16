@@ -1,6 +1,7 @@
 """Evaluate an explicit local checkpoint and normalized held-out task file."""
 
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
@@ -10,6 +11,8 @@ from scratchcoder.engine.generation import generate
 from scratchcoder.eval.checkpoint import load_checkpoint
 from scratchcoder.eval.harness import ContextLimitError, EvaluationConfig, evaluate, save_report
 from scratchcoder.eval.tasks import Task, load_tasks
+from scratchcoder.model.gpt import GPT
+from scratchcoder.tokenizer.bpe import ByteBPE
 
 
 def evaluate_checkpoint(
@@ -23,6 +26,20 @@ def evaluate_checkpoint(
 ) -> None:
     model, tokenizer = load_checkpoint(checkpoint, tokenizer_path)
 
+    tasks = list(load_tasks(tasks_path))
+    report = evaluate(
+        tasks,
+        checkpoint_generator(model, tokenizer, config),
+        config=config,
+        checkpoint_hash=file_sha256(checkpoint),
+        tokenizer_hash=tokenizer.sha256,
+    )
+    save_report(report, output, scorecard=scorecard)
+
+
+def checkpoint_generator(
+    model: GPT, tokenizer: ByteBPE, config: EvaluationConfig
+) -> Callable[[Task, int], str]:
     def candidate(task: Task, seed: int) -> str:
         prompt = tokenizer.encode(task.public_prompt())
         remaining = model.config.context - len(prompt)
@@ -48,12 +65,4 @@ def evaluate_checkpoint(
             code = task.prompt + code
         return code
 
-    tasks = list(load_tasks(tasks_path))
-    report = evaluate(
-        tasks,
-        candidate,
-        config=config,
-        checkpoint_hash=file_sha256(checkpoint),
-        tokenizer_hash=tokenizer.sha256,
-    )
-    save_report(report, output, scorecard=scorecard)
+    return candidate
