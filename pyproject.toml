@@ -24,6 +24,9 @@ tracking = [
 baseline = [
     "transformers>=4.49,<5",
 ]
+evaluation = [
+    "pyarrow==26.0.0",
+]
 
 [dependency-groups]
 dev = [

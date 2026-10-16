@@ -1,0 +1,22 @@
+name: ARC-Easy nano validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+      - run: uv sync --locked --extra evaluation
+      - name: Prepare synthetic-only nano checkpoint
+        run: uv run --locked python tools/prepare_eval_nano.py --output runs/arc-nano
+      - name: Score every pinned ARC-Easy test question
+        run: uv run --locked python tools/arc_check.py --data-directory runs/arc-data --download --checkpoint runs/arc-nano/train/checkpoint.pt --tokenizer runs/arc-nano/data/tokenizer.json --output runs/arc-evaluation

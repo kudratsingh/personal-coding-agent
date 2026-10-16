@@ -13,6 +13,7 @@ Start with the [project README](../README.md), [current status](status.md), and 
 | [Evaluation policy](evaluation.md) | Run local evaluators and interpret results and limitations. |
 | [Reference evaluation](reference-evaluation.md) | Understand the optional pinned comparison track. |
 | [EvalPlus intake](evalplus.md) | Preserve official standalone test releases and source attribution. |
+| [ARC-Easy intake](arc-easy.md) | Validate the complete held-out choice suite and fixed scoring protocol. |
 | [Sandbox](sandbox.md) | Understand requirements for executing generated programs. |
 | [Walkthroughs](walkthroughs/README.md) | Document core components as they land. |
 | [Decision records](adr/README.md) | Publish technical decisions safe for contributors to see. |

@@ -23,6 +23,8 @@ The optional independent tokenizer reference runs with `uv run --locked --extra 
 
 For now, use `.env.example` only as a template for local configuration; never commit the resulting `.env` file.
 
+The optional `evaluation` extra supplies locked PyArrow file-format parsing for [ARC-Easy](arc-easy.md), separate from core learning/scoring logic. `uv run --locked --extra evaluation pytest tests/test_arc.py` tests authored Parquet fixtures without downloading a benchmark. Base checks explicitly skip parser-dependent cases when the extra is absent; dedicated CI runs them. Full real-suite workflows are manual and do not authorize paid resources.
+
 ## Project layout
 
 ```text
