@@ -2,11 +2,13 @@
 
 An open, from-scratch learning project for building a small coding agent: tokenizer and model foundations, training and evaluation tooling, safe code execution, and an iterative repair loop.
 
-This repository contains the public project charter and a tested Python development scaffold. Model implementation and benchmark claims will be added as they become reproducible.
+This repository contains a tested from-scratch Python implementation and a reproducible synthetic development pipeline. It is not yet a trained coding agent or a hosted service.
 
 ## Current status
 
-Local foundations, data/tokenizer tooling, a compact transformer, resumable training, and generation are implemented. External-corpus training and benchmark validation remain pending.
+Data/tokenizer tooling, a compact transformer, optimizer, resumable two-stage training with domain validation, cached generation, isolated code evaluation, and multiple-choice scoring are implemented. Real-corpus training and full evaluation-suite acceptance remain pending.
+
+The reference benchmark is not yet validated: the initial external-model run passed 1/164 HumanEval tasks, below the published comparison score. All 164 canonical solutions passed the same isolated harness. See [reference evaluation](docs/reference-evaluation.md) for evidence and limitations.
 
 See [the public status page](docs/status.md), [roadmap](docs/roadmap.md), and [architecture overview](docs/architecture.md).
 

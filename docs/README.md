@@ -10,7 +10,7 @@ Start with the [project README](../README.md), [current status](status.md), and 
 | [Logging](logging.md) | Record local events, metrics, and diagnostic tracebacks. |
 | [Compute](compute.md) | Estimate two-stage compute from supplied assumptions. |
 | [Data policy](data.md) | Record provenance, licensing, splits, and contamination controls. |
-| [Evaluation policy](evaluation.md) | Interpret future results and their evidence. |
+| [Evaluation policy](evaluation.md) | Run local evaluators and interpret results and limitations. |
 | [Reference evaluation](reference-evaluation.md) | Understand the optional pinned comparison track. |
 | [Sandbox](sandbox.md) | Understand requirements for executing generated programs. |
 | [Walkthroughs](walkthroughs/README.md) | Document core components as they land. |

@@ -1,6 +1,6 @@
 # Evaluation policy
 
-No benchmark result is available yet. Future reports must identify the evaluated checkpoint, source revision, dataset revision, split, decoding settings, seed, execution limits, and metric definition.
+The initial external reference-model result is available but does not reproduce its published comparison score; see [reference evaluation](reference-evaluation.md). No result from a real-corpus-trained project checkpoint is available. Reports must identify checkpoint, source/dataset revision, split, decoding settings, seed, execution limits, and metric definition.
 
 Report uncertainty across tasks or seeds as appropriate, and include negative results. Compare checkpoints on the same task set and settings; distinguish development tuning from held-out reporting.
 
