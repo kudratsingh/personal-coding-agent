@@ -11,7 +11,7 @@ make check
 
 `.python-version` pins Python 3.12.13. `uv.lock` locks developer dependencies; `make setup` installs the editable package and its environment using `uv sync --locked`. Use `uv run --locked` for commands so another project's activated environment is not used.
 
-`make lint`, `make typecheck`, `make test`, and `make docs-check` run independently; `make check` runs all four. CPU CI uses the same commands on Linux and macOS.
+`make privacy-check`, `make lint`, `make typecheck`, `make test`, and `make docs-check` run independently; `make check` runs all five. CPU CI uses the same commands on Linux and macOS. The publication check rejects tracked paths matching repository `.gitignore` rules, including force-added files; it does not scan contents for secrets. Documentation checks include new nonignored public Markdown before staging, exclude ignored owner-only docs, and reject symlink documents without reading them. See [private-material guidance](private-material.md).
 
 `make smoke` runs a complete offline synthetic fixture pipeline: tokenizer/data preparation, two tiny pretraining stages, checkpoints, sampling, and held-out token validation for both domains. Artifacts stay in ignored `runs/smoke-*`. The supplied `configs/smoke.yaml` is intentionally tiny; this check does not establish benchmark capability or security of generated-code execution. It never executes generated code.
 

@@ -13,4 +13,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check documentation links
-        run: python3 tools/check_docs.py
+        run: |
+          python3 -m tools.check_public_tree
+          python3 -m tools.check_docs
