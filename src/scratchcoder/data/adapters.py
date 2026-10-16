@@ -168,6 +168,10 @@ def adapt_row(
     elif source == "google-research-datasets/mbpp":
         identifier, prompt, solution = "mbpp/" + str(row["task_id"]), row["text"], row["code"]
         tests, author, setup = row["test_list"], "human", row.get("test_setup_code", "")
+        challenge = row.get("challenge_test_list", [])
+        if not isinstance(tests, list) or not isinstance(challenge, list):
+            raise ValueError("MBPP primary/challenge tests must be explicit assertion arrays")
+        tests = [*tests, *challenge]
     elif source == "openai/human-eval":
         if split not in {"eval", "test"} or provenance.purpose != "eval":
             raise ValueError("HumanEval is evaluation-only")
