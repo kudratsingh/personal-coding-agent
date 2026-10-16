@@ -3,9 +3,9 @@ from dataclasses import replace
 
 import pytest
 
-from scratchcoder.data.adapters import adapt_row, assertion_partitions
+from scratchcoder.data.adapters import adapt_row, adapt_taco_io_row, assertion_partitions
 from scratchcoder.data.manifest import ManifestEntry
-from scratchcoder.data.pool import build_pool
+from scratchcoder.data.pool import build_pool, split_summary
 from scratchcoder.sandbox.runner import Result
 
 
@@ -101,3 +101,64 @@ def test_humaneval_adapter_is_evaluation_only() -> None:
     assert task.hidden_tests.endswith("check(add)")
     with pytest.raises(ValueError, match="evaluation-only"):
         adapt_row(source, row, entry, split="train")
+
+
+def taco_fixture() -> dict[str, str]:
+    return {
+        "question": "Add two integers from stdin and print their sum",
+        "difficulty": "EASY",
+        "starter_code": "",
+        "url": "https://example.invalid/problem/1",
+        "picture_num": "0",
+        "solutions": json.dumps(["a,b=map(int,input().split());print(a+b)"]),
+        "input_output": json.dumps(
+            {"inputs": ["1 2\n", "1 2\n", "4 5\n"], "outputs": ["3\n", "3", "9\n"]}
+        ),
+    }
+
+
+def test_taco_io_dedup_stable_id_holdout_and_partitioning() -> None:
+    source = provenance("BAAI/TACO")
+    row = taco_fixture()
+    task = adapt_taco_io_row(row, source, upstream_split="test", split="test")
+    assert task.mode == "io" and task.written_by == "human"
+    assert len(json.loads(task.public_tests)) == len(json.loads(task.hidden_tests)) == 1
+    assert "4 5" not in task.public_prompt()
+    assert adapt_taco_io_row(row, source, upstream_split="train", split="train").id == task.id
+    with pytest.raises(ValueError, match="cannot become training"):
+        adapt_taco_io_row(row, source, upstream_split="test", split="train")
+    with pytest.raises(ValueError, match="evaluation-only"):
+        adapt_taco_io_row(
+            row, replace(source, purpose="eval"), upstream_split="train", split="train"
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("difficulty", "HARD"),
+        ("starter_code", "class Solution:"),
+        ("picture_num", "1"),
+        ("solutions", "[]"),
+        ("input_output", '{"inputs": ["1", "1"], "outputs": ["2", "3"]}'),
+        ("input_output", '{"inputs": ["1", "2"], "outputs": ["2", "3"], "fn_name": "solve"}'),
+    ],
+)
+def test_taco_rejects_unsupported_or_conflicting_rows(field: str, value: str) -> None:
+    row = dict(taco_fixture(), **{field: value})
+    with pytest.raises(ValueError):
+        adapt_taco_io_row(row, provenance("BAAI/TACO"), upstream_split="train", split="train")
+
+
+def test_pool_drop_reasons_per_source_and_split_authorship_counts() -> None:
+    task = adapt_taco_io_row(
+        taco_fixture(), provenance("BAAI/TACO"), upstream_split="test", split="test"
+    )
+    missing = replace(
+        task, id="other", prompt="Reverse the characters in a supplied string", solution=None
+    )
+    kept, report = build_pool([task, missing], [], execute=lambda *_: Result("passed"))
+    assert kept == [task]
+    assert report["source:BAAI/TACO:seen"] == 2
+    assert report["source:BAAI/TACO:kept"] == report["source:BAAI/TACO:missing_solution"] == 1
+    assert split_summary(kept)["split:test:authorship:human"] == 1
