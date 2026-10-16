@@ -1,0 +1,21 @@
+name: Find-zero canonical diagnosis
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+      - run: make setup
+      - run: docker --host unix:///var/run/docker.sock build --platform linux/amd64 --iidfile /tmp/scratchcoder-diagnostic-image sandbox/evalplus
+      - name: Diagnostic-only canonical execution; no scoring or test filtering
+        run: uv run --locked python tools/find_zero_diagnose.py --release-path runs/data/humaneval-plus.jsonl.gz --download --image-id "$(cat /tmp/scratchcoder-diagnostic-image)" --output runs/find-zero/diagnosis.json
