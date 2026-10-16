@@ -4,6 +4,8 @@ Use `uv run --locked python tools/cost.py --help` for a two-stage estimate. All 
 
 GPU-hours equal tokens divided by per-GPU tokens/second and 3,600, multiplied by an optional slowdown and layer-parameter ratio. Wall time divides GPU-hours by the GPU count. Cost multiplies GPU-hours by the supplied per-GPU hourly rate. Parallel scaling is an estimate, not a measurement.
 
+Counts must be native integers (not booleans), and rates/prices/slowdown finite real values. Parameter scaling requires both positive integer counts. The estimator rejects nonfinite arithmetic and positive work or price that underflows to a spurious zero; ordinary zero-token work and an explicitly zero price remain supported. The CLI also checks that combined stage totals are finite before printing strict JSON. `tests/test_cost_integrity.py` covers these boundaries and preserves the hand-calculated examples. These checks are numerical validation, not a billing limit, current price verification or authorization to spend.
+
 Operational budgets, approvals, and the detailed spend ledger remain private. Every paid run still requires specific owner approval, working save/resume, durable artifact storage, and tested shutdown controls.
 
 ## Workflow runner review
