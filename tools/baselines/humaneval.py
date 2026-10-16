@@ -5,7 +5,10 @@ import gzip
 import hashlib
 import importlib
 import json
+import re
 import sys
+from collections import Counter
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, cast
 from urllib.request import urlopen
@@ -17,6 +20,7 @@ from scratchcoder.common.records import atomic_json
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.harness import EvaluationConfig, evaluate, save_report
 from scratchcoder.eval.tasks import Task
+from scratchcoder.sandbox.runner import Result, run
 
 MODEL = "bigcode/tiny_starcoder_py"
 MODEL_REVISION = "8547527bef0bc927268c1653cce6948c5c242dd1"
@@ -53,12 +57,41 @@ def truncate_completion(text: str) -> str:
     return text[: min(offsets)] if offsets else text
 
 
+def failure_category(result: Result) -> str:
+    """Return an allowlisted category, never candidate output or hidden test text."""
+    if result.status != "failed":
+        return result.status
+    for name in ("SyntaxError", "IndentationError", "AssertionError", "NameError", "TypeError"):
+        if re.search(r"(?m)^" + name + r"(?::|$)", result.stdout):
+            return name
+    return "other_failure"
+
+
+def validate_references(
+    tasks: Sequence[Task],
+    *,
+    execute: Callable[[str, str, str], Result],
+) -> dict[str, Any]:
+    """Check known answers through isolation before interpreting model performance."""
+    if any(not task.solution for task in tasks):
+        raise ValueError("canonical solution is missing")
+    return evaluate(
+        tasks,
+        lambda task, _: cast(str, task.solution),
+        config=EvaluationConfig(),
+        checkpoint_hash="canonical-solutions:" + DATA_SHA256,
+        tokenizer_hash="not-applicable:canonical-source",
+        execute=execute,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=164)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--threads", type=int, default=2)
+    parser.add_argument("--canonical-only", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.limit <= 164 or args.threads < 1 or args.max_new_tokens < 1:
         parser.error("invalid limit, thread count, or token budget")
@@ -82,6 +115,19 @@ def main() -> int:
         "license_url": f"https://github.com/openai/human-eval/blob/{DATA_REVISION}/LICENSE",
     }
     atomic_json(args.output / "data-manifest.json", metadata)
+    canonical = validate_references(
+        tasks, execute=lambda code, tests, mode: run(code, tests, mode=mode)
+    )
+    save_report(
+        canonical,
+        args.output / "canonical-evaluation",
+        scorecard=args.output / "canonical-scorecard.jsonl",
+    )
+    print("CANONICAL_REPORT=" + json.dumps(canonical, sort_keys=True), flush=True)
+    if canonical["metrics"]["greedy_pass_at_1"] != 1.0:
+        raise RuntimeError("canonical validation failed; model benchmark is not trustworthy")
+    if args.canonical_only:
+        return 0
     torch.set_num_threads(args.threads)
     transformers = importlib.import_module("transformers")
     hub = importlib.import_module("huggingface_hub")
@@ -127,12 +173,20 @@ def main() -> int:
         print(f"Generated reference candidate {counter}/{len(tasks)}", file=sys.stderr, flush=True)
         return task.prompt + truncate_completion(completion)
 
+    categories: Counter[str] = Counter()
+
+    def diagnostic_execution(code: str, tests: str, mode: str) -> Result:
+        result = run(code, tests, mode=mode)
+        categories[failure_category(result)] += 1
+        return result
+
     report = evaluate(
         tasks,
         candidate,
         config=EvaluationConfig(max_new_tokens=args.max_new_tokens),
         checkpoint_hash=file_sha256(weights_path),
         tokenizer_hash=tokenizer_hash,
+        execute=diagnostic_execution,
     )
     score = report["metrics"]["greedy_pass_at_1"]
     report["reference"] = {
@@ -148,6 +202,8 @@ def main() -> int:
         "model_license": "BigCode OpenRAIL-M v1",
         "device": "cpu",
         "threads": args.threads,
+        "canonical_passed": canonical["task_count"],
+        "outcome_categories": dict(categories),
     }
     save_report(report, args.output / "evaluation", scorecard=args.output / "scorecard.jsonl")
     # These records contain only public benchmark settings, hashes, and outcome statuses.
