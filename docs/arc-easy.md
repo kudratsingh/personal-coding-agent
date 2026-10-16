@@ -38,4 +38,12 @@ uv run --locked --extra evaluation python tools/arc_check.py \
   --output runs/arc-evaluation
 ```
 
-The manual **ARC-Easy nano validation** workflow prepares a checkpoint from repository-authored synthetic fixtures only, then scores all test questions on a standard public CPU runner. No paid compute or real-corpus training is authorized. Verified local intake found all expected rows and zero cross-split ID overlap. A complete nano run is pending; loader tests are not capability evidence. This label-scoring protocol is not claimed equivalent to published ARC leaderboard settings.
+The manual **ARC-Easy nano validation** workflow prepares a checkpoint from repository-authored synthetic fixtures only, then scores all test questions on a standard public CPU runner. No paid compute or real-corpus training is authorized. This label-scoring protocol is not claimed equivalent to published ARC leaderboard settings.
+
+## Observed complete run
+
+The [clean CPU workflow](https://github.com/kudratsingh/personal-coding-agent/actions/runs/38886494835) at `d4e1fa03b6781df8c770758982db90ed226a8257` completed all **2,376** test questions. The synthetic-only nano checkpoint scored **403/2,376 (16.96%)**, with a task-bootstrap 95% interval of 15.49–18.52%. There were 1,712 scored questions and **664 context-limit failures included in the full denominator**. No prompt was shortened and no task was removed. All three original split counts and zero cross-split ID overlap were verified.
+
+An earlier local run reproduced the same accuracy, context-limit count and aggregate task hash, but recorded a dirty checkout because it began before the implementation commit. The clean workflow records `dirty=false`; its complete safe report is preserved locally. Effective task hash: `51c699660bf114ee7f363ea83a531434d5e086f3de4d7ad4dd3dfe9f9042b50b`.
+
+This establishes the complete recorded integration path—not useful reasoning capability, real-corpus training, official leaderboard equivalence, or closure of all phase acceptance gates.
