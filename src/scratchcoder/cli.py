@@ -30,6 +30,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     train.add_argument("--output", type=Path, default=Path("runs"))
     train.add_argument("--run-id", required=True)
     train.add_argument("--resume", type=Path)
+    train.add_argument("--validation", type=Path)
     evaluation = subparsers.add_parser("eval")
     evaluation.add_argument("--checkpoint", type=Path, required=True)
     evaluation.add_argument("--tokenizer", type=Path, required=True)
@@ -103,5 +104,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_root=args.output,
         run_id=args.run_id,
         resume=args.resume,
+        validation_path=args.validation,
     )
     return 0
