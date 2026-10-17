@@ -10,6 +10,7 @@ from scratchcoder.data.shards import file_sha256
 from scratchcoder.engine.generation import generate
 from scratchcoder.eval.checkpoint import load_checkpoint
 from scratchcoder.eval.harness import ContextLimitError, EvaluationConfig, evaluate, save_report
+from scratchcoder.eval.prompt import base_prompt, prompt_protocol, truncate_completion
 from scratchcoder.eval.tasks import Task, load_tasks
 from scratchcoder.model.gpt import GPT
 from scratchcoder.tokenizer.bpe import ByteBPE
@@ -34,6 +35,7 @@ def evaluate_checkpoint(
         checkpoint_hash=file_sha256(checkpoint),
         tokenizer_hash=tokenizer.sha256,
     )
+    report.update(prompt_protocol(config.prompt_mode))
     save_report(report, output, scorecard=scorecard)
 
 
@@ -41,7 +43,8 @@ def checkpoint_generator(
     model: GPT, tokenizer: ByteBPE, config: EvaluationConfig
 ) -> Callable[[Task, int], str]:
     def candidate(task: Task, seed: int) -> str:
-        prompt = tokenizer.encode(task.public_prompt())
+        prefix = base_prompt(task.prompt) if config.prompt_mode == "base" else task.public_prompt()
+        prompt = tokenizer.encode(prefix)
         remaining = model.config.context - len(prompt)
         if remaining < 1:
             raise ContextLimitError("prompt exceeds configured context")
@@ -55,6 +58,8 @@ def checkpoint_generator(
             seed=seed,
         )
         text = tokenizer.decode(generated[0, len(prompt) :].tolist(), skip_special=True)
+        if config.prompt_mode == "base":
+            return prefix + truncate_completion(text)
         fence = re.search(r"```(?:python)?\s*\n(.*?)```", text, flags=re.DOTALL)
         code = fence.group(1) if fence else text.strip("\r\n")
         if (
