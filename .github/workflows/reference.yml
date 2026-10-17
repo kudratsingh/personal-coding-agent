@@ -14,6 +14,13 @@ on:
       max_new_tokens:
         description: Explicit completion token budget
         default: "256"
+      disable_stops:
+        description: Disable completion stop-string trimming (explicit protocol variant)
+        type: boolean
+        default: false
+      failure_recipient:
+        description: Optional public CMS certificate; encrypt first five failing completions
+        default: ""
 
 permissions:
   contents: read
@@ -34,8 +41,15 @@ jobs:
           TASK_LIMIT: ${{ inputs.limit }}
           CANONICAL_ONLY: ${{ inputs.canonical_only }}
           MAX_NEW_TOKENS: ${{ inputs.max_new_tokens }}
+          DISABLE_STOPS: ${{ inputs.disable_stops }}
+          FAILURE_RECIPIENT: ${{ inputs.failure_recipient }}
           HF_HUB_DISABLE_PROGRESS_BARS: "1"
         run: |
           args=()
           if [ "$CANONICAL_ONLY" = "true" ]; then args+=(--canonical-only); fi
+          if [ "$DISABLE_STOPS" = "true" ]; then args+=(--disable-stops); fi
+          if [ -n "$FAILURE_RECIPIENT" ]; then
+            printf '%s\n' "$FAILURE_RECIPIENT" > "$RUNNER_TEMP/failure-recipient.pem"
+            args+=(--failure-recipient "$RUNNER_TEMP/failure-recipient.pem")
+          fi
           uv run --locked --extra baseline python tools/baselines/humaneval.py --output runs/reference --limit "$TASK_LIMIT" --max-new-tokens "$MAX_NEW_TOKENS" "${args[@]}"

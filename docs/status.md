@@ -59,7 +59,7 @@ These are implementation milestones, not closed phase gates. Synthetic fixtures 
 
 ## Next public milestone
 
-Complete reviewed source/suite integration and reconcile the reference benchmark before making capability claims. The [model comparison and diagnostic rerun](reference-evaluation.md) each passed 1/164 HumanEval tasks (0.61%), not the card's 7.84%; canonical checks passed 164/164. The gap is repeatable but unexplained. GPU work and gated-data acceptance remain separately approval-gated.
+Complete reviewed source/suite integration and reconcile the reference benchmark before making capability claims. Earlier [model comparisons](reference-evaluation.md) each passed 1/164 HumanEval tasks (0.61%), not the card's 7.84%. The explicitly requested no-stop/512-token comparison passed **0/164**, with **30 empty completions** and **128 budget hits**; canonical preflight passed **164/164**. It missed the two-task criterion, so the reference thread stopped without a stop-rule fix or further variant. Per-task outcomes are on the evidence page. GPU work and gated-data acceptance remain separately approval-gated.
 
 ## Reporting policy
 
