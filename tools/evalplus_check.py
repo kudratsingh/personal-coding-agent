@@ -20,8 +20,13 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--tokenizer", type=Path)
-    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--memory-mb", type=int, default=4096)
+    parser.add_argument(
+        "--exclude-find-zero",
+        action="store_true",
+        help="Score 163 HumanEval+ tasks, excluding task 32: known numerical-tolerance failure",
+    )
     parser.add_argument(
         "--correct-find-zero-oracle",
         action="store_true",
@@ -30,6 +35,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.correct_find_zero_oracle and args.suite != "humaneval-plus":
         parser.error("find-zero correction is only available for HumanEval+")
+    if args.exclude_find_zero and args.suite != "humaneval-plus":
+        parser.error("task-32 exclusion is only available for HumanEval+")
+    if args.exclude_find_zero and args.correct_find_zero_oracle:
+        parser.error("task-32 exclusion cannot be combined with an oracle correction")
     if args.output.exists():
         parser.error("output must be a new directory")
     specification = release(args.suite)
@@ -50,6 +59,7 @@ def main() -> int:
             tokenizer_path=args.tokenizer,
             config=EvaluationConfig(max_new_tokens=args.max_new_tokens),
             correct_find_zero_oracle=args.correct_find_zero_oracle,
+            exclude_find_zero=args.exclude_find_zero,
         )
     finally:
         # Preserve safe completed records even when canonical correctness blocks model scoring.
