@@ -1,10 +1,14 @@
 # Reference-model evaluation
 
-## Stripped-prompt protocol (step 1d; result pending)
+## Stripped-prompt protocol (step 1d; owner acceptance pending)
 
 The explicitly authorized step 1d comparison uses the pinned model and benchmark, original five stop strings (including their unchanged position-zero matching), greedy decoding and a 256-token budget. Before tokenization, the raw benchmark prompt is transformed with Python `rstrip()`. The scored program is that exact stripped prompt plus the retained decoded completion; leading completion whitespace is not removed. Reports and scorecards record `prompt_stripped: true` and protocol `base-completion-rstrip-v1`. The source benchmark/task hash remains based on unmodified task records. Canonical answers/tests are unchanged. This tests the owner's trailing-whitespace hypothesis; no claim about the card's original unpublished recipe or successful reproduction is made before the result.
 
 Project base-model code evaluation uses the same shared stripping, stops and candidate assembly. Explicit `--prompt-mode instruction` retains the previous public-tests/fence-extraction path and is labeled separately; historical instruction-style results are not silently relabeled as base completions. No additional benchmark variant is authorized after this single run. The stated 12–13-pass success branch permits keeping the change and proceeding to the remaining ordered steps; otherwise the experiment stops for owner review.
+
+The [single step 1d run](https://github.com/kudratsingh/personal-coding-agent/actions/runs/39042645498), at source `e16667b012fd5feeb29f40eb54c9c100d6c2b0e4`, finished on 2026-10-17: **14/164 passed (8.54%), 0 empty retained completions, and 157 completions reached the 256-token budget**, all 157 without EOS. Canonical preflight passed **164/164**. Checkpoint, tokenizer, task, model/data revisions and runtime identities matched the previous pinned comparison; the run records `prompt_stripped: true`. Failure categories were **105 AssertionError, 23 SyntaxError, 10 TypeError, 6 RecursionError, 4 NameError, 1 AttributeError and 1 ValueError** (150 failures plus 14 passes).
+
+The result is 1.1424 equivalent tasks from the card's 7.84%, within a mathematical two-task tolerance but outside the owner's explicit “12 to 13 passes” success band. Acceptance is therefore awaiting owner clarification: [PR #66](https://github.com/kudratsingh/personal-coding-agent/pull/66) remains draft and unmerged, reference G3 is not declared closed, and no further variant or ordered step 2–4 was started. The shared base-model default described above is part of that unmerged change. The card's original unpublished recipe is not established by this result.
 
 The optional `baseline` dependency extra is used only by `tools/baselines/`; it is not a core training dependency. The HumanEval comparison pins the benchmark revision/content hash and the model revision, loads safetensor weights without remote model code, and executes every candidate through the isolated runner.
 
