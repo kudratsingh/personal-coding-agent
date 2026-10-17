@@ -28,8 +28,11 @@ class EvaluationConfig:
     top_p: float = 1.0
     top_k: int | None = None
     bootstrap_samples: int = 2000
+    prompt_mode: str = "base"
 
     def __post_init__(self) -> None:
+        if self.prompt_mode not in {"base", "instruction"}:
+            raise ValueError("prompt_mode must be base or instruction")
         if self.samples < 1 or self.max_new_tokens < 1 or not 0 <= self.seed < 2**63:
             raise ValueError("invalid evaluation counts/seed")
         if not 0 <= self.temperature < float("inf") or not 0 < self.top_p <= 1:

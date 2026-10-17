@@ -22,6 +22,9 @@ from torch import Tensor
 from scratchcoder.common.records import atomic_json
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.harness import EvaluationConfig, evaluate, save_report
+from scratchcoder.eval.prompt import BASE_STOPS as STOPS
+from scratchcoder.eval.prompt import base_prompt, prompt_protocol
+from scratchcoder.eval.prompt import truncate_completion as truncate_completion
 from scratchcoder.eval.tasks import Task
 from scratchcoder.sandbox.diagnostics import failure_category as failure_category
 from scratchcoder.sandbox.runner import Result, run
@@ -30,7 +33,6 @@ MODEL = "bigcode/tiny_starcoder_py"
 MODEL_REVISION = "8547527bef0bc927268c1653cce6948c5c242dd1"
 DATA_REVISION = "6d43fb980f9fee3c892a914eda09951f772ad10d"
 DATA_SHA256 = "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef"
-STOPS = ("\nclass ", "\ndef ", "\nif __name__", "\nprint(", "\n#")
 
 
 def normalize(rows: list[dict[str, Any]]) -> list[Task]:
@@ -56,9 +58,24 @@ def normalize(rows: list[dict[str, Any]]) -> list[Task]:
     return tasks
 
 
-def truncate_completion(text: str, *, stops: Sequence[str] = STOPS) -> str:
-    offsets = [text.find(stop) for stop in stops if stop in text]
-    return text[: min(offsets)] if offsets else text
+def generate_reference_completion(
+    model: Any, tokenizer: Any, prompt: str, *, seed: int, budget: int
+) -> tuple[str, str, list[int]]:
+    """Strip the exact generation prefix, preserving decoded completion whitespace."""
+    torch.manual_seed(seed)
+    prompt = base_prompt(prompt)
+    encoded = cast(dict[str, Tensor], tokenizer(prompt, return_tensors="pt"))
+    with torch.inference_mode():
+        generated = model.generate(
+            **encoded,
+            max_new_tokens=budget,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    tokens = cast(list[int], generated[0, encoded["input_ids"].shape[1] :].tolist())
+    completion = str(tokenizer.decode(tokens, skip_special_tokens=True))
+    return prompt, completion, tokens
 
 
 def completion_diagnostics(
@@ -218,25 +235,13 @@ def main() -> int:
 
     def candidate(task: Task, seed: int) -> str:
         nonlocal counter, current
-        torch.manual_seed(seed)
-        encoded = cast(dict[str, Tensor], tokenizer(task.prompt, return_tensors="pt"))
-        with torch.inference_mode():
-            generated = model.generate(
-                **encoded,
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        completion = str(
-            tokenizer.decode(
-                generated[0, encoded["input_ids"].shape[1] :], skip_special_tokens=True
-            )
+        prompt, completion, tokens = generate_reference_completion(
+            model, tokenizer, task.prompt, seed=seed, budget=args.max_new_tokens
         )
         generation_rows[task.id] = completion_diagnostics(
-            task.prompt,
+            prompt,
             completion,
-            cast(list[int], generated[0, encoded["input_ids"].shape[1] :].tolist()),
+            tokens,
             budget=args.max_new_tokens,
             eos_token_id=tokenizer.eos_token_id,
             stops=stops,
@@ -244,7 +249,7 @@ def main() -> int:
         current = (task.id, completion)
         counter += 1
         print(f"Generated reference candidate {counter}/{len(tasks)}", file=sys.stderr, flush=True)
-        return task.prompt + truncate_completion(completion, stops=stops)
+        return prompt + truncate_completion(completion, stops=stops)
 
     categories: Counter[str] = Counter()
 
@@ -266,11 +271,13 @@ def main() -> int:
         execute=diagnostic_execution,
     )
     score = report["metrics"]["greedy_pass_at_1"]
+    report.update(prompt_protocol(stops=stops))
     report["reference"] = {
         "model": MODEL,
         "revision": MODEL_REVISION,
         "data_revision": DATA_REVISION,
         "stops": stops,
+        "prompt_stripped": True,
         "published_pass_at_1": 0.0784,
         "published_marked_verified": False,
         "published_decoding_protocol": "not specified in model card",

@@ -12,4 +12,6 @@ Sampling requires nonempty dense floating logits shaped `[V]` or `[B,V]`, finite
 
 Answer scoring sums only continuation-token log probabilities. A padded batch is safe because causal attention prevents later padding from changing earlier scores. A slow per-prefix reference verifies this indexing.
 
+For base-model code evaluation, prompt whitespace is part of the protocol: `rstrip()` removes trailing whitespace before encoding `[1,T]` prompt IDs. The completion retains its initial newline/indentation, and the scored source is stripped prefix plus completion up to the first original stop string. The reference model and project checkpoint generator share this rule; no extra public-test instruction is appended in base mode. Authored tests observe the actual tokenizer/generation prefix and persisted report/scorecard metadata. Legacy instruction-style generation remains explicitly selectable and separately recorded. See the [evaluation policy](../evaluation.md) for comparability limits.
+
 Questions: why cache keys/values but not earlier queries (new tokens do not use them); why offset rotary positions (preserve absolute relative geometry); why sum answer log probabilities (sequence likelihood); why deterministic greedy batch parity (detect hidden batch dependence); why context limits (cache growth is bounded by the configured model).

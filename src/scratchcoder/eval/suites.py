@@ -11,6 +11,7 @@ from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.checkpoint import load_checkpoint
 from scratchcoder.eval.command import checkpoint_generator
 from scratchcoder.eval.harness import EvaluationConfig, evaluate, save_report
+from scratchcoder.eval.prompt import prompt_protocol
 from scratchcoder.eval.tasks import Task
 from scratchcoder.sandbox.diagnostics import failure_category
 from scratchcoder.sandbox.runner import Limits, Result, Runtime
@@ -93,8 +94,12 @@ def evaluate_suite(
             tokenizer_hash=tokenizer.sha256,
             execute=execute,
         )
+        report.update(prompt_protocol(options.prompt_mode))
         report["benchmark"] = dict(
-            metadata, kind="project-checkpoint", prompt_policy="public-prompt-with-public-tests"
+            metadata,
+            kind="project-checkpoint",
+            prompt_policy=report["protocol"]["prompt_format"],
+            prompt_stripped=report["prompt_stripped"],
         )
         save_report(report, output / "checkpoint", scorecard=output / "scorecard.jsonl")
         reports["checkpoint"] = report

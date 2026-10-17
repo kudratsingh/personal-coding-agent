@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import torch
 
 from scratchcoder.eval.tasks import Task
 from scratchcoder.sandbox.runner import Result
@@ -12,6 +13,7 @@ from tools.baselines.humaneval import (
     completion_diagnostics,
     encrypted_failures,
     failure_category,
+    generate_reference_completion,
     normalize,
     truncate_completion,
     validate_references,
@@ -34,6 +36,36 @@ def test_humaneval_mapping_and_stop_words() -> None:
     assert task.solution == "def add(a, b):\n    return a+b\n"
     assert "candidate(1,2)" not in task.public_prompt()
     assert truncate_completion("    return a+b\n\ndef other(): pass") == "    return a+b\n"
+
+
+def test_newline_ending_reference_prompt_is_stripped_before_generation() -> None:
+    calls: list[str] = []
+    completion = "\n    return 3\n# discard"
+
+    class Tokenizer:
+        eos_token_id = 0
+
+        def __call__(self, text: str, *, return_tensors: str) -> dict[str, torch.Tensor]:
+            assert return_tensors == "pt"
+            calls.append(text)
+            return {"input_ids": torch.tensor([[4, 5]])}
+
+        def decode(self, tokens: list[int], *, skip_special_tokens: bool) -> str:
+            assert tokens == [6, 7] and skip_special_tokens
+            return completion
+
+    class Model:
+        def generate(self, **options: object) -> torch.Tensor:
+            assert calls == ["def fixture():"]
+            assert options["max_new_tokens"] == 256 and options["do_sample"] is False
+            assert options["pad_token_id"] == options["eos_token_id"] == 0
+            return torch.tensor([[4, 5, 6, 7]])
+
+    prompt, text, tokens = generate_reference_completion(
+        Model(), Tokenizer(), "def fixture():\n \t\n", seed=7, budget=256
+    )
+    assert prompt == "def fixture():" and text == completion and tokens == [6, 7]
+    assert prompt + truncate_completion(text) == "def fixture():\n    return 3"
 
 
 def test_reference_validation_uses_solution_and_fails_closed() -> None:

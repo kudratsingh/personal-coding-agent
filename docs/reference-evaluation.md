@@ -1,5 +1,11 @@
 # Reference-model evaluation
 
+## Stripped-prompt protocol (step 1d; result pending)
+
+The explicitly authorized step 1d comparison uses the pinned model and benchmark, original five stop strings (including their unchanged position-zero matching), greedy decoding and a 256-token budget. Before tokenization, the raw benchmark prompt is transformed with Python `rstrip()`. The scored program is that exact stripped prompt plus the retained decoded completion; leading completion whitespace is not removed. Reports and scorecards record `prompt_stripped: true` and protocol `base-completion-rstrip-v1`. The source benchmark/task hash remains based on unmodified task records. Canonical answers/tests are unchanged. This tests the owner's trailing-whitespace hypothesis; no claim about the card's original unpublished recipe or successful reproduction is made before the result.
+
+Project base-model code evaluation uses the same shared stripping, stops and candidate assembly. Explicit `--prompt-mode instruction` retains the previous public-tests/fence-extraction path and is labeled separately; historical instruction-style results are not silently relabeled as base completions. No additional benchmark variant is authorized after this single run. The stated 12–13-pass success branch permits keeping the change and proceeding to the remaining ordered steps; otherwise the experiment stops for owner review.
+
 The optional `baseline` dependency extra is used only by `tools/baselines/`; it is not a core training dependency. The HumanEval comparison pins the benchmark revision/content hash and the model revision, loads safetensor weights without remote model code, and executes every candidate through the isolated runner.
 
 The tool uses greedy completion with an explicit token budget and stop strings, records all settings/hashes/outcomes, and compares the resulting rate with the model card's stated value. The card does not fully specify decoding settings, so a mismatch must be investigated rather than described as a reproduced score.

@@ -41,6 +41,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     evaluation.add_argument("--seed", type=int, default=0)
     evaluation.add_argument("--max-new-tokens", type=int, default=128)
     evaluation.add_argument("--temperature", type=float, default=0.0)
+    evaluation.add_argument("--prompt-mode", choices=("base", "instruction"), default="base")
     choices = subparsers.add_parser("eval-choice")
     choices.add_argument("--checkpoint", type=Path, required=True)
     choices.add_argument("--tokenizer", type=Path, required=True)
@@ -113,6 +114,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seed=args.seed,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
+                prompt_mode=args.prompt_mode,
             ),
         )
         return 0
