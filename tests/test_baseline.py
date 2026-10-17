@@ -1,4 +1,8 @@
+import base64
+import json
+import subprocess
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -6,6 +10,7 @@ from scratchcoder.eval.tasks import Task
 from scratchcoder.sandbox.runner import Result
 from tools.baselines.humaneval import (
     completion_diagnostics,
+    encrypted_failures,
     failure_category,
     normalize,
     truncate_completion,
@@ -110,3 +115,53 @@ def test_generation_budget_eos_and_first_stop_accounting() -> None:
     for tokens in ([True], [-1], [1, 2, 3]):
         with pytest.raises(ValueError, match="generation"):
             completion_diagnostics("", "", tokens, budget=2, eos_token_id=None)
+
+
+def test_explicit_no_stops_preserves_the_entire_decoded_completion() -> None:
+    completion = "\ndef other():\n    return 4\n# keep this too\n"
+    assert truncate_completion(completion) == ""  # Legacy default until authorized fix.
+    assert truncate_completion(completion, stops=()) == completion
+    row = completion_diagnostics(
+        "def fixture():\n", completion, [1, 2], budget=2, eos_token_id=9, stops=()
+    )
+    assert row["retained_characters"] == len(completion)
+    assert not row["empty_retained_completion"] and row["stop_index"] is None
+    assert row["budget_reached"] and row["budget_without_eos"]
+
+
+def test_failure_receipt_round_trip_keeps_source_out_of_plaintext(tmp_path: Path) -> None:
+    key, certificate = tmp_path / "private.key", tmp_path / "recipient.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(key),
+            "-out",
+            str(certificate),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=authored-receipt-fixture",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    rows = [
+        {"id": "authored/0", "category": "SyntaxError", "completion": "\nπ = 'fixture'\n"},
+        {"id": "authored/1", "category": "AssertionError", "completion": ""},
+    ]
+    encoded = encrypted_failures(rows, certificate)
+    assert "fixture" not in encoded and "completion" not in encoded
+    clear = subprocess.run(
+        ["openssl", "cms", "-decrypt", "-binary", "-inform", "DER", "-inkey", str(key)],
+        input=base64.b64decode(encoded),
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert json.loads(clear) == {"failures": rows}

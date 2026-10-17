@@ -6,6 +6,10 @@ The tool uses greedy completion with an explicit token budget and stop strings, 
 
 The manually dispatched Reference benchmark workflow uses a standard public-repository CPU runner. It does not provision rented GPUs or upload model caches, weights, or generated programs. Public benchmark provenance and outcome-status records are retained in its console log. Ordinary CI tests use synthetic rows and do not download the reference model.
 
+An explicitly approved comparison can set `--disable-stops` (workflow input `disable_stops`) and `--max-new-tokens 512`. The report records the effective empty stop list, budget, empty-completion/budget counts and per-task failure categories; the default remains the original stop policy and 256-token budget. This changes only the requested protocol controls, not the pinned model, benchmark, raw prompts or greedy decoding.
+
+For owner review, optional `--failure-recipient` accepts a public CMS certificate and emits only encrypted JSON for the first five failing decoded completions, in task evaluation order. The workflow accepts that certificate as input; the private key stays on the owner's machine. No plaintext completion, prompt or hidden test is added to the public report/log. Decryption preserves the completion verbatim, including empty strings and newlines. This transport is not a signed result or durable private backup. [OpenSSL CMS](https://docs.openssl.org/3.5/man1/openssl-cms/) performs the encryption/decryption; it never executes the source text.
+
 ## Observed comparison
 
 The [initial recorded run](https://github.com/kudratsingh/personal-coding-agent/actions/runs/38780757269) completed all 164 tasks with greedy decoding and a 256-token completion budget: **1/164 passed (0.61%)**, versus the card's stated 7.84%. This is not a reproduced score. The card marks its score unverified and does not specify the full decoding protocol. That uncertainty is a limitation, not an established explanation for the gap.

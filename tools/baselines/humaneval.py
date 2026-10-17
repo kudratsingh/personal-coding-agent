@@ -2,11 +2,13 @@
 
 import argparse
 import ast
+import base64
 import gzip
 import hashlib
 import importlib
 import json
 import platform
+import subprocess
 import sys
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -54,8 +56,8 @@ def normalize(rows: list[dict[str, Any]]) -> list[Task]:
     return tasks
 
 
-def truncate_completion(text: str) -> str:
-    offsets = [text.find(stop) for stop in STOPS if stop in text]
+def truncate_completion(text: str, *, stops: Sequence[str] = STOPS) -> str:
+    offsets = [text.find(stop) for stop in stops if stop in text]
     return text[: min(offsets)] if offsets else text
 
 
@@ -66,6 +68,7 @@ def completion_diagnostics(
     *,
     budget: int,
     eos_token_id: int | None,
+    stops: Sequence[str] = STOPS,
 ) -> dict[str, Any]:
     """Observe the existing candidate without executing or returning its source text."""
     if (
@@ -77,9 +80,9 @@ def completion_diagnostics(
         and (type(eos_token_id) is not int or eos_token_id < 0)
     ):
         raise ValueError("valid generation counts and token IDs required")
-    kept = truncate_completion(completion)
+    kept = truncate_completion(completion, stops=stops)
     matches = [
-        (completion.index(stop), index) for index, stop in enumerate(STOPS) if stop in completion
+        (completion.index(stop), index) for index, stop in enumerate(stops) if stop in completion
     ]
     stop_index = min(matches)[1] if matches else None
     try:
@@ -99,6 +102,26 @@ def completion_diagnostics(
         "empty_retained_completion": not kept.strip(),
         "candidate_syntax_valid": syntax_valid,
     }
+
+
+def encrypted_failures(rows: Sequence[dict[str, str]], recipient: Path) -> str:
+    """Return ciphertext only; the recipient's private key never leaves the owner."""
+    result = subprocess.run(
+        [
+            "openssl",
+            "cms",
+            "-encrypt",
+            "-binary",
+            "-aes-256-cbc",
+            "-outform",
+            "DER",
+            str(recipient),
+        ],
+        input=json.dumps({"failures": list(rows)}, ensure_ascii=False).encode(),
+        capture_output=True,
+        check=True,
+    )
+    return base64.b64encode(result.stdout).decode("ascii")
 
 
 def validate_references(
@@ -126,10 +149,13 @@ def main() -> int:
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--canonical-only", action="store_true")
+    parser.add_argument("--disable-stops", action="store_true")
+    parser.add_argument("--failure-recipient", type=Path, help="public CMS recipient certificate")
     args = parser.parse_args()
     if not 1 <= args.limit <= 164 or args.threads < 1 or args.max_new_tokens < 1:
         parser.error("invalid limit, thread count, or token budget")
     args.output.mkdir(parents=True, exist_ok=False)
+    stops = () if args.disable_stops else STOPS
     url = f"https://raw.githubusercontent.com/openai/human-eval/{DATA_REVISION}/data/HumanEval.jsonl.gz"
     with urlopen(url, timeout=30) as response:
         raw = response.read(100000)
@@ -186,9 +212,12 @@ def main() -> int:
     tokenizer_hash = hashlib.sha256(tokenizer.backend_tokenizer.to_str().encode()).hexdigest()
     counter = 0
     generation_rows: dict[str, dict[str, Any]] = {}
+    current: tuple[str, str] = ("", "")
+    failures: list[dict[str, str]] = []
+    task_categories: dict[str, str] = {}
 
     def candidate(task: Task, seed: int) -> str:
-        nonlocal counter
+        nonlocal counter, current
         torch.manual_seed(seed)
         encoded = cast(dict[str, Tensor], tokenizer(task.prompt, return_tensors="pt"))
         with torch.inference_mode():
@@ -210,16 +239,22 @@ def main() -> int:
             cast(list[int], generated[0, encoded["input_ids"].shape[1] :].tolist()),
             budget=args.max_new_tokens,
             eos_token_id=tokenizer.eos_token_id,
+            stops=stops,
         )
+        current = (task.id, completion)
         counter += 1
         print(f"Generated reference candidate {counter}/{len(tasks)}", file=sys.stderr, flush=True)
-        return task.prompt + truncate_completion(completion)
+        return task.prompt + truncate_completion(completion, stops=stops)
 
     categories: Counter[str] = Counter()
 
     def diagnostic_execution(code: str, tests: str, mode: str) -> Result:
         result = run(code, tests, mode=mode)
-        categories[failure_category(result)] += 1
+        category = failure_category(result)
+        categories[category] += 1
+        task_categories[current[0]] = category
+        if args.failure_recipient is not None and not result.passed and len(failures) < 5:
+            failures.append({"id": current[0], "category": category, "completion": current[1]})
         return result
 
     report = evaluate(
@@ -235,7 +270,7 @@ def main() -> int:
         "model": MODEL,
         "revision": MODEL_REVISION,
         "data_revision": DATA_REVISION,
-        "stops": STOPS,
+        "stops": stops,
         "published_pass_at_1": 0.0784,
         "published_marked_verified": False,
         "published_decoding_protocol": "not specified in model card",
@@ -252,8 +287,9 @@ def main() -> int:
         "tokenizer_class": type(tokenizer).__name__,
         "canonical_passed": canonical["task_count"],
         "outcome_categories": dict(categories),
+        "per_task_categories": task_categories,
         "generation_diagnostics": {
-            "policy": "observational-only-no-decoding-change",
+            "policy": "effective-recorded-stop-policy",
             "task_count": len(generation_rows),
             "budget_reached": sum(row["budget_reached"] for row in generation_rows.values()),
             "budget_without_eos": sum(
@@ -276,6 +312,10 @@ def main() -> int:
     # These records contain only public benchmark settings, hashes, and outcome statuses.
     # Console output preserves the run evidence without uploading caches, code, or weights.
     print("REFERENCE_REPORT=" + json.dumps(report, sort_keys=True), flush=True)
+    if args.failure_recipient is not None:
+        print(
+            "ENCRYPTED_FAILURES=" + encrypted_failures(failures, args.failure_recipient), flush=True
+        )
     return 0
 
 
