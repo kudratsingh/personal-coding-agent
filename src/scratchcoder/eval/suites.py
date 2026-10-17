@@ -5,7 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
 
-from scratchcoder.data.evalplus import EvalPlusRelease
+from scratchcoder.data.evalplus import EvalPlusRelease, release
 from scratchcoder.data.evalplus_corrections import correct_find_zero
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.checkpoint import load_checkpoint
@@ -29,6 +29,7 @@ def evaluate_suite(
     tokenizer_path: Path | None = None,
     config: EvaluationConfig | None = None,
     correct_find_zero_oracle: bool = False,
+    exclude_find_zero: bool = False,
 ) -> dict[str, Any]:
     specification.validate()
     if output.exists():
@@ -43,6 +44,18 @@ def evaluate_suite(
         raise ValueError("complete held-out canonical suite required")
     if (checkpoint is None) != (tokenizer_path is None):
         raise ValueError("checkpoint and tokenizer must be supplied together")
+    exclusions = []
+    if exclude_find_zero:
+        if correct_find_zero_oracle:
+            raise ValueError("task-32 exclusion cannot be combined with an oracle correction")
+        if specification != release("humaneval-plus"):
+            raise ValueError("task-32 exclusion requires the pinned HumanEval+ release")
+        if sum(task.id == "humaneval/32" for task in tasks) != 1:
+            raise ValueError("task-32 exclusion requires exactly one task 32")
+        tasks = [task for task in tasks if task.id != "humaneval/32"]
+        exclusions.append(
+            {"task_id": "humaneval/32", "reason": "known numerical-tolerance failure"}
+        )
     corrections = []
     if correct_find_zero_oracle:
         tasks, correction = correct_find_zero(tasks, specification)
@@ -57,6 +70,14 @@ def evaluate_suite(
             "OriginFmt-with-find-zero-residual-v1" if corrections else "unmodified-OriginFmt-tests"
         ),
         "oracle_corrections": corrections,
+        "original_task_count": specification.task_count,
+        "scored_task_count": len(tasks),
+        "excluded_tasks": exclusions,
+        "evaluation_scope": (
+            "HumanEval+ excluding HumanEval/32: 163 of 164 tasks; not the full suite"
+            if exclusions
+            else "complete pinned release"
+        ),
     }
     categories: list[str] = []
 

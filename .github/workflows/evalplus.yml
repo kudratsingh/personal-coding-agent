@@ -17,6 +17,10 @@ on:
         description: Opt into the recorded HumanEval/32 residual-oracle correction (HumanEval+ only)
         type: boolean
         default: false
+      exclude_find_zero:
+        description: Exclude HumanEval/32 (known numerical-tolerance failure); score 163 tasks
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -40,8 +44,10 @@ jobs:
           SUITE: ${{ inputs.suite }}
           NANO: ${{ inputs.nano }}
           CORRECT_FIND_ZERO: ${{ inputs.correct_find_zero_oracle }}
+          EXCLUDE_FIND_ZERO: ${{ inputs.exclude_find_zero }}
         run: |
           args=()
           if [ "$CORRECT_FIND_ZERO" = "true" ]; then args+=(--correct-find-zero-oracle); fi
+          if [ "$EXCLUDE_FIND_ZERO" = "true" ]; then args+=(--exclude-find-zero); fi
           if [ "$NANO" = "true" ]; then args+=(--checkpoint runs/eval-nano/train/checkpoint.pt --tokenizer runs/eval-nano/data/tokenizer.json); fi
           uv run --locked python tools/evalplus_check.py --suite "$SUITE" --release-path "runs/data/$SUITE.jsonl.gz" --download --image-id "$(cat /tmp/scratchcoder-evalplus-image)" --output "runs/$SUITE-check" "${args[@]}"
