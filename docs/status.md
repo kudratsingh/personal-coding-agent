@@ -53,13 +53,15 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 | 0. Foundation | Tooling, records, logs, estimator, CI | Final milestone review; live tracker delivery not exercised |
 | 1. Data/tokenizer | Manifest controls, filters, BPE, fast encoder, shards/loader | Reviewed real-source samples/reports, production tokenizer freeze, measured full-build review |
 | 2. Model/training | CPU-reference model/optimizer/trainer, generation, sanity ladder | Approved GPU pilot, hardware precision/throughput and durable-run validation |
-| 3. Evaluation/safety | Development sandbox, task/pool/metric tooling, code/choice CLI | Complete real-source suite/holdout coverage, host signoff, reference-score discrepancy |
+| 3. Evaluation/safety | Development sandbox, task/pool/metric tooling, code/choice CLI; reference G3 closed | Complete real-source suite/holdout coverage, host signoff, HumanEval+ task-32 exclusion |
 
 These are implementation milestones, not closed phase gates. Synthetic fixtures cannot substitute for real-source or hardware acceptance. No paid compute is authorized without explicit owner permission for the specific run.
 
+**G3 (reference benchmark): CLOSED — owner accepted 14/164 (8.54%) on 2026-10-17**, within two problems of the card's 7.84%. There were **0 empty completions**, **157 budget hits**, and **164/164 canonical passes**. The protocol of record is trailing-whitespace-stripped prompts, greedy decoding, a 256-token budget and the original stop strings, recorded as `prompt_stripped: true`. See [protocol and evidence](reference-evaluation.md). This closes the reference gate, not remaining suite coverage, host approval or the entire evaluation phase.
+
 ## Next public milestone
 
-Complete reviewed source/suite integration and reconcile the reference benchmark before making capability claims. Earlier [model comparisons](reference-evaluation.md) each passed 1/164 HumanEval tasks (0.61%), not the card's 7.84%. The requested no-stop/512-token comparison passed **0/164**, with **30 empty completions** and **128 budget hits**. The subsequently authorized single stripped-prompt/original-stops/256-token run passed **14/164 (8.54%)**, with **0 empty completions** and **157 budget hits**. Both canonical preflights passed **164/164**. The latest result is within two equivalent tasks of the card but outside the explicit 12–13-pass acceptance band; owner clarification is pending, PR #66 is draft/unmerged, and no further variant or ordered step 2–4 has started. Reference G3 is not declared closed. GPU work and gated-data acceptance remain separately approval-gated.
+Complete the explicitly documented HumanEval+ task-32 exclusion, then process the named real web/Python samples and freeze the tokenizer after measured held-out compression. Reference G3 is closed; no further reference variants are needed. Gated Python intake requires the owner's accepted terms and local token. GPU work remains separately approval-gated and untouched.
 
 ## Reporting policy
 

@@ -8,7 +8,7 @@ This repository contains a tested from-scratch Python implementation and a repro
 
 Data/tokenizer tooling, a compact transformer, optimizer, resumable two-stage training with domain validation, cached generation, isolated code evaluation, and multiple-choice scoring are implemented. Real-corpus training and full evaluation-suite acceptance remain pending.
 
-The reference benchmark is not yet validated: the initial external-model run passed 1/164 HumanEval tasks, below the published comparison score. All 164 canonical solutions passed the same isolated harness. See [reference evaluation](docs/reference-evaluation.md) for evidence and limitations.
+The reference benchmark gate G3 is closed with owner acceptance: the pinned external model passed 14/164 HumanEval tasks (8.54%) using the project's stripped-prompt protocol, with zero empty completions. All 164 canonical solutions passed the same isolated harness. This is not evidence of our own model's coding capability. See [reference evaluation](docs/reference-evaluation.md) for the protocol and limitations.
 
 See [the public status page](docs/status.md), [roadmap](docs/roadmap.md), and [architecture overview](docs/architecture.md).
 
