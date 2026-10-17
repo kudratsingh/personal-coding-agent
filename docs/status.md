@@ -31,7 +31,7 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 - Independently trained third-party BPE merge/encoding comparison, restricted to reference tooling and a dedicated CI job.
 - Parallel tokenization bounds producer prefetch to 16 documents per worker while preserving order, with explicit early-close/error cleanup tests; this is not a byte/RSS limit.
 - Hash-bound evaluation-only EvalPlus OriginFmt intake, a locked NumPy runtime, full canonical preflight and optional project-checkpoint workflow. A failing preflight blocks scoring. The reviewed task-32 correction remains explicit opt-in; unmodified tests remain the default.
-- Real MBPP+ canonical validation passed 378/378; a synthetic-only nano checkpoint completed the suite with 0/378, including 156 explicit context limits. HumanEval+ remains blocked: the corrected run still passed 163/164, with task 32 now reporting `AssertionError`. Separate sandbox-only numerical diagnostics do not change scoring or authorize further oracle changes. See [evidence](evalplus.md).
+- Real MBPP+ canonical validation passed 378/378; a synthetic-only nano checkpoint completed the suite with 0/378, including 156 explicit context limits. Current HumanEval+ scoring explicitly excludes task 32 as a known numerical-tolerance failure: canonical **163/163**, synthetic-only nano **0/163**, comprising **115 context limits and 48 candidate failures**. Every subset report discloses the exclusion; this is not the full 164-task suite. The task-32 thread is closed with no further diagnostics or oracle changes. See [evidence](evalplus.md).
 - Complete evaluation-only [ARC-Easy intake and clean CPU run](arc-easy.md): 2,376 held-out test questions, valid answer keys and zero cross-split ID overlap. Synthetic-only nano scored 403/2,376 (16.96%), including 664 context-limit failures, matching a local run. This is integration evidence, not useful reasoning capability.
 - Shard header/vocabulary/BOS integrity guards, with explicit tokenizer expectations in training/validation and unchanged legacy shard identities. See the [walkthrough](walkthroughs/shards.md).
 - Loader resume-state validation rejects malformed source maps, counters, buffers and RNG state before changing the live loader; native/JSON exact continuation remains reference-tested.
@@ -53,7 +53,7 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 | 0. Foundation | Tooling, records, logs, estimator, CI | Final milestone review; live tracker delivery not exercised |
 | 1. Data/tokenizer | Manifest controls, filters, BPE, fast encoder, shards/loader | Reviewed real-source samples/reports, production tokenizer freeze, measured full-build review |
 | 2. Model/training | CPU-reference model/optimizer/trainer, generation, sanity ladder | Approved GPU pilot, hardware precision/throughput and durable-run validation |
-| 3. Evaluation/safety | Development sandbox, task/pool/metric tooling, code/choice CLI; reference G3 closed | Complete real-source suite/holdout coverage, host signoff, HumanEval+ task-32 exclusion |
+| 3. Evaluation/safety | Development sandbox, task/pool/metric tooling, code/choice CLI; reference G3 closed; disclosed 163-task HumanEval+ scoring complete | Complete real-source suite/holdout coverage, host signoff |
 
 These are implementation milestones, not closed phase gates. Synthetic fixtures cannot substitute for real-source or hardware acceptance. No paid compute is authorized without explicit owner permission for the specific run.
 
@@ -61,7 +61,7 @@ These are implementation milestones, not closed phase gates. Synthetic fixtures 
 
 ## Next public milestone
 
-Complete the explicitly documented HumanEval+ task-32 exclusion, then process the named real web/Python samples and freeze the tokenizer after measured held-out compression. Reference G3 is closed; no further reference variants are needed. Gated Python intake requires the owner's accepted terms and local token. GPU work remains separately approval-gated and untouched.
+Process the named real web/Python samples and freeze the tokenizer after measured held-out compression. HumanEval+ integration is complete over **163 tasks with task 32 explicitly excluded**; reference G3 is closed. No further reference variants or task-32 investigations are needed. Gated Python intake requires the owner's accepted terms and local token. GPU work remains separately approval-gated and untouched.
 
 ## Reporting policy
 
