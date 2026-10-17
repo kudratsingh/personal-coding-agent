@@ -1,6 +1,6 @@
 # Public project status
 
-**Updated:** 2026-10-16
+**Updated:** 2026-10-17
 **Stage:** Local research pipeline; phase acceptance incomplete
 
 Local data/tokenization, model/trainer, generation, isolated code evaluation, and multiple-choice components are implemented and reference-tested. No trained coding capability, hosted service, or released weight is claimed.
@@ -38,13 +38,13 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 - Loader source/share mappings are defensively copied so caller-map edits cannot silently change batches under an unchanged signature; corpus contents must remain immutable.
 - Existing CPU bfloat16 autocast has fixed-seed float32 numerical comparisons, exact checkpoint/resume tests with gradient accumulation, and one-batch learning coverage. GPU validation remains separate.
 - Two-process CPU Gloo restart tests compare float32 and CPU bfloat16 continuation bit-for-bit, including rank-specific loader/RNG state and checkpoint provenance; GPU and distributed fault-recovery acceptance remain separate.
-- A bounded, CPU-only [checkpoint reference tool](cpu-resume-check.md) records exact uninterrupted/resumed comparisons on authored token IDs; CI exercises the tiny preset without network or paid resources.
+- A bounded, CPU-only [checkpoint reference tool](cpu-resume-check.md) records exact uninterrupted/resumed comparisons on authored token IDs; CI exercises the tiny preset without network or paid resources. A local 11,536,640-parameter nano check completed all six seed/precision cases exactly at full 256-token context; this is not real-corpus, GPU or capability acceptance.
 - Optimizer checkpoint loads validate moments, counters, masks and hyperparameters before applying state; malformed loads and copy failures leave the optimizer unchanged. Saved masks no longer alias live state.
 - Optimizer construction uses the same hyperparameter rules and owns its mask/beta inputs, preventing caller edits or constructor-only malformed settings from breaking subsequent updates/checkpoint loads.
 - Complete evaluation-only [original MBPP source audit](mbpp-audit.md): all 974 rows accounted for; 519 retained references passed both test partitions after benchmark-ID/schema/contamination checks. No training admission, full-pool approval or phase closure is implied.
 - Bounded evaluation-only [OpenCodeInstruct prefix pilot](opencode-pilot.md) completed on a clean isolated worker: all 200 rows accounted for, 60 references passed both partitions after 35 schema, 13 contamination/duplicate and 92 reference-failure rejections. This is not a representative/full-source estimate, training admission or a model benchmark.
 
-**Verification:** Latest owner-checkout suite with reference/evaluation extras: 632 passed, 18 explicitly skipped disposable-runtime tests; strict types, lint, workflow/publication checks and 47 public Markdown checks pass. A fresh public clone at `9cd8b3d` passed setup/check/smoke without private files: 373 passed, 41 explicit runtime/parser/reference skips; the optional parser/BPE checks separately passed all 30 cases. Dedicated CI exercises optional parsing/reference and actual isolation separately. Local skips are not evidence of isolation. See [EvalPlus validation](evalplus.md) for real-suite outcomes and blockers, rather than treating loader/unit tests as benchmark acceptance.
+**Verification (2026-10-17):** Source revision `45866276154b9da50cc59eeb4b0fb11a2def0235` passed the owner-checkout suite with reference/evaluation extras: 632 passed, 18 explicitly skipped disposable-runtime tests; strict types, lint, workflow/publication checks and 47 public Markdown checks pass. A clean public clone at that same revision passed offline setup/check/smoke without private files: 608 passed, 41 explicit runtime/parser/reference skips. Both synthetic smoke stages also passed in the owner checkout. Dedicated CI exercises optional parsing/reference and actual isolation separately. Local skips are not evidence of isolation. See [EvalPlus validation](evalplus.md) for real-suite outcomes and blockers, rather than treating loader/unit tests as benchmark acceptance.
 
 ## Phase acceptance
 
