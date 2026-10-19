@@ -32,6 +32,8 @@ The serial iterator consumes one document at a time. Parallel encoding feeds win
 
 ## Questions
 
+The completed [real-source freeze](../tokenizer-freeze.md) records one 192,446,084-byte balanced training run, vocabulary 32,768, held-out English/Python compression 2.74195/3.37015 bytes per token, and the immutable identities. It is not a benchmark-trained vocabulary or a full-data/model-training run. Production retraining now requires explicit owner approval.
+
 - Why bytes? Every valid UTF-8 string is representable without unknown tokens.
 - Why weighted chunks? Repeated words contribute fully without storing repeated sequences.
 - Why forbid merges across chunks? It preserves deliberate whitespace boundaries.

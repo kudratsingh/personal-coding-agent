@@ -18,6 +18,8 @@ The contamination index includes separately hash-verified original HumanEval pro
 
 Step-3 token counts use the byte alphabet before BPE merges: one UTF-8 byte per token, no BOS. They are labeled as such, not presented as production-BPE counts. After the separately authorized tokenizer freeze, recount the retained samples with that exact merge-table identity and report held-out compression. No tokenizer is trained or silently changed by the review tool.
 
+The subsequent [frozen-tokenizer recount](tokenizer-freeze.md) completed: **182,749,140 web** and **27,195,275 Python tokens**, excluding BOS. These are the production-BPE totals, distinct from the historical step-3 byte counts below.
+
 ## Verification
 
 `uv run --locked pytest tests/test_real_samples.py tests/test_filters.py` uses authored fixtures for UTF-8 whole-document selection, insufficient input, file-license decisions, primary filter accounting, provenance retention, contamination and deterministic splits. Real run values belong in the evidence section after collection; fixture tests are not sample measurements.
