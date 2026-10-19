@@ -24,4 +24,29 @@ Step-3 token counts use the byte alphabet before BPE merges: one UTF-8 byte per 
 
 ## Evidence
 
-The first full-size local review is in progress. No filtered-size, production token-count or tokenizer-freeze claim is made before measured reports exist. The full-build estimate remains a separate plan-only owner review; GPU pilot work is not authorized.
+The completed 2026-10-19 laptop review at source `933820988f1959b8531d911bae993f040c7c45c6` selected the following prefixes. Counts are documents; bytes are UTF-8 text, separate from raw-container transfer. The tokenizer has not yet been frozen at this step.
+
+| Measurement | Web | Python |
+| --- | ---: | ---: |
+| Sample documents | 103,985 | 209,914 |
+| Sample text bytes | 500,038,096 | 1,000,000,226 |
+| Missing/unapproved file-license drops | 0 | 198,883 |
+| Documents entering shape/contamination filters | 103,985 | 11,031 |
+| Too short / too large / long line / low alphanumeric / unknown domain | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 |
+| Generated-marker drops | 0 | 93 |
+| Exact-duplicate drops | 13 | 0 |
+| Contamination drops | 109 | 152 |
+| Kept documents | 103,863 | 10,786 |
+| Kept text bytes; pre-merge byte tokens, no BOS | 498,123,158 | 96,638,864 |
+| Validation documents / bytes | 524 / 2,589,956 | 45 / 415,822 |
+
+Retained Python declarations: Apache-2.0 **8,756**, MIT **1,832**, BSD-3-Clause **144**, BSD-2-Clause **51**, CC-BY-4.0 **2**, CC0-1.0 **1**. Web stage-1 allocation is **92,975 documents / 444,776,561 bytes**; disjoint stage-2 English is **10,364 / 50,756,641**. Python training allocation is **10,741 / 96,223,042**. Content hashes drive these allocations.
+
+Raw container bytes downloaded: **2,152,819,114 web + 399,133,539 Python = 2,551,952,653**. Revisions and complete-container SHA-256:
+
+- FineWeb-Edu `87f09149ef4734204d70ed1d046ddc9ca3f2b8f9`, `sample/10BT/000_00000.parquet`: `b1ba7b2ce4cb5ea6ef42dca40263eabb85f37700d01693a68e9b30a31d78e871`.
+- StarCoderData `9fc30b578cedaec69e47302df72cf00feed7c8c4`, `python/train-00000-of-00059.parquet`: `407cf6628d01fe2da72ac301d669fc99a75b223a1defe71a48ab583dcb047c70`.
+
+Derived retained-document JSONL hashes: web `8096430180bb736f9a977c973bb30756290674de3096efeb95351d980312509b`, Python `2d2a1accb9ed982a8a5526c20492f65b13b59f2fe172b4e466ee6c575fb3f0f6`. These files and private run receipts are not published. Exclusion inputs covered **164 original HumanEval + 164 HumanEval+ + 378 MBPP+ tasks and 2,376 ARC-Easy questions**; final-pool holdout coverage remains **0**. An additional **44,877-byte** hash-verified original HumanEval gzip was fetched for exclusion only, not training. Source notices/API/transport overhead are not included in corpus payload totals. Filtering completed in **144.4532 seconds** on the laptop; this is not a full-build throughput guarantee.
+
+The tool's command is `uv run --locked python -m tools.real_samples --receipts <verified-receipts.json> --evalplus-directory <pinned-releases> --arc-directory <pinned-arc> --humaneval-path <pinned-original.gz> --output <new-directory>`. The complete local report is under ignored `runs/real-samples-20261019/filtered-complete/`. No paid resources, model training, full data build or GPU pilot ran. The full-build estimate remains a separate plan-only owner review.

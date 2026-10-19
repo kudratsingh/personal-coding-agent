@@ -1,6 +1,7 @@
 # Public project status
 
 **Updated:** 2026-10-17
+**Real-source sample evidence updated:** 2026-10-19
 **Stage:** Local research pipeline; phase acceptance incomplete
 
 Local data/tokenization, model/trainer, generation, isolated code evaluation, and multiple-choice components are implemented and reference-tested. No trained coding capability, hosted service, or released weight is claimed.
@@ -61,7 +62,9 @@ These are implementation milestones, not closed phase gates. Synthetic fixtures 
 
 ## Next public milestone
 
-Process the named real web/Python samples and freeze the tokenizer after measured held-out compression. HumanEval+ integration is complete over **163 tasks with task 32 explicitly excluded**; reference G3 is closed. No further reference variants or task-32 investigations are needed. Gated Python intake requires the owner's accepted terms and local token. GPU work remains separately approval-gated and untouched.
+Real sample review completed: **2,551,952,653 raw-container bytes** downloaded and hash verified; selected **500,038,096 web / 1,000,000,226 Python text bytes**. Filters retained **103,863 web / 10,786 Python documents**, totaling **498,123,158 / 96,638,864 text bytes**. See [all filter counts, hashes and limitations](real-samples.md). Byte-alphabet token counts are explicit pre-BPE values; production counts follow the separate tokenizer freeze. Final verified pool-holdout contamination coverage remains unavailable, so this is not full-corpus training approval.
+
+Next: freeze the tokenizer on equal real web/code bytes and report held-out compression, then prepare gate reports and the requested full-build/rehearsal plans only. HumanEval+ integration is complete over **163 tasks with task 32 explicitly excluded**; reference G3 is closed. No further reference variants or task-32 investigations are needed. GPU work remains separately approval-gated and untouched.
 
 ## Reporting policy
 
