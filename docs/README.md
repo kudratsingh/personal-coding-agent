@@ -11,6 +11,9 @@ Start with the [project README](../README.md), [current status](status.md), and 
 | [Compute](compute.md) | Estimate two-stage compute from supplied assumptions. |
 | [CPU checkpoint reference](cpu-resume-check.md) | Compare bounded authored-fixture training and exact resume without paid compute. |
 | [Data policy](data.md) | Record provenance, licensing, splits, and contamination controls. |
+| [Real samples](real-samples.md) | Inspect actual sizes, hashes, per-filter counts and exclusion coverage. |
+| [Frozen tokenizer](tokenizer-freeze.md) | Identify the immutable table and held-out compression measurements. |
+| [G0 evidence](gates/g0-foundation.md) / [G1 evidence](gates/g1-data-tokenizer.md) / [G2 evidence](gates/g2-model-training.md) / [G3 evidence](gates/g3-evaluation.md) | Match every original gate/work-order pass condition to existing proof, numeric values and explicit gaps. |
 | [Evaluation policy](evaluation.md) | Run local evaluators and interpret results and limitations. |
 | [Reference evaluation](reference-evaluation.md) | Understand the optional pinned comparison track. |
 | [EvalPlus intake](evalplus.md) | Preserve official standalone test releases and source attribution. |
