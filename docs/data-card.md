@@ -1,5 +1,7 @@
 # Data card: development fixtures, real samples and evaluation
 
+The [production tokenizer freeze](tokenizer-freeze.md) used equal **96,223,042-byte** non-validation samples per domain, vocabulary **32,768**. Merge-table SHA-256 is `435729be21650397918abf42c56fd2aee742b12dbc3644e7095ee7c58fc0c1e7`; full retained-sample BPE totals are **182,749,140 web / 27,195,275 Python tokens**, excluding BOS. Validation compression is **2.74195 English / 3.37015 Python bytes per token**. No retraining is authorized without owner approval; no full corpus has been admitted or model pretrained on these samples.
+
 Real-source sample review is complete, but no full production training corpus has been admitted. Ordinary tests use synthetic strings and byte fixtures authored for this repository. These establish software behavior, not corpus quality or model performance. The reference workflow downloads HumanEval for evaluation only; benchmark material never enters training or tokenizer input.
 
 `data/manifest.json` intentionally contains no full-build-approved sources. The real sample review keeps its raw-container manifests/terms receipts local and ignored, with public source/hash evidence below. External sources require a pinned immutable revision, a verified license and attribution, SHA-256, exact byte count, declared purpose, and owner terms acceptance where applicable. An unverified or incomplete downloader entry fails before a network request.

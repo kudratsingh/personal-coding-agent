@@ -52,7 +52,7 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 | Phase | Implemented | Remaining acceptance |
 | --- | --- | --- |
 | 0. Foundation | Tooling, records, logs, estimator, CI | Final milestone review; live tracker delivery not exercised |
-| 1. Data/tokenizer | Manifest controls, filters, BPE, fast encoder, shards/loader | Reviewed real-source samples/reports, production tokenizer freeze, measured full-build review |
+| 1. Data/tokenizer | Manifest controls, real-source sample reports, frozen BPE, fast encoder, shards/loader | Full-build estimate owner decision, remaining source/pool coverage and real-scale acceptance |
 | 2. Model/training | CPU-reference model/optimizer/trainer, generation, sanity ladder | Approved GPU pilot, hardware precision/throughput and durable-run validation |
 | 3. Evaluation/safety | Development sandbox, task/pool/metric tooling, code/choice CLI; reference G3 closed; disclosed 163-task HumanEval+ scoring complete | Complete real-source suite/holdout coverage, host signoff |
 
@@ -64,7 +64,9 @@ These are implementation milestones, not closed phase gates. Synthetic fixtures 
 
 Real sample review completed: **2,551,952,653 raw-container bytes** downloaded and hash verified; selected **500,038,096 web / 1,000,000,226 Python text bytes**. Filters retained **103,863 web / 10,786 Python documents**, totaling **498,123,158 / 96,638,864 text bytes**. See [all filter counts, hashes and limitations](real-samples.md). Byte-alphabet token counts are explicit pre-BPE values; production counts follow the separate tokenizer freeze. Final verified pool-holdout contamination coverage remains unavailable, so this is not full-corpus training approval.
 
-Next: freeze the tokenizer on equal real web/code bytes and report held-out compression, then prepare gate reports and the requested full-build/rehearsal plans only. HumanEval+ integration is complete over **163 tasks with task 32 explicitly excluded**; reference G3 is closed. No further reference variants or task-32 investigations are needed. GPU work remains separately approval-gated and untouched.
+The [real tokenizer is frozen](tokenizer-freeze.md): **96,223,042 bytes per domain**, vocabulary **32,768**, merge-table SHA-256 `435729be21650397918abf42c56fd2aee742b12dbc3644e7095ee7c58fc0c1e7`. Held-out English/Python compression is **2.74195 / 3.37015 bytes/token**. All retained samples contain **182,749,140 web / 27,195,275 Python BPE tokens**, excluding BOS. The hash is recorded under Decided; **no retraining without owner approval**. G1's freeze condition is met; the full-build estimate still needs an owner decision.
+
+Next: documentation-only gate reports and the requested full-build/rehearsal plans, then stop. HumanEval+ integration is complete over **163 tasks with task 32 explicitly excluded**; reference G3 is closed. No further reference variants or task-32 investigations are needed. GPU work remains separately approval-gated and untouched.
 
 ## Reporting policy
 
