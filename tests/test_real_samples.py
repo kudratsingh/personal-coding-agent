@@ -1,9 +1,13 @@
+import gzip
+import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from scratchcoder.data.filters import ContaminationIndex
+from tools import real_samples
 from tools.real_samples import declared_license, process_sample, sample_rows
 
 
@@ -70,3 +74,44 @@ def test_license_filter_contamination_counts_split_and_provenance(tmp_path: Path
     assert document["provenance"]["license"] == "MIT"
     assert sum(value["documents"] for value in report["splits"].values()) == 1
     assert "pre-merge" in report["token_count_protocol"]
+
+
+def test_contamination_inputs_include_original_hidden_tests_separately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = gzip.compress(
+        json.dumps(
+            {
+                "prompt": "original prompt",
+                "canonical_solution": "original solution",
+                "test": "original hidden-test-only marker",
+            }
+        ).encode()
+    )
+    path = tmp_path / "authored.gz"
+    path.write_bytes(raw)
+    monkeypatch.setattr(real_samples, "HUMANEVAL_SHA256", hashlib.sha256(raw).hexdigest())
+    monkeypatch.setattr(
+        real_samples,
+        "read_release",
+        lambda *_: [
+            SimpleNamespace(
+                prompt="plus prompt",
+                hidden_tests="plus tests",
+                solution="plus solution",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        real_samples,
+        "read_arc_easy",
+        lambda *_: (
+            [SimpleNamespace(question="choice question")],
+            {"fixture": True},
+        ),
+    )
+    texts, coverage = real_samples.contamination_inputs(tmp_path, tmp_path, path)
+    assert "original hidden-test-only marker" in texts
+    assert "original solution" in texts and "choice question" in texts
+    assert coverage["humaneval"]["tasks"] == 1
+    assert coverage["final_pool_holdout"]["available"] is False

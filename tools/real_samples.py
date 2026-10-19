@@ -1,6 +1,7 @@
 """Offline sample review: pinned Parquet text, explicit code licenses, existing filters."""
 
 import argparse
+import gzip
 import importlib
 import json
 import re
@@ -24,6 +25,8 @@ from scratchcoder.data.filters import (
 )
 from scratchcoder.data.manifest import TRAINING_LICENSES
 from scratchcoder.data.shards import file_sha256
+
+HUMANEVAL_SHA256 = "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef"
 
 
 def declared_license(text: str) -> str | None:
@@ -71,10 +74,19 @@ def parquet_rows(path: Path) -> Iterator[dict[str, Any]]:
 
 
 def contamination_inputs(
-    evalplus_directory: Path, arc_directory: Path
+    evalplus_directory: Path, arc_directory: Path, humaneval_path: Path
 ) -> tuple[list[str], dict[str, Any]]:
     texts = []
     identities: dict[str, Any] = {}
+    expected = HUMANEVAL_SHA256
+    if file_sha256(humaneval_path) != expected:
+        raise ValueError("original HumanEval exclusion bytes differ")
+    original = [
+        json.loads(line) for line in gzip.decompress(humaneval_path.read_bytes()).splitlines()
+    ]
+    for row in original:
+        texts.extend([row["prompt"], row["canonical_solution"], row["test"]])
+    identities["humaneval"] = {"tasks": len(original), "release_sha256": expected}
     for name in ("humaneval-plus", "mbpp-plus"):
         spec = release(name)
         tasks = read_release(evalplus_directory / (name + ".jsonl.gz"), spec)
@@ -184,6 +196,7 @@ def main() -> int:
     parser.add_argument("--receipts", type=Path, required=True)
     parser.add_argument("--evalplus-directory", type=Path, required=True)
     parser.add_argument("--arc-directory", type=Path, required=True)
+    parser.add_argument("--humaneval-path", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     receipts = json.loads(args.receipts.read_text())
@@ -194,7 +207,9 @@ def main() -> int:
         if path.stat().st_size != entry["size_bytes"] or file_sha256(path) != entry["sha256"]:
             raise ValueError("raw source size/hash differs before parsing")
     started = time.perf_counter()
-    texts, coverage = contamination_inputs(args.evalplus_directory, args.arc_directory)
+    texts, coverage = contamination_inputs(
+        args.evalplus_directory, args.arc_directory, args.humaneval_path
+    )
     index = ContaminationIndex(texts)
     reports = []
     for entry in receipts["files"]:
