@@ -49,6 +49,8 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 
 ## Phase acceptance
 
+Condition-by-condition evidence reports: [G0](gates/g0-foundation.md), [G1](gates/g1-data-tokenizer.md), [G2](gates/g2-model-training.md), [G3](gates/g3-evaluation.md). They inventory existing runs/tests only and mark missing conditions. Reference G3 closure does not imply the original production-host condition or the entire phase is accepted.
+
 | Phase | Implemented | Remaining acceptance |
 | --- | --- | --- |
 | 0. Foundation | Tooling, records, logs, estimator, CI | Final milestone review; live tracker delivery not exercised |

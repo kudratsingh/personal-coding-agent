@@ -1,0 +1,16 @@
+# G0 — foundation evidence
+
+Report date: 2026-10-19. **Overall gate not met:** owner scope acceptance and some original acceptance evidence remain missing. This is an evidence inventory, not new validation or authorization. Commands below identify existing proofs or the command whose missing result is required; none was newly run for this report.
+
+The latest implementation snapshot, `121fa54`, passed local `env -u VIRTUAL_ENV make check`: **648 passed, 18 explicit runtime skips**, mypy **128** files, Ruff/format **180** files, **10** workflow declarations and **49** public Markdown documents before evidence-only edits. [PR #69](https://github.com/kudratsingh/personal-coding-agent/pull/69) final head passed **14/14 CI checks** before merge. Skips are not isolation evidence. CPU CI executes setup/check/smoke on Linux and macOS.
+
+| Roadmap condition | Existing command / record | Value and verdict |
+| --- | --- | --- |
+| G0: setup, lint, tests and smoke on a clean macOS clone and in CI | `make setup && make lint && make test && make smoke`; CPU checks in PR #69; historical clean public-clone record at `4586627` | CI **2 OS jobs** passed with two-stage smoke. Historical clean-clone **608 passed / 41 optional/runtime skips**, no private files. **Partial:** no fresh clean-macOS-clone result at latest source; do not relabel the older snapshot. |
+| G0: owner accepts scope ADR 0001 | Owner-only scope-and-claims ADR, separate from public development-environment ADR 0001 | **0 recorded acceptances; status Proposed. Not met.** |
+| P0-1: pinned Python, layout, local/CI targets, loud failure when stages absent | `.python-version`, Makefile, CPU workflow; `make check` / existing `make smoke` records | Python **3.12.13**; local **648/18** and CI **14/14**. Smoke has **2 real synthetic stages**, superseding the bootstrap placeholder. Public visibility is an explicit owner override of the original private-repo assumption. |
+| P0-2: YAML round-trip and schema-valid dummy run record | `pytest tests/test_records.py tests/test_cli.py`; schema-2 run records and legacy compatibility evidence | **24 record tests + 3 CLI tests passed** in the snapshot; schema **2**, checkpoint format **1** retained. Historical restore returned **step 4**, with **0 additional training steps**. |
+| P0-3: 10 steps to local and hosted trackers, offline tests | `pytest tests/test_logging.py` | **6 tests passed**; **10 local + 10 mock-tracker steps**. **0 live hosted deliveries demonstrated. Partial**, not a live tracker acceptance. |
+| P0-4: estimator matches reference run and original two-stage tables within 5%; budget linked | `pytest tests/test_cost.py tests/test_cost_integrity.py`; `tools/cost.py`, public compute guide, private budget ledger | **6 + 38 tests passed**. Unit example **1 GPU-hour / 0.5 wall-hour / $2**; CLI has a two-stage arithmetic fixture. **Not met for original table reproduction:** no retained measured error against both original tables within **5%**. Budget stays private by owner override; no public budget link or price authorization is implied. |
+
+No code, cloud resource, experiment or new test run was added to fill these gaps. The scope ADR, live tracking, exact latest clean-clone proof and original table comparison remain explicit acceptance items, not inferred from passing software tests.
