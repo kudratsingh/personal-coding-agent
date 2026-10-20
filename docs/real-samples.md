@@ -126,3 +126,59 @@ with the original JSONL hash. The new local reports are under
 `runs/retention-audit-20261020/{baseline,quality-review}/`. They preserve primary
 byte/file accounting and explicit non-admission flags. New corpus download bytes
 and tokenizer fits during this audit: **0**.
+
+### Current header-classifier result
+
+The owner's subsequent policy replaces the original blanket check with a
+classifier, **not** the historical bypass. It reads leading comments/module
+strings in the first **16,384 characters**, ignoring known leading metadata
+lines only for classification. Stored text and quality thresholds are unchanged.
+Recognized single SPDX IDs, named declarations and grant patterns are retained;
+unsupported/compound grants are unrecognized. Restrictive markers take precedence.
+"All rights reserved" is not itself a rejection. See [ADR 0011](adr/0011-quality-retention-and-rights-admission.md).
+
+The corrected run used the same input containers and selected prefixes; it took
+**182.8918 seconds**. The Python results below are disjoint final outcomes:
+
+| Class | Files | UTF-8 bytes | Input bytes |
+| --- | ---: | ---: | ---: |
+| Kept permissive after quality | 13,833 | 122,701,374 | 12.27013% |
+| Dropped copyleft (GPL/LGPL/AGPL/MPL markers) | 1,220 | 13,290,562 | 1.32906% |
+| Dropped non-commercial/proprietary restrictions | 125 | 928,113 | 0.09281% |
+| Dropped unrecognized/no grant | 194,417 | 856,648,292 | 85.66481% |
+| Dropped by quality/contamination | 319 | 6,431,885 | 0.64319% |
+| Total | 209,914 | 1,000,000,226 | 100% |
+
+Before quality filtering, recognized permissive headers account for
+**14,152 files / 129,133,259 bytes**. Quality rejects **116 generated-marker
+files / 2,204,697 bytes** and **203 contamination files / 4,227,188 bytes**;
+all other quality rules remove **0 files / 0 bytes**. Contamination remains
+**13 normalized words plus shorter complete indexed fields**. Do not add this
+pre-quality permissive count to the final-kept row.
+
+Kept license IDs: Apache-2.0 **8,776**, MIT **3,635**, BSD-2-Clause **280**,
+BSD-3-Clause **1,009**, ISC **82**, PSF-2.0 **0**, Unlicense **30**, CC0-1.0 **21**.
+Each retained row records its ID/evidence, repository/path, content hash and full
+original text/notices. The first five raw lines of ten unrecognized examples
+are saved in ignored `runs/header-classifier-fixed-20261020/python/unrecognized-examples.json`,
+not published in Git. Most illustrated files begin with imports or metadata,
+not a grant. No repository-level license is inferred from missing inline evidence.
+
+The **12.27013%** byte retention (**6.58984%** of files) remains below 60–85%
+because the specified unrecognized-header drop is still substantial. The 93.4%
+diagnostic rate is not the rate used for the revised admitted-header forecast.
+No threshold or rights relaxation is used to manufacture a target percentage.
+
+Current JSONL hashes: Python
+`220f6b1feaae0235a35a3e79ea6c54e8d3c1945cabb1cedee63dd5414c530b27`;
+web `88b25b977364bd1f271ac1500760f555a0fb8b04f0f6b82b3dcf9e64694b5ccc`.
+Web text/counts/splits are unchanged; its JSONL hash changes because per-file
+classification evidence is now included. The current run directory is
+`runs/header-classifier-fixed-20261020/`. Its first classifier predecessor
+missed grants behind upstream metadata; a reproduced failing synthetic regression
+led to the correction. That predecessor and its interrupted recount are
+superseded, not accepted inputs. The frozen tokenizer was never changed.
+
+Verification: **40 targeted tests**, and **692 passed / 7 explicit NumPy-runtime
+skips** in the full local check with stdlib Docker containment enabled. The
+classifier reads text/token syntax only and never executes corpus programs.

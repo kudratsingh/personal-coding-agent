@@ -12,6 +12,31 @@ The [OpenCodeInstruct component pilot](opencode-pilot.md) separately hash/schema
 
 The downloader verifies size and hash before atomically replacing the target. Test fixtures verify deterministic bytes, rejected licenses, absent terms acceptance, corruption, truncation, and oversized downloads.
 
+## Header-classified sample revision (2026-10-20)
+
+The current [header-classifier review](real-samples.md) retains **13,833 Python
+files / 122,701,374 UTF-8 bytes**, not the earlier 96,638,864-byte selection used
+to fit the already-frozen tokenizer. This is a new review output, not retroactive
+relabeling of the tokenizer's training corpus. Each retained row carries a
+recognized license ID, original repository/path and unchanged notices/text.
+
+| Recognized ID | Retained files |
+| --- | ---: |
+| Apache-2.0 | 8,776 |
+| MIT | 3,635 |
+| BSD-2-Clause | 280 |
+| BSD-3-Clause | 1,009 |
+| ISC | 82 |
+| PSF-2.0 | 0 |
+| Unlicense | 30 |
+| CC0-1.0 | 21 |
+
+Credit BigCode/The Stack, the original repository authors and the preserved
+per-file copyright holders. Full local notices/provenance are not redistributed
+here. Copyleft, restrictive and unrecognized headers are separately dropped;
+an "all rights reserved" line does not override a recognized BSD grant. Header
+recognition is not a comprehensive component-rights warranty or full-build approval.
+
 ## Evaluation-only source actually used
 
 - OpenAI HumanEval: 164 tasks, [revision and MIT attribution](https://github.com/openai/human-eval/tree/6d43fb980f9fee3c892a914eda09951f772ad10d). Pinned gzip SHA-256: `b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef` (44,877 bytes).
