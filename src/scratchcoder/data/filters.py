@@ -3,7 +3,7 @@
 import hashlib
 import re
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 
@@ -64,6 +64,8 @@ def filter_documents(
     documents: Iterable[Document],
     contamination: ContaminationIndex,
     config: FilterConfig | None = None,
+    *,
+    on_decision: Callable[[Document, str], None] | None = None,
 ) -> tuple[list[Document], dict[str, dict[str, int]]]:
     """Count one primary rejection reason per document, separately by source."""
     config = config or FilterConfig()
@@ -103,6 +105,8 @@ def filter_documents(
         elif contamination.contains(text):
             reason = "contamination"
         counts[reason] += 1
+        if on_decision is not None:
+            on_decision(document, reason)
         if reason == "kept":
             seen.add(digest)
             kept.append(document)

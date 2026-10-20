@@ -4,7 +4,6 @@ import argparse
 import gzip
 import importlib
 import json
-import re
 import time
 from collections import Counter
 from collections.abc import Iterable, Iterator
@@ -23,29 +22,15 @@ from scratchcoder.data.filters import (
     document_split,
     filter_documents,
 )
-from scratchcoder.data.manifest import TRAINING_LICENSES
 from scratchcoder.data.shards import file_sha256
+from tools.header_licenses import HeaderLicense, classify_header
 
 HUMANEVAL_SHA256 = "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef"
 
 
 def declared_license(text: str) -> str | None:
-    """Recognize an original-file declaration, never infer rights from dataset tags."""
-    header = text[:16384]
-    identifiers = re.findall(r"SPDX-License-Identifier:\s*([^\r\n]+)", header)
-    if identifiers:
-        # Compound, conflicting, or unfamiliar expressions need separate review.
-        names = {identifier.strip().removesuffix("*/").strip() for identifier in identifiers}
-        return next(iter(names)) if len(names) == 1 and names <= TRAINING_LICENSES else None
-    if re.search(r"GNU (?:GENERAL|LESSER|AFFERO)|CC-BY-(?:SA|NC)|non-commercial", header, re.I):
-        return None
-    if "Permission is hereby granted, free of charge" in header and all(
-        marker in header for marker in ("The above copyright notice", "THE SOFTWARE IS PROVIDED")
-    ):
-        return "MIT"
-    if re.search(r"Licensed under the Apache License, Version 2\.0", header, re.I):
-        return "Apache-2.0"
-    return None
+    """Compatibility helper; classification never infers rights from dataset tags."""
+    return classify_header(text).license_id
 
 
 def sample_rows(
@@ -118,26 +103,62 @@ def process_sample(
     documents = []
     provenance: dict[str, dict[str, Any]] = {}
     counts: Counter[str] = Counter()
+    rule_bytes: Counter[str] = Counter()
+    rule_files: Counter[str] = Counter()
+    license_classes: dict[str, Counter[str]] = {}
+    examples: list[dict[str, Any]] = []
+
+    def audit(document: Document, reason: str) -> None:
+        rule_bytes[reason] += len(document.text.encode())
+        rule_files[reason] += 1
+
     for number, row in enumerate(sample_rows(rows, domain, target)):
         text = row["text" if domain == "web" else "content"]
         counts["sample_documents"] += 1
         counts["sample_text_bytes"] += len(text.encode())
         identifier = str(row.get("id", number))
-        license_name = "ODC-By-1.0" if domain == "web" else declared_license(text)
-        if license_name is None:
+        classification = (
+            HeaderLicense("permissive", "ODC-By-1.0", "owner-reviewed web source terms")
+            if domain == "web"
+            else classify_header(text)
+        )
+        license_name = classification.license_id
+        license_counts = license_classes.setdefault(classification.category, Counter())
+        license_counts["files"] += 1
+        license_counts["text_bytes"] += len(text.encode())
+        if classification.category != "permissive":
             counts["missing_or_unapproved_file_license"] += 1
+            counts["missing_or_unapproved_file_license_bytes"] += len(text.encode())
+            reason = "license_" + classification.category
+            rule_bytes[reason] += len(text.encode())
+            rule_files[reason] += 1
+            if classification.category == "unrecognized" and len(examples) < 10:
+                examples.append(
+                    dict(
+                        id=identifier,
+                        repository=row.get("max_stars_repo_name"),
+                        path=row.get("max_stars_repo_path"),
+                        sha256=content_hash(text),
+                        evidence=classification.evidence,
+                        first_five_lines=text.splitlines()[:5],
+                    )
+                )
             continue
         documents.append(Document(identifier, source, text, domain))
         provenance[identifier] = dict(
             id=identifier,
             license=license_name,
+            license_class=classification.category,
+            license_evidence=classification.evidence,
             sha256=content_hash(text),
             repository=row.get("max_stars_repo_name"),
             path=row.get("max_stars_repo_path"),
             url=row.get("url"),
         )
-    kept, filters = filter_documents(documents, contamination)
-    counts["license_admitted_documents"] = len(documents)
+    kept, filters = filter_documents(documents, contamination, on_decision=audit)
+    counts["license_admitted_documents"] = (
+        counts["sample_documents"] - counts["missing_or_unapproved_file_license"]
+    )
     splits: dict[str, Counter[str]] = {}
     licenses: Counter[str] = Counter()
     with (output / "documents.jsonl").open("x", encoding="utf-8") as stream:
@@ -147,7 +168,7 @@ def process_sample(
             size = len(document.text.encode())
             split_counts["documents"] += 1
             split_counts["text_bytes"] += size
-            licenses[provenance[document.id]["license"]] += 1
+            licenses[provenance[document.id]["license"] or "unresolved"] += 1
             stream.write(
                 json.dumps(
                     dict(asdict(document), split=split, provenance=provenance[document.id]),
@@ -177,6 +198,23 @@ def process_sample(
         target_text_bytes=target,
         **counts,
         filters=filter_counts,
+        primary_decisions={
+            name: dict(files=rule_files[name], text_bytes=rule_bytes[name])
+            for name in (
+                "license_copyleft",
+                "license_restricted",
+                "license_unrecognized",
+                *filter_counts,
+            )
+            if name != "seen"
+        },
+        license_classes={name: dict(value) for name, value in license_classes.items()},
+        final_training_admission=False,
+        license_policy=(
+            "header-classifier-v1; recognized permissive only; no unresolved-license bypass"
+        ),
+        contamination_ngram_words=contamination.n,
+        contamination_short_fields="complete normalized fields shorter than n are also indexed",
         filter_configuration=asdict(FilterConfig()),
         kept_documents=len(kept),
         kept_text_bytes=sum(len(doc.text.encode()) for doc in kept),
@@ -186,6 +224,9 @@ def process_sample(
         # ByteBPE's pre-merge alphabet represents each UTF-8 byte as one token, no BOS.
         tokens=sum(len(doc.text.encode()) for doc in kept),
         token_count_protocol="pre-merge byte alphabet, no BOS; frozen-BPE recount in step 4",
+    )
+    atomic_json(
+        output / "unrecognized-examples.json", dict(examples=examples, raw_private_material=True)
     )
     atomic_json(output / "report.json", report)
     return report
