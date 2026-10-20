@@ -35,3 +35,44 @@ Split token totals, no BOS: stage-1 web **163,150,865**, stage-2 web **18,653,70
 Both 256-character real validation probes produced identical reference/fast IDs and exact Unicode round-trips. This is **512 characters checked**, not the roadmap's separate 100 MB reference/fast identity condition. Existing randomized slow/external BPE references, Unicode/code round-trips and fast-path fixtures passed in the **648 passed / 18 explicit runtime skips** local suite; [PR #69](https://github.com/kudratsingh/personal-coding-agent/pull/69) carries source/evidence CI. No production retraining was used to demonstrate determinism; repeat-training identity tests use authored corpora.
 
 The run command was `uv run --locked python -m tools.freeze_tokenizer --samples runs/real-samples-20261019/filtered-complete --output runs/tokenizer-freeze-20261019`. The completed ignored `record.json` and `measurements.json` preserve full identities, selection, timings and splits. No GPU, paid resources, model training or full corpus build ran. G1's tokenizer-freeze condition is met; owner review of the full-build estimate remains a separate gate condition.
+
+## GPT-2 comparison on identical held-out text (2026-10-20)
+
+This is an encoding-only comparison, **not retraining**. Both tokenizers receive
+the exact original frozen validation documents, with whitespace unchanged,
+per-document encoding and no BOS/EOS injection, padding or truncation. Counts
+are total UTF-8 bytes divided by total tokens, not the mean of per-file ratios.
+Both tokenizers round-trip every compared document exactly.
+
+| Original held-out text | Files | UTF-8 bytes | Project tokens | GPT-2 tokens | Project bytes/token | GPT-2 bytes/token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| English | 524 | 2,589,956 | 944,567 | 554,882 | **2.7419505445** | **4.6675797737** |
+| Python | 45 | 415,822 | 123,384 | 189,083 | **3.3701452376** | **2.1991506376** |
+
+The project uses **70.22844% more English tokens** and **34.74612% fewer Python
+tokens** on these samples. Higher bytes/token means fewer tokens for this text,
+not better model capability. Vocabularies differ (**32,768 project / 50,257
+GPT-2**) and the small, license-filtered ordered-prefix Python holdout is not
+representative of all Python. No merge-table change is proposed by these numbers.
+
+Reference: [OpenAI GPT-2 / Hugging Face distribution](https://huggingface.co/openai-community/gpt2),
+revision `607a30d783dfa663caf39e06633721c8d4cfcd7e`. Only `tokenizer.json`
+(**1,355,256 bytes**) was downloaded under the owner's explicit exception;
+**0 model-weight bytes / 0 new corpus bytes**. SHA-256:
+`8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6`;
+Git-blob SHA-1 matched the pinned source metadata. The existing locked baseline
+extra supplied `tokenizers 0.22.2`; the local JSON loader made no model/script/API
+execution or additional fetch. Receipts/comparison output remain ignored.
+
+Length-framed held-out corpus hashes: English
+`a4d6fc336f4ca5b7156352a0197a4716e906b2f365280ab7828e1d5ac9de4f94`,
+Python `542248a29eb7f9993a364c6e665b3c06d16d975c3e5650c72b4324836ba1dea5`.
+The measurement rechecked the original document-file hashes, reproduced the
+project's original token totals and verified the frozen artifact hash before
+and after. The owner-only record is under `runs/gpt2-tokenizer-reference-20261020/`.
+
+Separately, the new header-classified sample recount contains **35,009,073 Python
+tokens / 122,701,374 bytes** (**35,022,906 with BOS**). Its newer validation
+selection is **52 files / 475,430 bytes / 140,646 tokens = 3.3803307595 BPT**.
+That changed selection is **not** silently substituted into the comparison table
+above. Both sample counts use the same immutable production tokenizer.
