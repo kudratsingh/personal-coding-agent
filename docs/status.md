@@ -70,6 +70,8 @@ The [real tokenizer is frozen](tokenizer-freeze.md): **96,223,042 bytes per doma
 
 Next: documentation-only gate reports and the requested full-build/rehearsal plans, then stop. HumanEval+ integration is complete over **163 tasks with task 32 explicitly excluded**; reference G3 is closed. No further reference variants or task-32 investigations are needed. GPU work remains separately approval-gated and untouched.
 
+The [P1-6 full-build estimate is prepared](full-build-plan.md), **not approved/deferred**. It flags the sample-based Python capacity forecast and unmeasured task-source costs rather than assuming the larger one-pass budgets fit. Full builds and paid runs remain **0**. Phase 4 remains planning only.
+
 ## Reporting policy
 
 Public results will identify the configuration, evaluation method, and known limitations. Incomplete, single-run, or non-reproducible results will be labeled accordingly.
