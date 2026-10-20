@@ -66,6 +66,11 @@ def test_license_filter_contamination_counts_split_and_provenance(tmp_path: Path
     assert report["filters"]["duplicate"] == 1
     assert report["filters"]["generated"] == 1
     assert report["filters"]["contamination"] == 1
+    assert report["primary_decisions"]["duplicate"] == dict(files=1, text_bytes=len(clean.encode()))
+    assert sum(value["files"] for value in report["primary_decisions"].values()) == len(texts)
+    assert sum(value["text_bytes"] for value in report["primary_decisions"].values()) == sum(
+        len(text.encode()) for text in texts
+    )
     assert report["kept_documents"] == 1
     assert report["tokens"] == report["kept_text_bytes"] == len(clean.encode())
     document = json.loads((tmp_path / "review/documents.jsonl").read_text())
@@ -74,6 +79,27 @@ def test_license_filter_contamination_counts_split_and_provenance(tmp_path: Path
     assert document["provenance"]["license"] == "MIT"
     assert sum(value["documents"] for value in report["splits"].values()) == 1
     assert "pre-merge" in report["token_count_protocol"]
+
+
+def test_quality_review_does_not_turn_missing_header_into_license_approval(tmp_path: Path) -> None:
+    text = "def original_file_without_header(value):\n    return value + 123\n"
+    report = process_sample(
+        [dict(id="unresolved", content=text)],
+        domain="python",
+        source="fixture",
+        target=len(text.encode()),
+        contamination=ContaminationIndex([]),
+        output=tmp_path / "quality",
+        review_unresolved_licenses=True,
+    )
+    assert report["kept_documents"] == 1
+    assert report["license_admitted_documents"] == 0
+    assert report["missing_or_unapproved_file_license_bytes"] == len(text.encode())
+    assert report["primary_decisions"]["kept"]["text_bytes"] == len(text.encode())
+    assert report["primary_decisions"]["missing_or_unapproved_file_license"]["files"] == 0
+    assert report["final_training_admission"] is False
+    row = json.loads((tmp_path / "quality/documents.jsonl").read_text())
+    assert row["provenance"]["license"] is None
 
 
 def test_contamination_inputs_include_original_hidden_tests_separately(

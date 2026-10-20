@@ -113,11 +113,19 @@ def process_sample(
     target: int,
     contamination: ContaminationIndex,
     output: Path,
+    review_unresolved_licenses: bool = False,
 ) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=False)
     documents = []
     provenance: dict[str, dict[str, Any]] = {}
     counts: Counter[str] = Counter()
+    rule_bytes: Counter[str] = Counter()
+    rule_files: Counter[str] = Counter()
+
+    def audit(document: Document, reason: str) -> None:
+        rule_bytes[reason] += len(document.text.encode())
+        rule_files[reason] += 1
+
     for number, row in enumerate(sample_rows(rows, domain, target)):
         text = row["text" if domain == "web" else "content"]
         counts["sample_documents"] += 1
@@ -126,7 +134,11 @@ def process_sample(
         license_name = "ODC-By-1.0" if domain == "web" else declared_license(text)
         if license_name is None:
             counts["missing_or_unapproved_file_license"] += 1
-            continue
+            counts["missing_or_unapproved_file_license_bytes"] += len(text.encode())
+            if not review_unresolved_licenses:
+                rule_bytes["missing_or_unapproved_file_license"] += len(text.encode())
+                rule_files["missing_or_unapproved_file_license"] += 1
+                continue
         documents.append(Document(identifier, source, text, domain))
         provenance[identifier] = dict(
             id=identifier,
@@ -136,8 +148,10 @@ def process_sample(
             path=row.get("max_stars_repo_path"),
             url=row.get("url"),
         )
-    kept, filters = filter_documents(documents, contamination)
-    counts["license_admitted_documents"] = len(documents)
+    kept, filters = filter_documents(documents, contamination, on_decision=audit)
+    counts["license_admitted_documents"] = (
+        counts["sample_documents"] - counts["missing_or_unapproved_file_license"]
+    )
     splits: dict[str, Counter[str]] = {}
     licenses: Counter[str] = Counter()
     with (output / "documents.jsonl").open("x", encoding="utf-8") as stream:
@@ -147,7 +161,7 @@ def process_sample(
             size = len(document.text.encode())
             split_counts["documents"] += 1
             split_counts["text_bytes"] += size
-            licenses[provenance[document.id]["license"]] += 1
+            licenses[provenance[document.id]["license"] or "unresolved"] += 1
             stream.write(
                 json.dumps(
                     dict(asdict(document), split=split, provenance=provenance[document.id]),
@@ -177,6 +191,20 @@ def process_sample(
         target_text_bytes=target,
         **counts,
         filters=filter_counts,
+        primary_decisions={
+            name: dict(files=rule_files[name], text_bytes=rule_bytes[name])
+            for name in ("missing_or_unapproved_file_license", *filter_counts)
+            if name != "seen"
+        },
+        review_unresolved_licenses=review_unresolved_licenses,
+        final_training_admission=False,
+        license_policy=(
+            "quality audit only; unresolved original-file licenses retained as null, not approved"
+            if review_unresolved_licenses
+            else "original-file declaration required before quality filtering"
+        ),
+        contamination_ngram_words=contamination.n,
+        contamination_short_fields="complete normalized fields shorter than n are also indexed",
         filter_configuration=asdict(FilterConfig()),
         kept_documents=len(kept),
         kept_text_bytes=sum(len(doc.text.encode()) for doc in kept),
@@ -198,6 +226,11 @@ def main() -> int:
     parser.add_argument("--arc-directory", type=Path, required=True)
     parser.add_argument("--humaneval-path", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--review-unresolved-licenses",
+        action="store_true",
+        help="quality audit only, retain null license evidence; NEVER training admission",
+    )
     args = parser.parse_args()
     receipts = json.loads(args.receipts.read_text())
     if receipts["status"] != "completed" or args.output.exists():
@@ -221,6 +254,7 @@ def main() -> int:
             target=500_000_000 if domain == "web" else 1_000_000_000,
             contamination=index,
             output=args.output / domain,
+            review_unresolved_licenses=args.review_unresolved_licenses,
         )
         reports.append(report)
         print(json.dumps(report, sort_keys=True), flush=True)
