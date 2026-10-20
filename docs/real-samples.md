@@ -64,7 +64,7 @@ bad code or necessarily an unlicensed file.
 
 | Primary rule, in order | Threshold or logic | Python files removed | Python UTF-8 bytes removed |
 | --- | --- | ---: | ---: |
-| Missing/unapproved inline license | First 16,384 characters; one allowlisted SPDX identifier, complete MIT notice, or Apache-2.0 notice; otherwise reject | 198,883 | 895,975,942 |
+| Missing/unapproved inline license | First 16,384 characters; one allowlisted SPDX identifier, MIT notice markers, or Apache-2.0 notice; otherwise reject | 198,883 | 895,975,942 |
 | Unknown domain | Domain must be web or Python | 0 | 0 |
 | Too short | Fewer than 32 UTF-8 bytes | 0 | 0 |
 | Too large | More than 1,048,576 UTF-8 bytes | 0 | 0 |
@@ -80,6 +80,13 @@ sequential, not independent all-rule matches. In particular, zero quality drops
 after the old license gate says nothing about the 198,883 files it never examined.
 License observations in a quality-only review overlap with quality decisions and
 must not be summed as additional removals.
+
+The SPDX allowlist is MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, CC0-1.0,
+CC-BY-4.0, ODC-By-1.0 and CDLA-Permissive-2.0. Conflicting/compound identifiers
+are unresolved. Without SPDX, GNU/CC-BY-SA/CC-BY-NC/non-commercial header markers
+block recognition; MIT requires the permission, copyright-retention and warranty
+markers, while Apache requires its version-2.0 licensing phrase. Normalized
+contamination words are Unicode `\w+` matches after case folding, not BPE tokens.
 
 Proposed correction: separate quality accounting from rights admission, rather
 than relax quality thresholds or label missing headers as bad content. The
