@@ -106,7 +106,7 @@ def process_sample(
     rule_bytes: Counter[str] = Counter()
     rule_files: Counter[str] = Counter()
     license_classes: dict[str, Counter[str]] = {}
-    examples = []
+    examples: list[dict[str, Any]] = []
 
     def audit(document: Document, reason: str) -> None:
         rule_bytes[reason] += len(document.text.encode())
