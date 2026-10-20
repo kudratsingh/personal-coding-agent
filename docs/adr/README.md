@@ -13,3 +13,5 @@ Owner budgets, detailed work orders, private experiments, and account details be
 - [ADR 0007: explicit find-zero oracle correction](0007-find-zero-oracle-correction.md)
 - [ADR 0008: shard semantic integrity](0008-shard-semantic-integrity.md)
 - [ADR 0009: resume provenance and record versions](0009-resume-provenance.md)
+- [ADR 0010: disclosed HumanEval+ task-32 exclusion](0010-humaneval-plus-task32-exclusion.md)
+- [ADR 0011: quality retention versus rights admission](0011-quality-retention-and-rights-admission.md)
