@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from scratchcoder.data.filters import ContaminationIndex
-from tools.header_licenses import PERMISSIVE, classify_header
+from tools.header_licenses import PERMISSIVE, classify_file, classify_header
 from tools.real_samples import process_sample
 
 BSD = """# Copyright fixture. All rights reserved.
@@ -80,7 +80,6 @@ def test_restricted_header_is_not_admitted(header: str) -> None:
         "# All rights reserved",
         "# SPDX-License-Identifier: Mystery-1.0",
         "# See LICENSE",
-        "import os\n# SPDX-License-Identifier: MIT",
         "# SPDX-License-Identifier: CC-BY-4.0",
     ],
 )
@@ -99,6 +98,30 @@ def test_module_docstring_header_is_read_without_execution() -> None:
 def test_upstream_metadata_does_not_hide_an_explicit_license_header() -> None:
     text = "<gh_stars>1-10\n<filename>fixture.py\n# License: MIT license\nanswer = 123\n"
     assert classify_header(text).license_id == "MIT"
+
+
+@pytest.mark.parametrize("prefix", ["", "# helper utility\n", '"""Helper utility."""\n'])
+def test_no_license_header_uses_allowlisted_repository_metadata(prefix: str) -> None:
+    text = prefix + "import os\n# SPDX-License-Identifier: MIT\n"
+    assert classify_header(text).category == "no_header"
+    result = classify_file(text, "Apache-2.0")
+    assert result.category == "permissive" and result.license_id == "Apache-2.0"
+    assert "repository" in result.evidence
+
+
+@pytest.mark.parametrize("name", ["GPL-3.0-only", "CC-BY-NC-4.0", "Mystery-1.0"])
+def test_repository_license_outside_allowlist_is_attributed(name: str) -> None:
+    result = classify_file("answer = 123456789\n", name)
+    assert result.category == "repository_disallowed" and result.license_id == name
+
+
+def test_missing_repository_license_is_not_unrecognized_header() -> None:
+    assert classify_file("import os\n", None).category == "missing_repository_license"
+    assert classify_file("# License: Mystery-1.0\npass\n", "MIT").category == "unrecognized"
+    assert (
+        classify_file("# SPDX-License-Identifier: GPL-3.0-only\npass\n", "MIT").category
+        == "copyleft"
+    )
 
 
 def test_sample_class_attribution_examples_and_per_file_credit(tmp_path: Path) -> None:

@@ -23,7 +23,7 @@ from scratchcoder.data.filters import (
     filter_documents,
 )
 from scratchcoder.data.shards import file_sha256
-from tools.header_licenses import HeaderLicense, classify_header
+from tools.header_licenses import HeaderLicense, classify_file, classify_header
 
 HUMANEVAL_SHA256 = "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef"
 
@@ -106,6 +106,7 @@ def process_sample(
     rule_bytes: Counter[str] = Counter()
     rule_files: Counter[str] = Counter()
     license_classes: dict[str, Counter[str]] = {}
+    rejected_repository_licenses: Counter[str] = Counter()
     examples: list[dict[str, Any]] = []
 
     def audit(document: Document, reason: str) -> None:
@@ -120,13 +121,15 @@ def process_sample(
         classification = (
             HeaderLicense("permissive", "ODC-By-1.0", "owner-reviewed web source terms")
             if domain == "web"
-            else classify_header(text)
+            else classify_file(text, row.get("repository_license"))
         )
         license_name = classification.license_id
         license_counts = license_classes.setdefault(classification.category, Counter())
         license_counts["files"] += 1
         license_counts["text_bytes"] += len(text.encode())
         if classification.category != "permissive":
+            if classification.category == "repository_disallowed":
+                rejected_repository_licenses[classification.license_id or "unknown"] += 1
             counts["missing_or_unapproved_file_license"] += 1
             counts["missing_or_unapproved_file_license_bytes"] += len(text.encode())
             reason = "license_" + classification.category
@@ -204,14 +207,18 @@ def process_sample(
                 "license_copyleft",
                 "license_restricted",
                 "license_unrecognized",
+                "license_missing_repository_license",
+                "license_repository_disallowed",
                 *filter_counts,
             )
             if name != "seen"
         },
         license_classes={name: dict(value) for name, value in license_classes.items()},
+        rejected_repository_license_counts=dict(rejected_repository_licenses),
         final_training_admission=False,
         license_policy=(
-            "header-classifier-v1; recognized permissive only; no unresolved-license bypass"
+            "header-classifier-v2; explicit header first; absent header uses verified "
+            "repository_license field and D-05 allowlist; missing metadata is separate"
         ),
         contamination_ngram_words=contamination.n,
         contamination_short_fields="complete normalized fields shorter than n are also indexed",

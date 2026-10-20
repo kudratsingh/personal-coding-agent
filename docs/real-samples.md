@@ -127,7 +127,7 @@ with the original JSONL hash. The new local reports are under
 byte/file accounting and explicit non-admission flags. New corpus download bytes
 and tokenizer fits during this audit: **0**.
 
-### Current header-classifier result
+### Historical header-classifier-v1 result
 
 The owner's subsequent policy replaces the original blanket check with a
 classifier, **not** the historical bypass. It reads leading comments/module
@@ -178,6 +178,46 @@ classification evidence is now included. The current run directory is
 missed grants behind upstream metadata; a reproduced failing synthetic regression
 led to the correction. That predecessor and its interrupted recount are
 superseded, not accepted inputs. The frozen tokenizer was never changed.
+
+### Repository fallback correction (2026-10-20, current)
+
+Absent inline licensing now uses an explicit `repository_license` metadata
+field under the [D-05 fallback policy](adr/0011-quality-retention-and-rights-admission.md).
+Off-allowlist repository IDs have separate counters; missing metadata is not
+an unrecognized header. An unreadable/restrictive inline header still takes
+precedence over a repository-level grant. Ordinary comments/docstrings without
+license signals are not inline license declarations.
+
+The pinned Parquet has **zero repository-license fields or mappings**, so the
+fallback admits **0 additional files**. A verified mapping is required; the
+earlier prefix-parser fix provided no licenses. The actual rerun retained the
+same text and output hashes, with the corrected attribution below:
+
+| Final primary class | Python files | UTF-8 bytes |
+| --- | ---: | ---: |
+| Kept permissive, after quality | 13,833 | 122,701,374 |
+| Dropped copyleft header | 1,220 | 13,290,562 |
+| Dropped restricted header | 125 | 928,113 |
+| Dropped unrecognized inline header | 8,737 | 69,830,333 |
+| Unresolved: absent header and missing repository license | 185,680 | 786,817,959 |
+| Dropped off-allowlist repository license | 0 | 0 |
+| Dropped by quality/contamination | 319 | 6,431,885 |
+| Total | 209,914 | 1,000,000,226 |
+
+Byte retention remains **12.2701346%**, not an assumed 60–85%. All retained
+files still carry their inline license IDs. Repository-ID rejections are an
+empty map because no such metadata was supplied, **not** because all repositories
+are permissible. Quality removals remain **116 generated / 203 contamination**;
+the contamination index remains 13 normalized words plus shorter complete fields.
+Ten actual unrecognized-header examples, first five lines each, are saved in
+ignored `runs/repository-license-review-v2-20261020/python/unrecognized-examples.json`.
+The revised [capacity estimate](full-build-plan.md) must use only verified retained
+bytes, not the unresolved 786,817,959 bytes. New corpus downloads: **0 bytes**.
+
+Authored tests cover allowed repository fallback, rejected IDs, absent metadata,
+ordinary module comments, per-file credit and explicit-header precedence.
+The local full check passed **699 tests, 7 explicit NumPy-runtime skips** with
+the pinned stdlib isolation tests enabled. This does not approve a full build.
 
 Verification: **40 targeted tests**, and **692 passed / 7 explicit NumPy-runtime
 skips** in the full local check with stdlib Docker containment enabled. The
