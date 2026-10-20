@@ -20,9 +20,13 @@ class HeaderLicense:
 
 def leading_header(text: str) -> str:
     """Read comments and leading string literals only; never execute or import code."""
+    # StarCoderData prepends these metadata lines to some file contents. They are
+    # not Python statements and carry no grant; skip only this known prefix syntax.
+    window = text[:HEADER_CHARACTERS]
+    window = re.sub(r"\A(?:<(?:reponame|filename|gh_stars)>[^\n]*(?:\n|$))+", "", window)
     parts = []
     try:
-        for token in tokenize.generate_tokens(io.StringIO(text[:HEADER_CHARACTERS]).readline):
+        for token in tokenize.generate_tokens(io.StringIO(window).readline):
             if token.type in {tokenize.COMMENT, tokenize.STRING}:
                 parts.append(token.string)
             elif token.type not in {tokenize.NL, tokenize.NEWLINE, tokenize.ENDMARKER}:
@@ -76,7 +80,10 @@ def classify_header(text: str) -> HeaderLicense:
         ("CC0-1.0", r"cc0(?:[- ]1\.0)?(?: universal)?"),
     ):
         if re.search(
-            r"\b(?:licensed|released|distributed) under (?:the )?" + pattern + r"\b", normalized
+            r"\b(?:(?:licensed|released|distributed) under (?:the )?|license\s*:\s*)"
+            + pattern
+            + r"\b",
+            normalized,
         ):
             return HeaderLicense("permissive", name, "explicit named-license grant")
 

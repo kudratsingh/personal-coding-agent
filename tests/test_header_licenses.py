@@ -96,6 +96,11 @@ def test_module_docstring_header_is_read_without_execution() -> None:
     )
 
 
+def test_upstream_metadata_does_not_hide_an_explicit_license_header() -> None:
+    text = "<gh_stars>1-10\n<filename>fixture.py\n# License: MIT license\nanswer = 123\n"
+    assert classify_header(text).license_id == "MIT"
+
+
 def test_sample_class_attribution_examples_and_per_file_credit(tmp_path: Path) -> None:
     texts = [
         "# SPDX-License-Identifier: ISC\nanswer = 123456\n",
