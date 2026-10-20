@@ -81,7 +81,7 @@ def test_license_filter_contamination_counts_split_and_provenance(tmp_path: Path
     assert "pre-merge" in report["token_count_protocol"]
 
 
-def test_unrecognized_header_is_dropped_and_private_example_recorded(tmp_path: Path) -> None:
+def test_missing_repository_metadata_is_separate_from_unrecognized(tmp_path: Path) -> None:
     text = "def original_file_without_header(value):\n    return value + 123\n"
     report = process_sample(
         [dict(id="unresolved", content=text)],
@@ -94,10 +94,33 @@ def test_unrecognized_header_is_dropped_and_private_example_recorded(tmp_path: P
     assert report["kept_documents"] == 0
     assert report["license_admitted_documents"] == 0
     assert report["missing_or_unapproved_file_license_bytes"] == len(text.encode())
-    assert report["primary_decisions"]["license_unrecognized"]["text_bytes"] == len(text.encode())
+    assert report["primary_decisions"]["license_missing_repository_license"]["text_bytes"] == len(
+        text.encode()
+    )
     assert report["final_training_admission"] is False
     examples = json.loads((tmp_path / "quality/unrecognized-examples.json").read_text())["examples"]
-    assert examples[0]["first_five_lines"] == text.splitlines()
+    assert examples == []
+
+
+def test_repository_license_credit_and_rejected_id_counts(tmp_path: Path) -> None:
+    texts = [f"answer_{i} = 12345678901234567890\n" for i in range(3)]
+    report = process_sample(
+        [
+            dict(id=str(i), content=text, repository_license=license_id)
+            for i, (text, license_id) in enumerate(
+                zip(texts, ["MIT", "GPL-3.0-only", "GPL-3.0-only"], strict=True)
+            )
+        ],
+        domain="python",
+        source="fixture",
+        target=sum(len(text.encode()) for text in texts),
+        contamination=ContaminationIndex([]),
+        output=tmp_path / "review",
+    )
+    assert report["rejected_repository_license_counts"] == {"GPL-3.0-only": 2}
+    row = json.loads((tmp_path / "review/documents.jsonl").read_text())
+    assert row["provenance"]["license"] == "MIT"
+    assert row["provenance"]["license_evidence"] == "upstream repository license metadata"
 
 
 def test_contamination_inputs_include_original_hidden_tests_separately(

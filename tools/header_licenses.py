@@ -9,6 +9,20 @@ PERMISSIVE = frozenset(
     {"Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "PSF-2.0", "Unlicense", "CC0-1.0"}
 )
 HEADER_CHARACTERS = 16384
+# D-05 repository-level allowlist; the separately approved inline grants above
+# remain valid. This is an explicit repository field, never a dataset license tag.
+REPOSITORY_ALLOWLIST = frozenset(
+    {
+        "MIT",
+        "Apache-2.0",
+        "BSD-2-Clause",
+        "BSD-3-Clause",
+        "CC0-1.0",
+        "CC-BY-4.0",
+        "ODC-By-1.0",
+        "CDLA-Permissive-2.0",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -135,4 +149,26 @@ def classify_header(text: str) -> HeaderLicense:
         r"(?:creativecommons.org/publicdomain/zero/1\.0|cc0 1\.0 universal)", normalized
     ) and re.search(r"waiv|dedicat|released under", normalized):
         return HeaderLicense("permissive", "CC0-1.0", "CC0 public-domain dedication")
+    if not re.search(
+        r"licen[cs]e|copyright|rights reserved|permission|redistribut|grant|"
+        r"proprietary|confidential|commercial|public domain|creativecommons|\bcc0\b",
+        normalized,
+    ):
+        return HeaderLicense("no_header", None, "no inline license declaration")
     return HeaderLicense("unrecognized", None, "no recognized permissive grant in leading header")
+
+
+def classify_file(text: str, repository_license: str | None) -> HeaderLicense:
+    """An explicit file declaration wins; only its absence permits repo fallback."""
+    header = classify_header(text)
+    if header.category != "no_header":
+        return header
+    if not repository_license:
+        return HeaderLicense("missing_repository_license", None, "no verified repository license")
+    if repository_license in REPOSITORY_ALLOWLIST:
+        return HeaderLicense(
+            "permissive", repository_license, "upstream repository license metadata"
+        )
+    return HeaderLicense(
+        "repository_disallowed", repository_license, "repository license outside D-05 allowlist"
+    )

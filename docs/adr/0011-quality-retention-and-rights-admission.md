@@ -16,7 +16,7 @@ Replace the original blanket check with a header classifier. Recognize Apache-2.
 MIT, BSD-2-Clause, BSD-3-Clause, ISC, PSF-2.0, Unlicense and CC0-1.0. Preserve the
 license ID and recognition evidence per retained file. GPL/LGPL/AGPL/MPL markers
 are a separate copyleft rejection; non-commercial/proprietary restrictions have
-their own rejection class. A missing or unsupported grant is unrecognized, never
+their own rejection class. An unsupported inline grant is unrecognized, never
 silently approved. "All rights reserved" alone is not a restrictive-license
 trigger: a recognized BSD grant that follows can be retained.
 
@@ -47,3 +47,22 @@ tests cover each class, per-file IDs, byte/file conservation, private examples,
 BSD rights-reserved wording, metadata prefixes and no source execution. Real
 corpus rights, final holdouts and build authorization remain separate conditions.
 The [sample evidence](../real-samples.md) records the actual offline runs.
+
+## Owner amendment: repository fallback (2026-10-20)
+
+An absent inline license is **not** an unrecognized header. Ordinary module
+comments/docstrings without licensing signals do not require an inline grant.
+Use the explicit upstream `repository_license` metadata field, when available,
+only in this case: D-05 allows MIT, Apache-2.0, BSD-2/3-Clause, CC0-1.0,
+CC-BY-4.0, ODC-By-1.0 and CDLA-Permissive-2.0. Preserve that ID and evidence
+per file. Count off-allowlist repository IDs separately. An unreadable explicit
+header cannot be overridden by a permissive repository declaration.
+
+Missing repository metadata is its own unresolved rejection, not a header
+classification and not proof that a repository is unlicensed. The pinned local
+Python Parquet has **no repository-license column**: its five fields are
+`max_stars_repo_path`, `max_stars_repo_name`, `max_stars_count`, `id`, `content`.
+Arrow/Hugging Face schema metadata adds no license mapping. The earlier text
+prefix parsing fix did not supply licenses. Do not infer original rights from
+the dataset tag or a present-day repository lookup. A provenance-backed local
+mapping is needed to admit the currently unresolved no-header files.
