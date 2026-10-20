@@ -2,13 +2,29 @@
 
 ## A small example
 
-`banana banana` begins as UTF-8 bytes. Chunks separate the two words and the space. Count adjacent pairs within chunks; repeated words contribute their frequency. Merge the most frequent pair into a new token, resolving ties by the numeric pair. Repeat until the vocabulary limit or no remaining pairs.
+`banana banana` begins as UTF-8 bytes. Format 2 chunks are `banana` and
+` banana`: a single leading ASCII space attaches to the next nonwhite chunk.
+Runs of two or more non-newline whitespace characters, tabs and newline runs
+remain separate, preserving code indentation. This adopts GPT-2's single-space
+attachment, not its entire word/punctuation regex. Count adjacent pairs within
+chunks; repeated chunks contribute their frequency. Merge the most frequent
+pair, resolving ties by the numeric pair. Repeat until the vocabulary limit
+or no remaining pairs.
 
 Bytes occupy IDs 0–255. Sixteen special-token IDs follow, with merges beginning at 272. Special spellings in ordinary input remain ordinary bytes unless explicitly enabled, so untrusted text cannot insert conversation delimiters implicitly.
 
 ## Data flow
 
-Text becomes a list of byte lists, one per whitespace/non-whitespace chunk. A merge shortens a chunk by replacing non-overlapping matching adjacent pairs. Encoding applies merges in their learned order; decoding concatenates the bytes represented by each ID. Every UTF-8 input therefore round-trips, including code indentation and Unicode.
+Text becomes a list of byte lists, one per pre-split chunk. A merge shortens a chunk by replacing non-overlapping matching adjacent pairs. Encoding applies merges in their learned order; decoding concatenates the bytes represented by each ID. Every UTF-8 input therefore round-trips, including code indentation and Unicode.
+
+The serialized format version binds the split rule to the tokenizer hash.
+Existing format-1 artifacts keep their whitespace-separating rule, bytes and
+hashes; new training emits format 2. Both slow and cached encoders select the
+rule from the loaded artifact. Applying the new regex to an old merge table
+would silently change its protocol and is deliberately avoided. Regression
+tests cover a merge across a single leading space, intact indentation/newlines,
+both encoders and both save/load formats. The existing independent trainer
+reference now checks the corrected chunks.
 
 Training deduplicates chunks with weights. Pair counts and chunk-location sets update only where a selected merge appears. A heap selects the next candidate; stale heap entries are ignored. This avoids recounting every chunk for every merge.
 

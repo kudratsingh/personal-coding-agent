@@ -5,11 +5,12 @@ from functools import lru_cache
 from itertools import islice
 from multiprocessing import get_context
 
-from scratchcoder.tokenizer.bpe import CHUNKS, FIRST_MERGE, ByteBPE, merge_pair
+from scratchcoder.tokenizer.bpe import FIRST_MERGE, ByteBPE, merge_pair
 
 
 class FastEncoder:
     def __init__(self, tokenizer: ByteBPE) -> None:
+        self.chunks = tokenizer.chunks
         self.ranks = {pair: FIRST_MERGE + rank for rank, pair in enumerate(tokenizer.merges)}
         self.chunk = lru_cache(maxsize=65536)(self._encode_chunk)
 
@@ -28,7 +29,7 @@ class FastEncoder:
         return tuple(ids)
 
     def encode(self, text: str) -> list[int]:
-        return [token for chunk in CHUNKS.findall(text) for token in self.chunk(chunk)]
+        return [token for chunk in self.chunks.findall(text) for token in self.chunk(chunk)]
 
 
 _worker_encoder: FastEncoder | None = None
