@@ -8,7 +8,7 @@ The named sources are FineWeb-Edu `sample-10BT` and StarCoderData Python. An ord
 
 Before download, the owner-only manifest records source/revision/file, upstream LFS size/SHA-256, license/attribution, terms date and review purpose. After transfer, verify the complete container size/hash before parsing. The offline tool checks these receipts again and uses PyArrow only for file-format parsing, not training logic. No upstream loader script is run.
 
-FineWeb-Edu carries ODC-By 1.0 plus Common Crawl terms; credit Hugging Face and Lozhkov et al. (2024). StarCoderData/The Stack carries its accepted source terms and the original code licenses; credit BigCode and the original repository authors. The Python schema supplies repository/path provenance but no per-file license column. The default review retains only original-file declarations recognized as an allowlisted SPDX identifier, complete MIT notice, or Apache-2.0 notice; missing, compound, conflicting and unsupported declarations are excluded, not inferred from the dataset label. Full source text including notices and repository/path provenance is preserved locally. This narrow declaration check is not a warranty of rights and does not cover every permissive license spelling. An explicit quality-only mode, described below, measures content separately without approving unresolved licenses.
+FineWeb-Edu carries ODC-By 1.0 plus Common Crawl terms; credit Hugging Face and Lozhkov et al. (2024). StarCoderData/The Stack carries its accepted source terms and the original code licenses; credit BigCode and the original repository authors. The Python schema supplies repository/path provenance but no per-file license column. The current header classifier keeps recognized Apache-2.0, MIT, BSD-2/3-Clause, ISC, PSF-2.0, Unlicense and CC0 grants, with per-file IDs. Copyleft, restricted and unrecognized headers are separate rejection classes. Full source text including notices and repository/path provenance is preserved locally. This heuristic is not a warranty of rights and does not cover every permissive spelling. The earlier quality-only bypass was diagnostic, not admission, and has been removed.
 
 ## Filtering and contamination walkthrough
 
@@ -88,14 +88,14 @@ block recognition; MIT requires the permission, copyright-retention and warranty
 markers, while Apache requires its version-2.0 licensing phrase. Normalized
 contamination words are Unicode `\w+` matches after case folding, not BPE tokens.
 
-Proposed correction: separate quality accounting from rights admission, rather
-than relax quality thresholds or label missing headers as bad content. The
-explicit `--review-unresolved-licenses` switch retains unresolved license evidence
-as null for **audit only**. Repository/component license evidence and notices
-remain a separate training-admission requirement. See [ADR 0011](adr/0011-quality-retention-and-rights-admission.md).
+The first diagnostic separated quality accounting from rights admission, without
+relaxing quality thresholds. Its historical bypass retained unresolved evidence
+as null for **audit only**. That bypass is removed from the current tool under
+the subsequent owner-requested header-classifier policy. Repository/component
+rights and notices remain a separate full-build requirement. See [ADR 0011](adr/0011-quality-retention-and-rights-admission.md).
 No original artifact or frozen tokenizer is overwritten, and no corpus is fetched.
 
-### Quality-only rerun on the same input
+### Historical quality-only rerun on the same input — not current admission
 
 The single rerun retained **204,915 Python files / 934,016,511 bytes**:
 **97.61855% of files / 93.40163% of bytes**. This exceeds the requested 60–85%
