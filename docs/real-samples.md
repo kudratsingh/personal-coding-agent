@@ -87,3 +87,35 @@ explicit `--review-unresolved-licenses` switch retains unresolved license eviden
 as null for **audit only**. Repository/component license evidence and notices
 remain a separate training-admission requirement. See [ADR 0011](adr/0011-quality-retention-and-rights-admission.md).
 No original artifact or frozen tokenizer is overwritten, and no corpus is fetched.
+
+### Quality-only rerun on the same input
+
+The single rerun retained **204,915 Python files / 934,016,511 bytes**:
+**97.61855% of files / 93.40163% of bytes**. This exceeds the requested 60–85%
+expectation; no threshold was changed to force that range. The input is already
+cleaned upstream, and these are the actual outcomes under the stated rules.
+
+| Primary quality rule | Files removed | Bytes removed | Bytes remaining | Cumulative byte retention |
+| --- | ---: | ---: | ---: | ---: |
+| Unknown domain | 0 | 0 | 1,000,000,226 | 100% |
+| Too short (<32 bytes) | 668 | 16,076 | 999,984,150 | 99.99839% |
+| Too large (>1 MiB) | 0 | 0 | 999,984,150 | 99.99839% |
+| Long line (>1,000 characters) | 0 | 0 | 999,984,150 | 99.99839% |
+| Alphanumeric share (<0.1) | 0 | 0 | 999,984,150 | 99.99839% |
+| Generated marker | 1,673 | 27,989,051 | 971,995,099 | 97.19949% |
+| Exact duplicate | 1 | 85 | 971,995,014 | 97.19948% |
+| Contamination (same 13-word/short-field rule) | 2,657 | 37,978,503 | 934,016,511 | 93.40163% |
+
+**194,129 retained files still have unresolved inline license evidence.** They
+are not newly cleared for training. The retained recognized-declaration counts
+remain unchanged at 10,786. A downstream training build must resolve original
+repository/component licensing and attribution, not mistake this quality-only
+output for an admitted corpus. Default admission remains unchanged.
+
+Quality-review Python JSONL SHA-256:
+`d57313145d3a3af62c0d586b2c5a4bb376b20366a2c2c89af36c2525e856c2a3`.
+Web remains **103,863 files / 498,123,158 bytes / 99.61704% byte retention**,
+with the original JSONL hash. The new local reports are under
+`runs/retention-audit-20261020/{baseline,quality-review}/`. They preserve primary
+byte/file accounting and explicit non-admission flags. New corpus download bytes
+and tokenizer fits during this audit: **0**.
