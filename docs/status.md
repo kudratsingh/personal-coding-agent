@@ -1,7 +1,7 @@
 # Public project status
 
-**Updated:** 2026-10-17
-**Real-source sample evidence updated:** 2026-10-19
+**Updated:** 2026-10-20
+**Real-source sample evidence updated:** 2026-10-20
 **Stage:** Local research pipeline; phase acceptance incomplete
 
 Local data/tokenization, model/trainer, generation, isolated code evaluation, and multiple-choice components are implemented and reference-tested. No trained coding capability, hosted service, or released weight is claimed.
@@ -49,6 +49,13 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 
 ## Phase acceptance
 
+**Latest local verification (2026-10-20):** classifier source `cca6fe7` passed
+the full check with the actual stdlib sandbox enabled: **692 passed / 7 explicit
+NumPy-runtime skips**, strict types and lint. The dedicated local containment/
+evaluation command separately passed **13/13** cases. No additional NumPy image,
+reference-benchmark variant, task-32 diagnostic or paid run was launched. The
+earlier verification paragraph retains its original revision/scope.
+
 Condition-by-condition evidence reports: [G0](gates/g0-foundation.md), [G1](gates/g1-data-tokenizer.md), [G2](gates/g2-model-training.md), [G3](gates/g3-evaluation.md). They inventory existing runs/tests only and mark missing conditions. Reference G3 closure does not imply the original production-host condition or the entire phase is accepted.
 
 | Phase | Implemented | Remaining acceptance |
@@ -64,13 +71,13 @@ These are implementation milestones, not closed phase gates. Synthetic fixtures 
 
 ## Next public milestone
 
-Real sample review completed: **2,551,952,653 raw-container bytes** downloaded and hash verified; selected **500,038,096 web / 1,000,000,226 Python text bytes**. Filters retained **103,863 web / 10,786 Python documents**, totaling **498,123,158 / 96,638,864 text bytes**. See [all filter counts, hashes and limitations](real-samples.md). Byte-alphabet token counts are explicit pre-BPE values; production counts follow the separate tokenizer freeze. Final verified pool-holdout contamination coverage remains unavailable, so this is not full-corpus training approval.
+Original intake downloaded **2,551,952,653 raw-container bytes**, selecting **500,038,096 web / 1,000,000,226 Python text bytes**. The 2026-10-20 [header-classifier review](real-samples.md) on those same files retains **103,863 web / 13,833 Python documents**, **498,123,158 / 122,701,374 text bytes**. Python retention is **12.27013% by bytes**, with copyleft/restricted/unrecognized/quality drops separate. **New corpus download bytes: 0.** Final pool-holdout coverage is still unavailable; this is not full-build approval.
 
-The [real tokenizer is frozen](tokenizer-freeze.md): **96,223,042 bytes per domain**, vocabulary **32,768**, merge-table SHA-256 `435729be21650397918abf42c56fd2aee742b12dbc3644e7095ee7c58fc0c1e7`. Held-out English/Python compression is **2.74195 / 3.37015 bytes/token**. All retained samples contain **182,749,140 web / 27,195,275 Python BPE tokens**, excluding BOS. The hash is recorded under Decided; **no retraining without owner approval**. G1's freeze condition is met; the full-build estimate still needs an owner decision.
+The [tokenizer remains frozen](tokenizer-freeze.md): one fit, **96,223,042 bytes per domain**, vocabulary **32,768**, merge SHA `435729be21650397918abf42c56fd2aee742b12dbc3644e7095ee7c58fc0c1e7`. New classified-sample counts are **182,749,140 web / 35,009,073 Python tokens**, no BOS; the original tokenizer-fit selection remains separately identified. Same-text original held-out bytes/token: project **2.74195 English / 3.37015 Python**, GPT-2 **4.66758 / 2.19915**. Only the authorized reference-tokenizer file and pinned sandbox image were fetched. **No retraining without owner approval.**
 
-The requested [four gate reports](gates/g0-foundation.md), [full-build planning record](full-build-plan.md) and [12 Phase 4 work orders](rehearsal-plan.md) are prepared. **Planning stops here; no further implementation, experiment or paid run is authorized by these documents.** HumanEval+ integration remains complete over **163 tasks with task 32 explicitly excluded**; reference G3 is closed. No further reference variants or task-32 investigations are needed. GPU pilot preparation/launch remains untouched and separately approval-gated.
+The [four gate reports](gates/g0-foundation.md) and [12 Phase 4 work orders](rehearsal-plan.md) remain prepared, not blanket phase acceptance. HumanEval+ scoring still uses **163 tasks with task 32 explicitly excluded**; reference G3 stays closed. No further reference variants or task-32 investigations were run. The separately authorized [GPU pilot proposal](gpu-pilot-plan.md) is prepared only; **0 GPU-hours / 0 paid resources**. Provisioning and launch remain unapproved.
 
-The [P1-6 full-build estimate is prepared](full-build-plan.md), **not approved/deferred**. It flags the sample-based Python capacity forecast and unmeasured task-source costs rather than assuming the larger one-pass budgets fit. Full builds and paid runs remain **0**. Phase 4 remains planning only.
+The [revised P1-6 estimate](full-build-plan.md) remains **not approved**. The classifier/recount predicts **2.24058B Python tokens over 64GB**, conditionally—not a measured full-source count. Cached-source timing covers **80 isolated partition calls**, with unmeasured sources/proxies explicit. The small rehearsal remains selected, but full builds and Phase 4 model runs are **0**. The owner must review the estimate and separately authorize any next implementation or charged run.
 
 ## Reporting policy
 
