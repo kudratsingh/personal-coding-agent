@@ -81,7 +81,7 @@ def test_license_filter_contamination_counts_split_and_provenance(tmp_path: Path
     assert "pre-merge" in report["token_count_protocol"]
 
 
-def test_quality_review_does_not_turn_missing_header_into_license_approval(tmp_path: Path) -> None:
+def test_unrecognized_header_is_dropped_and_private_example_recorded(tmp_path: Path) -> None:
     text = "def original_file_without_header(value):\n    return value + 123\n"
     report = process_sample(
         [dict(id="unresolved", content=text)],
@@ -90,16 +90,14 @@ def test_quality_review_does_not_turn_missing_header_into_license_approval(tmp_p
         target=len(text.encode()),
         contamination=ContaminationIndex([]),
         output=tmp_path / "quality",
-        review_unresolved_licenses=True,
     )
-    assert report["kept_documents"] == 1
+    assert report["kept_documents"] == 0
     assert report["license_admitted_documents"] == 0
     assert report["missing_or_unapproved_file_license_bytes"] == len(text.encode())
-    assert report["primary_decisions"]["kept"]["text_bytes"] == len(text.encode())
-    assert report["primary_decisions"]["missing_or_unapproved_file_license"]["files"] == 0
+    assert report["primary_decisions"]["license_unrecognized"]["text_bytes"] == len(text.encode())
     assert report["final_training_admission"] is False
-    row = json.loads((tmp_path / "quality/documents.jsonl").read_text())
-    assert row["provenance"]["license"] is None
+    examples = json.loads((tmp_path / "quality/unrecognized-examples.json").read_text())["examples"]
+    assert examples[0]["first_five_lines"] == text.splitlines()
 
 
 def test_contamination_inputs_include_original_hidden_tests_separately(
