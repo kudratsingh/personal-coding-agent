@@ -210,7 +210,9 @@ def process_sample(
         },
         license_classes={name: dict(value) for name, value in license_classes.items()},
         final_training_admission=False,
-        license_policy="header-classifier-v1; recognized permissive only; no unresolved-license bypass",
+        license_policy=(
+            "header-classifier-v1; recognized permissive only; no unresolved-license bypass"
+        ),
         contamination_ngram_words=contamination.n,
         contamination_short_fields="complete normalized fields shorter than n are also indexed",
         filter_configuration=asdict(FilterConfig()),

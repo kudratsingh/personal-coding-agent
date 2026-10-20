@@ -27,7 +27,8 @@ def test_recognized_permissive_spdx(name: str) -> None:
         ("# Licensed under the Apache License, Version 2.0", "Apache-2.0"),
         ("# Released under the MIT license", "MIT"),
         (
-            "# Permission is hereby granted, free of charge, to deal in the Software without restriction.",
+            "# Permission is hereby granted, free of charge, "
+            "to deal in the Software without restriction.",
             "MIT",
         ),
         (BSD, "BSD-2-Clause"),
@@ -36,15 +37,19 @@ def test_recognized_permissive_spdx(name: str) -> None:
             "BSD-3-Clause",
         ),
         (
-            "# Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted.",
+            "# Permission to use, copy, modify, and/or distribute this software "
+            "for any purpose with or without fee is hereby granted.",
             "ISC",
         ),
         (
-            "# PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2\n# PSF hereby grants Licensee a nonexclusive royalty-free license.",
+            "# PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2\n"
+            "# PSF hereby grants Licensee a nonexclusive royalty-free license.",
             "PSF-2.0",
         ),
         (
-            "# This is free and unencumbered software released into the public domain.\n# Anyone is free to copy, modify, publish, use, compile, sell, or distribute this software for any purpose, commercial or non-commercial.",
+            "# This is free and unencumbered software released into the public domain.\n"
+            "# Anyone is free to copy, modify, publish, use, compile, sell, or distribute "
+            "this software for any purpose, commercial or non-commercial.",
             "Unlicense",
         ),
         ("# To the extent possible, rights are waived under CC0 1.0 Universal.", "CC0-1.0"),

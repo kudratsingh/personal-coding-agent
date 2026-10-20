@@ -49,7 +49,8 @@ def classify_header(text: str) -> HeaderLicense:
         return HeaderLicense("copyleft", None, "explicit copyleft marker")
     if re.search(
         r"non[- ]?commercial|cc-by-nc|proprietary|confidential|"
-        r"not (?:licensed |permitted )?for commercial|commercial use (?:is )?(?:prohibited|not permitted)",
+        r"not (?:licensed |permitted )?for commercial|"
+        r"commercial use (?:is )?(?:prohibited|not permitted)",
         restriction_text,
     ):
         return HeaderLicense("restricted", None, "non-commercial or proprietary restriction")
