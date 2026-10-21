@@ -26,6 +26,8 @@ Tests stop a tiny run halfway, serialize it, resume it, and compare every later 
 
 The optional [bounded CPU checkpoint tool](../cpu-resume-check.md) makes the single-process comparison reproducible at tiny or full-context nano shape on authored token IDs, saving local reports/checkpoint identities. CI tests its tiny preset only. A larger local run is still development evidence, not a substitute for real-corpus, GPU or durable-storage acceptance.
 
+For the separate probe/train/stop/transfer workflow, see the [bounded pilot walkthrough](bounded-pilot.md). It explains how exploratory microbatches are discarded before the fixed-token training run and how CPU evidence differs from measured GPU checks.
+
 Questions: why save loader buffers (avoid skipped/repeated tokens); why save RNG (reproduce stochastic state); why reject changed data (same counters can mean different examples); why reset stage-two moments (new optimization phase); why gather per-rank state (each rank consumed different data).
 
 ## Periodic held-out validation

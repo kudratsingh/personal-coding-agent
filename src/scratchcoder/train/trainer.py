@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -105,7 +106,15 @@ class Trainer:
         if self.rank == 0:
             self.record.save(run_root)
 
-    def train(self, *, stop_after: int | None = None) -> list[float]:
+    def train(
+        self,
+        *,
+        stop_after: int | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        on_step: Callable[["Trainer", dict[str, float]], None] | None = None,
+    ) -> list[float]:
+        if self.world_size != 1 and (should_stop is not None or on_step is not None):
+            raise ValueError("step controls require single-process training")
         target = self.config.train.steps if stop_after is None else stop_after
         if not self.step <= target <= self.config.train.steps:
             raise ValueError("stop_after must be between current and configured steps")
@@ -117,10 +126,24 @@ class Trainer:
                 if self.step == 0:
                     self._log_validation(logger)
                 while self.step < target:
+                    if should_stop is not None and should_stop():
+                        logger.event("training_stopped", step=self.step, partial_update=False)
+                        break
                     started = synchronized_time(self.device)
+                    loader_before = self.loader.state_dict() if should_stop is not None else None
+                    rng_before = torch.get_rng_state() if should_stop is not None else None
+                    cuda_before = (
+                        torch.cuda.get_rng_state_all()
+                        if should_stop is not None and self.device.type == "cuda"
+                        else []
+                    )
                     self.optimizer.zero_grad()
                     loss_value = 0.0
+                    interrupted = False
                     for _ in range(options.accumulation_steps):
+                        if should_stop is not None and should_stop():
+                            interrupted = True
+                            break
                         inputs, targets, _ = self.loader.next_batch()
                         x = torch.tensor(inputs, dtype=torch.long, device=self.device)
                         y = torch.tensor(targets, dtype=torch.long, device=self.device)
@@ -134,6 +157,18 @@ class Trainer:
                             raise FloatingPointError("nonfinite training loss")
                         loss.backward()  # type: ignore[no-untyped-call]  # PyTorch's Tensor stub.
                         loss_value += float(loss.detach())
+                    if interrupted or should_stop is not None and should_stop():
+                        # No optimizer update has occurred. Restore consumed inputs and
+                        # RNG as well as discarding partial gradients, so the checkpoint
+                        # resumes at a whole effective-batch boundary.
+                        assert loader_before is not None and rng_before is not None
+                        self.loader.load_state_dict(loader_before)
+                        torch.set_rng_state(rng_before)
+                        if self.device.type == "cuda":
+                            torch.cuda.set_rng_state_all(cuda_before)
+                        self.optimizer.zero_grad()
+                        logger.event("training_stopped", step=self.step, partial_update=True)
+                        break
                     if self.world_size > 1:
                         for parameter in self.model.parameters():
                             if parameter.grad is not None:
@@ -160,21 +195,21 @@ class Trainer:
                         * options.accumulation_steps
                         * self.world_size
                     )
-                    logger.metrics(
-                        {
-                            "loss": loss_value,
-                            "learning_rate": self.optimizer.lr,
-                            "gradient_norm": norm,
-                            "tokens": tokens,
-                            "step_seconds": elapsed,
-                            "tokens_per_second": tokens / max(elapsed, 1e-9),
-                        },
-                        step=self.step,
-                    )
+                    metrics = {
+                        "loss": loss_value,
+                        "learning_rate": self.optimizer.lr,
+                        "gradient_norm": norm,
+                        "tokens": tokens,
+                        "step_seconds": elapsed,
+                        "tokens_per_second": tokens / max(elapsed, 1e-9),
+                    }
+                    logger.metrics(metrics, step=self.step)
                     if options.validation_interval and (
                         self.step % options.validation_interval == 0 or self.step == options.steps
                     ):
                         self._log_validation(logger)
+                    if on_step is not None:
+                        on_step(self, metrics)
                 if self.step == options.steps:
                     self.record.finish(success=True)
             except Exception as error:

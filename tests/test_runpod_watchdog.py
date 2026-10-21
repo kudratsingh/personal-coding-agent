@@ -1,0 +1,444 @@
+"""Offline tests for the standalone Runpod watchdog control logic."""
+
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from urllib.request import Request
+
+from tools.runpod_watchdog import (
+    API_BASE,
+    Outcome,
+    PodIdentity,
+    Policy,
+    RunpodClient,
+    _NoRedirectHandler,
+    atomic_receipt,
+    check_once,
+    parse_timestamp,
+)
+
+NOW = 1_800_000_000.0
+CREATED_AT = "2027-01-15T08:00:00Z"
+
+
+def pod(**changes: object) -> dict[str, object]:
+    result: dict[str, object] = {
+        "id": "sample-pod-id",
+        "name": "sample-pilot",
+        "gpu": {"id": "NVIDIA A40", "count": 1},
+        "dataCenterId": "US-XX-1",
+        "createdAt": CREATED_AT,
+        "cost": 0.5,
+        "status": "RUNNING",
+    }
+    result.update(changes)
+    return result
+
+
+IDENTITY = PodIdentity.from_dict(
+    {
+        "id": "sample-pod-id",
+        "name": "sample-pilot",
+        "gpuId": "NVIDIA A40",
+        "gpuCount": 1,
+        "dataCenterId": "US-XX-1",
+        "createdAt": CREATED_AT,
+    }
+)
+POLICY = Policy(
+    5400,
+    2.0,
+    600,
+    0.5,
+    delete_verify_attempts=2,
+    delete_verify_delay_seconds=0,
+)
+
+
+class FakeTransport:
+    def __init__(self, responses: list[tuple[int, bytes]]) -> None:
+        self.responses = responses.copy()
+        self.calls: list[tuple[str, str, dict[str, str], float]] = []
+
+    def request(
+        self, method: str, url: str, headers: dict[str, str], timeout: float
+    ) -> tuple[int, bytes]:
+        self.calls.append((method, url, headers, timeout))
+        return self.responses.pop(0)
+
+
+def json_response(status: int, value: object) -> tuple[int, bytes]:
+    return status, json.dumps(value).encode()
+
+
+def heartbeat(
+    path: Path,
+    *,
+    activity: float = NOW - 20,
+    updated: float = NOW - 2,
+    status: str = "running",
+    mac_receipt_verified: bool = False,
+    github_receipt_verified: bool = False,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "updated_at_unix": updated,
+                "last_gpu_activity_unix": activity,
+                "phase": "train",
+                "step": 4,
+                "status": status,
+                "mac_receipt_verified": mac_receipt_verified,
+                "github_receipt_verified": github_receipt_verified,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+class RunpodWatchdogTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.heartbeat_path = Path(self.temp.name) / "heartbeat.json"
+        heartbeat(self.heartbeat_path)
+
+    def client(self, responses: list[tuple[int, bytes]]) -> tuple[RunpodClient, FakeTransport]:
+        transport = FakeTransport(responses)
+        return RunpodClient("secret-placeholder", transport), transport
+
+    def test_wall_deadline_requires_delete_204_and_get_404(self) -> None:
+        client, transport = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(
+            client,
+            IDENTITY,
+            POLICY,
+            self.heartbeat_path,
+            now=lambda: NOW + 5400,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.state, "terminated")
+        self.assertEqual(result.reason, "wall_limit_delete_204_get_404")
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "DELETE", "GET"])
+        self.assertTrue(
+            all(call[1] == API_BASE + "/pods/sample-pod-id" for call in transport.calls)
+        )
+
+    def test_pre_staging_cost_counts_toward_the_stop_cost(self) -> None:
+        client, transport = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        policy = replace(POLICY, max_cost_usd=1.0, starting_cost_usd=0.99)
+        result = check_once(
+            client,
+            IDENTITY,
+            policy,
+            self.heartbeat_path,
+            now=lambda: NOW + 100,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.state, "terminated")
+        self.assertEqual(result.reason, "cost_limit_delete_204_get_404")
+        with self.assertRaises(ValueError):
+            replace(policy, starting_cost_usd=1.0)
+        self.assertTrue(
+            all(call[2]["Authorization"] == "Bearer secret-placeholder" for call in transport.calls)
+        )
+        self.assertTrue(all(call[3] == POLICY.request_timeout_seconds for call in transport.calls))
+
+    def test_identity_mismatch_never_deletes(self) -> None:
+        different = pod(name="different-name")
+        client, transport = self.client([json_response(200, different)])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW + 6000)
+        self.assertEqual(result.state, "identity_mismatch")
+        self.assertEqual(result.reason, "identity_mismatch_no_delete")
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])
+
+    def test_pod_id_rejects_path_traversal_before_transport(self) -> None:
+        client, transport = self.client([])
+        with self.assertRaises(ValueError):
+            client.get_pod("../other-pod", 1)
+        self.assertEqual(transport.calls, [])
+
+    def test_gpu_identity_mismatch_never_deletes(self) -> None:
+        different = pod(gpu={"id": "NVIDIA A100", "count": 1})
+        client, transport = self.client([json_response(200, different)])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW + 6000)
+        self.assertEqual(result.state, "identity_mismatch")
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])
+
+    def test_all_captured_identity_fields_are_required_before_delete(self) -> None:
+        variants = [
+            pod(id="other-pod-id"),
+            pod(gpu={"id": "NVIDIA A40", "count": 2}),
+            pod(dataCenterId="US-YY-1"),
+            pod(createdAt="2027-01-15T08:01:00Z"),
+        ]
+        for different in variants:
+            with self.subTest(pod=different):
+                client, transport = self.client([json_response(200, different)])
+                result = check_once(
+                    client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW + 6000
+                )
+                self.assertEqual(result.state, "identity_mismatch")
+                self.assertEqual([call[0] for call in transport.calls], ["GET"])
+
+    def test_api_authorization_error_is_unknown_and_never_deletes(self) -> None:
+        client, transport = self.client([(403, b'{"error":"denied"}')])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW + 6000)
+        self.assertEqual(result.state, "unknown")
+        self.assertEqual(result.reason, "pod_get_http_403")
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])
+
+    def test_cost_guard_terminates_after_matching_identity(self) -> None:
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(
+            client,
+            IDENTITY,
+            Policy(5400, 0.01, 600, 0.5, delete_verify_attempts=1),
+            self.heartbeat_path,
+            now=lambda: NOW + 600,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.reason, "cost_limit_delete_204_get_404")
+
+    def test_stale_gpu_heartbeat_terminates(self) -> None:
+        heartbeat(self.heartbeat_path, activity=NOW - 600, updated=NOW - 1)
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.reason, "idle_gpu_limit_delete_204_get_404")
+
+    def test_malformed_heartbeat_fails_closed_after_identity_check(self) -> None:
+        self.heartbeat_path.write_text("{broken", encoding="utf-8")
+        client, transport = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.reason, "heartbeat_malformed_delete_204_get_404")
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "DELETE", "GET"])
+
+    def test_missing_first_heartbeat_uses_pod_creation_as_idle_baseline(self) -> None:
+        self.heartbeat_path.unlink()
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(
+            client,
+            IDENTITY,
+            POLICY,
+            self.heartbeat_path,
+            now=lambda: NOW + 2000,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.reason, "idle_gpu_limit_delete_204_get_404")
+
+    def test_stale_worker_heartbeat_fails_closed(self) -> None:
+        heartbeat(self.heartbeat_path, activity=NOW - 901, updated=NOW - 900)
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.reason, "heartbeat_stale_delete_204_get_404")
+
+    def test_terminal_worker_statuses_wait_for_transfer_with_idle_limit(self) -> None:
+        for status in ("awaiting_transfer", "completed", "time_limited"):
+            with self.subTest(status=status):
+                heartbeat(self.heartbeat_path, activity=NOW, updated=NOW + 10, status=status)
+                client, transport = self.client([json_response(200, pod())])
+                result = check_once(
+                    client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW + 10
+                )
+                self.assertEqual(result.state, "watching")
+                self.assertEqual([call[0] for call in transport.calls], ["GET"])
+
+    def test_awaiting_transfer_terminates_after_idle_window(self) -> None:
+        heartbeat(
+            self.heartbeat_path,
+            activity=NOW,
+            updated=NOW + 590,
+            status="awaiting_transfer",
+        )
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW + 600)
+        self.assertEqual(result.reason, "idle_gpu_limit_delete_204_get_404")
+
+    def test_shutdown_ready_holds_until_both_transfer_receipts_are_verified(self) -> None:
+        heartbeat(
+            self.heartbeat_path,
+            activity=NOW - 590,
+            updated=NOW - 1,
+            status="shutdown_ready",
+            mac_receipt_verified=True,
+            github_receipt_verified=False,
+        )
+        client, transport = self.client([json_response(200, pod())])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW + 5)
+        self.assertEqual(result.state, "watching")
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])
+
+    def test_shutdown_ready_deletes_after_both_transfer_receipts_are_verified(self) -> None:
+        heartbeat(
+            self.heartbeat_path,
+            activity=NOW,
+            updated=NOW + 2,
+            status="shutdown_ready",
+            mac_receipt_verified=True,
+            github_receipt_verified=True,
+        )
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW + 3)
+        self.assertEqual(result.reason, "shutdown_ready_verified_receipts_delete_204_get_404")
+
+    def test_unverified_shutdown_ready_still_deletes_after_idle_limit(self) -> None:
+        heartbeat(
+            self.heartbeat_path,
+            activity=NOW - 601,
+            updated=NOW - 1,
+            status="shutdown_ready",
+            mac_receipt_verified=True,
+            github_receipt_verified=False,
+        )
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.reason, "idle_gpu_limit_delete_204_get_404")
+
+    def test_malformed_shutdown_ready_heartbeat_cannot_authorize_receipt_delete(self) -> None:
+        heartbeat(
+            self.heartbeat_path,
+            activity=NOW + 10,
+            updated=NOW + 2,
+            status="shutdown_ready",
+            mac_receipt_verified=True,
+            github_receipt_verified=True,
+        )
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW + 20)
+        self.assertEqual(result.reason, "heartbeat_malformed_delete_204_get_404")
+
+    def test_stopped_and_failed_worker_wait_for_receipt_or_idle_limit(self) -> None:
+        for status in ("stopped", "failed"):
+            with self.subTest(status=status):
+                heartbeat(self.heartbeat_path, activity=NOW, updated=NOW, status=status)
+                client, transport = self.client([json_response(200, pod())])
+                result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+                self.assertEqual(result.state, "watching")
+                self.assertEqual([call[0] for call in transport.calls], ["GET"])
+
+                client, transport = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+                result = check_once(
+                    client,
+                    IDENTITY,
+                    POLICY,
+                    self.heartbeat_path,
+                    now=lambda: NOW + POLICY.max_idle_seconds,
+                    sleep=lambda _: None,
+                )
+                self.assertIn(
+                    result.reason,
+                    {
+                        "idle_gpu_limit_delete_204_get_404",
+                        "heartbeat_stale_delete_204_get_404",
+                    },
+                )
+                self.assertEqual([call[0] for call in transport.calls], ["GET", "DELETE", "GET"])
+
+    def test_failed_worker_waits_for_receipt_or_wall_deadline(self) -> None:
+        near_wall = parse_timestamp(CREATED_AT) + POLICY.max_wall_seconds - 1
+        heartbeat(
+            self.heartbeat_path,
+            activity=near_wall,
+            updated=near_wall,
+            status="failed",
+        )
+        client, transport = self.client([json_response(200, pod())])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: near_wall)
+        self.assertEqual(result.state, "watching")
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])
+
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(
+            client,
+            IDENTITY,
+            POLICY,
+            self.heartbeat_path,
+            now=lambda: parse_timestamp(CREATED_AT) + POLICY.max_wall_seconds,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.reason, "wall_limit_delete_204_get_404")
+
+    def test_quoted_total_hourly_floors_cost_above_api_cost(self) -> None:
+        client, _ = self.client([json_response(200, pod(cost=0.01)), (204, b""), (404, b"")])
+        policy = Policy(5400, 0.02, 600, 2.0, delete_verify_attempts=1)
+        result = check_once(client, IDENTITY, policy, self.heartbeat_path, now=lambda: NOW + 60)
+        self.assertEqual(result.reason, "cost_limit_delete_204_get_404")
+
+    def test_billing_start_before_pod_created_is_used_for_elapsed_guards(self) -> None:
+        created = parse_timestamp(CREATED_AT)
+        policy = Policy(5400, 10.0, 600, 0.5, billing_started_at_unix=created - 1000)
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(
+            client, IDENTITY, policy, self.heartbeat_path, now=lambda: created + 4500
+        )
+        self.assertEqual(result.reason, "wall_limit_delete_204_get_404")
+
+    def test_billing_start_after_pod_creation_fails_closed(self) -> None:
+        created = parse_timestamp(CREATED_AT)
+        policy = Policy(5400, 10.0, 600, 0.5, billing_started_at_unix=created + 1)
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(client, IDENTITY, policy, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.reason, "billing_start_after_pod_creation_delete_204_get_404")
+
+    def test_redirect_handler_refuses_forwarding_authorization(self) -> None:
+        handler = _NoRedirectHandler()
+        request = Request(API_BASE, headers={"Authorization": "Bearer test"})
+        result = handler.redirect_request(
+            request, None, 302, "Found", {}, "https://attacker.example/collect"
+        )
+        self.assertIsNone(result)
+
+    def test_future_gpu_activity_after_heartbeat_update_is_malformed(self) -> None:
+        heartbeat(self.heartbeat_path, activity=NOW + 10, updated=NOW + 2)
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW + 20)
+        self.assertEqual(result.reason, "heartbeat_malformed_delete_204_get_404")
+
+    def test_delete_error_is_unknown_not_success(self) -> None:
+        client, _ = self.client([json_response(200, pod()), (500, b"failure")])
+        result = check_once(
+            client,
+            IDENTITY,
+            POLICY,
+            self.heartbeat_path,
+            now=lambda: NOW + 5400,
+        )
+        self.assertEqual(result.state, "unknown")
+        self.assertEqual(result.reason, "wall_limit_delete_http_500")
+
+    def test_delete_204_without_absence_is_unknown(self) -> None:
+        client, _ = self.client(
+            [
+                json_response(200, pod()),
+                (204, b""),
+                json_response(200, pod()),
+                json_response(200, pod()),
+            ]
+        )
+        result = check_once(
+            client,
+            IDENTITY,
+            POLICY,
+            self.heartbeat_path,
+            now=lambda: NOW + 5400,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.state, "unknown")
+        self.assertEqual(result.reason, "wall_limit_delete_still_present")
+
+    def test_receipt_is_atomic_json_and_contains_no_secret(self) -> None:
+        receipt = Path(self.temp.name) / "receipts" / "watchdog.json"
+        atomic_receipt(receipt, Outcome("watching", "within_limits", IDENTITY.pod_id, NOW))
+        result = json.loads(receipt.read_text(encoding="utf-8"))
+        self.assertEqual(result["state"], "watching")
+        self.assertNotIn("secret-placeholder", receipt.read_text(encoding="utf-8"))
+        self.assertEqual(list(receipt.parent.glob("*.tmp")), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
