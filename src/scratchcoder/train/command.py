@@ -10,7 +10,7 @@ from scratchcoder.common.config import RunConfig
 from scratchcoder.data.loader import MixedLoader
 from scratchcoder.data.shards import TokenShard
 from scratchcoder.tokenizer.bpe import ByteBPE
-from scratchcoder.train.trainer import Trainer
+from scratchcoder.train.trainer import Trainer, training_device
 from scratchcoder.train.validation import shard_windows
 
 
@@ -23,7 +23,9 @@ def train_from_files(
     run_id: str,
     resume: Path | None = None,
     validation_path: Path | None = None,
+    device: str = "cpu",
 ) -> None:
+    resolved_device = training_device(device)
     config = RunConfig.load(config_path)
     tokenizer = ByteBPE.load(tokenizer_path)
     if config.model.vocab_size != tokenizer.vocab_size:
@@ -60,6 +62,7 @@ def train_from_files(
         run_root=output_root,
         data_hash=identity,
         tokenizer_hash=tokenizer.sha256,
+        device=str(resolved_device),
         validation=None
         if validation_path is None
         else {

@@ -20,11 +20,16 @@ The private proposal now binds the replacement **65,536-entry vocabulary** and
 **135,285,504-parameter S shape**, with the [current tokenizer identities](tokenizer-freeze.md).
 Earlier 32,768-entry configuration identities remain historical.
 
+The [file-training command](walkthroughs/training-loop.md) now accepts an explicit
+CPU/CUDA device and synchronizes the chosen CUDA device at step-timing boundaries.
+CPU and mocked-CUDA tests cover selection, timing boundaries and token arithmetic;
+they do not establish hardware precision, resume correctness or measured GPU speed.
+
 Before launch, resolve the conditional approval's prerequisites and check the
-exact quote against the approved run. Missing readiness includes a reviewed GPU entry point, synchronized CUDA timing,
-hardware equivalence/resume checks, an external watchdog, frozen approved shards
-and verified durable artifact transfers. No implementation work to fill those
-gaps is authorized by this proposal alone. No machine, payment, credit purchase,
+exact quote against the approved run. Remaining readiness includes a pinned
+CUDA-enabled environment (the Linux development lock uses CPU PyTorch), hardware
+equivalence/resume checks, periodic checkpointing, an external watchdog, frozen
+approved shards and verified durable artifact transfers. No machine, payment, credit purchase,
 volume or storage account was created. The provider/machine remains proposed,
 not selected for the full build or generated-code execution.
 

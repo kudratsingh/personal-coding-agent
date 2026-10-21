@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -20,6 +21,28 @@ from scratchcoder.data.loader import BatchSource
 from scratchcoder.model.gpt import GPT
 from scratchcoder.optim.adamw import AdamW, clip_gradients, cross_entropy, learning_rate
 from scratchcoder.train.validation import ValidationWindow, validate
+
+
+def training_device(value: str) -> torch.device:
+    """Resolve an explicit CPU/CUDA choice without falling back to another device."""
+    if value == "cpu":
+        return torch.device("cpu")
+    if not isinstance(value, str) or re.fullmatch(r"cuda(?::[0-9]+)?", value) is None:
+        raise ValueError("training device must be cpu, cuda or cuda:<nonnegative index>")
+    if not torch.cuda.is_available():
+        raise ValueError("CUDA requested but unavailable; select cpu explicitly to use CPU")
+    ordinal = value.partition(":")[2]
+    index = int(ordinal) if ordinal else torch.cuda.current_device()
+    if not 0 <= index < torch.cuda.device_count():
+        raise ValueError(f"CUDA device cuda:{index} is not available")
+    return torch.device("cuda", index)
+
+
+def synchronized_time(device: torch.device) -> float:
+    """Read wall time after pending work on the selected CUDA device completes."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return time.perf_counter()
 
 
 class Trainer:
@@ -50,7 +73,7 @@ class Trainer:
                 sort_keys=True,
             ).encode()
         ).hexdigest()
-        self.device = torch.device(device)
+        self.device = training_device(device)
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         torch.manual_seed(config.train.seed)
@@ -77,6 +100,7 @@ class Trainer:
         )
         self.step = 0
         self.record = RunRecord.start(run_id, config, data_hash, tokenizer_hash, parent_run)
+        self.record.hardware["training_device"] = str(self.device)
         self.run_root = run_root
         if self.rank == 0:
             self.record.save(run_root)
@@ -93,7 +117,7 @@ class Trainer:
                 if self.step == 0:
                     self._log_validation(logger)
                 while self.step < target:
-                    started = time.perf_counter()
+                    started = synchronized_time(self.device)
                     self.optimizer.zero_grad()
                     loss_value = 0.0
                     for _ in range(options.accumulation_steps):
@@ -127,19 +151,23 @@ class Trainer:
                         minimum_ratio=options.min_lr_ratio,
                     )
                     self.optimizer.step()
+                    elapsed = synchronized_time(self.device) - started
                     losses.append(loss_value)
                     self.step += 1
-                    elapsed = time.perf_counter() - started
+                    tokens = (
+                        options.batch_size
+                        * options.sequence_length
+                        * options.accumulation_steps
+                        * self.world_size
+                    )
                     logger.metrics(
                         {
                             "loss": loss_value,
                             "learning_rate": self.optimizer.lr,
                             "gradient_norm": norm,
-                            "tokens_per_second": options.batch_size
-                            * options.sequence_length
-                            * options.accumulation_steps
-                            * self.world_size
-                            / max(elapsed, 1e-9),
+                            "tokens": tokens,
+                            "step_seconds": elapsed,
+                            "tokens_per_second": tokens / max(elapsed, 1e-9),
                         },
                         step=self.step,
                     )
