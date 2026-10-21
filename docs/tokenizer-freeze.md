@@ -1,5 +1,98 @@
 # Frozen real-source tokenizer
 
+## Current freeze — 2026-10-20, 65,536 entries
+
+The owner authorized **one replacement fit**, chose **65,536 total entries for
+compression**, and replaced the October 19 freeze. The optional 32,768 fit was
+not performed. Further production retraining requires fresh approval.
+
+| Identity | Current value |
+| --- | --- |
+| Vocabulary / merges / byte-special prefix | **65,536 / 65,264 / 272** |
+| Tokenizer identity | `509ab5b810dee7ae93205721bd921728fe83dac8a857bf087296206f9de655e6` |
+| Merge-table SHA-256 | `b0297f478dd5172a690752ceac8f997fccbd95e36e5787ca56a2c555083c7b7b` |
+| Saved-file SHA-256 | `13e2eb08dc4930f645d5582b23f2b39a58c3735dbc264720b8c78fef1c21c23e` |
+| Serialization / pre-split | Format 2; single leading ASCII space attaches to following nonwhite chunk |
+| Training time / clean source | **1,013.821065875 CPU seconds** / `e680745344526dcba867e6fd62121a33b59314d1` |
+
+The exact original training selection was reused: **96,223,042 UTF-8 bytes
+per domain**, 192,446,084 total; **19,824 web prefixes / 10,741 Python files**.
+Stage-1 web and Python train only; no validation or stage-2 English. Length-framed
+corpus hashes match October 19: web
+`6b31a3ab72d9a626bb7a72b8d281a2de1c16f955a432c7380c61609a09b0a24f`,
+Python `2953ffb9f529d58a1c70a55ffb7871803b0541603b3c98100b98556ee1d10c8b`.
+The newer license-reviewed sample was **not** substituted into the fit.
+
+The old pre-split separated every word space. On the literal sentence
+`the quick brown fox jumps over the lazy dog`:
+
+| Tokenizer | Count | Token strings |
+| --- | ---: | --- |
+| October 19 project | 18 | `["the", " ", "quick", " ", "brown", " ", "fox", " ", "jump", "s", " ", "over", " ", "the", " ", "lazy", " ", "dog"]` |
+| October 20 project | 9 | `["the", " quick", " brown", " fox", " jumps", " over", " the", " lazy", " dog"]` |
+| Pinned GPT-2 | 9 | `["the", "Ġquick", "Ġbrown", "Ġfox", "Ġjumps", "Ġover", "Ġthe", "Ġlazy", "Ġdog"]` |
+
+GPT-2's `Ġ` represents an ASCII leading space. The correction preserves code
+whitespace runs, tabs and newlines; it does not adopt GPT-2's whole regex.
+[ADR 0012](adr/0012-tokenizer-space-protocol-and-vocabulary.md) records the
+decision and reference tests. Format-1 artifacts keep their original split rule,
+serialization and hash, so historical checkpoints are not silently reinterpreted.
+All **16 specials are inside the 65,536 entries**; maximum ID **65,535** fits
+uint16, verified with a shard round-trip including that ID and every special.
+See [model configuration and exact counts](model.md).
+
+The new ignored artifact/records live under
+`runs/tokenizer-freeze-65536-20261020/`. The owner-only decisions file records
+the replacement as **D-24**, superseding D-19 without deleting old evidence.
+Production fits: **2 lifetime (October 19 + this one replacement)**. Model
+pretraining/full corpus builds/paid runs for this packet: **0 / 0 / 0**.
+
+### Same-text held-out compression, current freeze versus GPT-2
+
+Exact original held-outs, whitespace unchanged, per-document encoding, no
+BOS/EOS injection, padding or truncation. Both tokenizers round-trip all
+**569 documents** exactly. Pinned GPT-2 JSON/revision remain those recorded below;
+**new downloads: 0 bytes**. Vocabulary sizes differ: **65,536 / 50,257**.
+
+| Text | Files | UTF-8 bytes | Project tokens | GPT-2 tokens | Project bytes/token | GPT-2 bytes/token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| English | 524 | 2,589,956 | 518,340 | 554,882 | **4.9966354130** | **4.6675797737** |
+| Python | 45 | 415,822 | 95,959 | 189,083 | **4.3333298596** | **2.1991506376** |
+| 50/50 byte mixture | — | Equal domain weights | — | — | **4.6414040782** | **2.9896939068** |
+
+The mixture is `2 / (1 / English_BPT + 1 / Python_BPT)`, not an arithmetic
+mean or the ratio from these unequal holdout sizes. The held-out corpus hashes
+are unchanged. More bytes/token means better compression on this text, not
+model capability; the small ordered-prefix Python holdout is not representative.
+
+On the **original fit-review corpus**, totals are web **100,709,712 tokens /
+498,123,158 bytes**, Python **20,389,757 / 96,638,864**, excluding BOS. Including
+document BOS: **100,813,575 / 20,400,543**. Web stage1 **89,902,727**, stage2
+**10,288,645**; Python train **20,293,798**. Original sample recount times were
+**79.88780s web / 47.20370s Python**, four CPU workers, including I/O/probes.
+These original-corpus counts are distinct from the newer classifier recount
+used in [P1-6](full-build-plan.md).
+
+The completed **current repository-license-review recount** contains
+**26,328,493 Python tokens / 122,701,374 bytes = 4.6604024773 BPT**,
+or **26,342,326 tokens with BOS**. Python train/validation totals are
+**26,219,610 / 108,883**; the newer validation selection is **52 files /
+475,430 bytes = 4.3664300212 BPT**. It is separate from the original 45-file
+comparison holdout. Web totals remain **100,709,712 / 498,123,158 bytes**.
+Four-worker recounts took **76.72603s web / 57.22570s Python**, including
+I/O/probes. No fit or additional download was needed for this recount.
+
+Verification: **64 targeted tests**, full **702 passed / 7 explicit NumPy-runtime
+skips**, two-stage synthetic smoke passed, and original real reference/fast
+probes **512 characters**. The separate 100 MB real identity condition remains
+unmet. No second fit was used to check determinism; repeat-training tests use
+authored fixtures. The replacement comparison is encoding-only after the one fit.
+
+## Historical October 19 freeze — superseded
+
+Everything below describes the preserved former artifact, **not** the current
+tokenizer of record or its current compression.
+
 Frozen on 2026-10-19 by **one** from-scratch `ByteBPE.train` call at source `121fa543aaed4801a5171bf3f7b363c463248be6`. Retraining requires the owner's explicit approval. The source data and production tokenizer artifact remain local and ignored; hashes are public reproducibility identities, not a claim of durable remote backup.
 
 ## Identity

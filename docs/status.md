@@ -1,6 +1,6 @@
 # Public project status
 
-**Updated:** 2026-10-20
+**Updated:** 2026-10-21
 **Real-source sample evidence updated:** 2026-10-20
 **Stage:** Local research pipeline; phase acceptance incomplete
 
@@ -49,10 +49,15 @@ Local data/tokenization, model/trainer, generation, isolated code evaluation, an
 
 ## Phase acceptance
 
-**Latest local verification (2026-10-20):** classifier source `cca6fe7` passed
-the full check with the actual stdlib sandbox enabled: **692 passed / 7 explicit
-NumPy-runtime skips**, strict types and lint. The dedicated local containment/
-evaluation command separately passed **13/13** cases. No additional NumPy image,
+**Latest local verification (2026-10-21):** corrected tokenizer source `e680745`,
+combined with merged classifier PR #77,
+passed **702 tests / 7 explicit NumPy-runtime skips** with the actual stdlib
+sandbox enabled, strict types and lint; the final public documentation check
+passes **60 Markdown files**. The dedicated local containment/
+evaluation command previously passed **13/13** cases on October 20. The October 21
+full suite includes those enabled stdlib containment/integration cases; an initial
+sandboxed attempt failed three Gloo cases because loopback access was unavailable,
+then the complete suite passed with local loopback/Docker access. No additional NumPy image,
 reference-benchmark variant, task-32 diagnostic or paid run was launched. The
 earlier verification paragraph retains its original revision/scope.
 
@@ -71,13 +76,21 @@ These are implementation milestones, not closed phase gates. Synthetic fixtures 
 
 ## Next public milestone
 
-Original intake downloaded **2,551,952,653 raw-container bytes**, selecting **500,038,096 web / 1,000,000,226 Python text bytes**. The 2026-10-20 [header-classifier review](real-samples.md) on those same files retains **103,863 web / 13,833 Python documents**, **498,123,158 / 122,701,374 text bytes**. Python retention is **12.27013% by bytes**, with copyleft/restricted/unrecognized/quality drops separate. **New corpus download bytes: 0.** Final pool-holdout coverage is still unavailable; this is not full-build approval.
+Original intake downloaded **2,551,952,653 raw-container bytes**, selecting **500,038,096 web / 1,000,000,226 Python text bytes**. The current [repository-license review](real-samples.md) on those same files retains **103,863 web / 13,833 Python documents**, **498,123,158 / 122,701,374 text bytes**. Python retention remains **12.27013% by bytes**. **185,680 files / 786,817,959 bytes** lack repository-license metadata; only **8,737 files / 69,830,333 bytes** are unreadable inline headers. Copyleft, restrictions and quality drops are separate. The Parquet has no repository-license field; the fallback cannot admit extra files without a verified mapping. **New corpus download bytes: 0.** Final pool-holdout coverage is still unavailable; this is not full-build approval.
 
-The [tokenizer remains frozen](tokenizer-freeze.md): one fit, **96,223,042 bytes per domain**, vocabulary **32,768**, merge SHA `435729be21650397918abf42c56fd2aee742b12dbc3644e7095ee7c58fc0c1e7`. New classified-sample counts are **182,749,140 web / 35,009,073 Python tokens**, no BOS; the original tokenizer-fit selection remains separately identified. Same-text original held-out bytes/token: project **2.74195 English / 3.37015 Python**, GPT-2 **4.66758 / 2.19915**. Only the authorized reference-tokenizer file and pinned sandbox image were fetched. **No retraining without owner approval.**
+The owner-authorized [replacement tokenizer freeze](tokenizer-freeze.md) is
+**65,536 entries**, single-leading-space format 2, on the identical **96,223,042
+bytes/domain**. Merge SHA `b0297f478dd5172a690752ceac8f997fccbd95e36e5787ca56a2c555083c7b7b`.
+Same-text original held-out BPT: project **4.99664 English / 4.33333 Python**,
+GPT-2 **4.66758 / 2.19915**; equal-byte mix **4.64140 / 2.98969**. Fox sentence
+**18 → 9 tokens**, GPT-2 **9**. One replacement fit, **1,013.82 CPU seconds**;
+the October 19 artifact is preserved with legacy behavior. **No further
+retraining without approval.** All specials fit inside IDs **0–65,535**;
+[model counts](model.md) now include the **135,285,504-parameter S shape**.
 
-The [four gate reports](gates/g0-foundation.md) and [12 Phase 4 work orders](rehearsal-plan.md) remain prepared, not blanket phase acceptance. HumanEval+ scoring still uses **163 tasks with task 32 explicitly excluded**; reference G3 stays closed. No further reference variants or task-32 investigations were run. The separately authorized [GPU pilot proposal](gpu-pilot-plan.md) is prepared only; **0 GPU-hours / 0 paid resources**. Provisioning and launch remain unapproved.
+The [four gate reports](gates/g0-foundation.md) and [12 Phase 4 work orders](rehearsal-plan.md) remain prepared, not blanket phase acceptance. HumanEval+ scoring still uses **163 tasks with task 32 explicitly excluded**; reference G3 stays closed. No further reference variants or task-32 investigations were run. The [GPU pilot](gpu-pilot-plan.md) has conditional owner approval, but launch still awaits the landed tokenizer, owner funding confirmation, durable checkpoint storage and operational readiness. **0 GPU-hours / 0 paid resources**.
 
-The [revised P1-6 estimate](full-build-plan.md) remains **not approved**. The classifier/recount predicts **2.24058B Python tokens over 64GB**, conditionally—not a measured full-source count. Cached-source timing covers **80 isolated partition calls**, with unmeasured sources/proxies explicit. The small rehearsal remains selected, but full builds and Phase 4 model runs are **0**. The owner must review the estimate and separately authorize any next implementation or charged run.
+The [revised P1-6 estimate](full-build-plan.md) remains **not approved**. The replacement-tokenizer recount gives **26,328,493 Python tokens / 122,701,374 bytes**, predicting **1.68502B Python tokens over 64GB**, or **1.67660B after validation reserve**, conditionally—not a measured full-source count. The old 2.24058B forecast used the superseded tokenizer. Cached-source timing covers **80 isolated partition calls**, with unmeasured sources/proxies explicit. The small rehearsal remains selected, but full builds and Phase 4 model runs are **0**. Owner review and the pilot's separate launch prerequisites remain outstanding.
 
 ## Reporting policy
 

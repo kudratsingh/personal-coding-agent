@@ -1,6 +1,15 @@
 # Data card: development fixtures, real samples and evaluation
 
-The [production tokenizer freeze](tokenizer-freeze.md) used equal **96,223,042-byte** non-validation samples per domain, vocabulary **32,768**. Merge-table SHA-256 is `435729be21650397918abf42c56fd2aee742b12dbc3644e7095ee7c58fc0c1e7`; full retained-sample BPE totals are **182,749,140 web / 27,195,275 Python tokens**, excluding BOS. Validation compression is **2.74195 English / 3.37015 Python bytes per token**. No retraining is authorized without owner approval; no full corpus has been admitted or model pretrained on these samples.
+The **2026-10-20 replacement [production tokenizer freeze](tokenizer-freeze.md)**
+used the identical **96,223,042-byte** non-validation selection per domain at
+**65,536 total entries**, including specials. Merge SHA-256 is
+`b0297f478dd5172a690752ceac8f997fccbd95e36e5787ca56a2c555083c7b7b`.
+Original-review corpus totals are **100,709,712 web / 20,389,757 Python tokens**,
+no BOS. Original held-outs measure **4.9966354130 English / 4.3333298596 Python
+bytes/token**, versus GPT-2 **4.6675797737 / 2.1991506376**; 50/50 byte-mixture
+**4.6414040782 / 2.9896939068**. This one owner-authorized replacement supersedes
+the October 19 freeze without overwriting it. Further retraining needs approval;
+no full corpus has been admitted or model pretrained on these samples.
 
 Real-source sample review is complete, but no full production training corpus has been admitted. Ordinary tests use synthetic strings and byte fixtures authored for this repository. These establish software behavior, not corpus quality or model performance. The reference workflow downloads HumanEval for evaluation only; benchmark material never enters training or tokenizer input.
 
@@ -36,6 +45,22 @@ per-file copyright holders. Full local notices/provenance are not redistributed
 here. Copyleft, restrictive and unrecognized headers are separately dropped;
 an "all rights reserved" line does not override a recognized BSD grant. Header
 recognition is not a comprehensive component-rights warranty or full-build approval.
+
+The repository fallback correction separates **185,680 files / 786,817,959
+bytes** with no inline license and no repository metadata from **8,737 files /
+69,830,333 bytes** with unrecognized inline licensing. The actual five-column
+Parquet has no repository-license field. No such files are admitted by inference;
+off-allowlist repository-ID counts are empty because metadata is absent. When
+verified metadata is supplied, retained no-header files record its allowlisted
+ID for attribution. The current sample still retains the same 13,833 files and
+the ID counts above. See the [current class table](real-samples.md).
+
+With the replacement 65,536-entry tokenizer, this review contains
+**26,328,493 Python tokens / 122,701,374 bytes** and **100,709,712 web tokens /
+498,123,158 bytes**, excluding BOS. Its newer Python validation selection is
+**52 files / 475,430 bytes / 108,883 tokens**. The original 45-file holdout
+remains the compression comparison above; see [P1-6](full-build-plan.md) for
+the revised conditional capacity forecast.
 
 ## Evaluation-only source actually used
 
