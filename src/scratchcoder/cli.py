@@ -31,6 +31,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     train.add_argument("--run-id", required=True)
     train.add_argument("--resume", type=Path)
     train.add_argument("--validation", type=Path)
+    train.add_argument("--device", default="cpu", help="cpu (default), cuda or cuda:N")
     evaluation = subparsers.add_parser("eval")
     evaluation.add_argument("--checkpoint", type=Path, required=True)
     evaluation.add_argument("--tokenizer", type=Path, required=True)
@@ -128,5 +129,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_id=args.run_id,
         resume=args.resume,
         validation_path=args.validation,
+        device=args.device,
     )
     return 0
