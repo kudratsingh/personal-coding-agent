@@ -93,7 +93,7 @@ def freeze(
     sample_root: Path,
     output: Path,
     *,
-    vocab_size: int = 32768,
+    vocab_size: int = 65536,
     domain_byte_cap: int = 100_000_000,
     workers: int = 4,
 ) -> dict[str, Any]:
@@ -132,6 +132,8 @@ def freeze(
         dirty=dirty,
         status="training",
         requested_vocab_size=vocab_size,
+        pre_split_version=2,
+        pre_split="single-leading-space-v2; preserve whitespace runs and newlines",
         domain_byte_cap=domain_byte_cap,
         training_bytes={"web": size, "python": size},
         training_total_bytes=size * 2,
@@ -189,8 +191,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--vocab-size", type=int, default=65536)
     args = parser.parse_args()
-    freeze(args.samples, args.output)
+    freeze(args.samples, args.output, vocab_size=args.vocab_size)
     return 0
 
 

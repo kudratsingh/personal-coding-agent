@@ -6,6 +6,16 @@ import pytest
 
 from scratchcoder.data.loader import MixedLoader
 from scratchcoder.data.shards import TokenShard, write_shard
+from scratchcoder.tokenizer.bpe import SPECIAL_TOKENS
+
+
+def test_65536_vocabulary_includes_specials_and_uint16_maximum(tmp_path: Path) -> None:
+    path = tmp_path / "maximum.bin"
+    ids = [*range(256, 256 + len(SPECIAL_TOKENS)), 65535]
+    write_shard(path, [ids], vocab_size=65536, tokenizer_hash="maximum-vocabulary")
+    shard = TokenShard(path, tokenizer_hash="maximum-vocabulary", vocab_size=65536, bos_id=256)
+    assert shard[0] == [256, *ids]
+    assert path.read_bytes()[-2:] == b"\xff\xff"
 
 
 def test_shard_roundtrip_and_integrity(tmp_path: Path) -> None:

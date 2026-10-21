@@ -6,6 +6,46 @@ from pathlib import Path
 import pytest
 
 from scratchcoder.tokenizer.bpe import CHUNKS, FIRST_MERGE, ByteBPE
+from scratchcoder.tokenizer.bulk import FastEncoder
+
+
+def test_single_space_attaches_without_splitting_code_whitespace_runs() -> None:
+    text = "the quick brown\n\n    return value\t+  other\n "
+    assert CHUNKS.findall(text) == [
+        "the",
+        " quick",
+        " brown",
+        "\n\n",
+        "    ",
+        "return",
+        " value",
+        "\t",
+        "+",
+        "  ",
+        "other",
+        "\n",
+        " ",
+    ]
+    assert "".join(CHUNKS.findall(text)) == text
+    trained = ByteBPE.train(["the quick brown fox jumps over the lazy dog"] * 3, 400)
+    assert trained.pre_split_version == 2
+    assert trained.decode(trained.encode(text)) == text
+    assert FastEncoder(trained).encode(text) == trained.encode(text)
+    tokens = trained.byte_tokens()
+    assert any(tokens[token].startswith(b" quick") for token in trained.encode("the quick"))
+
+
+def test_split_protocol_is_hashed_and_legacy_encoding_is_preserved(tmp_path: Path) -> None:
+    legacy = ByteBPE(((32, 97),))
+    current = ByteBPE(legacy.merges, pre_split_version=2)
+    assert legacy.encode(" a") == FastEncoder(legacy).encode(" a") == [32, 97]
+    assert current.encode(" a") == FastEncoder(current).encode(" a") == [FIRST_MERGE]
+    assert legacy.sha256 != current.sha256
+    for tokenizer in (legacy, current):
+        path = tmp_path / f"v{tokenizer.pre_split_version}.json"
+        tokenizer.save(path)
+        loaded = ByteBPE.load(path)
+        assert loaded == tokenizer and loaded.encode(" a") == tokenizer.encode(" a")
 
 
 def slow_reference(corpus: list[str], merges: int) -> tuple[tuple[int, int], ...]:

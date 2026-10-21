@@ -23,7 +23,10 @@ SPECIAL_TOKENS = (
 )
 FIRST_MERGE = 256 + len(SPECIAL_TOKENS)
 MAX_VOCAB_SIZE = 65536
-CHUNKS = re.compile(r"[^\S\n]+|\n+|[^\s]+")
+LEGACY_CHUNKS = re.compile(r"[^\S\n]+|\n+|[^\s]+")
+# Preserve whitespace runs first. Only a single ASCII space can attach to a
+# following nonwhite chunk; indentation, tabs and newlines remain separate.
+CHUNKS = re.compile(r"[^\S\n]{2,}| ?[^\s]+|\n+|[^\S\n]")
 
 
 def merge_pair(tokens: list[int], pair: tuple[int, int], new_id: int) -> list[int]:
@@ -42,8 +45,11 @@ def merge_pair(tokens: list[int], pair: tuple[int, int], new_id: int) -> list[in
 @dataclass(frozen=True)
 class ByteBPE:
     merges: tuple[tuple[int, int], ...] = ()
+    pre_split_version: int = 1
 
     def __post_init__(self) -> None:
+        if type(self.pre_split_version) is not int or self.pre_split_version not in (1, 2):
+            raise ValueError("unsupported tokenizer pre-split version")
         if not isinstance(self.merges, (tuple, list)):
             raise ValueError("invalid merge table structure")
         if FIRST_MERGE + len(self.merges) > MAX_VOCAB_SIZE:
@@ -68,6 +74,10 @@ class ByteBPE:
             known.add(FIRST_MERGE + index)
         # frozen=True protects attributes, not mutable containers supplied by callers.
         object.__setattr__(self, "merges", tuple(owned))
+
+    @property
+    def chunks(self) -> re.Pattern[str]:
+        return LEGACY_CHUNKS if self.pre_split_version == 1 else CHUNKS
 
     @property
     def vocab_size(self) -> int:
@@ -95,7 +105,7 @@ class ByteBPE:
             if allow_special and piece in specials:
                 encoded.append(specials[piece])
                 continue
-            for chunk in CHUNKS.findall(piece):
+            for chunk in self.chunks.findall(piece):
                 ids = list(chunk.encode("utf-8"))
                 for index, pair in enumerate(self.merges):
                     ids = merge_pair(ids, pair, FIRST_MERGE + index)
@@ -119,7 +129,7 @@ class ByteBPE:
 
     def serialized(self) -> str:
         return json.dumps(
-            {"version": 1, "specials": SPECIAL_TOKENS, "merges": self.merges},
+            {"version": self.pre_split_version, "specials": SPECIAL_TOKENS, "merges": self.merges},
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -139,7 +149,7 @@ class ByteBPE:
             not isinstance(raw, dict)
             or set(raw) != {"version", "specials", "merges"}
             or type(raw["version"]) is not int
-            or raw["version"] != 1
+            or raw["version"] not in (1, 2)
             or raw["specials"] != list(SPECIAL_TOKENS)
         ):
             raise ValueError("unsupported tokenizer format")
@@ -150,7 +160,7 @@ class ByteBPE:
             for pair in raw["merges"]
         ):
             raise ValueError("invalid merge table structure")
-        return cls(tuple((pair[0], pair[1]) for pair in raw["merges"]))
+        return cls(tuple((pair[0], pair[1]) for pair in raw["merges"]), raw["version"])
 
     @classmethod
     def train(cls, corpus: Iterable[str], vocab_size: int) -> "ByteBPE":
@@ -193,4 +203,4 @@ class ByteBPE:
             for other in changed:
                 if counts[other] > 0:
                     heapq.heappush(heap, (-counts[other], other))
-        return cls(tuple(merges))
+        return cls(tuple(merges), pre_split_version=2)

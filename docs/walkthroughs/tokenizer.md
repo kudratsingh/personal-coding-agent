@@ -2,13 +2,29 @@
 
 ## A small example
 
-`banana banana` begins as UTF-8 bytes. Chunks separate the two words and the space. Count adjacent pairs within chunks; repeated words contribute their frequency. Merge the most frequent pair into a new token, resolving ties by the numeric pair. Repeat until the vocabulary limit or no remaining pairs.
+`banana banana` begins as UTF-8 bytes. Format 2 chunks are `banana` and
+` banana`: a single leading ASCII space attaches to the next nonwhite chunk.
+Runs of two or more non-newline whitespace characters, tabs and newline runs
+remain separate, preserving code indentation. This adopts GPT-2's single-space
+attachment, not its entire word/punctuation regex. Count adjacent pairs within
+chunks; repeated chunks contribute their frequency. Merge the most frequent
+pair, resolving ties by the numeric pair. Repeat until the vocabulary limit
+or no remaining pairs.
 
 Bytes occupy IDs 0–255. Sixteen special-token IDs follow, with merges beginning at 272. Special spellings in ordinary input remain ordinary bytes unless explicitly enabled, so untrusted text cannot insert conversation delimiters implicitly.
 
 ## Data flow
 
-Text becomes a list of byte lists, one per whitespace/non-whitespace chunk. A merge shortens a chunk by replacing non-overlapping matching adjacent pairs. Encoding applies merges in their learned order; decoding concatenates the bytes represented by each ID. Every UTF-8 input therefore round-trips, including code indentation and Unicode.
+Text becomes a list of byte lists, one per pre-split chunk. A merge shortens a chunk by replacing non-overlapping matching adjacent pairs. Encoding applies merges in their learned order; decoding concatenates the bytes represented by each ID. Every UTF-8 input therefore round-trips, including code indentation and Unicode.
+
+The serialized format version binds the split rule to the tokenizer hash.
+Existing format-1 artifacts keep their whitespace-separating rule, bytes and
+hashes; new training emits format 2. Both slow and cached encoders select the
+rule from the loaded artifact. Applying the new regex to an old merge table
+would silently change its protocol and is deliberately avoided. Regression
+tests cover a merge across a single leading space, intact indentation/newlines,
+both encoders and both save/load formats. The existing independent trainer
+reference now checks the corrected chunks.
 
 Training deduplicates chunks with weights. Pair counts and chunk-location sets update only where a selected merge appears. A heap selects the next candidate; stale heap entries are ignored. This avoids recounting every chunk for every merge.
 
@@ -18,7 +34,18 @@ Training deduplicates chunks with weights. Pair counts and chunk-location sets u
 
 The production freeze is a separate, single authorized run on reviewed real samples; its evidence is recorded only after measurement. Fixture tests and synthetic throughput cannot establish held-out real-source compression.
 
-`tools/freeze_tokenizer.py` selects equal UTF-8 byte prefixes from stage-1 web and Python training documents, never validation. It preserves earlier document boundaries and shortens only a final prefix to a common valid UTF-8 byte boundary. The smaller available source limits both domains; the declared cap is 100 MB per domain. Training uses the existing from-scratch BPE trainer with 32,768 vocabulary entries. It journals the selection/source hashes before the one training call, then saves the frozen tokenizer identity, file SHA and merge-only SHA before any encoding measurement. An existing output directory blocks retraining. The encoded token count excludes BOS, with a separate count including one BOS per document. Held-out bytes per token use the hash-split validation text only; all retained samples are recounted with four ordered CPU encoding workers. Small real validation probes also check reference/fast IDs and round-trip equality, not a 100 MB reference-equivalence claim. `tests/test_freeze_tokenizer.py` exercises these policies on authored text, including UTF-8 balance, held-out exclusion, a single training call, identity records and refusal to retrain the same output.
+`tools/freeze_tokenizer.py` selects equal UTF-8 byte prefixes from stage-1 web
+and Python training documents, never validation. It preserves earlier document
+boundaries and shortens only a final prefix to a common valid UTF-8 boundary.
+The smaller source limits both domains; the default cap is 100 MB per domain.
+The owner-authorized replacement selects the identical original **96,223,042
+bytes/domain** at **65,536 total vocabulary entries**. It journals corpus/source
+hashes and pre-split version before one training call, then saves the artifact,
+full identity and merge-only hash before measurements. An existing output
+directory blocks a repeat fit; a new directory alone is not authorization.
+Counts exclude BOS, with a separate BOS-inclusive total. Held-out compression
+uses validation only; small real reference/fast probes are not a 100 MB identity
+claim. `tests/test_freeze_tokenizer.py` checks these policies on authored text.
 
 The tokenizer owns an immutable tuple of merge pairs, even when a runtime caller supplies lists. A frozen dataclass alone would not protect caller-owned lists: editing one could change the tokenizer hash after a fast encoder had already cached the old ranks. Construction copies both levels, rejects malformed/duplicate/forward-reference pairs and enforces the same 65,536-token ceiling as training and uint16 shards. `tests/test_tokenizer_integrity.py` checks caller-mutation isolation, reference/fast identity, format-1 hash compatibility and the exact vocabulary boundary. Serialization and valid existing tokenizer hashes are unchanged. These structural checks are not a memory sandbox for arbitrary tokenizer files or expanded token bytes.
 
@@ -32,7 +59,11 @@ The serial iterator consumes one document at a time. Parallel encoding feeds win
 
 ## Questions
 
-The completed [real-source freeze](../tokenizer-freeze.md) records one 192,446,084-byte balanced training run, vocabulary 32,768, held-out English/Python compression 2.74195/3.37015 bytes per token, and the immutable identities. It is not a benchmark-trained vocabulary or a full-data/model-training run. Production retraining now requires explicit owner approval.
+The [real-source freeze evidence](../tokenizer-freeze.md) distinguishes the
+superseded October 19 fit from the one owner-authorized October 20 replacement.
+Both use the same 192,446,084-byte balanced training selection and held-outs.
+The replacement uses 65,536 entries; neither fit is model pretraining or a
+full-data build. Further production retraining requires explicit owner approval.
 
 - Why bytes? Every valid UTF-8 string is representable without unknown tokens.
 - Why weighted chunks? Repeated words contribute fully without storing repeated sequences.

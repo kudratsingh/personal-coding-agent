@@ -15,3 +15,4 @@ Owner budgets, detailed work orders, private experiments, and account details be
 - [ADR 0009: resume provenance and record versions](0009-resume-provenance.md)
 - [ADR 0010: disclosed HumanEval+ task-32 exclusion](0010-humaneval-plus-task32-exclusion.md)
 - [ADR 0011: quality retention versus rights admission](0011-quality-retention-and-rights-admission.md)
+- [ADR 0012: leading-space protocol and 65,536-entry vocabulary](0012-tokenizer-space-protocol-and-vocabulary.md)

@@ -1,5 +1,24 @@
 # G1 — data and tokenizer evidence
 
+## Current amendment — 2026-10-20
+
+This block supersedes freeze/compression values in the historical inventory
+below. The owner authorized exactly one replacement fit, not a full build.
+
+| Condition | Current proof / measured value | Verdict |
+| --- | --- | --- |
+| Frozen tokenizer and dated decision | [Replacement freeze](../tokenizer-freeze.md), D-24: **65,536 entries / 65,264 merges**, merge SHA `b0297f478dd5172a690752ceac8f997fccbd95e36e5787ca56a2c555083c7b7b` | Met; replaces October 19 D-19 |
+| Same balanced fit selection, held-out compression | **96,223,042 bytes/domain**, original corpus hashes unchanged; English **518,340 tokens / 2,589,956 bytes = 4.9966354130 BPT**; Python **95,959 / 415,822 = 4.3333298596**; 50/50 bytes **4.6414040782** | Met at measured scope; optional 32,768 fit **0** |
+| Reference, compatibility and shard boundary | **64 targeted tests**, full **702 passed / 7 explicit NumPy skips**; maximum ID **65,535**, all **16 specials** included; legacy identities preserved | Met at CPU/fixture scope |
+| Original versus current license-review selections | Original fit-review **10,786 Python files / 96,638,864 bytes**; current review **13,833 / 122,701,374**; **185,680 / 786,817,959 bytes** lack repository metadata, separate from **8,737 unreadable headers** | No admission inferred for missing metadata; data-card credits retained |
+| 100 MB real slow/fast identity and loader/GPU throughput | Actual real probe **512 characters**; GPU runs **0** | Still not met |
+| Current review recount and capacity | **26,328,493 Python tokens / 122,701,374 bytes**, **4.6604024773 BPT**; conditional 64GB forecast **1.68502B tokens**, **1.67660B after validation reserve** | Encoding-only replacement-tokenizer recount; supersedes the old-tokenizer forecast below |
+| Full-build decision | [P1-6](../full-build-plan.md), owner approvals/deferrals **0** | Still not met; overall G1 remains open |
+
+The following inventory preserves the original measurement scopes and historical
+October 19 freeze. It is not permission to use that superseded tokenizer for
+the new pilot or to reinterpret its old checkpoint identities.
+
 Report date: 2026-10-19; retention/estimate evidence revised 2026-10-20. **Tokenizer-freeze condition met; overall roadmap gate awaits owner approval/deferral of the revised full-build estimate.** This page inventories the cited measurements; it does not itself launch a run or authorize a build.
 
 | Roadmap condition | Existing command / record | Value and verdict |
