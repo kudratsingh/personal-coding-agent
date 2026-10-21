@@ -12,6 +12,7 @@ Start with the [project README](../README.md), [current status](status.md), and 
 | [Compute](compute.md) | Estimate two-stage compute from supplied assumptions. |
 | [GPU pilot preparation](gpu-pilot-plan.md) | Understand the proposal's approval boundary and missing execution readiness; no provision/launch authorization. |
 | [CPU checkpoint reference](cpu-resume-check.md) | Compare bounded authored-fixture training and exact resume without paid compute. |
+| [Bounded pilot walkthrough](walkthroughs/bounded-pilot.md) | Prepare hash-bound data, understand probe/training behavior, monitor deadlines, and verify transferred artifacts. |
 | [Data policy](data.md) | Record provenance, licensing, splits, and contamination controls. |
 | [Real samples](real-samples.md) | Inspect actual sizes, hashes, per-filter counts and exclusion coverage. |
 | [Frozen tokenizer](tokenizer-freeze.md) | Identify the immutable table and held-out compression measurements. |
