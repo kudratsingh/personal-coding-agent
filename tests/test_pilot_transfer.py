@@ -253,3 +253,17 @@ def test_existing_bundle_is_never_overwritten(tmp_path: Path) -> None:
             run_ssh=lambda *_args, **_kwargs: pytest.fail("SSH must not run"),
         )
     assert (bundle / "marker").read_text() == "keep"
+
+
+def test_ssh_command_has_keepalives_and_rejects_the_runpod_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tools.pilot_transfer import _ssh_command, _validate_host, child_environment
+
+    identity, known_hosts = credentials(tmp_path)
+    command = _ssh_command("root@203.0.113.8", 22, identity, known_hosts)
+    assert "ConnectTimeout=10" in command and "ServerAliveInterval=15" in command
+    with pytest.raises(ValueError, match="proxy"):
+        _validate_host("abc123-6441@ssh.runpod.io")
+    monkeypatch.setenv("RUNPOD_API_KEY", "placeholder")
+    assert "RUNPOD_API_KEY" not in child_environment()

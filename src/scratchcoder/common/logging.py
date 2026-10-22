@@ -13,7 +13,7 @@ from typing import Protocol
 from scratchcoder.common.records import utc_now
 
 _SENSITIVE = re.compile(r"password|secret|api.?key|access.?token|authorization|credential", re.I)
-_TOKENS = re.compile(r"(?:hf_|gh[pousr]_|sk-)[A-Za-z0-9_-]{8,}|Bearer\s+\S+", re.I)
+_TOKENS = re.compile(r"(?:hf_|gh[pousr]_|sk-|rpa_)[A-Za-z0-9_-]{8,}|Bearer\s+\S+", re.I)
 
 
 def sanitize(value: object) -> object:

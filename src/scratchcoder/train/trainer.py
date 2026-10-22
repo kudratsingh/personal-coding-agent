@@ -20,8 +20,18 @@ from scratchcoder.common.logging import EventLogger, debug_logger
 from scratchcoder.common.records import RunRecord, validate_resume_details
 from scratchcoder.data.loader import BatchSource
 from scratchcoder.model.gpt import GPT
-from scratchcoder.optim.adamw import AdamW, clip_gradients, cross_entropy, learning_rate
+from scratchcoder.optim.adamw import (
+    AdamW,
+    clip_gradients,
+    cross_entropy,
+    cross_entropy_and_z,
+    learning_rate,
+)
 from scratchcoder.train.validation import ValidationWindow, validate
+
+
+class TrainingStop(RuntimeError):
+    """A deliberate, recorded stop raised from a step callback; not a training failure."""
 
 
 def training_device(value: str) -> torch.device:
@@ -79,6 +89,12 @@ class Trainer:
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         torch.manual_seed(config.train.seed)
         self.model = GPT(config.model).to(self.device)
+        self.model.set_fused_attention(config.train.attention == "fused")
+        # The compiled wrapper shares parameters with the eager module; checkpoints,
+        # validation and generation keep using the eager module.
+        self.forward: Callable[[Tensor], Tensor] = (
+            torch.compile(self.model, dynamic=True) if config.train.compile else self.model
+        )
         parent_run: str | None = None
         if config.parent_checkpoint:
             parent = torch.load(config.parent_checkpoint, map_location="cpu", weights_only=True)
@@ -98,6 +114,7 @@ class Trainer:
             decay_mask=[
                 parameter.ndim >= 2 and name != "embedding.weight" for name, parameter in named
             ],
+            foreach=config.train.optimizer_foreach,
         )
         self.step = 0
         self.record = RunRecord.start(run_id, config, data_hash, tokenizer_hash, parent_run)
@@ -139,6 +156,7 @@ class Trainer:
                     )
                     self.optimizer.zero_grad()
                     loss_value = 0.0
+                    z_value = 0.0
                     interrupted = False
                     for _ in range(options.accumulation_steps):
                         if should_stop is not None and should_stop():
@@ -152,11 +170,23 @@ class Trainer:
                             dtype=torch.bfloat16,
                             enabled=options.precision == "bfloat16",
                         ):
-                            loss = cross_entropy(self.model(x), y) / options.accumulation_steps
+                            logits = self.forward(x)
+                            if options.z_loss > 0:
+                                nll, z_term = cross_entropy_and_z(logits, y)
+                                objective = nll + options.z_loss * z_term
+                            else:
+                                nll = cross_entropy(logits, y)
+                                objective = nll
+                                z_term = None
+                            loss = objective / options.accumulation_steps
                         if not bool(torch.isfinite(loss)):
                             raise FloatingPointError("nonfinite training loss")
                         loss.backward()  # type: ignore[no-untyped-call]  # PyTorch's Tensor stub.
-                        loss_value += float(loss.detach())
+                        # The logged loss is the next-token loss, comparable with validation;
+                        # the z term is reported separately.
+                        loss_value += float(nll.detach()) / options.accumulation_steps
+                        if z_term is not None:
+                            z_value += float(z_term.detach()) / options.accumulation_steps
                     if interrupted or should_stop is not None and should_stop():
                         # No optimizer update has occurred. Restore consumed inputs and
                         # RNG as well as discarding partial gradients, so the checkpoint
@@ -184,6 +214,8 @@ class Trainer:
                         warmup_steps=options.warmup_steps,
                         peak=options.learning_rate,
                         minimum_ratio=options.min_lr_ratio,
+                        schedule=options.schedule,
+                        decay_fraction=options.decay_fraction,
                     )
                     self.optimizer.step()
                     elapsed = synchronized_time(self.device) - started
@@ -203,6 +235,8 @@ class Trainer:
                         "step_seconds": elapsed,
                         "tokens_per_second": tokens / max(elapsed, 1e-9),
                     }
+                    if options.z_loss > 0:
+                        metrics["z_loss"] = z_value
                     logger.metrics(metrics, step=self.step)
                     if options.validation_interval and (
                         self.step % options.validation_interval == 0 or self.step == options.steps
@@ -212,6 +246,11 @@ class Trainer:
                         on_step(self, metrics)
                 if self.step == options.steps:
                     self.record.finish(success=True)
+            except TrainingStop as stop:
+                logger.event(
+                    "training_stopped", step=self.step, partial_update=False, reason=str(stop)
+                )
+                raise
             except Exception as error:
                 logger.event("training_failed", error_type=type(error).__name__, step=self.step)
                 diagnostic = debug_logger(log_path.with_name(f"debug-rank{self.rank}.jsonl"))
@@ -277,14 +316,29 @@ class Trainer:
                     temporary.unlink(missing_ok=True)
                     raise
             temporary.replace(path)
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)  # Make the rename itself durable, not only the bytes.
+            finally:
+                os.close(directory)
         if self.world_size > 1:
             dist.barrier()
 
-    def resume(self, path: Path) -> None:
+    def finish(self, *, success: bool = True) -> None:
+        """Close the run record for a run that ended deliberately before its final step."""
+        if self.record.status == "running":
+            self.record.finish(success=success)
+            if self.rank == 0:
+                self.record.save(self.run_root)
+
+    def resume(self, path: Path, *, expected_sha256: str | None = None) -> None:
+        """Restore exact training state; ``expected_sha256`` rejects altered bytes first."""
         checkpoint_hash: str | None = None
         try:
             with path.open("rb") as stream:
                 checkpoint_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+                if expected_sha256 is not None and checkpoint_hash != expected_sha256:
+                    raise ValueError("checkpoint bytes differ from the expected identity")
                 stream.seek(0)
                 state = torch.load(stream, map_location="cpu", weights_only=True)
             self._restore_checkpoint(state, checkpoint_hash)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
@@ -22,6 +23,7 @@ from typing import Any
 import torch
 
 from scratchcoder.common.config import ModelConfig, RunConfig, TrainConfig, finite_number
+from scratchcoder.common.logging import sanitize
 from scratchcoder.common.records import atomic_json, git_state, utc_now
 from scratchcoder.data.loader import Documents, MixedLoader
 from scratchcoder.data.shards import TokenShard, file_sha256
@@ -34,12 +36,31 @@ from scratchcoder.train.pilot import (
     cost_per_billion,
     throughput,
 )
-from scratchcoder.train.trainer import Trainer, synchronized_time, training_device
+from scratchcoder.train.trainer import (
+    Trainer,
+    TrainingStop,
+    synchronized_time,
+    training_device,
+)
 from scratchcoder.train.validation import ValidationWindow, shard_windows, validate
 from tools.cpu_resume_check import assert_identical
 from tools.pilot_data import verify_binding
 from tools.pilot_preflight import hardware_description
-from tools.runpod_watchdog import PodIdentity, Policy, parse_timestamp
+from tools.runpod_watchdog import CLOCK_SKEW_SECONDS, PodIdentity, Policy, parse_timestamp
+
+_CUDA_MEMORY_MARKERS = (
+    "out of memory",
+    "CUBLAS_STATUS_ALLOC_FAILED",
+    "CUBLAS_STATUS_NOT_INITIALIZED",
+)
+
+
+def _is_cuda_memory_error(error: BaseException) -> bool:
+    """Recognize allocation failures that CUDA libraries raise as plain RuntimeError."""
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(error)
+    return any(marker in message for marker in _CUDA_MEMORY_MARKERS)
 
 
 def cpu_tree(value: Any) -> Any:
@@ -69,8 +90,16 @@ class Specification:
     checkpoint_seconds: float
     expected_tokens_per_second: float | None
     quoted_gpu_hourly: float
+    probe_accumulation_steps: int = 2
+    memory_headroom_fraction: float = 0.9
 
     def __post_init__(self) -> None:
+        if type(self.probe_accumulation_steps) is not int or self.probe_accumulation_steps < 2:
+            # One accumulated microbatch keeps the fp32 gradients resident during the
+            # next forward pass, so the probe peak bounds the accumulated training peak.
+            raise ValueError("probe_accumulation_steps must be an integer of at least 2")
+        if not 0 < finite_number(self.memory_headroom_fraction, "memory headroom") <= 1:
+            raise ValueError("memory_headroom_fraction must be in (0, 1]")
         if (
             not self.microbatches
             or len(set(self.microbatches)) != len(self.microbatches)
@@ -120,20 +149,38 @@ class Specification:
         return cls(**raw)
 
 
+TERMINATION_GUARANTEES = ("provider_enforced", "redundant_best_effort")
+
+
 def check_readiness(receipt: dict[str, Any], *, now: float, spec: Specification) -> float:
-    """Reject unresolved launch gates before model allocation or output creation."""
+    """Reject unresolved launch gates before model allocation or output creation.
+
+    The receipt must state honestly how termination is enforced. Runpod offers
+    no provider-enforced Pod lifetime, so a ``redundant_best_effort`` guarantee
+    (in-pod self-destruct timer plus the Mac-side API watchdog plus the worker
+    deadline) additionally requires the owner's explicit acceptance of that
+    residual risk; it is never upgraded to a hard guarantee by this check.
+    """
     required = (
         "owner_confirms_four_runpod_steps",
         "cloud_data_pre_staged",
         "ssh_transfer_tested",
         "external_watchdog_armed",
-        "provider_hard_deadline_confirmed",
+        "pod_self_destruct_armed",
         "hardware_preflight_passed",
         "full_console_quote_confirmed",
         "staging_storage_cost_bound",
     )
     if any(receipt.get(name) is not True for name in required):
         raise ValueError("launch readiness gates are unresolved")
+    guarantee = receipt.get("termination_guarantee")
+    if guarantee not in TERMINATION_GUARANTEES:
+        raise ValueError("termination_guarantee must be provider_enforced or redundant_best_effort")
+    if (
+        guarantee == "redundant_best_effort"
+        and receipt.get("owner_accepts_best_effort_termination") is not True
+    ):
+        raise ValueError("best-effort termination requires explicit owner acceptance")
     if spec.limits.pod_seconds > 5400 or spec.limits.idle_seconds > 600:
         raise ValueError("specification exceeds the pilot wall or idle ceiling")
     identity = PodIdentity.from_dict(receipt.get("pod_identity"))
@@ -147,25 +194,29 @@ def check_readiness(receipt: dict[str, Any], *, now: float, spec: Specification)
     ):
         raise ValueError("watchdog policy is weaker than the bound specification")
     if (
-        not isinstance(receipt.get("provider_deadline_evidence"), str)
-        or not receipt["provider_deadline_evidence"].strip()
+        not isinstance(receipt.get("termination_evidence"), str)
+        or not receipt["termination_evidence"].strip()
     ):
-        raise ValueError("provider deadline evidence is required")
+        raise ValueError("termination evidence is required")
     created = finite_number(receipt.get("pod_created_at_unix"), "pod creation timestamp")
     if created != parse_timestamp(identity.created_at):
         raise ValueError("pod timestamp differs from captured provider identity")
     origin = policy.billing_started_at_unix
-    if origin is None or not 0 < origin <= created:
+    if origin is None or not 0 < origin <= created + CLOCK_SKEW_SECONDS:
         raise ValueError("conservative create-request billing origin is required")
-    termination = finite_number(receipt.get("provider_termination_at_unix"), "provider deadline")
+    origin = min(origin, created)  # A fast Mac clock never shortens the accounted lifetime.
+    termination = finite_number(
+        receipt.get("self_destruct_deadline_unix"), "self-destruct deadline"
+    )
     if not now < termination <= origin + spec.limits.pod_seconds:
-        raise ValueError("provider deadline is outside the approved pod lifetime")
+        raise ValueError("self-destruct deadline is outside the approved pod lifetime")
     if created <= 0 or created > now:
         raise ValueError("pod creation timestamp is invalid")
     if spec.limits.stop_reason(pod_elapsed=now - origin):
         raise ValueError("pod already exceeds an operating limit")
-    if now - origin >= spec.limits.probe_seconds:
-        raise ValueError("initial batch-probe window already expired")
+    remaining = origin + spec.limits.pod_seconds - now
+    if remaining <= spec.limits.probe_seconds + spec.limits.finalization_reserve_seconds:
+        raise ValueError("pod lifetime left is too short for probes and finalization")
     return origin
 
 
@@ -189,14 +240,26 @@ class Worker:
         self.device = training_device(device)
         if not windows:
             raise ValueError("fixed held-out windows are required")
+        self.validation_identity = {
+            "windows": len(windows),
+            "target_tokens": sum(len(window.tokens) - 1 for window in windows),
+            "target_bytes": sum(window.target_bytes for window in windows),
+            "sha256": hashlib.sha256(
+                json.dumps([asdict(window) for window in windows], sort_keys=True).encode()
+            ).hexdigest(),
+        }
         if root.exists():
             raise FileExistsError("pilot output must be a new directory")
         self.clock, self.pod_created = clock, pod_created
+        self.probe_started: float | None = None
         self.training_started: float | None = None
+        self.training_deadline: float | None = None
+        self.tokens_processed = 0
         self.last_activity = clock()
         self.stop_reason: str | None = None
         self.speed_reference = spec.expected_tokens_per_second
         self.phase = "initializing"
+        self.save_label = "initializing"  # Checkpoint directory; differs from phase in Phase C.
         self.rows: dict[str, list[dict[str, float]]] = {}
         self.checkpoints: list[dict[str, Any]] = []
         self.last_saved: dict[str, float] = {}
@@ -215,9 +278,17 @@ class Worker:
             "data_kind": data_kind,
             "binding_sha256": data_hash,
             "tokenizer_identity": tokenizer_hash,
+            "validation_identity": self.validation_identity,
             "probes": [],
+            "probe_window_expired": False,
             "arms": [],
+            "training_tokens_processed": 0,
             "checkpoints": self.checkpoints,
+            "deadline_semantics": (
+                "probe window counts from the first probe; the training deadline is the "
+                "earlier of the training budget and the pod wall minus the finalization "
+                "reserve; wall, cost and idle limits are never extended"
+            ),
             "shutdown_receipt": None,
             "durable_copy_receipt": None,
             "actual_provider_cost": None,
@@ -243,6 +314,7 @@ class Worker:
                 "last_gpu_activity_unix": self.last_activity,
                 "phase": self.phase,
                 "step": step,
+                "training_tokens_processed": self.tokens_processed,
                 "status": "awaiting_transfer"
                 if self.report["status"] in {"completed", "time_limited"}
                 else self.report["status"],
@@ -259,13 +331,21 @@ class Worker:
             self.stop_reason = reason
         elif (
             self.phase.startswith("probe")
-            and now - self.pod_created >= self.spec.limits.probe_seconds
+            and self.probe_started is not None
+            and now - self.probe_started >= self.spec.limits.probe_seconds
         ):
             self.stop_reason = "probe_time_limit"
-        elif self.training_started is not None and (
-            now - self.training_started >= self.spec.limits.training_seconds
+        elif (
+            self.training_started is not None
+            and self.training_deadline is not None
+            and (now >= self.training_deadline)
         ):
-            self.stop_reason = "training_time_limit"
+            self.stop_reason = (
+                "training_time_limit"
+                if self.training_deadline
+                == self.training_started + self.spec.limits.training_seconds
+                else "finalization_reserve"
+            )
         return self.stop_reason is not None
 
     def require_time(self) -> None:
@@ -273,13 +353,12 @@ class Worker:
             raise PilotStop(str(self.stop_reason))
 
     def trainer(self, name: str, size: int, rate: float, *, probe: bool = False) -> Trainer:
-        self.require_time()
         config = replace(
             self.spec.config,
             train=replace(
                 self.spec.config.train,
                 batch_size=size,
-                accumulation_steps=1
+                accumulation_steps=self.spec.probe_accumulation_steps
                 if probe
                 else accumulation_steps(
                     size, self.spec.config.train.sequence_length, self.spec.tokens_per_update
@@ -307,6 +386,13 @@ class Worker:
             device=str(self.device),
         )
 
+    def peak_budget_bytes(self) -> float | None:
+        """Largest reserved probe peak accepted for training; None on CPU."""
+        if self.device.type != "cuda":
+            return None
+        total = int(torch.cuda.get_device_properties(self.device).total_memory)
+        return total * self.spec.memory_headroom_fraction
+
     def reset_peak(self) -> None:
         if self.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(self.device)
@@ -326,12 +412,17 @@ class Worker:
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
-    def save(self, trainer: Trainer, name: str) -> Path:
+    def save(self, trainer: Trainer, name: str, *, export: bool = True) -> Path:
         self.require_time()
         path = self.root / name / "last.pt"
         started = synchronized_time(self.device)
         trainer.checkpoint(path)
         seconds = synchronized_time(self.device) - started
+        digest = file_sha256(path)
+        atomic_json(
+            path.with_name(path.name + ".sha256.json"),
+            {"sha256": digest, "size_bytes": path.stat().st_size, "step": trainer.step},
+        )
         self.checkpoints.append(
             {
                 "arm": name,
@@ -339,12 +430,16 @@ class Worker:
                 "path": str(path.relative_to(self.root)),
                 "save_seconds": seconds,
                 "size_bytes": path.stat().st_size,
-                "sha256": file_sha256(path),
+                "sha256": digest,
+                "training_tokens_processed": self.tokens_processed,
             }
         )
         self.last_saved[name] = self.clock()
+        if hasattr(trainer.loader, "positions"):
+            self.checkpoints[-1]["documents_consumed"] = dict(trainer.loader.positions)
         self.publish()
-        self.export(path, name, trainer.step)
+        if export:
+            self.export(path, name, trainer.step)
         return path
 
     def export(self, checkpoint: Path, name: str, step: int) -> None:
@@ -353,15 +448,31 @@ class Worker:
         directory = self.root / "exports" / f"{name}-step{step}-{self.export_count}"
         staging = directory.with_name("." + directory.name)
         staging.mkdir(parents=True, exist_ok=False)
-        os.link(checkpoint, staging / "checkpoint.pt")
+        try:
+            os.link(checkpoint, staging / "checkpoint.pt")
+        except OSError:
+            # Filesystems without hard links (some network mounts) get a byte copy.
+            shutil.copyfile(checkpoint, staging / "checkpoint.pt")
+            self.report["export_copy_mode"] = "copy"
+        else:
+            self.report.setdefault("export_copy_mode", "hard-link")
         shutil.copyfile(self.root / "updates.jsonl", staging / "training.jsonl")
         self.report["latest_transfer_bundle"] = str(directory.relative_to(self.root))
         atomic_json(staging / "record.json", self.report)
         staging.replace(directory)
         self.publish()
-        for previous in directory.parent.glob(f"{name}-step*"):
-            if previous != directory and previous.is_dir() and not previous.is_symlink():
-                shutil.rmtree(previous)
+        # Keep the newest previous bundle so a pull in progress can finish; older
+        # bundles for the same label are removed (hard links keep this cheap).
+        previous = sorted(
+            (
+                path
+                for path in directory.parent.glob(f"{name}-step*")
+                if path != directory and path.is_dir() and not path.is_symlink()
+            ),
+            key=lambda path: int(path.name.rsplit("-", 1)[1]),
+        )
+        for stale in previous[:-1]:
+            shutil.rmtree(stale)
 
     def on_step(self, trainer: Trainer, metrics: dict[str, float]) -> None:
         row = {**metrics, "step": float(trainer.step)}
@@ -372,6 +483,9 @@ class Worker:
         with (self.root / "updates.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps({"arm": self.phase, **row}, allow_nan=False) + "\n")
             stream.flush()
+        if not self.phase.startswith("probe"):
+            self.tokens_processed += int(metrics["tokens"])
+            self.report["training_tokens_processed"] = self.tokens_processed
         self.heartbeat(trainer.step)
         if self.phase.startswith("probe"):
             return
@@ -400,37 +514,73 @@ class Worker:
                 raise PilotStop(self.stop_reason)
         if (
             not self.stopped()
-            and self.clock() - self.last_saved.get(self.phase, self.training_started)
+            and self.clock() - self.last_saved.get(self.save_label, self.training_started)
             >= self.spec.checkpoint_seconds
         ):
-            self.save(trainer, self.phase)
+            self.save(trainer, self.save_label)
 
     def probe(self) -> int:
+        """Measure each candidate microbatch; the window counts from the first probe.
+
+        When the probe window expires, the running probe is recorded as
+        ``incomplete`` and the remaining sizes as ``skipped``; the pilot then
+        continues with the largest completed probe rather than aborting. Wall,
+        cost and idle limits still stop the pilot outright.
+        """
+        self.probe_started = self.clock()
+        self.report["probe_started_at_unix"] = self.probe_started
         for size in self.spec.microbatches:
             self.phase = f"probe-{size}"
-            self.require_time()
+            if self.stopped():
+                if self.stop_reason != "probe_time_limit":
+                    raise PilotStop(str(self.stop_reason))
+                self.report["probe_window_expired"] = True
+                self.report["probes"].append(
+                    {"microbatch": size, "status": "skipped", "updates": 0}
+                )
+                continue
             self.reset_peak()
             trainer: Trainer | None = None
             row: dict[str, Any] = {"microbatch": size}
             try:
                 trainer = self.trainer(self.phase, size, self.spec.learning_rates[0], probe=True)
                 trainer.train(should_stop=self.stopped, on_step=self.on_step)
-                self.require_time()
-                row.update(
-                    status="completed", updates=trainer.step, **throughput(self.rows[self.phase])
-                )
-            except torch.cuda.OutOfMemoryError:
-                if self.device.type != "cuda":
+                self.stopped()
+                if self.stop_reason is not None and self.stop_reason != "probe_time_limit":
+                    raise PilotStop(str(self.stop_reason))
+                if trainer.step == self.spec.probe_steps:
+                    row.update(
+                        status="completed",
+                        updates=trainer.step,
+                        **throughput(self.rows[self.phase]),
+                    )
+                else:
+                    row.update(status="incomplete", updates=trainer.step)
+                if self.stop_reason == "probe_time_limit":
+                    self.report["probe_window_expired"] = True
+            except TrainingStop:
+                raise  # A recorded safety stop is never an allocation failure.
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
+                if self.device.type != "cuda" or not _is_cuda_memory_error(error):
                     raise
-                row.update(status="oom", updates=0 if trainer is None else trainer.step)
+                row.update(
+                    status="oom",
+                    updates=0 if trainer is None else trainer.step,
+                    error_type=type(error).__name__,
+                )
             finally:
                 row.update(self.peak())
                 self.report["probes"].append(row)
                 self.publish()
                 del trainer
                 self.release()
+        if self.stop_reason == "probe_time_limit":
+            self.stop_reason = None  # Soft limit: select among measured probes.
         size = choose_microbatch(
-            self.report["probes"], self.spec.microbatches, self.spec.probe_steps
+            self.report["probes"],
+            self.spec.microbatches,
+            self.spec.probe_steps,
+            max_peak_bytes=self.peak_budget_bytes(),
         )
         self.report["chosen_microbatch"] = size
         self.report["accumulation_steps"] = accumulation_steps(
@@ -452,32 +602,57 @@ class Worker:
         print(json.dumps({"chosen_microbatch": size, "probes": self.report["probes"]}), flush=True)
         return size
 
-    def resume_test(self, trainer: Trainer, name: str, checkpoint: Path) -> None:
-        """Restore the actual last checkpoint, compare all state and held-out outputs."""
+    def verify_checkpoint(self, checkpoint: Path) -> str:
+        """Reject a checkpoint whose bytes differ from its recorded save identity."""
+        sidecar = checkpoint.with_name(checkpoint.name + ".sha256.json")
+        recorded = json.loads(sidecar.read_text())
+        actual = file_sha256(checkpoint)
+        if (
+            recorded.get("sha256") != actual
+            or recorded.get("size_bytes") != checkpoint.stat().st_size
+            or not any(row["sha256"] == actual for row in self.checkpoints)
+        ):
+            raise ValueError("checkpoint bytes differ from the recorded save identity")
+        return actual
+
+    def resume_test(
+        self, trainer: Trainer, name: str, checkpoint: Path, size: int, rate: float
+    ) -> None:
+        """Restore the final checkpoint into a fresh trainer and compare every state.
+
+        A separate trainer keeps the continuation's own run record intact: its
+        provenance still names the screen checkpoint it resumed from.
+        """
         self.require_time()
+        digest = self.verify_checkpoint(checkpoint)
         before = validate(trainer.model, self.windows)
         expected = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        trainer.resume(checkpoint)
-        after = validate(trainer.model, self.windows)
+        restored = self.trainer(name + "-resume-check", size, rate)
+        torch.manual_seed(999)  # Deliberately unrelated RNG position before the restore.
+        restored.resume(checkpoint, expected_sha256=digest)
+        after = validate(restored.model, self.windows)
+        self.last_activity = self.clock()
         assert_identical(after, before)
-        assert_identical(cpu_tree(trainer.model.state_dict()), expected["model"])
-        assert_identical(cpu_tree(trainer.optimizer.state_dict()), expected["optimizer"])
-        assert_identical(trainer.loader.state_dict(), expected["rank_states"][0]["loader"])
+        assert_identical(cpu_tree(restored.model.state_dict()), expected["model"])
+        assert_identical(cpu_tree(restored.optimizer.state_dict()), expected["optimizer"])
+        assert_identical(restored.loader.state_dict(), expected["rank_states"][0]["loader"])
         assert_identical(torch.get_rng_state(), expected["rank_states"][0]["rng_cpu"])
         if self.device.type == "cuda":
             assert_identical(torch.cuda.get_rng_state_all(), expected["rank_states"][0]["rng_cuda"])
-        if trainer.step != expected["step"]:
+        if restored.step != expected["step"] or restored.step != trainer.step:
             raise AssertionError("restored checkpoint step differs")
         self.report["last_checkpoint_resume"] = {
             "tested": True,
             "arm": name,
-            "step": trainer.step,
-            "sha256": file_sha256(checkpoint),
+            "step": restored.step,
+            "sha256": digest,
             "scope": (
-                "restored numerical state, loader, RNG and identical held-out outputs; "
-                "no extra training update"
+                "fresh trainer restored numerical state, loader, RNG and identical "
+                "held-out outputs; no extra training update"
             ),
         }
+        del restored
+        self.release()
         self.publish()
 
     def execute(self) -> dict[str, Any]:
@@ -487,10 +662,15 @@ class Worker:
             size = self.probe()
             self.phase = "screen"
             self.training_started = self.clock()
+            self.training_deadline = self.spec.limits.training_deadline(
+                pod_created=self.pod_created, training_started=self.training_started
+            )
+            self.report["training_started_at_unix"] = self.training_started
+            self.report["training_deadline_unix"] = self.training_deadline
             self.reset_peak()
             scores: list[tuple[float, float, str]] = []
             for i, rate in enumerate(self.spec.learning_rates):
-                self.phase = f"lr-{i}"
+                self.phase = self.save_label = f"lr-{i}"
                 self.rising, self.previous_loss = 0, None
                 trainer = self.trainer(self.phase, size, rate)
                 trainer.train(
@@ -503,12 +683,15 @@ class Worker:
                     raise PilotStop("incomplete_learning_rate_screen")
                 heldout = validate(trainer.model, self.windows)
                 path = self.save(trainer, self.phase)
+                trainer.finish(success=True)
                 self.report["arms"].append(
                     {
                         "name": self.phase,
                         "learning_rate": rate,
                         "validation": heldout,
                         "step": trainer.step,
+                        "checkpoint_sha256": file_sha256(path),
+                        "training_tokens": trainer.step * self.spec.tokens_per_update,
                     }
                 )
                 scores.append((heldout["loss"], rate, self.phase))
@@ -517,24 +700,38 @@ class Worker:
                 self.release()
             _, rate, name = min(scores)
             self.report["winner"] = name
-            self.phase = name
-            trainer = self.trainer(name + "-continued", size, rate)
-            trainer.resume(self.root / name / "last.pt")
+            self.phase = name  # Loss curves continue under the winning arm's key.
+            self.save_label = name + "-continued"  # The step-100 checkpoint stays untouched.
+            trainer = self.trainer(self.save_label, size, rate)
+            screen_checkpoint = self.root / name / "last.pt"
+            trainer.resume(
+                screen_checkpoint, expected_sha256=self.verify_checkpoint(screen_checkpoint)
+            )
+            self.report["continuation"] = {
+                "arm": name,
+                "resumed_from_step": trainer.step,
+                "resumed_checkpoint_sha256": file_sha256(screen_checkpoint),
+            }
             self.rising, self.previous_loss = 0, None
+            self.last_saved[self.save_label] = self.clock()  # Cadence restarts at resume.
             trainer.train(should_stop=self.stopped, on_step=self.on_step)
             # A training deadline permits final save/resume inside the remaining pod
             # budget; cost, idle and pod deadlines never permit additional work.
-            if self.stop_reason == "training_time_limit":
+            if self.stop_reason in {"training_time_limit", "finalization_reserve"}:
+                self.report["training_stop_reason"] = self.stop_reason
                 self.training_started = None
+                self.training_deadline = None
                 self.stop_reason = None
             self.phase = "finalizing"
-            path = self.save(trainer, name)
-            self.resume_test(trainer, name, path)
+            # The single final bundle is published after the status is known.
+            path = self.save(trainer, self.save_label, export=False)
+            trainer.finish(success=True)
+            self.resume_test(trainer, self.save_label, path, size, rate)
             self.report["selected_step"] = trainer.step
             self.report["status"] = (
                 "time_limited" if trainer.step < self.spec.config.train.steps else "completed"
             )
-            final_checkpoint = (path, name, trainer.step)
+            final_checkpoint = (path, self.save_label, trainer.step)
         except PilotStop as error:
             self.report.update(status="stopped", stop_reason=str(error))
             # Only previously published whole-update checkpoints are promised on a
@@ -618,12 +815,28 @@ def main(argv: Sequence[str] | None = None) -> None:
         report = smoke(args.output)
     else:
         spec = Specification.load(args.specification)
+        if spec.config.train.precision != "bfloat16":
+            raise ValueError("the A40 pilot specification must use bfloat16 autocast")
         receipt = json.loads(args.readiness.read_text())
         if receipt.get("specification_sha256") != file_sha256(args.specification):
             raise ValueError("specification differs from the operational receipt")
         if receipt.get("binding_sha256") != args.binding_sha256:
             raise ValueError("binding identity differs from the operational receipt")
         created = check_readiness(receipt, now=time.time(), spec=spec)
+        if spec.limits.finalization_reserve_seconds < 600:
+            raise ValueError("the A40 pilot needs at least a 600-second finalization reserve")
+        armed_deadline = finite_number(receipt["self_destruct_deadline_unix"], "deadline")
+        if armed_deadline - created < spec.limits.pod_seconds:
+            # The in-pod timer fires earlier than the specification's wall; plan against it.
+            try:
+                spec = replace(
+                    spec, limits=replace(spec.limits, pod_seconds=armed_deadline - created)
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "the armed self-destruct deadline leaves too little pod lifetime for the "
+                    "specification's probe, training and finalization budgets"
+                ) from error
         if receipt.get("preflight_sha256") != file_sha256(args.preflight):
             raise ValueError("preflight report differs from bound receipt")
         preflight = json.loads(args.preflight.read_text())
@@ -637,7 +850,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise ValueError("a matching A40 hardware precision/resume preflight is required")
         if file_sha256(args.binding) != args.binding_sha256:
             raise ValueError("data binding differs from externally recorded SHA-256")
-        binding = verify_binding(args.binding)
+        binding = verify_binding(
+            args.binding,
+            sequence_length=spec.config.train.sequence_length,
+            validation_documents=spec.config.train.validation_documents,
+        )
         directory = args.binding.parent
         tokenizer = ByteBPE.load(directory / "tokenizer.json")
         if spec.config.model.vocab_size != tokenizer.vocab_size:
@@ -654,12 +871,36 @@ def main(argv: Sequence[str] | None = None) -> None:
             vocab_size=tokenizer.vocab_size,
             bos_id=tokenizer.bos_id,
         )
+        if spec.config.train.validation_documents != binding["validation"]["documents"]:
+            raise ValueError("the specification must validate on every bound held-out document")
+        if not 0 < spec.config.train.warmup_steps < spec.screen_steps:
+            raise ValueError("warmup must finish inside the learning-rate screen")
         windows = shard_windows(
             heldout,
             tokenizer,
             documents=spec.config.train.validation_documents,
             sequence_length=spec.config.train.sequence_length,
         )
+        if len(windows) != spec.config.train.validation_documents:
+            raise ValueError("validation shard holds fewer documents than specified")
+        train_tokens = int(binding["train"]["tokens_including_bos"])
+        arm_tokens = spec.screen_steps * spec.tokens_per_update
+        winner_tokens = spec.config.train.steps * spec.tokens_per_update
+        exposure = {
+            "train_tokens_including_bos": train_tokens,
+            "tokens_per_screen_arm": arm_tokens,
+            "tokens_for_winner_at_full_run": winner_tokens,
+            "epochs_for_winner_at_full_run": winner_tokens / train_tokens,
+            "aggregate_training_tokens_maximum": (
+                len(spec.learning_rates) * arm_tokens + winner_tokens - arm_tokens
+            ),
+            "repetition": (
+                "none within one pass; a second pass would repeat the same seeded "
+                "document permutation"
+                if winner_tokens <= train_tokens
+                else "the winner continuation wraps and repeats the seeded permutation"
+            ),
+        }
         worker = Worker(
             spec,
             args.output,
@@ -671,7 +912,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             pod_created=created,
         )
         worker.report["hardware"] = hardware
-        worker.report["readiness_receipt"] = receipt
+        worker.report["readiness_receipt"] = sanitize(receipt)
+        worker.report["leakage_audit"] = binding.get("leakage_audit")
+        worker.report["data_exposure"] = exposure
+        worker.publish()
         worker.report["preflight_sha256"] = file_sha256(args.preflight)
         report = worker.execute()
     print(f"Pilot {report['status']}: {args.output / 'report.json'}")

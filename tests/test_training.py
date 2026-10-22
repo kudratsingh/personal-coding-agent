@@ -245,3 +245,131 @@ def test_failed_resume_debug_trace_does_not_leak_secret(tmp_path: Path) -> None:
         target.resume(tmp_path / "Bearer synthetic-secret")
     trace = (tmp_path / "private-error/debug-rank0.jsonl").read_text()
     assert "FileNotFoundError" in trace and "synthetic-secret" not in trace
+
+
+def test_fused_attention_training_tracks_the_reference_path(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from scratchcoder.common.config import ModelConfig, RunConfig, TrainConfig
+    from scratchcoder.data.loader import MixedLoader
+    from scratchcoder.train.trainer import Trainer
+
+    base = RunConfig(
+        model=ModelConfig(vocab_size=272, width=16, layers=1, heads=2, context=16),
+        train=TrainConfig(steps=4, sequence_length=8, batch_size=2, accumulation_steps=2),
+    )
+    losses: dict[str, list[float]] = {}
+    for attention in ("reference", "fused"):
+        config = replace(base, train=replace(base.train, attention=attention))
+        trainer = Trainer(
+            config,
+            MixedLoader(
+                {"web": [[256, 1, 2, 3] * 8]},
+                {"web": 1.0},
+                sequence_length=8,
+                batch_size=2,
+                seed=0,
+            ),
+            run_id=attention,
+            run_root=tmp_path,
+            data_hash="authored",
+            tokenizer_hash="authored",
+        )
+        assert trainer.model.fused_attention is (attention == "fused")
+        losses[attention] = trainer.train()
+        trainer.checkpoint(tmp_path / f"{attention}.pt")
+    for left, right in zip(losses["fused"], losses["reference"], strict=True):
+        assert abs(left - right) <= 1e-4 * max(1.0, abs(right))
+    state = torch.load(tmp_path / "fused.pt", map_location="cpu", weights_only=True)
+    assert state["config"]["train"]["attention"] == "fused"
+    with pytest.raises(ValueError, match="attention must be"):
+        TrainConfig(attention="flash")
+
+
+def _recipe_trainer(root: Path, name: str, **train_overrides: object) -> Trainer:
+    from dataclasses import replace
+
+    from scratchcoder.common.config import ModelConfig, RunConfig, TrainConfig
+    from scratchcoder.data.loader import MixedLoader
+
+    config = RunConfig(
+        model=ModelConfig(vocab_size=272, width=16, layers=1, heads=2, context=16),
+        train=TrainConfig(steps=4, sequence_length=8, batch_size=2, accumulation_steps=2),
+    )
+    config = replace(config, train=replace(config.train, **train_overrides))  # type: ignore[arg-type]
+    return Trainer(
+        config,
+        MixedLoader(
+            {"web": [[256, 1, 2, 3] * 8]}, {"web": 1.0}, sequence_length=8, batch_size=2, seed=0
+        ),
+        run_id=name,
+        run_root=root,
+        data_hash="authored",
+        tokenizer_hash="authored",
+    )
+
+
+def test_z_loss_objective_logs_next_token_loss_and_z_term(tmp_path: Path) -> None:
+    plain = _recipe_trainer(tmp_path, "plain")
+    plain_losses = plain.train()
+    with_z = _recipe_trainer(tmp_path, "with-z", z_loss=1e-4)
+    z_losses = with_z.train()
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "with-z/events-rank0.jsonl").read_text().splitlines()
+    ]
+    metrics = [row for row in events if row["event"] == "metrics"]
+    assert all(row["fields"]["metrics"].get("z_loss", 0) > 0 for row in metrics)
+    # The first update sees identical weights, so the logged next-token loss is the
+    # plain cross-entropy, not the regularized objective.
+    assert z_losses[0] == pytest.approx(plain_losses[0], rel=1e-6)
+    plain_events = [
+        json.loads(line)
+        for line in (tmp_path / "plain/events-rank0.jsonl").read_text().splitlines()
+    ]
+    assert all(
+        "z_loss" not in row["fields"]["metrics"]
+        for row in plain_events
+        if row["event"] == "metrics"
+    )
+
+
+def test_foreach_optimizer_and_wsd_schedule_train_and_checkpoint(tmp_path: Path) -> None:
+    reference = _recipe_trainer(tmp_path, "reference-opt")
+    expected = reference.train()
+    foreach = _recipe_trainer(tmp_path, "foreach-opt", optimizer_foreach=True)
+    assert foreach.train() == expected  # Same update issued through list kernels.
+    wsd = _recipe_trainer(tmp_path, "wsd", schedule="wsd", decay_fraction=0.5)
+    wsd.train()
+    rows = [
+        json.loads(line)["fields"]["metrics"]["learning_rate"]
+        for line in (tmp_path / "wsd/events-rank0.jsonl").read_text().splitlines()
+        if '"metrics"' in line
+    ]
+    assert rows[1] == pytest.approx(0.0006) and rows[-1] == pytest.approx(0.00006)
+    wsd.checkpoint(tmp_path / "wsd.pt")
+    state = torch.load(tmp_path / "wsd.pt", map_location="cpu", weights_only=True)
+    assert state["config"]["train"]["schedule"] == "wsd"
+    from scratchcoder.common.config import TrainConfig
+
+    for bad in ({"z_loss": -1.0}, {"schedule": "linear"}, {"decay_fraction": 0.0}, {"compile": 1}):
+        with pytest.raises(ValueError):
+            TrainConfig(**bad)
+
+
+def test_compiled_training_matches_eager_within_tolerance(tmp_path: Path) -> None:
+    eager = _recipe_trainer(tmp_path, "eager")
+    expected = eager.train()
+    try:
+        compiled = _recipe_trainer(tmp_path, "compiled", compile=True)
+        actual = compiled.train()
+    except Exception as error:  # noqa: BLE001 - inductor needs a C++ toolchain
+        if "inductor" in str(error).lower() or "compiler" in str(error).lower():
+            pytest.skip(f"torch.compile backend unavailable here: {type(error).__name__}")
+        raise
+    for left, right in zip(actual, expected, strict=True):
+        assert abs(left - right) <= 1e-4 * max(1.0, abs(right))
+    compiled.checkpoint(tmp_path / "compiled.pt")
+    resumed = _recipe_trainer(tmp_path, "compiled-resume", compile=True)
+    resumed.resume(tmp_path / "compiled.pt")
+    assert resumed.step == 4

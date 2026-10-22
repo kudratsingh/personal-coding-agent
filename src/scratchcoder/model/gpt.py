@@ -4,6 +4,7 @@ import math
 from typing import cast
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from scratchcoder.common.config import ModelConfig
@@ -47,12 +48,33 @@ def causal_attention(q: Tensor, k: Tensor, v: Tensor, *, offset: int = 0) -> Ten
     return probabilities @ v
 
 
+def fused_causal_attention(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    """Same mathematics as ``causal_attention`` without materializing ``[B,H,T,T]``.
+
+    The scaled-dot-product primitive applies the causal mask, the ``1/sqrt(D)``
+    scale and the softmax inside one kernel, so autograd keeps no score or
+    probability matrices. It is only used for the uncached training/validation
+    path (query and key positions coincide). ``tests/test_model.py`` checks its
+    outputs and gradients against the reference formulation; the A40 preflight
+    repeats that comparison on the actual device. Fused CUDA backward kernels
+    may not be bitwise deterministic across runs.
+    """
+    if q.shape[-2] != k.shape[-2]:
+        raise ValueError("fused attention requires equal query and key lengths")
+    return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+
 class Attention(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.heads = config.heads
         self.qkv = nn.Linear(config.width, 3 * config.width, bias=False)
         self.output = nn.Linear(config.width, config.width, bias=False)
+        self.fused = False  # Set through GPT.set_fused_attention; never persisted.
+        # Optional per-head query/key normalization keeps attention logits bounded
+        # at high learning rates (Wortsman et al. 2023); gains are shared by heads.
+        self.q_norm = RMSNorm(config.width // config.heads) if config.qk_norm else None
+        self.k_norm = RMSNorm(config.width // config.heads) if config.qk_norm else None
 
     def forward(self, x: Tensor) -> Tensor:
         return self.forward_cached(x, None)[0]
@@ -63,21 +85,20 @@ class Attention(nn.Module):
         batch, time, width = x.shape
         offset = 0 if cache is None else cache[0].shape[-2]
         q, k, v = self.qkv(x).chunk(3, dim=-1)
-        q = rotary(
-            q.view(batch, time, self.heads, width // self.heads).transpose(1, 2), offset=offset
-        )
-        k = rotary(
-            k.view(batch, time, self.heads, width // self.heads).transpose(1, 2), offset=offset
-        )
+        q = q.view(batch, time, self.heads, width // self.heads).transpose(1, 2)
+        k = k.view(batch, time, self.heads, width // self.heads).transpose(1, 2)
+        if self.q_norm is not None and self.k_norm is not None:
+            q, k = self.q_norm(q), self.k_norm(k)
+        q = rotary(q, offset=offset)
+        k = rotary(k, offset=offset)
         v = v.view(batch, time, self.heads, width // self.heads).transpose(1, 2)
         if cache is not None:
             k, v = torch.cat((cache[0], k), dim=-2), torch.cat((cache[1], v), dim=-2)
-        attended = (
-            causal_attention(q, k, v, offset=offset)
-            .transpose(1, 2)
-            .contiguous()
-            .view(batch, time, width)
-        )
+        if self.fused and cache is None:
+            mixed = fused_causal_attention(q, k, v)
+        else:
+            mixed = causal_attention(q, k, v, offset=offset)
+        attended = mixed.transpose(1, 2).contiguous().view(batch, time, width)
         return cast(Tensor, self.output(attended)), (k, v)
 
 
@@ -111,9 +132,17 @@ class GPT(nn.Module):
         self.embedding = nn.Embedding(config.vocab_size, config.width)
         self.blocks = nn.ModuleList(Block(config) for _ in range(config.layers))
         self.norm = RMSNorm(config.width)
+        self.fused_attention = False
         for parameter in self.parameters():
             if parameter.ndim >= 2:
                 nn.init.normal_(parameter, mean=0.0, std=0.02)
+        # GPT-2 depth scaling: the two projections that write into the residual
+        # stream start at std 0.02 / sqrt(2L), so the residual variance does not
+        # grow with depth at initialization.
+        residual_std = 0.02 / math.sqrt(2 * config.layers)
+        for block in self.blocks:
+            nn.init.normal_(cast(Block, block).attention.output.weight, mean=0.0, std=residual_std)
+            nn.init.normal_(cast(Block, block).down.weight, mean=0.0, std=residual_std)
 
     def forward(self, ids: Tensor) -> Tensor:
         if ids.ndim != 2 or ids.shape[1] > self.config.context or ids.shape[1] == 0:
@@ -126,6 +155,14 @@ class GPT(nn.Module):
 
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
+
+    def set_fused_attention(self, enabled: bool) -> None:
+        """Select the fused kernel for the uncached path; cached generation stays reference."""
+        if type(enabled) is not bool:
+            raise ValueError("fused attention flag must be a boolean")
+        self.fused_attention = enabled
+        for block in self.blocks:
+            cast(Block, block).attention.fused = enabled
 
     def forward_cached(
         self, ids: Tensor, cache: list[tuple[Tensor, Tensor]] | None = None
@@ -151,8 +188,9 @@ class GPT(nn.Module):
 
 
 def expected_parameters(config: ModelConfig) -> int:
+    qk_gains = 2 * (config.width // config.heads) if config.qk_norm else 0
     return (
         config.vocab_size * config.width
-        + config.layers * (12 * config.width**2 + 2 * config.width)
+        + config.layers * (12 * config.width**2 + 2 * config.width + qk_gains)
         + config.width
     )

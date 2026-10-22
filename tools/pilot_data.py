@@ -11,6 +11,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import numpy.typing as npt
+
 from scratchcoder.data.shards import TokenShard, file_sha256, write_shard
 from scratchcoder.tokenizer.bpe import SPECIAL_TOKENS, ByteBPE
 from scratchcoder.tokenizer.bulk import FastEncoder, encode_many
@@ -271,8 +274,135 @@ def build_pilot_data(
     return binding
 
 
-def verify_binding(binding_path: Path) -> dict[str, Any]:
-    """Verify all bound bytes, strict relative paths, metadata, tokenizer and shard headers."""
+_AUDIT_METHOD = (
+    "exact token-level containment; document boundaries ignored; "
+    "no near-duplicate/n-gram statistics"
+)
+_DUPLICATE_EXAMPLE_LIMIT = 5
+
+
+class LeakageError(ValueError):
+    """Validation content was found verbatim in the training shard; carries the audit."""
+
+    def __init__(self, message: str, audit: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.audit = audit
+
+
+def _document_digest(tokens: npt.NDArray[np.uint16]) -> str:
+    return hashlib.sha256(np.ascontiguousarray(tokens, dtype="<u2").tobytes()).hexdigest()
+
+
+def _find_window(
+    stream: npt.NDArray[np.uint16], window: npt.NDArray[np.uint16]
+) -> tuple[int | None, int]:
+    """Return (first offset of ``window`` in ``stream`` or None, longest window prefix found)."""
+    size = int(stream.size)
+    count = int(window.size)
+    if count == 0:
+        return None, 0
+    candidates = np.flatnonzero(stream == window[0])
+    found = 1 if candidates.size else 0
+    for i in range(1, count):
+        if candidates.size == 0:
+            break
+        candidates = candidates[candidates + i < size]
+        candidates = candidates[stream[candidates + i] == window[i]]
+        if candidates.size:
+            found = i + 1
+    return (int(candidates[0]) if found == count else None), found
+
+
+def audit_overlap(
+    train: TokenShard,
+    validation: TokenShard,
+    *,
+    sequence_length: int,
+    validation_documents: int,
+) -> dict[str, Any]:
+    """Audit exact token-level leakage of validation content into the training stream.
+
+    For each of the first ``validation_documents`` validation documents this reports whether
+    its full token content repeats a training document (under any index) and whether its
+    validation window, the first ``sequence_length + 1`` tokens exactly as
+    ``scratchcoder.train.validation.shard_windows`` takes them, appears without its leading
+    BOS as a contiguous run anywhere in the training token stream, document boundaries
+    ignored. The longest found window prefix exposes near misses. Exact training-document
+    repeats are counted as well. This is exact containment only: it does not compute
+    near-duplicate, n-gram, or paraphrase statistics.
+    """
+    if type(sequence_length) is not int or sequence_length < 1:
+        raise ValueError("sequence_length must be a positive integer")
+    if type(validation_documents) is not int or validation_documents < 1:
+        raise ValueError("validation_documents must be a positive integer")
+    if train.vocab_size != validation.vocab_size or train.bos_id != validation.bos_id:
+        raise ValueError("training and validation shards must share vocabulary and BOS")
+    _reject_symlink(train.path)
+    stream: npt.NDArray[np.uint16] = np.fromfile(train.path, dtype="<u2")
+    if int(stream.size) != sum(length for _, length in train.offsets):
+        raise ValueError("training shard size differs from its document offsets")
+    first_by_digest: dict[str, int] = {}
+    duplicate_examples: list[list[int]] = []
+    duplicates = 0
+    for index, (offset, length) in enumerate(train.offsets):
+        first = first_by_digest.setdefault(
+            _document_digest(stream[offset : offset + length]), index
+        )
+        if first != index:
+            duplicates += 1
+            if len(duplicate_examples) < _DUPLICATE_EXAMPLE_LIMIT:
+                duplicate_examples.append([first, index])
+    audited = min(validation_documents, len(validation))
+    reports: list[dict[str, Any]] = []
+    leaks = 0
+    for index in range(audited):
+        document: npt.NDArray[np.uint16] = np.asarray(validation[index], dtype="<u2")
+        duplicate = first_by_digest.get(_document_digest(document))
+        window = document[1 : sequence_length + 1]
+        found_at, prefix = _find_window(stream, window)
+        if duplicate is not None or found_at is not None:
+            leaks += 1
+        reports.append(
+            {
+                "index": index,
+                "tokens": int(document.size),
+                "duplicate_of_training_index": duplicate,
+                "window_tokens": int(window.size),
+                "window_found_in_training_at": found_at,
+                "longest_window_prefix_found": prefix,
+            }
+        )
+    return {
+        "schema_version": 1,
+        "sequence_length": sequence_length,
+        "train_tokens": int(stream.size),
+        "train_documents": len(train),
+        "validation_documents_audited": audited,
+        "duplicate_training_documents": duplicates,
+        "duplicate_training_examples": duplicate_examples,
+        "validation": reports,
+        "leaks": leaks,
+        "method": _AUDIT_METHOD,
+    }
+
+
+def verify_binding(
+    binding_path: Path,
+    *,
+    leakage_audit: bool = True,
+    sequence_length: int = 1024,
+    validation_documents: int | None = None,
+) -> dict[str, Any]:
+    """Verify all bound bytes, strict relative paths, metadata, tokenizer and shard headers.
+
+    With ``leakage_audit`` the verified shards are also audited with :func:`audit_overlap`;
+    a leak raises :class:`LeakageError`, otherwise the audit is attached to the returned
+    dictionary as ``leakage_audit``. ``binding.json`` on disk is never rewritten.
+    """
+    if validation_documents is not None and (
+        type(validation_documents) is not int or validation_documents < 1
+    ):
+        raise ValueError("validation_documents must be a positive integer")
     _reject_symlink(binding_path)
     if not binding_path.is_file():
         raise ValueError("binding path must be a regular file")
@@ -340,9 +470,10 @@ def verify_binding(binding_path: Path) -> dict[str, Any]:
         or file_sha256(verified["tokenizer:tokenizer.json"]) != tokenizer_meta.get("file_sha256")
     ):
         raise ValueError("tokenizer identity or special-token metadata differs")
+    shards: dict[str, TokenShard] = {}
     for name, section in (("train_shard", "train"), ("validation_shard", "validation")):
         shard_path = verified[f"{name}:{'train.bin' if section == 'train' else 'validation.bin'}"]
-        shard = TokenShard(
+        shard = shards[section] = TokenShard(
             shard_path,
             tokenizer_hash=tokenizer.sha256,
             vocab_size=tokenizer.vocab_size,
@@ -383,6 +514,31 @@ def verify_binding(binding_path: Path) -> dict[str, Any]:
         or binding.get("selection_sha256") != _selection_hash(train_ids + validation_ids)
     ):
         raise ValueError("document selection metadata is invalid")
+    if leakage_audit:
+        audit = audit_overlap(
+            shards["train"],
+            shards["validation"],
+            sequence_length=sequence_length,
+            validation_documents=(
+                validation_documents
+                if validation_documents is not None
+                else binding["validation"]["documents"]
+            ),
+        )
+        if audit["leaks"] > 0:
+            leaking = [
+                item["index"]
+                for item in audit["validation"]
+                if item["duplicate_of_training_index"] is not None
+                or item["window_found_in_training_at"] is not None
+            ]
+            raise LeakageError(
+                f"validation content leaks into training: {audit['leaks']} of "
+                f"{audit['validation_documents_audited']} audited validation documents "
+                f"(validation indices {leaking[:10]})",
+                audit,
+            )
+        binding["leakage_audit"] = audit
     return binding
 
 

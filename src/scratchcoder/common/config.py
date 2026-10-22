@@ -44,9 +44,14 @@ class ModelConfig:
     layers: int = 4
     heads: int = 4
     context: int = 256
+    qk_norm: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.qk_norm) is not bool:
+            raise ValueError("model.qk_norm must be a boolean")
         for name, value in asdict(self).items():
+            if name == "qk_norm":
+                continue
             if type(value) is not int or value <= 0:
                 raise ValueError(f"model.{name} must be a positive integer")
         if self.width % self.heads or (self.width // self.heads) % 2:
@@ -71,6 +76,12 @@ class TrainConfig:
     beta2: float = 0.95
     adam_epsilon: float = 1e-8
     precision: str = "float32"
+    attention: str = "reference"
+    optimizer_foreach: bool = False
+    z_loss: float = 0.0
+    schedule: str = "cosine"
+    decay_fraction: float = 0.2
+    compile: bool = False
     validation_interval: int = 0
     validation_documents: int = 2
 
@@ -103,6 +114,18 @@ class TrainConfig:
             raise ValueError("Adam betas must be in [0,1)")
         if self.precision not in {"float32", "bfloat16"}:
             raise ValueError("precision must be float32 or bfloat16")
+        if self.attention not in {"reference", "fused"}:
+            raise ValueError("attention must be reference or fused")
+        if type(self.optimizer_foreach) is not bool:
+            raise ValueError("optimizer_foreach must be a boolean")
+        if finite_number(self.z_loss, "z_loss") < 0:
+            raise ValueError("z_loss must be finite and nonnegative")
+        if self.schedule not in {"cosine", "wsd"}:
+            raise ValueError("schedule must be cosine or wsd")
+        if not 0 < finite_number(self.decay_fraction, "decay_fraction") <= 1:
+            raise ValueError("decay_fraction must be in (0, 1]")
+        if type(self.compile) is not bool:
+            raise ValueError("compile must be a boolean")
 
 
 @dataclass(frozen=True)

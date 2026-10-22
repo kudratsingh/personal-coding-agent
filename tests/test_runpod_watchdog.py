@@ -380,10 +380,37 @@ class RunpodWatchdogTests(unittest.TestCase):
 
     def test_billing_start_after_pod_creation_fails_closed(self) -> None:
         created = parse_timestamp(CREATED_AT)
-        policy = Policy(5400, 10.0, 600, 0.5, billing_started_at_unix=created + 1)
+        policy = Policy(5400, 10.0, 600, 0.5, billing_started_at_unix=created + 120)
         client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
         result = check_once(client, IDENTITY, policy, self.heartbeat_path, now=lambda: NOW)
         self.assertEqual(result.reason, "billing_start_after_pod_creation_delete_204_get_404")
+        # A Mac clock a few seconds ahead of the provider's is tolerated, not fatal.
+        tolerated = Policy(5400, 10.0, 600, 0.5, billing_started_at_unix=created + 30)
+        client, transport = self.client([json_response(200, pod())])
+        result = check_once(client, IDENTITY, tolerated, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.state, "watching")
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])
+
+    def test_created_at_rendering_differences_still_match_identity(self) -> None:
+        rendered = pod(createdAt="2027-01-15T08:00:00.000+00:00")
+        client, _ = self.client([json_response(200, rendered)])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.state, "watching")
+        shifted = pod(createdAt="2027-01-15T08:00:02Z")
+        client, _ = self.client([json_response(200, shifted)])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.state, "identity_mismatch")
+
+    def test_slightly_fast_pod_clock_is_not_a_malformed_heartbeat(self) -> None:
+        heartbeat(self.heartbeat_path, activity=NOW + 5, updated=NOW + 10)
+        client, transport = self.client([json_response(200, pod())])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.state, "watching")
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])
+        heartbeat(self.heartbeat_path, activity=NOW, updated=NOW + 120)
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.reason, "heartbeat_malformed_delete_204_get_404")
 
     def test_redirect_handler_refuses_forwarding_authorization(self) -> None:
         handler = _NoRedirectHandler()
@@ -442,3 +469,145 @@ class RunpodWatchdogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ObservationAndTransferTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.heartbeat_path = Path(self.temp.name) / "heartbeat.json"
+        heartbeat(self.heartbeat_path)
+
+    def client(self, responses: list[tuple[int, bytes]]) -> tuple[RunpodClient, FakeTransport]:
+        transport = FakeTransport(responses)
+        return RunpodClient("secret-placeholder", transport), transport
+
+    def test_first_poll_404_is_unknown_not_absent(self) -> None:
+        # A wrong base URL, Pod ID or key scope must not read as a completed shutdown.
+        client, transport = self.client([(404, b"")])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.state, "unknown")
+        self.assertEqual(result.reason, "pod_get_404_before_identity_observed")
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])
+        client, _ = self.client([(404, b"")])
+        observed = check_once(
+            client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW, observed=True
+        )
+        self.assertEqual((observed.state, observed.reason), ("absent", "pod_get_404"))
+
+    def test_observed_state_round_trips_through_the_state_file(self) -> None:
+        from tools.runpod_watchdog import load_observed, save_observed
+
+        path = Path(self.temp.name) / "receipts" / "watchdog.json.observed.json"
+        self.assertFalse(load_observed(path, IDENTITY))
+        save_observed(path, IDENTITY, NOW)
+        self.assertTrue(load_observed(path, IDENTITY))
+        other = PodIdentity.from_dict(
+            {
+                "id": "other-pod",
+                "name": "sample-pilot",
+                "gpuId": "NVIDIA A40",
+                "gpuCount": 1,
+                "dataCenterId": "US-XX-1",
+                "createdAt": CREATED_AT,
+            }
+        )
+        self.assertFalse(load_observed(path, other))
+
+    def _transfer_heartbeat(
+        self, *, progress: float | None, status: str = "awaiting_transfer"
+    ) -> None:
+        value = {
+            "schema_version": 1,
+            "updated_at_unix": NOW + 900,
+            "last_gpu_activity_unix": NOW,
+            "phase": "finalizing",
+            "step": 4,
+            "status": status,
+        }
+        if progress is not None:
+            value["transfer_progress_unix"] = progress
+        self.heartbeat_path.write_text(json.dumps(value), encoding="utf-8")
+
+    def test_live_transfer_progress_extends_idle_within_transfer_window(self) -> None:
+        policy = replace(POLICY, max_transfer_seconds=1500)
+        self._transfer_heartbeat(progress=NOW + 890)
+        client, transport = self.client([json_response(200, pod())])
+        result = check_once(client, IDENTITY, policy, self.heartbeat_path, now=lambda: NOW + 900)
+        self.assertEqual(result.state, "watching")
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])
+
+    def test_stale_transfer_progress_or_no_window_still_terminates(self) -> None:
+        self._transfer_heartbeat(progress=NOW + 200)  # Progress older than the idle limit.
+        policy = replace(POLICY, max_transfer_seconds=1500)
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(
+            client,
+            IDENTITY,
+            policy,
+            self.heartbeat_path,
+            now=lambda: NOW + 900,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.reason, "idle_gpu_limit_delete_204_get_404")
+        self._transfer_heartbeat(progress=NOW + 890)  # Fresh progress but no window configured.
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(
+            client,
+            IDENTITY,
+            POLICY,
+            self.heartbeat_path,
+            now=lambda: NOW + 900,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.reason, "idle_gpu_limit_delete_204_get_404")
+
+    def test_transfer_window_itself_is_bounded(self) -> None:
+        policy = replace(POLICY, max_transfer_seconds=800)
+        self._transfer_heartbeat(progress=NOW + 890)
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(
+            client,
+            IDENTITY,
+            policy,
+            self.heartbeat_path,
+            now=lambda: NOW + 900,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.reason, "idle_gpu_limit_delete_204_get_404")
+
+    def test_running_status_never_uses_the_transfer_window(self) -> None:
+        policy = replace(POLICY, max_transfer_seconds=1500)
+        self._transfer_heartbeat(progress=NOW + 890, status="running")
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(
+            client,
+            IDENTITY,
+            policy,
+            self.heartbeat_path,
+            now=lambda: NOW + 900,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.reason, "idle_gpu_limit_delete_204_get_404")
+
+    def test_future_transfer_progress_is_malformed(self) -> None:
+        policy = replace(POLICY, max_transfer_seconds=1500)
+        self._transfer_heartbeat(progress=NOW + 950)
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(
+            client,
+            IDENTITY,
+            policy,
+            self.heartbeat_path,
+            now=lambda: NOW + 900,
+            sleep=lambda _: None,
+        )
+        self.assertEqual(result.reason, "heartbeat_malformed_delete_204_get_404")
+
+    def test_transfer_window_policy_is_bounded(self) -> None:
+        with self.assertRaises(ValueError):
+            replace(POLICY, max_transfer_seconds=1801)
+        with self.assertRaises(ValueError):
+            replace(POLICY, max_transfer_seconds=-1)
+        with self.assertRaises(ValueError):
+            RunpodClient("k", FakeTransport([])).request_path("GET", "pods/../x", 1)

@@ -33,6 +33,9 @@ def test_cpu_preflight_runs_authored_precision_and_exact_resume(tmp_path: Path) 
     assert report["precision"]["loss_atol"] == LOSS_ATOL == 0.001
     assert report["precision"]["loss_rtol"] == LOSS_RTOL == 0.001
     assert report["precision"]["gradient_relative_norm_max"] == GRADIENT_RELATIVE_NORM_MAX
+    assert report["fused_attention"]["status"] == "passed"
+    assert report["fused_attention"]["causality_exact"] is True
+    assert report["fused_attention"]["max_gradient_relative_norm_error"] <= 0.03
     assert report["exact_resume"]["steps"] == 4
     assert report["exact_resume"]["accumulation_steps"] == 2
     assert report["exact_resume"]["losses_match_exactly"] is True
