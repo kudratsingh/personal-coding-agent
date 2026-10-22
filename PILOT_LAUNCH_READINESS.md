@@ -76,7 +76,7 @@ Measured in this container with the CPU torch build (the locked `uv run --locked
 | Check | Result |
 | --- | --- |
 | Base revision `940530d` full suite | 791 passed, 41 skipped (Docker, NumPy image, evaluation extra), 9 subtests |
-| Audited branch full suite | 872 passed, 41 skipped, 9 subtests (871 in the worktree run with the console-script test deselected; that test passes under `uv run`) |
+| Audited branch full suite (`uv run pytest`, main tree) | 890 passed, 41 skipped, 9 subtests, 0 failed |
 | `ruff check`, `ruff format --check` | clean |
 | `mypy --strict` (src, tests, tools) | clean |
 | `tools.check_workflows`, `tools.check_public_tree`, `tools.check_docs` | pass |
@@ -85,9 +85,9 @@ Measured in this container with the CPU torch build (the locked `uv run --locked
 | `tools/cpu_resume_check.py --size tiny --seeds 0 7 --steps 4` | 4 exact cases |
 | Untrained S checkpoint on CPU | 1,623,502,465 bytes = 1.5120 GiB |
 
-One existing test, `tests/test_cli.py::test_smoke_runs_complete_synthetic_pipeline[entrypoint1]`, needs the `scratchcoder` console script on `PATH`; it passes under `uv run` and was deselected only in the worktree run where the script was not on `PATH`.
+The same commands pass `make`-equivalent checks in order: workflow check, publication check, ruff check and format, mypy strict, pytest, docs check, and the synthetic two-stage smoke.
 
-New regression tests added: probe window semantics (two tests), finalization reserve, tampered checkpoint rejection, token accounting, single final export and bundle retention, CUDA library OOM classification, rising-guard floor, readiness gates, `Limits.training_deadline`, skipped/incomplete/headroom selection, specification pinning (two tests), resume hash rejection, controlled stop logging, sanitizer, supervisor transfer-progress stamping and bundle names, watchdog observation gating, state file, transfer window (six tests), idle baseline (two tests), self-destruct timer (twelve tests), Pod identity and billing capture (five tests), readiness receipt (three tests), leakage audit (five tests), feasibility calculator (29 tests), cross-entropy equivalence (two parametrised cases).
+New regression tests added: probe window semantics (two tests), finalization reserve, tampered checkpoint rejection, token accounting, single final export and bundle retention, CUDA library OOM classification, rising-guard floor, readiness gates, `Limits.training_deadline`, skipped/incomplete/headroom selection, specification pinning (two tests), resume hash rejection, controlled stop logging, sanitizer, supervisor transfer-progress stamping and bundle names, watchdog observation gating, state file, transfer window (six tests), idle baseline (two tests), self-destruct timer (twelve tests), Pod identity and billing capture (five tests), readiness receipt (three tests), leakage audit (five tests), feasibility calculator (29 tests), cross-entropy equivalence (two parametrised cases), fused attention equivalence at kernel, model and training level (four tests), depth-scaled initialization, QK-norm accounting and causality, list-kernel AdamW bitwise equality, single-sync clipping, z-loss and warmup-stable-decay arithmetic, z-loss logging, foreach/WSD training and checkpointing, compiled-versus-eager training, improved-specification pinning.
 
 ## 6. Remaining blockers
 
