@@ -243,7 +243,13 @@ This pilot creates no network volume and no volume disk. Verify in the console u
 
 ```sh
 uv run --locked python -m tools.runpod_pod_identity billing --pod-id "$POD_ID" --output "$CTRL/billing.json"
-python3 -c 'import json; r=json.load(open("'"$CTRL"'/supervisor/received/'"'"'$(ls "$CTRL/supervisor/received" | tail -1)'"'"'/record.json")); print("quoted accrued", r["quoted_accrued_cost_usd"], "pod seconds", r["pod_elapsed_seconds"])'
+uv run --locked python - <<'PY'
+import glob, json
+bundle = sorted(glob.glob("runs/pilot-controller/supervisor/received/*/record.json"))[-1]
+record = json.load(open(bundle))
+print("quoted accrued USD", record["quoted_accrued_cost_usd"], "pod seconds", record["pod_elapsed_seconds"])
+print("provider totals", json.load(open("runs/pilot-controller/billing.json"))["totals"])
+PY
 ```
 
 Compare the provider totals with the quoted accrued cost in the record. Re-fetch billing after an hour; Runpod bills every five minutes and records may lag. Confirm the total stays below the $5 ceiling and note any disk charge.
