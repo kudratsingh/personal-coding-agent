@@ -138,8 +138,12 @@ def test_unverified_archive_never_sets_shutdown_flags(tmp_path: Path) -> None:
         supervisor.cycle()
     local = json.loads((supervisor.root / "heartbeat.json").read_text())
     assert local["status"] == "awaiting_transfer"
-    assert not local.get("mac_receipt_verified")
-    assert not supervisor.received
+    # The verified Mac copy is recorded even though the GitHub archive failed.
+    assert "exports/lr-0-step4-1" in supervisor.received and not supervisor.archived
+    supervisor.refresh_heartbeat()
+    local = json.loads((supervisor.root / "heartbeat.json").read_text())
+    assert local.get("mac_receipt_verified") is True
+    assert not local.get("github_receipt_verified") and local["status"] == "awaiting_transfer"
     pulls: list[str] = []
 
     def pull(name: str) -> Path:
@@ -313,3 +317,20 @@ def test_continuation_export_names_are_accepted_and_unsafe_names_rejected(tmp_pa
     assert _BUNDLE.fullmatch("exports/lr-0-step100-2")
     assert not _BUNDLE.fullmatch("exports/../lr-0-step100-2")
     assert not _BUNDLE.fullmatch("exports/probe-8-step20-1")
+
+
+def test_gh_failure_with_non_json_output_is_a_clear_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    from tools.pilot_supervisor import _gh
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert "RUNPOD_API_KEY" not in kwargs["env"]
+        return subprocess.CompletedProcess(args[0], 1, b"gh: not logged in", b"")
+
+    monkeypatch.setenv("RUNPOD_API_KEY", "placeholder")
+    monkeypatch.setattr("tools.pilot_supervisor.subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="exit 1"):
+        _gh(["repos/owner/private"])

@@ -411,3 +411,14 @@ def test_cuda_library_allocation_failures_count_as_probe_oom(
 def test_rising_guard_floor_is_enforced() -> None:
     with pytest.raises(ValueError, match="inconsistent"):
         replace(specification().limits, rising_steps=4)
+
+
+def test_billing_origin_slightly_after_creation_is_clamped_to_creation() -> None:
+    base = receipt()
+    policy = {**base["watchdog_policy"], "billing_started_at_unix": 1030}
+    assert (
+        check_readiness({**base, "watchdog_policy": policy}, now=1031, spec=specification()) == 1000
+    )
+    policy["billing_started_at_unix"] = 1100
+    with pytest.raises(ValueError, match="billing origin"):
+        check_readiness({**base, "watchdog_policy": policy}, now=1101, spec=specification())

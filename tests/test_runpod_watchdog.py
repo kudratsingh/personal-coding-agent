@@ -380,10 +380,37 @@ class RunpodWatchdogTests(unittest.TestCase):
 
     def test_billing_start_after_pod_creation_fails_closed(self) -> None:
         created = parse_timestamp(CREATED_AT)
-        policy = Policy(5400, 10.0, 600, 0.5, billing_started_at_unix=created + 1)
+        policy = Policy(5400, 10.0, 600, 0.5, billing_started_at_unix=created + 120)
         client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
         result = check_once(client, IDENTITY, policy, self.heartbeat_path, now=lambda: NOW)
         self.assertEqual(result.reason, "billing_start_after_pod_creation_delete_204_get_404")
+        # A Mac clock a few seconds ahead of the provider's is tolerated, not fatal.
+        tolerated = Policy(5400, 10.0, 600, 0.5, billing_started_at_unix=created + 30)
+        client, transport = self.client([json_response(200, pod())])
+        result = check_once(client, IDENTITY, tolerated, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.state, "watching")
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])
+
+    def test_created_at_rendering_differences_still_match_identity(self) -> None:
+        rendered = pod(createdAt="2027-01-15T08:00:00.000+00:00")
+        client, _ = self.client([json_response(200, rendered)])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.state, "watching")
+        shifted = pod(createdAt="2027-01-15T08:00:02Z")
+        client, _ = self.client([json_response(200, shifted)])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.state, "identity_mismatch")
+
+    def test_slightly_fast_pod_clock_is_not_a_malformed_heartbeat(self) -> None:
+        heartbeat(self.heartbeat_path, activity=NOW + 5, updated=NOW + 10)
+        client, transport = self.client([json_response(200, pod())])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.state, "watching")
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])
+        heartbeat(self.heartbeat_path, activity=NOW, updated=NOW + 120)
+        client, _ = self.client([json_response(200, pod()), (204, b""), (404, b"")])
+        result = check_once(client, IDENTITY, POLICY, self.heartbeat_path, now=lambda: NOW)
+        self.assertEqual(result.reason, "heartbeat_malformed_delete_204_get_404")
 
     def test_redirect_handler_refuses_forwarding_authorization(self) -> None:
         handler = _NoRedirectHandler()

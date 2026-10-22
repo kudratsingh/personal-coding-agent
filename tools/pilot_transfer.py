@@ -94,6 +94,7 @@ finally:
 """
 
 _SAFE_HOST = re.compile(r"[A-Za-z0-9._-]+\Z")
+_PROXY_SUFFIX = "ssh.runpod.io"  # The Runpod SSH proxy carries no file transfers.
 _SAFE_USER = re.compile(r"[A-Za-z0-9._-]+\Z")
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _SAFE_LOG = re.compile(
@@ -138,6 +139,8 @@ def _validate_host(host: str) -> str:
         raise ValueError("SSH host must contain only letters, digits, dot, underscore, or dash")
     if host.split("@")[-1].startswith("-"):
         raise ValueError("SSH hostname must not start with a dash")
+    if host.split("@")[-1].lower().endswith(_PROXY_SUFFIX):
+        raise ValueError("the Runpod SSH proxy cannot carry transfers; use the direct public IP")
     return host
 
 
@@ -242,9 +245,20 @@ def _ssh_command(
         "GlobalKnownHostsFile=/dev/null",
         "-o",
         "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
         host,
         remote,
     ]
+
+
+def child_environment() -> dict[str, str]:
+    """Environment for ssh/gh children without the Runpod API key."""
+    return {key: value for key, value in os.environ.items() if key != "RUNPOD_API_KEY"}
 
 
 def _request(
@@ -339,9 +353,11 @@ def pull_artifacts(
         capture_output=True,
         timeout=remaining_time(),
         check=False,
+        env=child_environment(),
     )
     if manifest_result.returncode != 0:
-        raise RuntimeError("SSH manifest request failed")
+        tail = (manifest_result.stderr or b"")[-300:].decode("utf-8", errors="replace")
+        raise RuntimeError(f"SSH manifest request failed: {tail.strip()}")
     manifest = _remote_manifest(manifest_result.stdout, selected)
     required_bytes = sum(int(row["size_bytes"]) for row in manifest.values())
     if required_bytes > shutil.disk_usage(parent).free:
@@ -364,9 +380,11 @@ def pull_artifacts(
                     stderr=subprocess.PIPE,
                     timeout=remaining_time(),
                     check=False,
+                    env=child_environment(),
                 )
                 if result.returncode != 0:
-                    raise RuntimeError("SSH artifact stream failed")
+                    tail = (result.stderr or b"")[-300:].decode("utf-8", errors="replace")
+                    raise RuntimeError(f"SSH artifact stream failed: {tail.strip()}")
                 output.flush()
                 os.fsync(output.fileno())
             with staged_path.open("rb") as source:

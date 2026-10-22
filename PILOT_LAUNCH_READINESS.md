@@ -42,6 +42,10 @@ Confirmed by the parallel audit and reproduced in code or tests before fixing:
 16. No checked-in A40 specification existed; the defaults would have allowed fp32, 2 validation documents and a 1-step warmup; nothing verified the validation document count against the binding.
 17. No in-Pod termination existed, no tool captured the Pod identity in the shape the watchdog requires, and the readiness receipt had to be typed by hand.
 18. The sanitizer did not recognise Runpod key prefixes; the readiness receipt was embedded in records unsanitised.
+19. A Pod or provider clock a few seconds ahead of the Mac made the first poll read the heartbeat as malformed, or the billing origin as "after creation", and delete the Pod.
+20. `createdAt` was compared as a string, so any rendering difference (milliseconds, `+00:00` versus `Z`) would have made every poll an identity mismatch and disabled deletion.
+21. A GitHub archive failure hid the verified Mac copy, blocked `shutdown_ready` forever and suppressed the final local record; `gh` output was parsed before its exit code.
+22. SSH transfers had no connect timeout or keepalive, accepted the `ssh.runpod.io` proxy that cannot carry files, and child processes inherited the Runpod API key.
 
 Risks noted but not changed (documented limitations): attention materialises `[B, H, T, T]` scores in bf16 with an fp32 softmax (about 6 bytes per score saved per layer); gradient clipping performs one device sync per parameter tensor; data loading is synchronous Python; the schedule applies the peak learning rate on two consecutive steps; the rising-loss guard counts consecutive increases (minimum now 5, specification uses 25); the loader never reshuffles across passes (not reached in this pilot).
 
@@ -52,7 +56,9 @@ Risks noted but not changed (documented limitations): attention materialises `[B
 - `src/scratchcoder/train/trainer.py`: `resume(expected_sha256=...)`, `finish()`, directory fsync after the checkpoint rename, `TrainingStop` logged as a stop rather than a failure.
 - `src/scratchcoder/optim/adamw.py`: cross-entropy formed from the log-softmax primitive (one fp32 saved copy, 4 bytes per logit) with an equivalence test against the explicit formulation and a saved-memory bound.
 - `tools/runpod_watchdog.py`: a 404 before the identity was ever observed alive is `unknown`, observation persisted across restarts, exit 3 if never observed; 429 back-off; 15-second default poll; `max_transfer_seconds` window driven only by Mac-observed progress; `idle_baseline_unix`; generic `request_path`.
-- `tools/pilot_supervisor.py`: `--transfer-timeout` (default 1,800 s), `--poll-seconds`, transfer-progress stamps from growing staged bytes, observation state, `-continued` bundle names.
+- `tools/pilot_supervisor.py`: `--transfer-timeout` (default 1,800 s), `--poll-seconds`, transfer-progress stamps from growing staged bytes, observation state, `-continued` bundle names; the Mac copy counts as verified independently of the GitHub archive, which is retried every cycle; the final local record is always written and a final archive failure is reported with exit status 2; Ctrl-C stops supervising cleanly; `gh` exit codes are checked before parsing.
+- `tools/pilot_transfer.py`: connect timeout and keepalives on every SSH call, rejection of the `ssh.runpod.io` proxy host, SSH stderr tails in error messages, and a child environment without the Runpod API key.
+- Clock skew: a 60-second tolerance between Pod, provider and Mac clocks in the watchdog and the launch gate; `createdAt` is compared as a parsed instant.
 - `tools/pilot_data.py` and new `tools/pilot_data_audit.py`: token-level audit (exact duplicate documents, validation window containment anywhere in the training stream) integrated into `verify_binding`.
 - New `tools/pod_self_destruct.py` (standard-library in-Pod timer), `tools/pilot_pod_bootstrap.sh`, `tools/runpod_pod_identity.py` (capture, status, billing), `tools/pilot_readiness_receipt.py`, `tools/pilot_feasibility.py`, `configs/pilot-a40-s.json`, `configs/runpod-pod-a40-s.json`.
 - `src/scratchcoder/common/logging.py`: `rpa_` keys redacted.

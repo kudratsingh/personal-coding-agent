@@ -24,7 +24,7 @@ import torch
 
 from scratchcoder.common.records import atomic_json
 from scratchcoder.data.shards import file_sha256
-from tools.pilot_transfer import Artifact, _ssh_command, pull_artifacts
+from tools.pilot_transfer import Artifact, _ssh_command, child_environment, pull_artifacts
 from tools.runpod_watchdog import (
     API_KEY_ENV,
     Outcome,
@@ -48,7 +48,12 @@ def fetch_status(ssh: list[str], root: str, name: str) -> dict[str, Any]:
     limit = 65_536 if name == "heartbeat.json" else 4_194_304
     request = json.dumps({"root": root, "action": "stream", "artifact": name, "max_bytes": limit})
     result = subprocess.run(
-        ssh, input=request.encode(), capture_output=True, timeout=5, check=False
+        ssh,
+        input=request.encode(),
+        capture_output=True,
+        timeout=15,
+        check=False,
+        env=child_environment(),
     )
     if result.returncode or len(result.stdout) > limit:
         raise RuntimeError("bounded SSH status request failed")
@@ -67,14 +72,21 @@ def _gh(
             path.write_text(json.dumps(payload))
             arguments = [*arguments, "--input", str(path)]
         result = subprocess.run(
-            ["gh", "api", *arguments], capture_output=True, timeout=30, check=False
+            ["gh", "api", *arguments],
+            capture_output=True,
+            timeout=30,
+            check=False,
+            env=child_environment(),
         )
-        value = json.loads(result.stdout)
+        try:
+            value = json.loads(result.stdout)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            value = None
         if result.returncode:
             if missing_ok and isinstance(value, dict) and str(value.get("status")) == "404":
                 return {"missing": True}
             # gh diagnostics can contain request data; never echo them here.
-            raise RuntimeError("private GitHub request failed")
+            raise RuntimeError(f"private GitHub request failed (exit {result.returncode})")
         if not isinstance(value, dict):
             raise ValueError("GitHub returned a malformed object")
         return value
@@ -178,6 +190,7 @@ class Supervisor:
     ) -> None:
         self.root, self.fetch, self.pull, self.archive = root, fetch, pull, archive
         self.received: dict[str, Path] = {}
+        self.archived: set[str] = set()
         self.pending: dict[str, Path] = {}
         self.latest: Path | None = None
         self.checkpoint_bundle: Path | None = None
@@ -213,6 +226,8 @@ class Supervisor:
             self.staged_bytes = staged
         if self.transfer_progress_unix is not None:
             heartbeat["transfer_progress_unix"] = self.transfer_progress_unix
+        if self.checkpoint_bundle is not None and not self.shutdown_ready:
+            heartbeat["mac_receipt_verified"] = True  # Durable copy exists even if GitHub lags.
         if self.shutdown_ready:
             heartbeat.update(
                 status="shutdown_ready", mac_receipt_verified=True, github_receipt_verified=True
@@ -240,14 +255,16 @@ class Supervisor:
                 bundle = self.pull(name)
                 self.pending[name] = bundle
             verified = verify_received(bundle)
+            # The Mac copy is durable from here on, whatever GitHub does next.
             self.checkpoint_bundle = bundle
-            if not failed:
-                self.archive_verified(bundle)
             self.received[name], self.latest = bundle, bundle
             self.pending.pop(name, None)
         else:
             bundle = self.received[name]
             verified = json.loads((bundle / "record.json").read_text())
+        if not failed and name not in self.archived:
+            self.archive_verified(bundle)  # Retried every cycle until it succeeds.
+            self.archived.add(name)
         # Only a final export can complete a successful/time-limited run. A failed
         # run may use its last verified periodic export, while preserving failure.
         terminal = report.get("status") in {"completed", "time_limited", "stopped", "failed"}
@@ -401,36 +418,55 @@ def main(argv: list[str] | None = None) -> int:
     heartbeat_watcher = threading.Thread(target=mirror, name="ssh-heartbeat-mirror", daemon=False)
     watcher.start()
     heartbeat_watcher.start()
+    interrupted = False
     try:
         while not done.is_set():
             try:
                 supervisor.cycle()
             except Exception as error:
                 atomic_json(
-                    args.output / "controller-error.json", {"error_type": type(error).__name__}
+                    args.output / "controller-error.json",
+                    {"error_type": type(error).__name__, "detail": str(error)[:500]},
                 )
                 # Preserve the last authenticated heartbeat; never fabricate GPU
                 # activity or receipt flags when SSH/transfer/archival fails.
             done.wait(args.cycle_seconds)
+    except KeyboardInterrupt:
+        interrupted = True  # The API guard keeps the Pod bounded; stop supervising cleanly.
+        done.set()
     finally:
         watcher.join()
         heartbeat_watcher.join()
-    if supervisor.latest is not None and outcomes:
+    archive_failed = False
+    if supervisor.latest is not None:
         final = args.output / (supervisor.latest.name + "-final")
-        final.mkdir()
+        final.mkdir(exist_ok=True)
         path = final / "record.json"
         record = json.loads((supervisor.latest / "record.json").read_text())
-        record["shutdown_receipt"] = json.loads((args.output / "watchdog-receipt.json").read_text())
+        receipt = args.output / "watchdog-receipt.json"
+        record["shutdown_receipt"] = json.loads(receipt.read_text()) if receipt.exists() else None
         receipt_path = supervisor.latest / "transfer-receipt.json"
         if not receipt_path.exists():
             receipt_path = supervisor.latest / "diagnostic-receipt.json"
-        record["durable_copy_receipt"] = json.loads(receipt_path.read_text())
+        record["durable_copy_receipt"] = (
+            json.loads(receipt_path.read_text()) if receipt_path.exists() else None
+        )
         record["resource_audit"] = (
             "Pod only; network volumes and account billing require separate audit"
         )
-        atomic_json(path, record)
+        record["supervisor_interrupted"] = interrupted
+        atomic_json(path, record)  # Always written locally, before any GitHub call.
         (final / "training.jsonl").write_bytes((supervisor.latest / "training.jsonl").read_bytes())
-        archive_bundle(final, args.repository, run_id=identity.pod_id)
+        try:
+            archive_bundle(final, args.repository, run_id=identity.pod_id)
+        except Exception as error:
+            archive_failed = True
+            atomic_json(
+                args.output / "final-archive-error.json",
+                {"error_type": type(error).__name__, "detail": str(error)[:500]},
+            )
+    if interrupted or archive_failed:
+        return 2
     return 0 if outcomes and outcomes[-1].state in {"terminated", "absent"} else 2
 
 

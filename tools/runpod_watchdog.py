@@ -29,6 +29,7 @@ MAX_RESPONSE_BYTES = 1_048_576
 MAX_POD_WALL_SECONDS = 5_400
 MAX_GPU_IDLE_SECONDS = 600
 MAX_TRANSFER_SECONDS = 1_800
+CLOCK_SKEW_SECONDS = 60.0  # Tolerated difference between Pod, provider and Mac clocks.
 TRANSFER_STATUSES = frozenset(
     {"awaiting_transfer", "completed", "time_limited", "stopped", "failed"}
 )
@@ -111,6 +112,12 @@ class PodIdentity:
         if not isinstance(pod, dict):
             return False
         gpu = pod.get("gpu")
+        try:
+            same_creation = (
+                abs(parse_timestamp(pod.get("createdAt")) - parse_timestamp(self.created_at)) < 1.0
+            )  # Same instant; the API may render the timestamp differently.
+        except ValueError:
+            return False
         return (
             pod.get("id") == self.pod_id
             and pod.get("name") == self.name
@@ -119,7 +126,7 @@ class PodIdentity:
             and type(gpu.get("count")) is int
             and gpu.get("count") == self.gpu_count
             and pod.get("dataCenterId") == self.data_center_id
-            and pod.get("createdAt") == self.created_at
+            and same_creation
         )
 
 
@@ -261,8 +268,9 @@ def read_heartbeat(path: Path, *, now: float, max_idle_seconds: float) -> Heartb
         return Heartbeat(0.0, "heartbeat_malformed", None)
     if activity > updated:
         return Heartbeat(float(activity), "heartbeat_malformed", worker_status)
-    if updated > now:
+    if updated > now + CLOCK_SKEW_SECONDS:
         return Heartbeat(float(activity), "heartbeat_malformed", worker_status)
+    updated = min(updated, now)  # A slightly fast Pod clock is not evidence of anything.
     if now - updated >= max_idle_seconds:
         return Heartbeat(float(activity), "heartbeat_stale", worker_status)
     receipts_verified = (
@@ -396,7 +404,7 @@ def check_once(
         try:
             created_at = parse_timestamp(identity.created_at)
             billing_started = policy.billing_started_at_unix
-            if billing_started is not None and billing_started > created_at:
+            if billing_started is not None and billing_started > created_at + CLOCK_SKEW_SECONDS:
                 trigger = "billing_start_after_pod_creation"
                 elapsed = 0.0
             else:
@@ -436,7 +444,7 @@ def check_once(
                         trigger = ""
                 elif (
                     not math.isfinite(heartbeat.last_gpu_activity_unix)
-                    or heartbeat.last_gpu_activity_unix > checked_at
+                    or heartbeat.last_gpu_activity_unix > checked_at + CLOCK_SKEW_SECONDS
                 ):
                     trigger = "heartbeat_malformed"
                 elif checked_at - heartbeat.last_gpu_activity_unix >= policy.max_idle_seconds:

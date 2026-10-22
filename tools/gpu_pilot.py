@@ -46,7 +46,7 @@ from scratchcoder.train.validation import ValidationWindow, shard_windows, valid
 from tools.cpu_resume_check import assert_identical
 from tools.pilot_data import verify_binding
 from tools.pilot_preflight import hardware_description
-from tools.runpod_watchdog import PodIdentity, Policy, parse_timestamp
+from tools.runpod_watchdog import CLOCK_SKEW_SECONDS, PodIdentity, Policy, parse_timestamp
 
 _CUDA_MEMORY_MARKERS = (
     "out of memory",
@@ -202,8 +202,9 @@ def check_readiness(receipt: dict[str, Any], *, now: float, spec: Specification)
     if created != parse_timestamp(identity.created_at):
         raise ValueError("pod timestamp differs from captured provider identity")
     origin = policy.billing_started_at_unix
-    if origin is None or not 0 < origin <= created:
+    if origin is None or not 0 < origin <= created + CLOCK_SKEW_SECONDS:
         raise ValueError("conservative create-request billing origin is required")
+    origin = min(origin, created)  # A fast Mac clock never shortens the accounted lifetime.
     termination = finite_number(
         receipt.get("self_destruct_deadline_unix"), "self-destruct deadline"
     )
