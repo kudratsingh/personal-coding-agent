@@ -104,12 +104,12 @@ def test_microbatch_table_with_default_proxy(spec: PilotSpecification) -> None:
     assert list(rows) == [16, 32, 8, 4]
     assert rows[4].verdict == "likely fits" and rows[4].fits
     assert rows[8].verdict == "likely fits" and rows[8].fits
-    assert rows[16].verdict in {"marginal", "likely OOM"}
+    assert rows[16].verdict == "likely fits" and rows[16].fits
     assert rows[32].verdict == "likely OOM" and not rows[32].fits
     assert rows[8].accumulation_steps == 16
     assert rows[8].static_bytes == 16 * PARAMETERS
-    assert rows[8].activation_proxy_bytes == pytest.approx(8 * 2.85 * GIB)
-    assert rows[8].proxy_total_bytes == pytest.approx(16 * PARAMETERS + 8 * 2.85 * GIB)
+    assert rows[8].activation_proxy_bytes == pytest.approx(8 * 1.72 * GIB)
+    assert rows[8].proxy_total_bytes == pytest.approx(16 * PARAMETERS + 8 * 1.72 * GIB)
     # The analytical output-layer term is reported but never added to the fit decision.
     assert rows[8].output_layer_analytical_bytes == 8 * 1024 * 65536 * 14
     assert rows[8].proxy_total_bytes == rows[8].static_bytes + rows[8].activation_proxy_bytes
@@ -258,7 +258,7 @@ def test_specification_rejects_malformed_input() -> None:
 def test_report_and_markdown_carry_the_disclaimer(spec: PilotSpecification) -> None:
     report = build_report(spec, FeasibilityOptions(), str(SPEC_PATH))
     assert report["disclaimer"] == GPU_DISCLAIMER
-    assert report["probe_microbatches"] == [8, 4]
+    assert report["probe_microbatches"] == [16, 8, 4]
     assert [item["updates"] for item in report["requirements"]] == [300, 700]
     assert report["requirements"][1]["schedule"]["outcome"] == "complete 500"
     assert [item["throughput"] for item in report["scenarios"]] == [

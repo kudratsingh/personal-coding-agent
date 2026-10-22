@@ -45,6 +45,8 @@ PY
 
 If the console price exceeds `quoted_gpu_hourly` (0.59), edit both `quoted_gpu_hourly` and `limits.quoted_total_hourly` in `configs/pilot-a40-s.json` (total = GPU price + 20 GB x $0.10 / 730 h, rounded up to the cent), commit the change, and rerun `tests/test_pilot_specification.py`. The spending ceiling of $5 and the 1.5 x estimate cost stop ($1.35) stay as they are. Confirm the account balance covers at least one hour at the quoted rate (Runpod refuses to deploy otherwise) and that no network volume exists on the account.
 
+Decide which specification the run uses before building the receipt: `configs/pilot-a40-s.json` is the agreed pilot of record; `configs/pilot-a40-s-improved.json` adds z-loss, QK-normalization and `torch.compile` (see [docs/training-recipe.md](docs/training-recipe.md)) and changes the parameter count to 135,287,040, so it is an owner decision. Use the chosen path everywhere `configs/pilot-a40-s.json` appears below.
+
 ## 4. Dataset staging and checksum verification (Mac, free)
 
 The reviewed binding was built earlier with `tools/pilot_data.py`; do not rebuild it. Verify it, run the token-level leakage audit, and pin its hash:

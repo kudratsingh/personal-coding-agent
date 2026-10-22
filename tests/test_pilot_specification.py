@@ -22,6 +22,10 @@ def test_specification_matches_the_agreed_experiment() -> None:
     )
     assert expected_parameters(model) == 135_285_504
     assert spec.config.train.precision == "bfloat16"
+    assert spec.config.train.attention == "fused"  # Equivalence-tested kernel; no score matrices.
+    assert spec.config.train.optimizer_foreach is True  # Bitwise-identical update, fewer kernels.
+    assert spec.config.train.z_loss == 0 and spec.config.model.qk_norm is False  # Agreed recipe.
+    assert spec.config.train.compile is False and spec.config.train.schedule == "cosine"
     assert spec.config.train.sequence_length == 1024
     assert spec.config.train.validation_interval == 0
     assert spec.config.train.validation_documents == 32
@@ -50,6 +54,22 @@ def test_specification_matches_the_agreed_experiment() -> None:
     assert spec.expected_tokens_per_second is None  # Measured probe baseline, not a guess.
     # The 65.5M winner tokens (500 x 131,072) stay below one pass over the reviewed shard.
     assert spec.config.train.steps * spec.tokens_per_update == 65_536_000 < 66_030_000
+
+
+def test_improved_variant_changes_only_the_declared_recipe_options() -> None:
+    base = Specification.load(SPEC)
+    improved = Specification.load(SPEC.with_name("pilot-a40-s-improved.json"))
+    assert improved.config.model.qk_norm is True
+    assert expected_parameters(improved.config.model) == 135_285_504 + 12 * 2 * 64
+    assert improved.config.train.z_loss == 0.0001
+    assert improved.config.train.compile is True and improved.config.train.attention == "fused"
+    assert improved.config.train.schedule == "cosine"
+    for name in ("steps", "sequence_length", "learning_rate", "warmup_steps", "precision"):
+        assert getattr(improved.config.train, name) == getattr(base.config.train, name)
+    assert improved.limits == base.limits
+    assert improved.microbatches == base.microbatches
+    assert improved.learning_rates == base.learning_rates
+    assert improved.tokens_per_update == base.tokens_per_update
 
 
 def test_specification_file_is_plain_json_without_private_material() -> None:

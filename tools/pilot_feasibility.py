@@ -42,10 +42,12 @@ MEASURED_UNTRAINED_CHECKPOINT_PROVENANCE = (
     "1,623,502,465 bytes = 1.5120 GiB; a file-size observation, not a GPU measurement"
 )
 
-DEFAULT_ACTIVATION_GIB_PER_SEQUENCE = 2.85
+DEFAULT_ACTIVATION_GIB_PER_SEQUENCE = 1.72
 ACTIVATION_PROXY_PROVENANCE = (
-    "CPU allocator proxy measured 2026-10-22 on this implementation: 2,919 MiB growth for one "
-    "1024-token sequence, 2,871 MiB for the second; not a CUDA measurement"
+    "CPU allocator proxy measured 2026-10-22 on this implementation with fused attention and "
+    "the log-softmax cross-entropy: 1,760 MiB growth for one 1024-token sequence, 1,720 MiB "
+    "for the second (reference attention: 2,617 / 2,467 MiB; original code: 2,919 / 2,871 MiB); "
+    "not a CUDA measurement"
 )
 # bf16 logits, fp32 copy, shifted copy, exp: the analytical output-layer term.
 OUTPUT_LAYER_BYTES_PER_LOGIT = 2 + 4 + 4 + 4

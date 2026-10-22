@@ -1,6 +1,12 @@
 {
   "config": {
-    "model": {"vocab_size": 65536, "width": 768, "layers": 12, "heads": 12, "context": 1024},
+    "model": {
+      "vocab_size": 65536,
+      "width": 768,
+      "layers": 12,
+      "heads": 12,
+      "context": 1024
+    },
     "train": {
       "seed": 1,
       "steps": 500,
@@ -16,10 +22,14 @@
       "beta2": 0.95,
       "adam_epsilon": 1e-08,
       "precision": "bfloat16",
+      "attention": "fused",
       "validation_interval": 0,
-      "validation_documents": 32
+      "validation_documents": 32,
+      "optimizer_foreach": true
     },
-    "data_mix": {"web": 1.0},
+    "data_mix": {
+      "web": 1.0
+    },
     "parent_checkpoint": null
   },
   "limits": {
@@ -37,10 +47,19 @@
     "starting_cost_usd": 0.0,
     "finalization_reserve_seconds": 900
   },
-  "microbatches": [16, 32, 8, 4],
+  "microbatches": [
+    16,
+    32,
+    8,
+    4
+  ],
   "probe_steps": 20,
   "tokens_per_update": 131072,
-  "learning_rates": [0.0003, 0.0006, 0.0012],
+  "learning_rates": [
+    0.0003,
+    0.0006,
+    0.0012
+  ],
   "screen_steps": 100,
   "checkpoint_seconds": 300,
   "expected_tokens_per_second": null,

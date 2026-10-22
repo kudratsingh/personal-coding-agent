@@ -189,6 +189,48 @@ def _precision_check(device: torch.device) -> dict[str, Any]:
     }
 
 
+def _attention_check(device: torch.device) -> dict[str, Any]:
+    """Compare the fused attention kernel with the reference path on this device."""
+    torch.manual_seed(2718)
+    model_config = ModelConfig(vocab_size=272, width=32, layers=2, heads=4, context=16)
+    reference = GPT(model_config).to(device)
+    fused = GPT(model_config).to(device)
+    fused.load_state_dict(reference.state_dict())
+    fused.set_fused_attention(True)
+    inputs = torch.randint(0, model_config.vocab_size, (4, 16), device=device)
+    targets = torch.randint(0, model_config.vocab_size, (4, 16), device=device)
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+        reference_loss = cross_entropy(reference(inputs), targets)
+        fused_loss = cross_entropy(fused(inputs), targets)
+    reference_loss.backward()  # type: ignore[no-untyped-call]  # PyTorch's Tensor stub.
+    fused_loss.backward()  # type: ignore[no-untyped-call]  # PyTorch's Tensor stub.
+    torch.testing.assert_close(fused_loss, reference_loss, atol=LOSS_ATOL * 10, rtol=LOSS_RTOL * 10)
+    relative_errors: list[float] = []
+    for left, right in zip(fused.parameters(), reference.parameters(), strict=True):
+        if left.grad is None or right.grad is None or not bool(torch.isfinite(left.grad).all()):
+            raise AssertionError("fused attention produced a missing or nonfinite gradient")
+        reference_norm = float(right.grad.norm())
+        error = float((left.grad - right.grad).norm())
+        relative = error / reference_norm if reference_norm else error
+        if relative > GRADIENT_RELATIVE_NORM_MAX:
+            raise AssertionError("fused attention gradient relative norm error exceeds 0.03")
+        relative_errors.append(relative)
+    with torch.no_grad():
+        changed = inputs.clone()
+        changed[:, 8:] = (changed[:, 8:] + 1) % model_config.vocab_size
+        torch.testing.assert_close(fused(changed)[:, :8], fused(inputs)[:, :8], atol=0, rtol=0)
+    return {
+        "status": "passed",
+        "same_initial_weights": True,
+        "autocast_dtype": "bfloat16",
+        "loss_absolute_error": abs(float(fused_loss.detach()) - float(reference_loss.detach())),
+        "max_gradient_relative_norm_error": max(relative_errors),
+        "gradient_relative_norm_max": GRADIENT_RELATIVE_NORM_MAX,
+        "causality_exact": True,
+        "note": "fused CUDA backward kernels may not be bitwise deterministic across runs",
+    }
+
+
 def _make_trainer(config: RunConfig, root: Path, name: str, device: torch.device) -> Trainer:
     rng = random.Random(config.train.seed)
     sources = {
@@ -296,6 +338,7 @@ def run_preflight(output: Path, *, device: str = "cpu") -> dict[str, Any]:
     torch.set_num_threads(1)
     try:
         report["precision"] = _precision_check(selected)
+        report["fused_attention"] = _attention_check(selected)
         report["exact_resume"] = _resume_check(output / "resume", selected)
         report["hardware_precision_and_resume_checked"] = selected.type == "cuda"
         report["status"] = "completed"

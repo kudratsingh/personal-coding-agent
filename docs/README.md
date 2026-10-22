@@ -7,6 +7,7 @@ Start with the [project README](../README.md), [current status](status.md), and 
 | [Getting started](getting-started.md) | Navigate the starter and choose a first task. |
 | [Architecture](architecture.md) | Understand the intended component boundaries. |
 | [Model and vocabulary](model.md) | Exact tied-embedding parameter counts, special-token IDs and uint16 vocabulary limits. |
+| [Training recipe](training-recipe.md) | What comparable small-model runs do, which practices are implemented, and which specification enables each option. |
 | [Development](development.md) | Run the starter checks and understand the implementation milestone. |
 | [Logging](logging.md) | Record local events, metrics, and diagnostic tracebacks. |
 | [Compute](compute.md) | Estimate two-stage compute from supplied assumptions. |

@@ -38,7 +38,9 @@ For vocabulary `V`, width `W` and `L` layers:
 `parameters = V × W + L × (12 × W² + 2 × W) + W`.
 The first term is the **single shared embedding/output table**; the other
 terms include attention, feed-forward matrices and all RMS gains. Rotary
-positions add no parameters. Counts below are computed by
+positions add no parameters. With the optional `qk_norm` (see the
+[training recipe](training-recipe.md)) each layer adds `2 × (W / heads)`
+shared query/key gains: 1,536 parameters for the S shape. Counts below are computed by
 `scratchcoder.model.gpt.expected_parameters`, not rounded size labels.
 
 | Planned shape | Layers | Width | Heads | Context | Shared embedding, 65,536 × width | Total parameters |

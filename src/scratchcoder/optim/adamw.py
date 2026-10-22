@@ -50,24 +50,72 @@ def cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
     return -chosen.mean()
 
 
+def cross_entropy_and_z(logits: Tensor, targets: Tensor) -> tuple[Tensor, Tensor]:
+    """Mean next-token loss and the z-loss term ``mean(log Z^2)``.
+
+    ``log Z`` is the log-partition function of each position's softmax. Adding
+    a small multiple of its square (``1e-4`` in Wortsman et al. 2023 and PaLM)
+    keeps output logits from drifting without changing the predicted
+    distribution. Autograd keeps one fp32 ``[B,T,V]`` tensor, as for
+    ``cross_entropy``.
+    """
+    if logits.shape[:-1] != targets.shape or targets.numel() == 0:
+        raise ValueError("logits/target shape mismatch or empty targets")
+    values = logits.float()
+    log_partition = torch.logsumexp(values, dim=-1)
+    chosen = values.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    return (log_partition - chosen).mean(), log_partition.square().mean()
+
+
 def learning_rate(
-    step: int, *, total_steps: int, warmup_steps: int, peak: float, minimum_ratio: float = 0.1
+    step: int,
+    *,
+    total_steps: int,
+    warmup_steps: int,
+    peak: float,
+    minimum_ratio: float = 0.1,
+    schedule: str = "cosine",
+    decay_fraction: float = 0.2,
 ) -> float:
+    """Warmup then cosine decay, or warmup-stable-decay (WSD) with a linear tail.
+
+    WSD holds the peak after warmup and decays linearly over the final
+    ``decay_fraction`` of the run, which lets a stable-phase checkpoint be
+    continued without re-warming and is the schedule used by recent small-model
+    pretraining such as SmolLM2 and MiniCPM.
+    """
     if not 0 <= step < total_steps or not 0 <= warmup_steps <= total_steps:
         raise ValueError("invalid schedule position")
     if not 0 <= minimum_ratio <= 1 or not 0 < peak < float("inf"):
         raise ValueError("invalid learning rate bounds")
+    if schedule not in {"cosine", "wsd"}:
+        raise ValueError("schedule must be cosine or wsd")
+    if not 0 < decay_fraction <= 1:
+        raise ValueError("decay_fraction must be in (0, 1]")
     if step < warmup_steps:
         return peak * (step + 1) / warmup_steps
+    if schedule == "wsd":
+        decay_steps = max(1, round(decay_fraction * total_steps))
+        decay_start = max(warmup_steps, total_steps - decay_steps)
+        if step < decay_start:
+            return peak
+        progress = (step - decay_start) / max(1, total_steps - decay_start - 1)
+        return peak * (1 - (1 - minimum_ratio) * min(1.0, progress))
     progress = (step - warmup_steps) / max(1, total_steps - warmup_steps - 1)
     return peak * (minimum_ratio + (1 - minimum_ratio) * 0.5 * (1 + math.cos(math.pi * progress)))
 
 
 def clip_gradients(parameters: Iterable[Tensor], maximum: float) -> float:
+    """Scale gradients to a global L2 norm; one device sync for all tensors."""
     if not 0 < maximum < float("inf"):
         raise ValueError("maximum norm must be finite and positive")
     grads = [parameter.grad for parameter in parameters if parameter.grad is not None]
-    norm = math.sqrt(sum(float(gradient.detach().double().square().sum()) for gradient in grads))
+    if not grads:
+        return 0.0
+    # Per-tensor float64 partial sums are reduced on the device, so the only
+    # host synchronization is the final scalar read, not one per parameter.
+    squares = torch.stack([gradient.detach().double().square().sum() for gradient in grads])
+    norm = float(squares.sum().sqrt())
     if not math.isfinite(norm):
         raise FloatingPointError("nonfinite gradient norm")
     scale = min(1.0, maximum / (norm + 1e-6))
@@ -86,8 +134,12 @@ class AdamW:
         eps: float = 1e-8,
         weight_decay: float = 0.1,
         decay_mask: list[bool] | None = None,
+        foreach: bool = False,
     ) -> None:
         _validate_hyperparameters(learning_rate, betas, eps, weight_decay)
+        if type(foreach) is not bool:
+            raise ValueError("foreach must be a boolean")
+        self.foreach = foreach
         self.parameters = list(parameters)
         mask = decay_mask if decay_mask is not None else [True] * len(self.parameters)
         if (
@@ -109,6 +161,9 @@ class AdamW:
 
     @torch.no_grad()
     def step(self) -> None:
+        if self.foreach:
+            self._step_foreach()
+            return
         beta1, beta2 = self.betas
         for i, parameter in enumerate(self.parameters):
             gradient = parameter.grad
@@ -124,6 +179,45 @@ class AdamW:
             self.v[i].mul_(beta2).addcmul_(gradient, gradient, value=1 - beta2)
             denominator = self.v[i].sqrt() / math.sqrt(1 - beta2**step) + self.eps
             parameter.addcdiv_(self.m[i], denominator, value=-self.lr / (1 - beta1**step))
+
+    @torch.no_grad()
+    def _step_foreach(self) -> None:
+        """The same update as ``step`` issued as one kernel per operation.
+
+        Each elementwise operation runs over the whole parameter list at once
+        instead of once per tensor, which removes most launch overhead on a GPU.
+        ``tests/test_optimizer.py`` checks the result against the per-tensor
+        loop exactly. Bias corrections stay per tensor because a parameter
+        that skipped an update keeps its own step count.
+        """
+        beta1, beta2 = self.betas
+        indices = [i for i, parameter in enumerate(self.parameters) if parameter.grad is not None]
+        if not indices:
+            return
+        grads: list[Tensor] = []
+        for i in indices:
+            gradient = self.parameters[i].grad
+            assert gradient is not None
+            if gradient.is_sparse:
+                raise ValueError("sparse gradients are unsupported")
+            grads.append(gradient)
+            self.steps[i] += 1
+        params = [self.parameters[i] for i in indices]
+        first = [self.m[i] for i in indices]
+        second = [self.v[i] for i in indices]
+        decayed = [self.parameters[i] for i in indices if self.decay_mask[i]]
+        if decayed:
+            torch._foreach_mul_(decayed, 1 - self.lr * self.weight_decay)
+        torch._foreach_mul_(first, beta1)
+        torch._foreach_add_(first, grads, alpha=1 - beta1)
+        torch._foreach_mul_(second, beta2)
+        torch._foreach_addcmul_(second, grads, grads, value=1 - beta2)
+        denominators = torch._foreach_sqrt(second)
+        torch._foreach_div_(denominators, [math.sqrt(1 - beta2 ** self.steps[i]) for i in indices])
+        torch._foreach_add_(denominators, self.eps)
+        torch._foreach_addcdiv_(
+            params, first, denominators, [-self.lr / (1 - beta1 ** self.steps[i]) for i in indices]
+        )
 
     def state_dict(self) -> dict[str, Any]:
         return {
