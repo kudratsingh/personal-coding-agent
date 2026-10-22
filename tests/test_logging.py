@@ -82,3 +82,12 @@ def test_tracker_finish_failure_is_local_and_permissions_are_tightened(tmp_path:
     assert "sensitive-provider-message" not in text
     assert json.loads(text.splitlines()[-1])["fields"]["phase"] == "finish"
     assert path.stat().st_mode & 0o077 == 0
+
+
+def test_sanitizer_redacts_runpod_api_keys() -> None:
+    from scratchcoder.common.logging import sanitize
+
+    value = sanitize({"note": "key rpa_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 leaked", "pod": "ok"})
+    assert isinstance(value, dict)
+    assert "rpa_ABCDEFG" not in value["note"] and "[REDACTED]" in value["note"]
+    assert value["pod"] == "ok"

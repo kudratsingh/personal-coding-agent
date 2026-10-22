@@ -1,6 +1,6 @@
 # Loss and optimization
 
-For logits `[B,T,V]`, subtract the largest logit per position, compute log of the summed exponentials, and subtract the selected target logit. Averaging `[B,T]` yields stable next-token cross-entropy. Tests compare the scalar and its gradients to a trusted reference, including large logits.
+For logits `[B,T,V]`, subtract the largest logit per position, compute log of the summed exponentials, and subtract the selected target logit. Averaging `[B,T]` yields stable next-token cross-entropy. Tests compare the scalar and its gradients to a trusted reference, including large logits. The implementation forms the max-shifted log-probabilities with the log-softmax primitive and gathers the target by hand; this is the same arithmetic as an explicit max/exp/sum/log chain but keeps one fp32 `[B,T,V]` tensor for backward instead of three, which at a 65,536-entry vocabulary saves about 8 bytes per logit. A test compares it against the explicit formulation and bounds the saved memory.
 
 AdamW maintains first and second moment tensors with the same shape as each parameter. Each step updates exponential averages, corrects their initial zero bias, divides the corrected first moment by the square-root second moment plus epsilon, and takes a learning-rate-scaled step. Decoupled weight decay multiplies selected weights before the update. Parameters without gradients do not advance their step counters.
 

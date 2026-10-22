@@ -24,6 +24,10 @@ from scratchcoder.optim.adamw import AdamW, clip_gradients, cross_entropy, learn
 from scratchcoder.train.validation import ValidationWindow, validate
 
 
+class TrainingStop(RuntimeError):
+    """A deliberate, recorded stop raised from a step callback; not a training failure."""
+
+
 def training_device(value: str) -> torch.device:
     """Resolve an explicit CPU/CUDA choice without falling back to another device."""
     if value == "cpu":
@@ -212,6 +216,11 @@ class Trainer:
                         on_step(self, metrics)
                 if self.step == options.steps:
                     self.record.finish(success=True)
+            except TrainingStop as stop:
+                logger.event(
+                    "training_stopped", step=self.step, partial_update=False, reason=str(stop)
+                )
+                raise
             except Exception as error:
                 logger.event("training_failed", error_type=type(error).__name__, step=self.step)
                 diagnostic = debug_logger(log_path.with_name(f"debug-rank{self.rank}.jsonl"))
@@ -277,14 +286,29 @@ class Trainer:
                     temporary.unlink(missing_ok=True)
                     raise
             temporary.replace(path)
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)  # Make the rename itself durable, not only the bytes.
+            finally:
+                os.close(directory)
         if self.world_size > 1:
             dist.barrier()
 
-    def resume(self, path: Path) -> None:
+    def finish(self, *, success: bool = True) -> None:
+        """Close the run record for a run that ended deliberately before its final step."""
+        if self.record.status == "running":
+            self.record.finish(success=success)
+            if self.rank == 0:
+                self.record.save(self.run_root)
+
+    def resume(self, path: Path, *, expected_sha256: str | None = None) -> None:
+        """Restore exact training state; ``expected_sha256`` rejects altered bytes first."""
         checkpoint_hash: str | None = None
         try:
             with path.open("rb") as stream:
                 checkpoint_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+                if expected_sha256 is not None and checkpoint_hash != expected_sha256:
+                    raise ValueError("checkpoint bytes differ from the expected identity")
                 stream.seek(0)
                 state = torch.load(stream, map_location="cpu", weights_only=True)
             self._restore_checkpoint(state, checkpoint_hash)

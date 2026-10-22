@@ -5,10 +5,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from scratchcoder.common.config import finite_number
+from scratchcoder.train.trainer import TrainingStop
 
 
-class PilotStop(RuntimeError):
+class PilotStop(TrainingStop):
     """A recorded safety rule ended an experiment; it must not be auto-retried."""
+
+
+NON_SELECTING_PROBE_STATUSES = frozenset({"oom", "skipped", "incomplete"})
 
 
 def accumulation_steps(microbatch: int, sequence_length: int, tokens_per_update: int) -> int:
@@ -58,7 +62,24 @@ def cost_per_billion(tokens_per_second: float, quoted_gpu_hourly: float) -> floa
     return result
 
 
-def choose_microbatch(probes: list[dict[str, Any]], sizes: tuple[int, ...], steps: int) -> int:
+def choose_microbatch(
+    probes: list[dict[str, Any]],
+    sizes: tuple[int, ...],
+    steps: int,
+    *,
+    max_peak_bytes: float | None = None,
+) -> int:
+    """Select the largest microbatch whose probe completed its fixed step budget.
+
+    ``oom``, ``skipped`` (probe window expired before it started) and
+    ``incomplete`` (probe window expired during it) rows never select; any
+    other status is a protocol violation and stops the pilot. A completed
+    probe whose reserved peak exceeds ``max_peak_bytes`` is kept in the table
+    but marked ``exceeds_headroom`` and never selected: a probe that barely
+    fits leaves no room for allocator fragmentation in a 500-update run.
+    """
+    if max_peak_bytes is not None and finite_number(max_peak_bytes, "peak budget") <= 0:
+        raise ValueError("peak budget must be positive")
     if (
         not sizes
         or len(set(sizes)) != len(sizes)
@@ -74,14 +95,18 @@ def choose_microbatch(probes: list[dict[str, Any]], sizes: tuple[int, ...], step
         size = row["microbatch"]
         if type(size) is not int or size not in sizes:
             raise ValueError("probe microbatch must match the requested integer size")
-        if row.get("status") == "oom":
+        if row.get("status") in NON_SELECTING_PROBE_STATUSES:
             continue
         if row.get("status") != "completed" or row.get("updates") != steps:
             raise PilotStop("batch probe did not complete its fixed step budget")
         rate = finite_number(row.get("tokens_per_second"), "probe throughput")
         peak = finite_number(row.get("peak_allocated_bytes"), "probe peak memory")
-        if rate <= 0 or peak < 0:
+        reserved = finite_number(row.get("peak_reserved_bytes", peak), "probe reserved memory")
+        if rate <= 0 or peak < 0 or reserved < peak:
             raise ValueError("invalid measured probe")
+        if max_peak_bytes is not None and reserved > max_peak_bytes:
+            row["exceeds_headroom"] = True
+            continue
         fitting.append(size)
     if not fitting:
         raise PilotStop("no measured microbatch fits")
@@ -102,20 +127,23 @@ class Limits:
     idle_seconds: float
     rising_steps: int
     starting_cost_usd: float = 0.0
+    finalization_reserve_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
             value = finite_number(getattr(self, name), name)
-            if name == "starting_cost_usd" and value == 0:
+            if name in {"starting_cost_usd", "finalization_reserve_seconds"} and value == 0:
                 continue
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
         if (
             self.probe_seconds >= self.pod_seconds
             or self.training_seconds >= self.pod_seconds
+            or self.probe_seconds + self.finalization_reserve_seconds >= self.pod_seconds
             or self.minimum_speed_fraction > 1
             or self.cost_multiplier < 1
             or type(self.rising_steps) is not int
+            or self.rising_steps < 5
             or self.starting_cost_usd >= self.cost_stop
         ):
             raise ValueError("inconsistent experiment limits")
@@ -126,6 +154,22 @@ class Limits:
         if not math.isfinite(result):
             raise ValueError("cost limit is not representable")
         return result
+
+    def training_deadline(self, *, pod_created: float, training_started: float) -> float:
+        """Absolute time by which training must stop.
+
+        The earlier of the training budget and the moment at which only the
+        finalization reserve (final save, resume test, export, transfer) is
+        left before the pod wall limit.
+        """
+        started = finite_number(training_started, "training start")
+        created = finite_number(pod_created, "pod creation")
+        if started < created:
+            raise ValueError("training cannot start before the pod exists")
+        return min(
+            started + self.training_seconds,
+            created + self.pod_seconds - self.finalization_reserve_seconds,
+        )
 
     def stop_reason(self, *, pod_elapsed: float, idle_elapsed: float = 0) -> str | None:
         elapsed = finite_number(pod_elapsed, "pod elapsed")

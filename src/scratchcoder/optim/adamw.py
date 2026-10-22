@@ -33,13 +33,21 @@ def _validate_hyperparameters(lr: Any, betas: Any, eps: Any, weight_decay: Any) 
 
 
 def cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
-    """Stable mean next-token loss without delegating to a loss framework."""
+    """Stable mean next-token loss without delegating to a loss framework.
+
+    The log-probabilities are formed with the max-shifted log-softmax primitive
+    and the target is gathered by hand. Mathematically this is the same
+    ``log(sum(exp(x - max))) - (x_target - max)`` as the earlier explicit
+    formulation, but autograd keeps one fp32 ``[B,T,V]`` tensor for backward
+    instead of three (4 instead of 12 bytes per logit), which matters at a
+    65,536-entry vocabulary. ``tests/test_optimizer.py`` checks both the
+    reference values and the saved-memory bound.
+    """
     if logits.shape[:-1] != targets.shape or targets.numel() == 0:
         raise ValueError("logits/target shape mismatch or empty targets")
-    shifted = logits.float() - logits.float().amax(dim=-1, keepdim=True)
-    log_normalizer = shifted.exp().sum(dim=-1).log()
-    chosen = shifted.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-    return (log_normalizer - chosen).mean()
+    log_probabilities = torch.log_softmax(logits.float(), dim=-1)
+    chosen = log_probabilities.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    return -chosen.mean()
 
 
 def learning_rate(

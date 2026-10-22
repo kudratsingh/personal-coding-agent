@@ -99,3 +99,48 @@ def test_rank_local_controls_rejected_for_distributed_training(tmp_path: Path) -
     trainer.world_size = 2
     with pytest.raises(ValueError, match="single-process"):
         trainer.train(should_stop=lambda: False)
+
+
+def test_resume_rejects_unexpected_bytes_before_restoring_anything(tmp_path: Path) -> None:
+    trainer = make_trainer(tiny_config(), tmp_path, "origin")
+    trainer.train(stop_after=2)
+    trainer.checkpoint(tmp_path / "step2.pt")
+    resumed = make_trainer(tiny_config(), tmp_path, "resumed")
+    with pytest.raises(ValueError, match="expected identity"):
+        resumed.resume(tmp_path / "step2.pt", expected_sha256="0" * 64)
+    assert resumed.step == 0
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "resumed/events-rank0.jsonl").read_text().splitlines()
+    ]
+    assert any(row["event"] == "resume_failed" for row in events)
+    from scratchcoder.data.shards import file_sha256
+
+    resumed_ok = make_trainer(tiny_config(), tmp_path, "resumed-ok")
+    resumed_ok.resume(tmp_path / "step2.pt", expected_sha256=file_sha256(tmp_path / "step2.pt"))
+    assert resumed_ok.step == 2
+
+
+def test_controlled_stop_from_callback_is_logged_as_a_stop_not_a_failure(tmp_path: Path) -> None:
+    from scratchcoder.train.trainer import TrainingStop
+
+    trainer = make_trainer(tiny_config(), tmp_path, "stopped")
+
+    def halt(instance: object, metrics: dict[str, float]) -> None:
+        if trainer.step == 2:
+            raise TrainingStop("authored_rule")
+
+    with pytest.raises(TrainingStop, match="authored_rule"):
+        trainer.train(on_step=halt)
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "stopped/events-rank0.jsonl").read_text().splitlines()
+    ]
+    assert any(
+        row["event"] == "training_stopped" and row["fields"]["reason"] == "authored_rule"
+        for row in events
+    )
+    assert not any(row["event"] == "training_failed" for row in events)
+    assert not (tmp_path / "stopped/debug-rank0.jsonl").exists()
+    trainer.finish(success=True)
+    assert json.loads((tmp_path / "stopped/record.json").read_text())["status"] == "completed"
