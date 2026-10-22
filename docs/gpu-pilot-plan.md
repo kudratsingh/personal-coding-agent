@@ -26,12 +26,18 @@ CPU and mocked-CUDA tests cover selection, timing boundaries and token arithmeti
 they do not establish hardware precision, resume correctness or measured GPU speed.
 
 Before launch, resolve the conditional approval's prerequisites and check the
-exact quote against the approved run. Remaining readiness includes a pinned
-CUDA-enabled environment (the Linux development lock uses CPU PyTorch), hardware
-equivalence/resume checks, periodic checkpointing, an external watchdog, frozen
-approved shards and verified durable artifact transfers. No machine, payment, credit purchase,
-volume or storage account was created. The provider/machine remains proposed,
-not selected for the full build or generated-code execution.
+exact quote against the approved run. The 2026-10-22 readiness audit added the
+checked-in [A40 specification](../configs/pilot-a40-s.json), an in-Pod
+self-destruct timer, a Pod-identity capture tool, a receipt assembler, a
+token-level leakage audit, an analytical feasibility calculator and a
+finalization reserve; the complete verdict, blockers and exact commands are in
+[PILOT_LAUNCH_READINESS.md](../PILOT_LAUNCH_READINESS.md) and
+[PILOT_RUNBOOK.md](../PILOT_RUNBOOK.md). Runpod offers no provider-enforced Pod
+lifetime, so termination remains layered best-effort and the owner must accept
+that residual risk explicitly in the readiness receipt. No machine, payment,
+credit purchase, volume or storage account was created by that audit. The
+provider/machine remains proposed, not selected for the full build or
+generated-code execution.
 
 The proposed durable destination is a private folder on the owner's laptop SSD.
 The owner must confirm that destination and keep it available for a verified
