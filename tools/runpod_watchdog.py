@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -27,6 +28,10 @@ API_KEY_ENV = "RUNPOD_API_KEY"
 MAX_RESPONSE_BYTES = 1_048_576
 MAX_POD_WALL_SECONDS = 5_400
 MAX_GPU_IDLE_SECONDS = 600
+MAX_TRANSFER_SECONDS = 1_800
+TRANSFER_STATUSES = frozenset(
+    {"awaiting_transfer", "completed", "time_limited", "stopped", "failed"}
+)
 _SAFE_POD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 
@@ -129,6 +134,7 @@ class Policy:
     delete_verify_attempts: int = 3
     delete_verify_delay_seconds: float = 1.0
     starting_cost_usd: float = 0.0
+    max_transfer_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         for key in (
@@ -151,6 +157,12 @@ class Policy:
             raise ValueError("starting cost must be finite, nonnegative and below the stop cost")
         if self.max_idle_seconds > MAX_GPU_IDLE_SECONDS:
             raise ValueError("max_idle_seconds cannot exceed the 600-second pilot ceiling")
+        if (
+            not _is_number(self.max_transfer_seconds)
+            or not math.isfinite(self.max_transfer_seconds)
+            or not 0 <= self.max_transfer_seconds <= MAX_TRANSFER_SECONDS
+        ):
+            raise ValueError("max_transfer_seconds must be between 0 and the 1800-second ceiling")
         if self.billing_started_at_unix is not None and (
             not _is_number(self.billing_started_at_unix)
             or not math.isfinite(self.billing_started_at_unix)
@@ -199,6 +211,7 @@ class Heartbeat:
     error: str | None
     status: str | None
     shutdown_receipts_verified: bool = False
+    transfer_progress_unix: float | None = None
 
 
 def read_heartbeat(path: Path, *, now: float, max_idle_seconds: float) -> Heartbeat:
@@ -257,7 +270,18 @@ def read_heartbeat(path: Path, *, now: float, max_idle_seconds: float) -> Heartb
         and value.get("mac_receipt_verified") is True
         and value.get("github_receipt_verified") is True
     )
-    return Heartbeat(float(activity), None, worker_status, receipts_verified)
+    progress = value.get("transfer_progress_unix")
+    if progress is not None and (
+        not _is_number(progress) or not math.isfinite(progress) or not 0 <= progress <= now
+    ):
+        return Heartbeat(float(activity), "heartbeat_malformed", worker_status)
+    return Heartbeat(
+        float(activity),
+        None,
+        worker_status,
+        receipts_verified,
+        None if progress is None else float(progress),
+    )
 
 
 def _decode_object(body: bytes) -> dict[str, object] | None:
@@ -281,13 +305,19 @@ class RunpodClient:
         headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
         return self._transport.request(method, url, headers, timeout)
 
+    def request_path(self, method: str, path: str, timeout: float) -> tuple[int, bytes]:
+        """Send a request for an API-relative path such as ``/pods/{id}``."""
+        if not isinstance(path, str) or not path.startswith("/") or ".." in path:
+            raise ValueError("API path must be absolute within the API base")
+        return self._request(method, API_BASE + path, timeout)
+
     def get_pod(self, pod_id: str, timeout: float) -> tuple[int, bytes]:
         safe_id = _validated_pod_id(pod_id)
-        return self._request("GET", f"{API_BASE}/pods/{safe_id}", timeout)
+        return self.request_path("GET", f"/pods/{safe_id}", timeout)
 
     def delete_pod(self, pod_id: str, timeout: float) -> tuple[int, bytes]:
         safe_id = _validated_pod_id(pod_id)
-        return self._request("DELETE", f"{API_BASE}/pods/{safe_id}", timeout)
+        return self.request_path("DELETE", f"/pods/{safe_id}", timeout)
 
 
 def _validated_pod_id(pod_id: str) -> str:
@@ -328,8 +358,15 @@ def check_once(
     *,
     now: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
+    observed: bool = False,
 ) -> Outcome:
-    """Inspect once, terminating only after exact captured identity matches."""
+    """Inspect once, terminating only after exact captured identity matches.
+
+    ``observed`` states whether this identity has already been seen alive
+    through the API. Until then a 404 is not evidence of termination: a wrong
+    base URL, Pod ID or key scope would otherwise read as a successful
+    shutdown while the Pod keeps billing.
+    """
     raw_now = now()
     clock_valid = _is_number(raw_now) and math.isfinite(raw_now)
     checked_at = float(raw_now) if clock_valid else 0.0
@@ -341,6 +378,8 @@ def check_once(
     except ApiTransportError:
         return _outcome("unknown", "pod_get_transport_error", identity, checked_at)
     if status == 404:
+        if not observed:
+            return _outcome("unknown", "pod_get_404_before_identity_observed", identity, checked_at)
         return _outcome("absent", "pod_get_404", identity, checked_at)
     if status != 200:
         return _outcome("unknown", f"pod_get_http_{status}", identity, checked_at)
@@ -401,7 +440,10 @@ def check_once(
                 ):
                     trigger = "heartbeat_malformed"
                 elif checked_at - heartbeat.last_gpu_activity_unix >= policy.max_idle_seconds:
-                    trigger = "idle_gpu_limit"
+                    if _transfer_in_progress(heartbeat, policy, checked_at):
+                        trigger = ""
+                    else:
+                        trigger = "idle_gpu_limit"
                 else:
                     trigger = ""
         except (ValueError, OverflowError):
@@ -452,6 +494,22 @@ def check_once(
     return _outcome("unknown", trigger + "_delete_still_present", identity, checked_at)
 
 
+def _transfer_in_progress(heartbeat: Heartbeat, policy: Policy, now: float) -> bool:
+    """Allow a bounded transfer window after GPU work when the Mac shows live progress.
+
+    Progress stamps come from the Mac-side supervisor (staged bytes growing),
+    never from the worker, so a hung Pod cannot extend its own lease. The wall
+    and cost limits still apply unchanged.
+    """
+    return (
+        policy.max_transfer_seconds > 0
+        and heartbeat.status in TRANSFER_STATUSES
+        and heartbeat.transfer_progress_unix is not None
+        and now - heartbeat.transfer_progress_unix < policy.max_idle_seconds
+        and now - heartbeat.last_gpu_activity_unix < policy.max_transfer_seconds
+    )
+
+
 def _load_identity(path: Path) -> PodIdentity:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -473,9 +531,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quoted-total-hourly", type=float, required=True)
     parser.add_argument("--starting-cost-usd", type=float, default=0.0)
     parser.add_argument("--billing-started-at-unix", type=float)
-    parser.add_argument("--poll-seconds", type=float, default=5.0)
+    parser.add_argument("--max-transfer-seconds", type=float, default=0.0)
+    parser.add_argument("--poll-seconds", type=float, default=15.0)
     parser.add_argument("--request-timeout-seconds", type=float, default=5.0)
     parser.add_argument("--delete-verify-attempts", type=int, default=3)
+    parser.add_argument(
+        "--max-unobserved-seconds",
+        type=float,
+        default=900.0,
+        help="exit with status 3 if the captured identity is never seen alive within this time",
+    )
     args = parser.parse_args(argv)
     if not math.isfinite(args.poll_seconds) or args.poll_seconds <= 0:
         parser.error("--poll-seconds must be finite and positive")
@@ -493,16 +558,50 @@ def main(argv: list[str] | None = None) -> int:
             args.request_timeout_seconds,
             args.delete_verify_attempts,
             starting_cost_usd=args.starting_cost_usd,
+            max_transfer_seconds=args.max_transfer_seconds,
         )
     except ValueError as error:
         parser.error(str(error))
     client = RunpodClient(token, UrllibTransport())
+    state_path = args.receipt.with_name(args.receipt.name + ".observed.json")
+    observed = load_observed(state_path, identity)
+    started = time.time()
     while True:
-        outcome = check_once(client, identity, policy, args.heartbeat)
+        outcome = check_once(client, identity, policy, args.heartbeat, observed=observed)
         atomic_receipt(args.receipt, outcome)
+        if outcome.state in {"watching", "terminated"} and not observed:
+            observed = True
+            save_observed(state_path, identity, outcome.checked_at_unix)
         if outcome.state in {"terminated", "absent", "identity_mismatch"}:
             return 0 if outcome.state != "identity_mismatch" else 2
-        time.sleep(args.poll_seconds)
+        if not observed and time.time() - started >= args.max_unobserved_seconds:
+            print("watchdog never observed the captured Pod identity alive", file=sys.stderr)
+            return 3
+        delay = args.poll_seconds
+        if outcome.reason.endswith("_429") or "_http_429" in outcome.reason:
+            delay = max(delay, 30.0)  # Respect the API rate limit before polling again.
+        time.sleep(delay)
+
+
+def load_observed(path: Path, identity: PodIdentity) -> bool:
+    """Read whether a previous watchdog process already saw this Pod alive."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(value, dict)
+        and value.get("pod_id") == identity.pod_id
+        and (value.get("observed") is True)
+    )
+
+
+def save_observed(path: Path, identity: PodIdentity, when: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump({"pod_id": identity.pod_id, "observed": True, "at_unix": when}, stream)
+    os.replace(temp_name, path)
 
 
 if __name__ == "__main__":

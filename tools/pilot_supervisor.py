@@ -34,10 +34,12 @@ from tools.runpod_watchdog import (
     UrllibTransport,
     atomic_receipt,
     check_once,
+    load_observed,
+    save_observed,
 )
 
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
-_BUNDLE = re.compile(r"exports/lr-[0-9]+-step[0-9]+-[0-9]+\Z")
+_BUNDLE = re.compile(r"exports/lr-[0-9]+(?:-continued)?-step[0-9]+-[0-9]+\Z")
 
 
 def fetch_status(ssh: list[str], root: str, name: str) -> dict[str, Any]:
@@ -172,6 +174,7 @@ class Supervisor:
         fetch: Callable[[str], dict[str, Any]],
         pull: Callable[[str], Path],
         archive: Callable[[Path], dict[str, Any]],
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self.root, self.fetch, self.pull, self.archive = root, fetch, pull, archive
         self.received: dict[str, Path] = {}
@@ -179,12 +182,37 @@ class Supervisor:
         self.latest: Path | None = None
         self.checkpoint_bundle: Path | None = None
         self.shutdown_ready = False
+        self.clock = clock
+        self.staged_bytes = -1
+        self.transfer_progress_unix: float | None = None
         root.mkdir(parents=True, exist_ok=False)
+
+    def staging_bytes(self) -> int:
+        """Bytes currently staged by an in-progress pull, measured on the Mac."""
+        received = self.root / "received"
+        if not received.is_dir():
+            return 0
+        total = 0
+        for staging in received.glob(".*.staging-*"):
+            if staging.is_dir() and not staging.is_symlink():
+                for item in staging.iterdir():
+                    if item.is_file() and not item.is_symlink():
+                        total += item.stat().st_size
+        return total
 
     def refresh_heartbeat(self) -> dict[str, Any]:
         heartbeat = self.fetch("heartbeat.json")
         heartbeat.pop("mac_receipt_verified", None)
         heartbeat.pop("github_receipt_verified", None)
+        heartbeat.pop("transfer_progress_unix", None)  # Only Mac-observed progress counts.
+        staged = self.staging_bytes()
+        if staged > self.staged_bytes:
+            # Growing staging bytes are evidence the Mac is receiving the artifact.
+            if self.staged_bytes >= 0 or staged > 0:
+                self.transfer_progress_unix = self.clock()
+            self.staged_bytes = staged
+        if self.transfer_progress_unix is not None:
+            heartbeat["transfer_progress_unix"] = self.transfer_progress_unix
         if self.shutdown_ready:
             heartbeat.update(
                 status="shutdown_ready", mac_receipt_verified=True, github_receipt_verified=True
@@ -283,7 +311,25 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("host", "remote-root", "repository"):
         parser.add_argument(f"--{name}", required=True)
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument(
+        "--transfer-timeout",
+        type=float,
+        default=1800.0,
+        help="total seconds allowed for one bundle pull (1.5 GiB needs ~7 Mbit/s at 1800 s)",
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=15.0,
+        help="API guard interval; the REST API is rate limited per minute",
+    )
+    parser.add_argument("--cycle-seconds", type=float, default=5.0)
     args = parser.parse_args(argv)
+    if any(
+        not (0 < value < 3600)
+        for value in (args.transfer_timeout, args.poll_seconds, args.cycle_seconds)
+    ):
+        parser.error("timeouts and intervals must be positive and below one hour")
     identity = PodIdentity.from_dict(json.loads(args.identity.read_text()))
     policy = Policy(**json.loads(args.policy.read_text()))
     token = os.environ.get(API_KEY_ENV)
@@ -308,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
                 Artifact("record", "record.json"),
                 Artifact("log", "training.jsonl"),
             ),
-            timeout=300,
+            timeout=args.transfer_timeout,
         ),
         archive=lambda bundle: archive_bundle(bundle, args.repository, run_id=identity.pod_id),
     )
@@ -316,10 +362,19 @@ def main(argv: list[str] | None = None) -> int:
     done = threading.Event()
     outcomes: list[Outcome] = []
 
+    state_path = args.output / "watchdog-receipt.json.observed.json"
+    observed = load_observed(state_path, identity)
+
     def guard() -> None:
+        nonlocal observed
         while not done.is_set():
             try:
-                outcome = check_once(client, identity, policy, args.output / "heartbeat.json")
+                outcome = check_once(
+                    client, identity, policy, args.output / "heartbeat.json", observed=observed
+                )
+                if outcome.state in {"watching", "terminated"} and not observed:
+                    observed = True
+                    save_observed(state_path, identity, outcome.checked_at_unix)
             except Exception as error:
                 outcome = Outcome(
                     "unknown", "watchdog_error", identity.pod_id, time.time(), type(error).__name__
@@ -329,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
                 outcomes.append(outcome)
                 done.set()
                 return
-            done.wait(2)
+            done.wait(args.poll_seconds)
 
     watcher = threading.Thread(target=guard, name="independent-runpod-guard", daemon=False)
 
@@ -341,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
                 atomic_json(
                     args.output / "heartbeat-error.json", {"error_type": type(error).__name__}
                 )
-            done.wait(2)
+            done.wait(args.cycle_seconds)
 
     heartbeat_watcher = threading.Thread(target=mirror, name="ssh-heartbeat-mirror", daemon=False)
     watcher.start()
@@ -356,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 # Preserve the last authenticated heartbeat; never fabricate GPU
                 # activity or receipt flags when SSH/transfer/archival fails.
-            done.wait(2)
+            done.wait(args.cycle_seconds)
     finally:
         watcher.join()
         heartbeat_watcher.join()

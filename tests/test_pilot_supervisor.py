@@ -272,3 +272,44 @@ def test_terminal_failure_preserved_even_without_checkpoint(
     assert saved["status"] == "failed" and saved["error_type"] == "FloatingPointError"
     assert saved["checkpoint_present_on_mac"] is with_checkpoint
     assert json.loads((supervisor.latest / "training.jsonl").read_text())["loss"] == 2.0
+
+
+def test_transfer_progress_is_stamped_only_from_growing_mac_side_staging(tmp_path: Path) -> None:
+    now = [100.0]
+    supervisor = Supervisor(
+        tmp_path / "controller",
+        fetch=lambda name: (
+            {**heartbeat(), "transfer_progress_unix": 1.0}
+            if name == "heartbeat.json"
+            else {"status": "running"}
+        ),
+        pull=lambda _: tmp_path,
+        archive=lambda _: {},
+        clock=lambda: now[0],
+    )
+    first = supervisor.refresh_heartbeat()
+    assert "transfer_progress_unix" not in first  # Remote-supplied stamps are discarded.
+    staging = supervisor.root / "received" / ".bundle.staging-abc"
+    staging.mkdir(parents=True)
+    (staging / "checkpoint.pt").write_bytes(b"x" * 10)
+    now[0] = 110.0
+    second = supervisor.refresh_heartbeat()
+    assert second["transfer_progress_unix"] == 110.0
+    now[0] = 120.0
+    third = supervisor.refresh_heartbeat()
+    assert third["transfer_progress_unix"] == 110.0  # No growth, no new stamp.
+    (staging / "checkpoint.pt").write_bytes(b"x" * 20)
+    now[0] = 130.0
+    assert supervisor.refresh_heartbeat()["transfer_progress_unix"] == 130.0
+    local = json.loads((supervisor.root / "heartbeat.json").read_text())
+    assert local["transfer_progress_unix"] == 130.0
+    assert local["last_gpu_activity_unix"] == 1899  # GPU activity is never fabricated.
+
+
+def test_continuation_export_names_are_accepted_and_unsafe_names_rejected(tmp_path: Path) -> None:
+    from tools.pilot_supervisor import _BUNDLE
+
+    assert _BUNDLE.fullmatch("exports/lr-1-continued-step500-7")
+    assert _BUNDLE.fullmatch("exports/lr-0-step100-2")
+    assert not _BUNDLE.fullmatch("exports/../lr-0-step100-2")
+    assert not _BUNDLE.fullmatch("exports/probe-8-step20-1")
