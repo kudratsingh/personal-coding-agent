@@ -36,7 +36,12 @@ from scratchcoder.train.pilot import (
     cost_per_billion,
     throughput,
 )
-from scratchcoder.train.trainer import Trainer, synchronized_time, training_device
+from scratchcoder.train.trainer import (
+    Trainer,
+    TrainingStop,
+    synchronized_time,
+    training_device,
+)
 from scratchcoder.train.validation import ValidationWindow, shard_windows, validate
 from tools.cpu_resume_check import assert_identical
 from tools.pilot_data import verify_binding
@@ -552,6 +557,8 @@ class Worker:
                     row.update(status="incomplete", updates=trainer.step)
                 if self.stop_reason == "probe_time_limit":
                     self.report["probe_window_expired"] = True
+            except TrainingStop:
+                raise  # A recorded safety stop is never an allocation failure.
             except (torch.cuda.OutOfMemoryError, RuntimeError) as error:
                 if self.device.type != "cuda" or not _is_cuda_memory_error(error):
                     raise
@@ -820,7 +827,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         armed_deadline = finite_number(receipt["self_destruct_deadline_unix"], "deadline")
         if armed_deadline - created < spec.limits.pod_seconds:
             # The in-pod timer fires earlier than the specification's wall; plan against it.
-            spec = replace(spec, limits=replace(spec.limits, pod_seconds=armed_deadline - created))
+            try:
+                spec = replace(
+                    spec, limits=replace(spec.limits, pod_seconds=armed_deadline - created)
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "the armed self-destruct deadline leaves too little pod lifetime for the "
+                    "specification's probe, training and finalization budgets"
+                ) from error
         if receipt.get("preflight_sha256") != file_sha256(args.preflight):
             raise ValueError("preflight report differs from bound receipt")
         preflight = json.loads(args.preflight.read_text())
