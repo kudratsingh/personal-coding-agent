@@ -2,13 +2,17 @@
 
 StarCoderData keeps repository/path provenance but no license column. The Stack
 dedup v1.2, from which it was built, records ``max_stars_repo_licenses`` for the
-same files. This tool reads only the join keys (``max_stars_repo_name``,
-``max_stars_repo_path``) and that license column from the pinned ``data/python``
-Parquet files with HTTPS range requests. Every fetched byte range is checked
-against the ``content`` column chunks and the run fails if any byte overlaps
-one, so file contents are never downloaded. The footer is fetched exactly (its
-length from the final eight bytes), so no speculative read-ahead is issued; any
-byte outside the footer and the three selected column chunks is counted.
+same files. This tool reads the join keys (``max_stars_repo_name``,
+``max_stars_repo_path``), that license column and each file's Parquet footer from
+the pinned ``data/python`` files with HTTPS range requests. A request that would
+touch any byte of a ``content`` column chunk is refused before it is sent, so no
+content column data is transferred.
+
+The footer cannot be skipped by any column-projected read, and Parquet writers
+store per-row-group min/max statistics for every column there, including
+``content``: short complete files can appear in those values. The footer is held
+in memory only; its content-statistics bytes are measured from the raw Thrift
+footer and reported, so the exposure is stated rather than hidden.
 
 The join is the exact (repository, path) key. Several upstream rows with one key
 are admitted only when their license lists agree. A sample file whose path is
@@ -70,6 +74,163 @@ class RemoteFile:
     lfs_sha256: str
 
 
+THRIFT_STOP, THRIFT_TRUE, THRIFT_FALSE, THRIFT_BYTE, THRIFT_I16, THRIFT_I32 = range(6)
+THRIFT_I64, THRIFT_DOUBLE, THRIFT_BINARY, THRIFT_LIST, THRIFT_SET, THRIFT_MAP = range(6, 12)
+THRIFT_STRUCT = 12
+
+
+class CompactReader:
+    """Minimal Thrift compact-protocol reader, enough to walk a Parquet footer."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data, self.position = data, 0
+
+    def byte(self) -> int:
+        if self.position >= len(self.data):
+            raise ValueError("truncated Parquet footer")
+        value = self.data[self.position]
+        self.position += 1
+        return value
+
+    def varint(self) -> int:
+        shift = result = 0
+        while True:
+            value = self.byte()
+            result |= (value & 0x7F) << shift
+            if not value & 0x80:
+                return result
+            shift += 7
+            if shift > 70:
+                raise ValueError("malformed Thrift varint")
+
+    def binary(self) -> bytes:
+        length = self.varint()
+        end = self.position + length
+        if end > len(self.data):
+            raise ValueError("truncated Parquet footer")
+        value = self.data[self.position : end]
+        self.position = end
+        return value
+
+    def list_header(self) -> tuple[int, int]:
+        header = self.byte()
+        size = header >> 4
+        return (self.varint() if size == 15 else size), header & 0x0F
+
+    def element(self, kind: int) -> None:
+        if kind in (THRIFT_TRUE, THRIFT_FALSE):
+            self.position += 1  # Booleans inside containers take one byte.
+        else:
+            self.skip(kind)
+
+    def skip(self, kind: int) -> None:
+        if kind in (THRIFT_TRUE, THRIFT_FALSE):
+            return  # A boolean field's value lives in its header.
+        if kind == THRIFT_BYTE:
+            self.position += 1
+        elif kind in (THRIFT_I16, THRIFT_I32, THRIFT_I64):
+            self.varint()
+        elif kind == THRIFT_DOUBLE:
+            self.position += 8
+        elif kind == THRIFT_BINARY:
+            self.binary()
+        elif kind in (THRIFT_LIST, THRIFT_SET):
+            size, item = self.list_header()
+            for _ in range(size):
+                self.element(item)
+        elif kind == THRIFT_MAP:
+            size = self.varint()
+            if size:
+                types = self.byte()
+                for _ in range(size):
+                    self.element(types >> 4)
+                    self.element(types & 0x0F)
+        elif kind == THRIFT_STRUCT:
+            self.struct(lambda _field, _kind: False)
+        else:
+            raise ValueError(f"unknown Thrift type {kind}")
+        if self.position > len(self.data):
+            raise ValueError("truncated Parquet footer")
+
+    def struct(self, visit: Callable[[int, int], bool]) -> None:
+        """Walk one struct; ``visit(field, kind)`` returns True when it read the value."""
+        last = 0
+        while True:
+            header = self.byte()
+            if header == THRIFT_STOP:
+                return
+            kind, delta = header & 0x0F, header >> 4
+            if delta:
+                field_id = last + delta
+            else:
+                raw = self.varint()
+                field_id = (raw >> 1) ^ -(raw & 1)
+            last = field_id
+            if not visit(field_id, kind):
+                self.skip(kind)
+
+
+def statistics_bytes_by_column(footer_thrift: bytes) -> dict[str, int]:
+    """Bytes of min/max statistics values per top-level column in a raw Parquet footer."""
+    reader = CompactReader(footer_thrift)
+    totals: Counter[str] = Counter()
+
+    def column_metadata() -> None:
+        path: list[str] = []
+        stats = [0]
+
+        def statistics(field_id: int, kind: int) -> bool:
+            if field_id in (1, 2, 5, 6) and kind == THRIFT_BINARY:  # max, min, max_value, min_value
+                stats[0] += len(reader.binary())
+                return True
+            return False
+
+        def visit(field_id: int, kind: int) -> bool:
+            if field_id == 3 and kind == THRIFT_LIST:
+                size, item = reader.list_header()
+                for _ in range(size):
+                    if item != THRIFT_BINARY:
+                        raise ValueError("unexpected path_in_schema element type")
+                    path.append(reader.binary().decode("utf-8", "replace"))
+                return True
+            if field_id == 12 and kind == THRIFT_STRUCT:
+                reader.struct(statistics)
+                return True
+            return False
+
+        reader.struct(visit)
+        totals[path[0] if path else "?"] += stats[0]
+
+    def column_chunk(field_id: int, kind: int) -> bool:
+        if field_id == 3 and kind == THRIFT_STRUCT:
+            column_metadata()
+            return True
+        return False
+
+    def row_group(field_id: int, kind: int) -> bool:
+        if field_id == 1 and kind == THRIFT_LIST:
+            size, item = reader.list_header()
+            for _ in range(size):
+                if item != THRIFT_STRUCT:
+                    raise ValueError("unexpected column chunk type")
+                reader.struct(column_chunk)
+            return True
+        return False
+
+    def file_metadata(field_id: int, kind: int) -> bool:
+        if field_id == 4 and kind == THRIFT_LIST:
+            size, item = reader.list_header()
+            for _ in range(size):
+                if item != THRIFT_STRUCT:
+                    raise ValueError("unexpected row group type")
+                reader.struct(row_group)
+            return True
+        return False
+
+    reader.struct(file_metadata)
+    return dict(totals)
+
+
 @dataclass
 class FileScan:
     """Join results and transfer accounting for one upstream Parquet file."""
@@ -78,6 +239,8 @@ class FileScan:
     rows: int = 0
     row_groups: int = 0
     footer_sha256: str = ""
+    footer_bytes: int = 0
+    footer_content_statistics_bytes: int = 0
     bytes_fetched: int = 0
     bytes_outside_selected_columns: int = 0
     requests: int = 0
@@ -158,9 +321,16 @@ class HuggingFaceClient:
 class RangeFile(io.RawIOBase):
     """Seekable read-only view of a remote file; every read is one recorded range."""
 
-    def __init__(self, url: str, size: int, fetch: Fetch) -> None:
+    def __init__(
+        self,
+        url: str,
+        size: int,
+        fetch: Fetch,
+        forbidden: Sequence[tuple[int, int]] = (),
+    ) -> None:
         super().__init__()
         self.url, self.size, self._fetch = url, size, fetch
+        self.forbidden = list(forbidden)
         self.position = 0
         self.ranges: list[tuple[int, int]] = []
 
@@ -186,6 +356,10 @@ class RangeFile(io.RawIOBase):
         if count <= 0:
             return 0
         first, last = self.position, self.position + count - 1
+        if overlapping([(first, last)], self.forbidden):
+            raise RuntimeError(
+                f"refusing to fetch bytes {first}-{last}: they overlap the content column"
+            )
         data = self._fetch(self.url, first, last)
         view[:count] = data
         self.ranges.append((first, last))
@@ -275,9 +449,10 @@ def scan_file(
     parquet = importlib.import_module("pyarrow.parquet")
     compute = importlib.import_module("pyarrow.compute")
     pyarrow = importlib.import_module("pyarrow")
-    source = RangeFile(url, remote.size, fetch)
     result = FileScan(remote.path)
     metadata, footer_bytes, footer = read_footer(url, remote.size, fetch)
+    content_ranges = column_ranges(metadata, [CONTENT_COLUMN])
+    source = RangeFile(url, remote.size, fetch, forbidden=content_ranges)
     reader = parquet.ParquetFile(source, metadata=metadata, pre_buffer=True)
     names = set(reader.schema_arrow.names)
     if not set(COLUMNS) <= names:
@@ -285,7 +460,6 @@ def scan_file(
     if footer != footer_range(metadata, remote.size):
         raise ValueError(f"{remote.path}: footer length disagrees with its metadata")
     selected_ranges = [footer, *column_ranges(metadata, COLUMNS)]
-    content_ranges = column_ranges(metadata, [CONTENT_COLUMN])
     if CONTENT_COLUMN in names and not content_ranges:
         raise ValueError(f"{remote.path}: content column chunks could not be located")
     result.rows, result.row_groups = int(metadata.num_rows), int(metadata.num_row_groups)
@@ -325,6 +499,10 @@ def scan_file(
         raise RuntimeError(f"{remote.path}: fetched bytes overlap the content column: {leaked[:3]}")
     source.ranges.extend([(remote.size - 8, remote.size - 1), (footer[0], remote.size - 9)])
     result.footer_sha256 = hashlib.sha256(footer_bytes).hexdigest()
+    result.footer_bytes = len(footer_bytes)
+    result.footer_content_statistics_bytes = statistics_bytes_by_column(footer_bytes[:-8]).get(
+        CONTENT_COLUMN, 0
+    )
     result.bytes_fetched = sum(last - first + 1 for first, last in source.ranges)
     result.bytes_outside_selected_columns = bytes_outside(source.ranges, selected_ranges)
     result.requests = len(source.ranges)
@@ -483,8 +661,13 @@ def load_mapping(report_path: Path) -> tuple[dict[Key, tuple[str, ...]], dict[st
     report = json.loads(report_path.read_text())
     if report.get("schema_version") != 1 or report.get("status") != "completed":
         raise ValueError("a completed schema-1 license recovery report is required")
-    if report.get("content_downloaded") is not False:
-        raise ValueError("the recovery report must certify that no content was downloaded")
+    # Schema-1 reports before 2026-10-24's correction used "content_downloaded" for the
+    # same column-chunk guarantee; neither field covers footer statistics.
+    chunks = report.get("content_column_chunks_downloaded", report.get("content_downloaded"))
+    if chunks is not False:
+        raise ValueError(
+            "the recovery report must certify that no content column chunk was fetched"
+        )
     mapping_path = report_path.parent / report["mapping"]["file"]
     if file_sha256(mapping_path) != report["mapping"]["sha256"]:
         raise ValueError("license mapping bytes differ from the recovery report")
@@ -565,10 +748,16 @@ def recover(
             ),
         },
         "columns_read": list(COLUMNS),
-        "content_downloaded": False,
+        "content_column_chunks_downloaded": False,
         "byte_range_guard": (
-            "the footer is read exactly; the run fails if any fetched byte overlaps a content "
-            "column chunk; bytes outside the selected column chunks and footer are counted"
+            "the footer is read exactly; any request overlapping a content column chunk is "
+            "refused before it is sent; bytes outside the selected column chunks and footer "
+            "are counted"
+        ),
+        "footer_statistics_exposure": (
+            "Parquet footers carry per-row-group min/max statistics for every column; for "
+            "content these can be short complete files. Footers are held in memory only and "
+            "their content-statistics bytes are reported per file"
         ),
         "join_rule": (
             "exact (max_stars_repo_name, max_stars_repo_path); duplicate keys admitted only with "
@@ -581,6 +770,8 @@ def recover(
                 "rows": scan.rows,
                 "row_groups": scan.row_groups,
                 "footer_sha256": scan.footer_sha256,
+                "footer_bytes": scan.footer_bytes,
+                "footer_content_statistics_bytes": scan.footer_content_statistics_bytes,
                 "bytes_fetched": scan.bytes_fetched,
                 "bytes_outside_selected_columns": scan.bytes_outside_selected_columns,
                 "range_requests": scan.requests,
@@ -596,6 +787,10 @@ def recover(
             "bytes_fetched": client.bytes_fetched,
             "bytes_outside_selected_columns": sum(
                 scan.bytes_outside_selected_columns for scan in scans
+            ),
+            "footer_bytes": sum(scan.footer_bytes for scan in scans),
+            "footer_content_statistics_bytes": sum(
+                scan.footer_content_statistics_bytes for scan in scans
             ),
             "requests": client.requests,
         },

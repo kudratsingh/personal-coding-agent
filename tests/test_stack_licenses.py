@@ -26,6 +26,7 @@ from tools.stack_licenses import (
     overlapping,
     recover,
     scan_file,
+    statistics_bytes_by_column,
     write_jsonl,
 )
 
@@ -114,14 +115,18 @@ def test_content_guard_fails_closed_if_a_read_touches_content(
     monkeypatch.setattr(
         stack_licenses, "COLUMNS", (*stack_licenses.COLUMNS, stack_licenses.CONTENT_COLUMN)
     )
-    with pytest.raises(RuntimeError, match="overlap the content column"):
+    fetch = Recorder({URL: data})
+    with pytest.raises(RuntimeError, match="refusing to fetch"):
         scan_file(
             RemoteFile("x.parquet", len(data), "0" * 64),
             URL,
-            Recorder({URL: data}),
+            fetch,
             {("o/r", "a.py"): 0},
             frozenset({"o/r"}),
         )
+    # The guard refuses before sending: no content byte ever reaches the fetcher.
+    content = column_ranges(pq.ParquetFile(io.BytesIO(data)).metadata, ["content"])
+    assert not overlapping([(a, b) for _, a, b in fetch.requests], content)
 
 
 def test_range_arithmetic() -> None:
@@ -176,7 +181,7 @@ def write_recovery(tmp_path: Path, rows: list[dict[str, Any]], **overrides: Any)
     report = {
         "schema_version": 1,
         "status": "completed",
-        "content_downloaded": False,
+        "content_column_chunks_downloaded": False,
         "dataset": "bigcode/the-stack-dedup",
         "revision": REVISION,
         "columns_read": list(stack_licenses.COLUMNS),
@@ -201,8 +206,10 @@ def test_load_mapping_verifies_identity_and_rejects_tampering(tmp_path: Path) ->
     )
     with pytest.raises(ValueError, match="bytes differ"):
         load_mapping(tampered)
-    with pytest.raises(ValueError, match="no content"):
-        load_mapping(write_recovery(tmp_path / "content", rows, content_downloaded=True))
+    with pytest.raises(ValueError, match="no content column chunk"):
+        load_mapping(
+            write_recovery(tmp_path / "content", rows, content_column_chunks_downloaded=True)
+        )
     with pytest.raises(ValueError, match="duplicate key"):
         load_mapping(write_recovery(tmp_path / "dup", rows + rows))
     with pytest.raises(ValueError, match="row count"):
@@ -371,7 +378,9 @@ def test_recover_end_to_end_then_the_review_admits_only_allowlisted_matches(tmp_
         progress=lambda _: None,
         target=target,
     )
-    assert report["content_downloaded"] is False
+    assert report["content_column_chunks_downloaded"] is False
+    # 12 KB contents exceed the 4 KiB statistics limit, so these footers hold none.
+    assert report["totals"]["footer_content_statistics_bytes"] == 0
     assert report["columns_read"] == [
         "max_stars_repo_name",
         "max_stars_repo_path",
@@ -420,3 +429,49 @@ def test_recover_end_to_end_then_the_review_admits_only_allowlisted_matches(tmp_
             client=FakeHub(upstream, revision="f" * 40),
             target=target,
         )
+
+
+def test_footer_statistics_bytes_are_measured_from_the_raw_thrift_footer() -> None:
+    short = [
+        {
+            "repository": "o/r",
+            "path": f"{i}.py",
+            "licenses": ["MIT"],
+            "content": f"value_{i} = {i}\n",
+        }
+        for i in range(4)
+    ]
+    for statistics, expect_content in ((True, True), (False, False)):
+        table = pa.table(
+            {"name": [r["repository"] for r in short], "content": [r["content"] for r in short]}
+        )
+        sink = io.BytesIO()
+        pq.write_table(table, sink, row_group_size=2, write_statistics=statistics)
+        data = sink.getvalue()
+        length = int.from_bytes(data[-8:-4], "little")
+        measured = statistics_bytes_by_column(data[-8 - length : -8])
+        visible = 0
+        metadata = pq.ParquetFile(io.BytesIO(data)).metadata
+        for group in range(metadata.num_row_groups):
+            column = metadata.row_group(group).column(1)
+            if column.is_stats_set and column.statistics.has_min_max:
+                visible += len(column.statistics.min) + len(column.statistics.max)
+        if expect_content:
+            assert measured["content"] >= visible > 0  # Legacy and current fields may both be set.
+        else:
+            assert measured.get("content", 0) == 0
+    with pytest.raises(ValueError, match="truncated"):
+        statistics_bytes_by_column(data[-8 - length : -20])
+
+
+def test_legacy_recovery_reports_still_load(tmp_path: Path) -> None:
+    rows = [{"repository": "o/r", "path": "a.py", "licenses": ["MIT"]}]
+    report = write_recovery(tmp_path / "legacy", rows)
+    raw = json.loads(report.read_text())
+    raw["content_downloaded"] = raw.pop("content_column_chunks_downloaded")
+    report.write_text(json.dumps(raw))
+    assert load_mapping(report)[0] == {("o/r", "a.py"): ("MIT",)}
+    raw.pop("content_downloaded")
+    report.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="no content column chunk"):
+        load_mapping(report)

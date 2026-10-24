@@ -37,26 +37,74 @@ class HeaderLicense:
     evidence: str
 
 
-def leading_header(text: str) -> str:
-    """Read comments and leading string literals only; never execute or import code."""
+LICENSE_DUNDER = re.compile(
+    r"""^__license__\s*=\s*(?P<quote>['"])(?P<value>[^'"\n]{1,200})(?P=quote)""", re.M
+)
+
+
+def header_window(text: str) -> str:
+    """The classified prefix: known StarCoderData metadata lines and a BOM removed."""
     # StarCoderData prepends these metadata lines to some file contents. They are
     # not Python statements and carry no grant; skip only this known prefix syntax.
     window = text[:HEADER_CHARACTERS]
     window = re.sub(r"\A(?:<(?:reponame|filename|gh_stars)>[^\n]*(?:\n|$))+", "", window)
-    parts = []
+    return window.removeprefix("\ufeff")
+
+
+def scan_header(text: str) -> tuple[str, bool]:
+    """Leading comments/strings, and whether the leading header could be read at all.
+
+    Reads tokens only; never executes or imports code. ``from __future__`` imports
+    are skipped because they must precede other statements and often sit above a
+    license block. A header that cannot be tokenized before its first token (an
+    unterminated leading docstring, a stray character) is unreadable, which callers
+    treat as unrecognized rather than absent, so repository metadata never
+    overrides it.
+    """
+    parts: list[str] = []
+    tokens: list[tokenize.TokenInfo] = []
+    readable = True
     try:
-        for token in tokenize.generate_tokens(io.StringIO(window).readline):
-            if token.type in {tokenize.COMMENT, tokenize.STRING}:
-                parts.append(token.string)
-            elif token.type not in {tokenize.NL, tokenize.NEWLINE, tokenize.ENDMARKER}:
+        for token in tokenize.generate_tokens(io.StringIO(header_window(text)).readline):
+            tokens.append(token)
+            if token.type == tokenize.ENDMARKER:
                 break
     except (tokenize.TokenError, IndentationError, SyntaxError):
-        pass
-    return "\n".join(parts)
+        readable = bool(tokens) and any(t.type != tokenize.NL for t in tokens)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.type in {tokenize.COMMENT, tokenize.STRING}:
+            parts.append(token.string)
+        elif token.type in {tokenize.NL, tokenize.NEWLINE, tokenize.ENDMARKER}:
+            pass
+        elif (
+            token.type == tokenize.NAME
+            and token.string == "from"
+            and index + 1 < len(tokens)
+            and tokens[index + 1].string == "__future__"
+        ):
+            while index < len(tokens) and tokens[index].type != tokenize.NEWLINE:
+                index += 1
+        else:
+            if token.type == tokenize.ERRORTOKEN and not parts:
+                readable = False
+            break
+        index += 1
+    if not readable and parts:
+        readable = True  # Something was read before the failure; classify that.
+    return "\n".join(parts), readable
+
+
+def leading_header(text: str) -> str:
+    """Read comments and leading string literals only; never execute or import code."""
+    return scan_header(text)[0]
 
 
 def classify_header(text: str) -> HeaderLicense:
-    header = leading_header(text)
+    header, readable = scan_header(text)
+    if not readable:
+        return HeaderLicense("unrecognized", None, "unreadable leading header")
     normalized = " ".join(re.sub(r"(?m)^\s*#\s?", "", header).casefold().split())
     # A public-domain grant explicitly permits both purposes; it is not an NC restriction.
     restriction_text = re.sub(
@@ -65,7 +113,7 @@ def classify_header(text: str) -> HeaderLicense:
         normalized,
     )
     if re.search(
-        r"\b(?:agpl|lgpl|gpl|mpl)(?:[- ]\d|\b)|mozilla public license|"
+        r"\b(?:agpl|lgpl|gpl|mpl)(?:[- ]?v?\d|\b)|mozilla public license|"
         r"gnu (?:general|lesser|library|affero) public license",
         restriction_text,
     ):
@@ -188,6 +236,13 @@ def classify_file(text: str, repository_license: str | Sequence[str] | None) -> 
     header = classify_header(text)
     if header.category != "no_header":
         return header
+    declared = LICENSE_DUNDER.search(header_window(text))
+    if declared:
+        # A module-level __license__ string is an explicit declaration and wins.
+        result = classify_header(f"# License: {declared.group('value')}\n")
+        if result.category == "no_header":
+            return HeaderLicense("unrecognized", None, "unrecognized __license__ declaration")
+        return HeaderLicense(result.category, result.license_id, "__license__ declaration")
     ids = repository_license_ids(repository_license)
     if not ids:
         return HeaderLicense("missing_repository_license", None, "no verified repository license")
