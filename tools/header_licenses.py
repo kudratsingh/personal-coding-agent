@@ -3,6 +3,7 @@
 import io
 import re
 import tokenize
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 PERMISSIVE = frozenset(
@@ -158,17 +159,40 @@ def classify_header(text: str) -> HeaderLicense:
     return HeaderLicense("unrecognized", None, "no recognized permissive grant in leading header")
 
 
-def classify_file(text: str, repository_license: str | None) -> HeaderLicense:
-    """An explicit file declaration wins; only its absence permits repo fallback."""
+def repository_license_ids(value: str | Sequence[str] | None) -> tuple[str, ...]:
+    """Normalize upstream repository license metadata to sorted, unique SPDX-like IDs.
+
+    The Stack lists every license detected for a repository; a single string is
+    one ID. Blank entries are ignored; anything that is not text is rejected.
+    """
+    if value is None:
+        return ()
+    items = (value,) if isinstance(value, str) else tuple(value)
+    if not all(isinstance(item, str) for item in items):
+        raise ValueError("repository license IDs must be strings")
+    return tuple(sorted({item.strip() for item in items if item.strip()}))
+
+
+def classify_file(text: str, repository_license: str | Sequence[str] | None) -> HeaderLicense:
+    """An explicit file declaration wins; only its absence permits repo fallback.
+
+    With several repository IDs, every one must be on the D-05 allowlist: the
+    repository may contain code under each detected license, so the file is
+    admitted only when all of them are allowed. The admitted ID is the IDs
+    joined with " AND "; a rejection names every listed ID.
+    """
     header = classify_header(text)
     if header.category != "no_header":
         return header
-    if not repository_license:
+    ids = repository_license_ids(repository_license)
+    if not ids:
         return HeaderLicense("missing_repository_license", None, "no verified repository license")
-    if repository_license in REPOSITORY_ALLOWLIST:
-        return HeaderLicense(
-            "permissive", repository_license, "upstream repository license metadata"
-        )
+    joined = " AND ".join(ids)
+    blocked = [item for item in ids if item not in REPOSITORY_ALLOWLIST]
+    if not blocked:
+        return HeaderLicense("permissive", joined, "upstream repository license metadata")
     return HeaderLicense(
-        "repository_disallowed", repository_license, "repository license outside D-05 allowlist"
+        "repository_disallowed",
+        joined,
+        "repository license outside D-05 allowlist: " + ", ".join(blocked),
     )
