@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch._dynamo
 
 from scratchcoder.common.config import ModelConfig, RunConfig, TrainConfig, finite_number
 from scratchcoder.common.logging import sanitize
@@ -53,6 +54,10 @@ _CUDA_MEMORY_MARKERS = (
     "CUBLAS_STATUS_ALLOC_FAILED",
     "CUBLAS_STATUS_NOT_INITIALIZED",
 )
+
+
+COMPILE_PROBE_PREFIX = "probe-compiled-"
+"""Phase prefix of the measurement-only ``torch.compile`` probe (a probe for every other rule)."""
 
 
 def _is_cuda_memory_error(error: BaseException) -> bool:
@@ -92,6 +97,12 @@ class Specification:
     quoted_gpu_hourly: float
     probe_accumulation_steps: int = 2
     memory_headroom_fraction: float = 0.9
+    # One extra measurement-only probe with ``torch.compile`` on, at the chosen
+    # microbatch, after the eager probes and before the first real update. It never
+    # selects the microbatch and never trains an arm; 0 steps disables it.
+    compile_probe_steps: int = 0
+    compile_probe_seconds: float = 0.0
+    compile_probe_warmup_updates: int = 2
 
     def __post_init__(self) -> None:
         if type(self.probe_accumulation_steps) is not int or self.probe_accumulation_steps < 2:
@@ -100,6 +111,29 @@ class Specification:
             raise ValueError("probe_accumulation_steps must be an integer of at least 2")
         if not 0 < finite_number(self.memory_headroom_fraction, "memory headroom") <= 1:
             raise ValueError("memory_headroom_fraction must be in (0, 1]")
+        for name in ("compile_probe_steps", "compile_probe_warmup_updates"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        seconds = finite_number(self.compile_probe_seconds, "compile probe seconds")
+        if self.compile_probe_steps:
+            if self.config.train.compile:
+                raise ValueError(
+                    "the compile probe compares against eager training; keep compile off"
+                )
+            if seconds <= 0:
+                raise ValueError("an enabled compile probe needs a positive time window")
+            if not self.compile_probe_warmup_updates < min(
+                self.compile_probe_steps, self.probe_steps
+            ):
+                raise ValueError("compile probe warmup must leave measured updates in both probes")
+        elif seconds != 0:
+            raise ValueError("a disabled compile probe must not reserve pod time")
+        reserved = self.limits.probe_seconds + seconds + self.limits.finalization_reserve_seconds
+        if reserved >= self.limits.pod_seconds:
+            raise ValueError(
+                "probe, compile probe and finalization windows exceed the pod lifetime"
+            )
         if (
             not self.microbatches
             or len(set(self.microbatches)) != len(self.microbatches)
@@ -215,9 +249,35 @@ def check_readiness(receipt: dict[str, Any], *, now: float, spec: Specification)
     if spec.limits.stop_reason(pod_elapsed=now - origin):
         raise ValueError("pod already exceeds an operating limit")
     remaining = origin + spec.limits.pod_seconds - now
-    if remaining <= spec.limits.probe_seconds + spec.limits.finalization_reserve_seconds:
+    needed = (
+        spec.limits.probe_seconds
+        + spec.compile_probe_seconds
+        + spec.limits.finalization_reserve_seconds
+    )
+    if remaining <= needed:
         raise ValueError("pod lifetime left is too short for probes and finalization")
     return origin
+
+
+def check_preflight(
+    preflight: dict[str, Any], *, hardware: dict[str, Any], spec: Specification
+) -> None:
+    """Require a completed on-device preflight, including the fused-attention check."""
+    if (
+        preflight.get("status") != "completed"
+        or preflight.get("hardware_precision_and_resume_checked") is not True
+        or preflight.get("device") != "cuda:0"
+        or preflight.get("hardware") != hardware
+    ):
+        raise ValueError("a matching A40 hardware precision/resume preflight is required")
+    fused = preflight.get("fused_attention")
+    if spec.config.train.attention == "fused" and (
+        not isinstance(fused, dict) or fused.get("status") != "passed"
+    ):
+        raise ValueError(
+            "a fused-attention specification needs the on-device fused attention "
+            "equivalence check to have passed in the preflight"
+        )
 
 
 class Worker:
@@ -252,6 +312,7 @@ class Worker:
             raise FileExistsError("pilot output must be a new directory")
         self.clock, self.pod_created = clock, pod_created
         self.probe_started: float | None = None
+        self.compile_probe_started: float | None = None
         self.training_started: float | None = None
         self.training_deadline: float | None = None
         self.tokens_processed = 0
@@ -281,6 +342,7 @@ class Worker:
             "validation_identity": self.validation_identity,
             "probes": [],
             "probe_window_expired": False,
+            "compile_probe": None,
             "arms": [],
             "training_tokens_processed": 0,
             "checkpoints": self.checkpoints,
@@ -329,6 +391,13 @@ class Worker:
         )
         if reason:
             self.stop_reason = reason
+        elif self.phase.startswith(COMPILE_PROBE_PREFIX):
+            # Its own window: the eager probe window has usually expired by now.
+            if (
+                self.compile_probe_started is not None
+                and now - self.compile_probe_started >= self.spec.compile_probe_seconds
+            ):
+                self.stop_reason = "compile_probe_time_limit"
         elif (
             self.phase.startswith("probe")
             and self.probe_started is not None
@@ -352,7 +421,12 @@ class Worker:
         if self.stopped():
             raise PilotStop(str(self.stop_reason))
 
-    def trainer(self, name: str, size: int, rate: float, *, probe: bool = False) -> Trainer:
+    def trainer(
+        self, name: str, size: int, rate: float, *, probe: bool = False, compiled: bool = False
+    ) -> Trainer:
+        if compiled and not probe:
+            raise ValueError("compiled training is measured only by the compile probe")
+        probe_steps = self.spec.compile_probe_steps if compiled else self.spec.probe_steps
         config = replace(
             self.spec.config,
             train=replace(
@@ -364,10 +438,11 @@ class Worker:
                     size, self.spec.config.train.sequence_length, self.spec.tokens_per_update
                 ),
                 learning_rate=rate,
-                steps=self.spec.probe_steps if probe else self.spec.config.train.steps,
-                warmup_steps=min(self.spec.config.train.warmup_steps, self.spec.probe_steps)
+                steps=probe_steps if probe else self.spec.config.train.steps,
+                warmup_steps=min(self.spec.config.train.warmup_steps, probe_steps)
                 if probe
                 else self.spec.config.train.warmup_steps,
+                compile=self.spec.config.train.compile or compiled,
             ),
         )
         return Trainer(
@@ -602,6 +677,121 @@ class Worker:
         print(json.dumps({"chosen_microbatch": size, "probes": self.report["probes"]}), flush=True)
         return size
 
+    def compile_probe(self, size: int) -> None:
+        """Time ``torch.compile`` once at the chosen microbatch; measurement only.
+
+        The row is recorded under ``compile_probe``, separate from the eager probe
+        table, and never influences the microbatch, the learning-rate arms or the
+        continuation: every trainer reseeds and owns its loader, and the compiled
+        graphs are discarded before the first real update. Its window counts from
+        its own start; the stop check runs between microbatches, so a first compiled
+        update that outlasts the window is still recorded, just as ``incomplete``.
+        A compiler failure is recorded and the pilot continues eagerly; wall, cost
+        and idle limits still stop the pilot.
+        """
+        steps = self.spec.compile_probe_steps
+        if steps == 0:
+            self.report["compile_probe"] = {"status": "disabled"}
+            self.publish()
+            return
+        warmup = self.spec.compile_probe_warmup_updates
+        self.phase = COMPILE_PROBE_PREFIX + str(size)
+        row: dict[str, Any] = {
+            "microbatch": size,
+            "accumulation_steps": self.spec.probe_accumulation_steps,
+            "steps_requested": steps,
+            "warmup_updates_excluded": warmup,
+            "window_seconds": self.spec.compile_probe_seconds,
+            "torch_version": torch.__version__,
+            "compile_mode": "torch.compile(model, dynamic=True), default backend",
+            "scope": (
+                "measurement only: not used for microbatch choice, learning-rate arms, "
+                "continuation or checkpoints; the pilot trains eagerly"
+            ),
+        }
+        self.require_time()
+        self.compile_probe_started = self.clock()
+        self.reset_peak()
+        trainer: Trainer | None = None
+        try:
+            trainer = self.trainer(
+                self.phase, size, self.spec.learning_rates[0], probe=True, compiled=True
+            )
+            trainer.train(should_stop=self.stopped, on_step=self.on_step)
+            self.stopped()
+            if self.stop_reason not in {None, "compile_probe_time_limit"}:
+                raise PilotStop(str(self.stop_reason))
+            row["updates"] = trainer.step
+            if trainer.step == steps:
+                row.update(status="completed", **self._compile_comparison(size, warmup))
+            else:
+                row["status"] = "incomplete"
+                compiled_rows = self.rows.get(self.phase, [])
+                if compiled_rows:
+                    row["first_update_seconds"] = compiled_rows[0]["step_seconds"]
+        except TrainingStop:
+            row.setdefault("status", "stopped")
+            row.setdefault("updates", 0 if trainer is None else trainer.step)
+            raise  # A recorded safety stop is never a compiler failure.
+        except Exception as error:
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)  # A broken CUDA context fails the pilot.
+            memory = _is_cuda_memory_error(error) and self.device.type == "cuda"
+            row.update(
+                status="oom" if memory else "failed",
+                updates=0 if trainer is None else trainer.step,
+                error_type=type(error).__name__,
+                error=str(sanitize(str(error)))[:500],
+            )
+        finally:
+            row.update(self.peak())
+            row["elapsed_seconds"] = max(0.0, self.clock() - self.compile_probe_started)
+            self.report["compile_probe"] = row
+            self.publish()
+            del trainer
+            torch._dynamo.reset()  # Compiled graphs and guards never reach the arms.
+            self.release()
+            if self.stop_reason == "compile_probe_time_limit":
+                self.stop_reason = None  # Soft limit, like the eager probe window.
+        print(json.dumps({"compile_probe": row}), flush=True)
+
+    def _compile_comparison(self, size: int, warmup: int) -> dict[str, Any]:
+        """Steady-state speedup and one-off compile cost against the eager probe."""
+        compiled_rows = self.rows[self.phase]
+        eager_rows = self.rows[f"probe-{size}"]
+        compiled = throughput(compiled_rows, warmup_steps=warmup)
+        eager = throughput(eager_rows, warmup_steps=warmup)
+        compiled_mean = compiled["step_seconds"] / (len(compiled_rows) - warmup)
+        eager_mean = eager["step_seconds"] / (len(eager_rows) - warmup)
+        # Time spent above each probe's own steady state during its warmup updates;
+        # the difference estimates what compilation costs once.
+        compiled_excess = math.fsum(r["step_seconds"] for r in compiled_rows[:warmup]) - (
+            warmup * compiled_mean
+        )
+        eager_excess = math.fsum(r["step_seconds"] for r in eager_rows[:warmup]) - (
+            warmup * eager_mean
+        )
+        one_off = compiled_excess - eager_excess
+        saving = eager_mean - compiled_mean
+        break_even = max(0.0, one_off) / saving if saving > 0 else None
+        tokens_per_update = compiled_rows[0]["tokens"]
+        return {
+            "tokens_per_second": compiled["tokens_per_second"],
+            "eager_tokens_per_second": eager["tokens_per_second"],
+            "speedup": compiled["tokens_per_second"] / eager["tokens_per_second"],
+            "steady_step_seconds": compiled_mean,
+            "eager_steady_step_seconds": eager_mean,
+            "first_update_seconds": compiled_rows[0]["step_seconds"],
+            "eager_first_update_seconds": eager_rows[0]["step_seconds"],
+            "one_off_compile_seconds_estimate": one_off,
+            "break_even_updates": break_even,
+            "break_even_tokens": None if break_even is None else break_even * tokens_per_update,
+            "comparison_basis": (
+                "same microbatch, accumulation, seed and data order as the eager probe; "
+                "both exclude the same warmup updates"
+            ),
+        }
+
     def verify_checkpoint(self, checkpoint: Path) -> str:
         """Reject a checkpoint whose bytes differ from its recorded save identity."""
         sidecar = checkpoint.with_name(checkpoint.name + ".sha256.json")
@@ -660,6 +850,7 @@ class Worker:
         final_checkpoint: tuple[Path, str, int] | None = None
         try:
             size = self.probe()
+            self.compile_probe(size)
             self.phase = "screen"
             self.training_started = self.clock()
             self.training_deadline = self.spec.limits.training_deadline(
@@ -786,6 +977,9 @@ def smoke(root: Path) -> dict[str, Any]:
         30,
         1,
         1,
+        compile_probe_steps=3,
+        compile_probe_seconds=120,
+        compile_probe_warmup_updates=1,
     )
     return Worker(
         spec,
@@ -841,13 +1035,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise ValueError("preflight report differs from bound receipt")
         preflight = json.loads(args.preflight.read_text())
         hardware = hardware_description(training_device("cuda:0"))
-        if (
-            preflight.get("status") != "completed"
-            or preflight.get("hardware_precision_and_resume_checked") is not True
-            or preflight.get("device") != "cuda:0"
-            or preflight.get("hardware") != hardware
-        ):
-            raise ValueError("a matching A40 hardware precision/resume preflight is required")
+        check_preflight(preflight, hardware=hardware, spec=spec)
         if file_sha256(args.binding) != args.binding_sha256:
             raise ValueError("data binding differs from externally recorded SHA-256")
         binding = verify_binding(

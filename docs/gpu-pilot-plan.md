@@ -32,7 +32,9 @@ self-destruct timer, a Pod-identity capture tool, a receipt assembler, a
 token-level leakage audit, an analytical feasibility calculator and a
 finalization reserve; the complete verdict, blockers and exact commands are in
 [PILOT_LAUNCH_READINESS.md](../PILOT_LAUNCH_READINESS.md) and
-[PILOT_RUNBOOK.md](../PILOT_RUNBOOK.md). Runpod offers no provider-enforced Pod
+[PILOT_RUNBOOK.md](../PILOT_RUNBOOK.md). On 2026-10-24 the owner selected the
+agreed specification, with `torch.compile` off for training and one separate
+20-update compiled measurement probe. Runpod offers no provider-enforced Pod
 lifetime, so termination remains layered best-effort and the owner must accept
 that residual risk explicitly in the readiness receipt. No machine, payment,
 credit purchase, volume or storage account was created by that audit. The

@@ -12,7 +12,7 @@ from scratchcoder.data.shards import file_sha256
 from scratchcoder.train.pilot import Limits
 from scratchcoder.train.trainer import Trainer
 from scratchcoder.train.validation import ValidationWindow
-from tools.gpu_pilot import Specification, Worker, check_readiness
+from tools.gpu_pilot import Specification, Worker, check_preflight, check_readiness
 
 
 def specification() -> Specification:
@@ -422,3 +422,172 @@ def test_billing_origin_slightly_after_creation_is_clamped_to_creation() -> None
     policy["billing_started_at_unix"] = 1100
     with pytest.raises(ValueError, match="billing origin"):
         check_readiness({**base, "watchdog_policy": policy}, now=1101, spec=specification())
+
+
+def compile_spec(**overrides: Any) -> Specification:
+    """The test specification with the measurement-only compile probe enabled."""
+    settings: dict[str, Any] = {
+        "compile_probe_steps": 3,
+        "compile_probe_seconds": 60,
+        "compile_probe_warmup_updates": 1,
+    }
+    settings.update(overrides)
+    return replace(specification(), **settings)
+
+
+def _require_compiler(row: dict[str, Any]) -> None:
+    message = str(row.get("error", "")).lower()
+    if row.get("status") == "failed" and ("inductor" in message or "compiler" in message):
+        pytest.skip(f"torch.compile backend unavailable here: {row.get('error_type')}")
+
+
+def test_compile_probe_is_recorded_separately_and_never_changes_the_arms(
+    tmp_path: Path,
+) -> None:
+    eager = worker(tmp_path / "eager").execute()
+    assert eager["compile_probe"] == {"status": "disabled"}
+    pilot = worker(tmp_path / "compiled", compile_spec())
+    result = pilot.execute()
+    row = result["compile_probe"]
+    _require_compiler(row)
+    assert row["status"] == "completed", row
+    assert row["microbatch"] == result["chosen_microbatch"] == eager["chosen_microbatch"] == 4
+    assert row["updates"] == row["steps_requested"] == 3
+    assert row["warmup_updates_excluded"] == 1
+    assert row["speedup"] == pytest.approx(
+        row["tokens_per_second"] / row["eager_tokens_per_second"]
+    )
+    assert row["speedup"] > 0 and row["first_update_seconds"] > 0
+    assert row["peak_allocated_bytes"] == 0  # CPU fixture: no GPU evidence.
+    # The eager probe table, the arms and the continuation are untouched.
+    assert [r["status"] for r in result["probes"]] == [r["status"] for r in eager["probes"]]
+    assert [a["validation"] for a in result["arms"]] == [a["validation"] for a in eager["arms"]]
+    assert result["winner"] == eager["winner"]
+    for arm in ("lr-0", "lr-1", "lr-2"):
+        compiled_losses = [r["loss"] for r in result["loss_curves"][arm]]
+        assert compiled_losses == [r["loss"] for r in eager["loss_curves"][arm]]
+    assert result["training_tokens_processed"] == eager["training_tokens_processed"]
+    assert result["training_throughput"]["tokens"] == 9 * 32
+    assert len(result["loss_curves"]["probe-compiled-4"]) == 3
+    assert result["status"] == "completed"
+    assert result["last_checkpoint_resume"]["tested"] is True
+
+
+def test_compile_failure_is_recorded_and_the_pilot_trains_eagerly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pilot = worker(tmp_path, compile_spec())
+    original = pilot.trainer
+
+    def broken(
+        name: str, size: int, rate: float, *, probe: bool = False, compiled: bool = False
+    ) -> Trainer:
+        if compiled:
+            raise RuntimeError("backend compiler failed: no working C++ compiler")
+        return original(name, size, rate, probe=probe, compiled=compiled)
+
+    monkeypatch.setattr(pilot, "trainer", broken)
+    result = pilot.execute()
+    row = result["compile_probe"]
+    assert row["status"] == "failed" and row["error_type"] == "RuntimeError"
+    assert "compiler" in row["error"] and row["updates"] == 0
+    assert result["status"] == "completed" and len(result["arms"]) == 3
+    assert "stop_reason" not in result
+
+
+def test_compile_probe_window_is_soft_and_separate_from_the_probe_window(
+    tmp_path: Path,
+) -> None:
+    now = [1000.0]
+    pilot = worker(tmp_path, compile_spec(), clock=lambda: now[0])
+    original = pilot.on_step
+
+    def advance(trainer: Trainer, metrics: dict[str, float]) -> None:
+        if pilot.phase.startswith("probe-compiled-") and trainer.step == 1:
+            now[0] += 61  # The compile window (60 s) expires after the first compiled update.
+        original(trainer, metrics)
+
+    pilot.on_step = advance  # type: ignore[method-assign]
+    result = pilot.execute()
+    row = result["compile_probe"]
+    _require_compiler(row)
+    assert row["status"] == "incomplete" and row["updates"] == 1
+    assert row["first_update_seconds"] > 0 and "speedup" not in row
+    assert row["elapsed_seconds"] >= 61
+    assert result["probe_window_expired"] is False  # The eager window was not involved.
+    assert result["status"] == "completed" and len(result["arms"]) == 3
+    assert "stop_reason" not in result
+
+
+def test_wall_limit_during_the_compile_probe_stops_the_pilot(tmp_path: Path) -> None:
+    now = [1000.0]
+    pilot = worker(tmp_path, compile_spec(), clock=lambda: now[0])
+    original = pilot.on_step
+
+    def advance(trainer: Trainer, metrics: dict[str, float]) -> None:
+        if pilot.phase.startswith("probe-compiled-"):
+            now[0] += 400  # Past the 300 s pod wall.
+        original(trainer, metrics)
+
+    pilot.on_step = advance  # type: ignore[method-assign]
+    result = pilot.execute()
+    row = result["compile_probe"]
+    _require_compiler(row)
+    assert row["status"] == "stopped"
+    assert result["status"] == "stopped" and result["stop_reason"] == "pod_wall_limit"
+    assert not result["arms"]
+
+
+def test_compile_probe_specification_rules(tmp_path: Path) -> None:
+    base = specification()
+    compiled_training = replace(base.config, train=replace(base.config.train, compile=True))
+    with pytest.raises(ValueError, match="keep compile off"):
+        compile_spec(config=compiled_training)
+    with pytest.raises(ValueError, match="warmup"):
+        compile_spec(compile_probe_warmup_updates=2)  # The eager probe has only 2 updates.
+    with pytest.raises(ValueError, match="positive time window"):
+        compile_spec(compile_probe_seconds=0)
+    with pytest.raises(ValueError, match="must not reserve"):
+        replace(base, compile_probe_seconds=60)
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        replace(base, compile_probe_steps=-1)
+    with pytest.raises(ValueError, match="exceed the pod lifetime"):
+        compile_spec(compile_probe_seconds=240)
+    with pytest.raises(ValueError, match="measured only by the compile probe"):
+        worker(tmp_path).trainer("arm", 2, 0.0003, compiled=True)
+
+
+def test_readiness_reserves_the_compile_probe_window() -> None:
+    assert check_readiness(receipt(), now=1200, spec=specification()) == 1000
+    with pytest.raises(ValueError, match="too short"):
+        check_readiness(receipt(), now=1200, spec=compile_spec())
+    assert check_readiness(receipt(), now=1170, spec=compile_spec()) == 1000
+
+
+def test_preflight_gate_requires_the_on_device_fused_attention_check() -> None:
+    hardware = {"device_type": "cuda", "name": "NVIDIA A40"}
+    passed = {
+        "status": "completed",
+        "hardware_precision_and_resume_checked": True,
+        "device": "cuda:0",
+        "hardware": hardware,
+    }
+    base = specification()
+    fused = replace(
+        base, config=replace(base.config, train=replace(base.config.train, attention="fused"))
+    )
+    with pytest.raises(ValueError, match="fused attention"):
+        check_preflight(passed, hardware=hardware, spec=fused)
+    with pytest.raises(ValueError, match="fused attention"):
+        check_preflight(
+            {**passed, "fused_attention": {"status": "failed"}}, hardware=hardware, spec=fused
+        )
+    check_preflight(
+        {**passed, "fused_attention": {"status": "passed"}}, hardware=hardware, spec=fused
+    )
+    check_preflight(
+        passed, hardware=hardware, spec=base
+    )  # Reference attention needs no kernel check.
+    for bad in ({"device": "cpu"}, {"status": "failed"}, {"hardware": {"name": "other"}}):
+        with pytest.raises(ValueError, match="matching A40"):
+            check_preflight({**passed, **bad}, hardware=hardware, spec=base)

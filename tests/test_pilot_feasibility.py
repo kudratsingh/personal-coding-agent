@@ -134,7 +134,9 @@ def test_schedule_at_required_throughput_completes_the_pilot(
     assert plan.outcome == "complete 500"
     assert plan.training_deadline_seconds == 3600
     assert plan.training_seconds_used == pytest.approx(3600, abs=1e-6)
-    assert plan.probe_seconds == pytest.approx(20 * (8 + 4) * 1024 / rate)
+    # Each probe update accumulates two microbatches; the compile probe is charged its window.
+    assert plan.probe_seconds == pytest.approx(20 * 2 * (8 + 4) * 1024 / rate)
+    assert plan.compile_probe_seconds == 240
     assert plan.probe_within_limit
     assert plan.fits_pod and plan.fits_cost_cap
 
@@ -142,15 +144,17 @@ def test_schedule_at_required_throughput_completes_the_pilot(
 def test_schedule_at_5000_tokens_per_second(spec: PilotSpecification, flops_token: int) -> None:
     plan = schedule(spec, 5000, probe_microbatches=[8, 4], flops_token=flops_token)
     assert plan.seconds_per_update == pytest.approx(26.2144)
-    assert plan.updates_reached == 137
+    # The pod budget binds before the training budget at this speed.
+    assert plan.updates_reached == 135
     assert plan.screens_completed == 1
     assert plan.outcome == "no complete screen"
-    assert plan.training_seconds_used == pytest.approx(137 * 26.2144)
+    assert plan.training_seconds_used == pytest.approx(135 * 26.2144)
     assert plan.finalization_seconds == pytest.approx(finalization_seconds(1_623_502_465))
     assert plan.transfer_seconds == pytest.approx(649.4, abs=0.01)
     assert plan.total_pod_seconds == pytest.approx(
         600
         + plan.probe_seconds
+        + plan.compile_probe_seconds
         + plan.training_seconds_used
         + plan.finalization_seconds
         + plan.transfer_seconds
@@ -178,9 +182,11 @@ def test_schedule_deadline_is_bounded_by_pod_budget(flops_token: int) -> None:
     raw["limits"]["pod_seconds"] = 3000
     tight = PilotSpecification.from_mapping(raw)
     plan = schedule(tight, 40000, probe_microbatches=[8, 4], flops_token=flops_token)
-    assert plan.training_deadline_seconds == pytest.approx(3000 - 600 - plan.probe_seconds - 900)
-    assert plan.updates_reached == 455 < 700
-    assert plan.outcome == "partial continuation to step 255"
+    assert plan.training_deadline_seconds == pytest.approx(
+        3000 - 600 - plan.probe_seconds - 240 - 900
+    )
+    assert plan.updates_reached == 380 < 700
+    assert plan.outcome == "partial continuation to step 180"
     # The 900 s reserve exceeds actual finalization + transfer, so the pod still fits.
     assert plan.total_pod_seconds <= 3000 and plan.fits_pod
 

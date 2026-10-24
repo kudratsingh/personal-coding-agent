@@ -32,7 +32,7 @@ agreed S model exactly; the options are selected per specification.
 | Warmup-stable-decay schedule with a linear tail | `train.schedule: wsd`, `train.decay_fraction` | cosine | lets a stable-phase checkpoint continue without re-warming; the 500-step pilot keeps cosine so the step-100 learning-rate screen compares arms on one schedule |
 | Single-synchronization gradient clipping | `clip_gradients` | always on | one device-to-host read instead of one per parameter tensor (74 for the S model) |
 | List-kernel AdamW (`torch._foreach_*`) | `train.optimizer_foreach` | off | the identical update issued as one kernel per operation instead of per tensor; tested bitwise equal to the per-tensor loop |
-| `torch.compile` of the training forward | `train.compile` | off | typical 1.3x to 2x speedup for an eager model on a GPU; compile time is paid once per distinct shape (`dynamic=True` covers the probe sizes); compiled training is tested against eager within 1e-4 |
+| `torch.compile` of the training forward | `train.compile` | off | typical 1.3x to 2x speedup for an eager model on a GPU; compile time is paid once per distinct shape (`dynamic=True` covers the probe sizes); compiled training is tested against eager within 1e-4; the pilot of record trains eagerly and measures the speedup with one separate 20-update compiled probe |
 
 ## Which specification enables what
 

@@ -113,6 +113,21 @@ def _number(value: object, name: str) -> float:
     return result
 
 
+def _count(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a nonnegative integer")
+    return value
+
+
+def _count_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite nonnegative number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise ValueError(f"{name} must be a finite nonnegative number")
+    return result
+
+
 @dataclass(frozen=True)
 class PilotSpecification:
     """The subset of the pilot JSON specification that the calculator consumes."""
@@ -134,6 +149,9 @@ class PilotSpecification:
     estimated_total_cost: float
     approved_cost_cap: float
     finalization_reserve_seconds: float
+    probe_accumulation_steps: int = 2
+    compile_probe_steps: int = 0
+    compile_probe_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.microbatches or not self.learning_rates:
@@ -188,6 +206,13 @@ class PilotSpecification:
             approved_cost_cap=_number(limits.get("approved_cost_cap"), "limits.approved_cost_cap"),
             finalization_reserve_seconds=_number(
                 limits.get("finalization_reserve_seconds"), "limits.finalization_reserve_seconds"
+            ),
+            probe_accumulation_steps=_integer(
+                spec.get("probe_accumulation_steps", 2), "probe_accumulation_steps"
+            ),
+            compile_probe_steps=_count(spec.get("compile_probe_steps", 0), "compile_probe_steps"),
+            compile_probe_seconds=_count_number(
+                spec.get("compile_probe_seconds", 0), "compile_probe_seconds"
             ),
         )
 
@@ -357,6 +382,7 @@ class Schedule:
     probe_microbatches: tuple[int, ...]
     probe_seconds: float
     probe_within_limit: bool
+    compile_probe_seconds: float
     screens_seconds: float
     continuation_seconds: float
     training_deadline_seconds: float
@@ -413,18 +439,27 @@ def schedule(
 
     `probe_microbatches` lists the probes expected to run; probes already judged
     likely-OOM are omitted by the caller because they fail before doing work.
+    Each probe update accumulates `probe_accumulation_steps` microbatches. An
+    enabled compile probe is charged its whole window, because compilation time
+    is unknown until the A40 measures it.
     """
     if not math.isfinite(throughput) or throughput <= 0:
         raise ValueError("throughput must be a finite positive number")
     per_update = spec.tokens_per_update / throughput
     probe = sum(
-        spec.probe_steps * b * spec.sequence_length / throughput for b in probe_microbatches
+        spec.probe_steps * spec.probe_accumulation_steps * b * spec.sequence_length / throughput
+        for b in probe_microbatches
     )
+    compile_probe = spec.compile_probe_seconds if spec.compile_probe_steps else 0.0
     screens = spec.arms * spec.screen_steps * per_update
     continuation = (spec.steps - spec.screen_steps) * per_update
     deadline = min(
         spec.training_seconds,
-        spec.pod_seconds - startup_seconds - probe - spec.finalization_reserve_seconds,
+        spec.pod_seconds
+        - startup_seconds
+        - probe
+        - compile_probe
+        - spec.finalization_reserve_seconds,
     )
     deadline = max(deadline, 0.0)
     updates_all = total_updates(spec)
@@ -432,7 +467,7 @@ def schedule(
     used = reached * per_update
     final = finalization_seconds(checkpoint_bytes)
     transfer = transfer_seconds(checkpoint_bytes, transfer_mbps)
-    total = startup_seconds + probe + used + final + transfer
+    total = startup_seconds + probe + compile_probe + used + final + transfer
     cost = total / 3600 * spec.quoted_total_hourly
     return Schedule(
         throughput=throughput,
@@ -442,6 +477,7 @@ def schedule(
         probe_microbatches=tuple(probe_microbatches),
         probe_seconds=probe,
         probe_within_limit=probe <= spec.probe_seconds,
+        compile_probe_seconds=compile_probe,
         screens_seconds=screens,
         continuation_seconds=continuation,
         training_deadline_seconds=deadline,
@@ -635,6 +671,7 @@ def build_report(
         },
         "microbatches": [asdict(row) for row in table],
         "probe_microbatches": probe_microbatches,
+        "compile_probe_seconds": spec.compile_probe_seconds if spec.compile_probe_steps else 0.0,
         "requirements": [
             {**asdict(item), "schedule": asdict(plan(item.throughput))} for item in requirements
         ],
@@ -726,7 +763,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "## Scenario table",
         "",
         f"Startup {options['startup_seconds']:.0f} s (image pull, bootstrap, data staging, "
-        f"preflight); finalization = 2 x checkpoint at 1 GB/s + {FINAL_VALIDATION_WINDOWS} "
+        f"preflight); compile probe charged its full {report['compile_probe_seconds']:.0f} s "
+        "window; finalization = 2 x checkpoint at 1 GB/s + {FINAL_VALIDATION_WINDOWS} "
         f"validation windows ({FINAL_VALIDATION_SECONDS:.0f} s); transfer at "
         f"{options['transfer_mbps']:.0f} Mbps; cost at the quoted total hourly rate.",
         "",
