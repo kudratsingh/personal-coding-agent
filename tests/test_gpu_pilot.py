@@ -1,4 +1,7 @@
 import json
+import os
+import sys
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -12,7 +15,14 @@ from scratchcoder.data.shards import file_sha256
 from scratchcoder.train.pilot import Limits
 from scratchcoder.train.trainer import Trainer
 from scratchcoder.train.validation import ValidationWindow
-from tools.gpu_pilot import Specification, Worker, check_preflight, check_readiness
+from tools.gpu_pilot import (
+    Specification,
+    Worker,
+    _completed_rows,
+    check_preflight,
+    check_readiness,
+    trainer_config,
+)
 
 
 def specification() -> Specification:
@@ -441,24 +451,113 @@ def _require_compiler(row: dict[str, Any]) -> None:
         pytest.skip(f"torch.compile backend unavailable here: {row.get('error_type')}")
 
 
+# A stand-in for the compile probe child: real compilation is slow, so these
+# tests drive the parent's supervision with a tiny script that obeys the same
+# request/rows/result protocol. One test below runs the real compiled child.
+FAKE_CHILD = """
+import json, os, sys, time
+from pathlib import Path
+request = json.loads(Path(sys.argv[sys.argv.index("--request") + 1]).read_text())
+rows, result = Path(request["rows_path"]), Path(request["result_path"])
+(rows.parent / "child.pid").write_text(str(os.getpid()))
+mode = os.environ["FAKE_COMPILE_CHILD"]
+def row(step):
+    seconds = 3.0 if step == 1 else 0.5
+    return json.dumps({"loss": 5.0, "tokens": 64.0, "step_seconds": seconds, "step": float(step)})
+if mode == "fail":
+    sys.stderr.write("backend compiler failed: no working C++ compiler\\n")
+    raise SystemExit(1)
+if mode == "one-then-sleep":
+    with rows.open("a") as stream:
+        stream.write(row(1) + "\\n")
+if mode == "complete-on-go":
+    while not (rows.parent / "go").exists():
+        time.sleep(0.01)
+    with rows.open("a") as stream:
+        stream.write("".join(row(step) + "\\n" for step in range(1, 4)))
+    result.write_text(json.dumps({
+        "status": "completed", "updates": 3, "peak_allocated_bytes": 0,
+        "peak_reserved_bytes": 0, "torch_version": "fake", "compile": True,
+    }))
+    raise SystemExit(0)
+time.sleep(120)
+"""
+
+
+def fake_child_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, **kwargs: Any
+) -> Worker:
+    script = tmp_path / "fake_compile_child.py"
+    script.write_text(FAKE_CHILD)
+    monkeypatch.setenv("FAKE_COMPILE_CHILD", mode)
+    spec = kwargs.pop("spec", compile_spec())
+    return worker(
+        tmp_path,
+        spec,
+        compile_probe_command=(sys.executable, str(script)),
+        compile_poll_seconds=0.02,
+        **kwargs,
+    )
+
+
+def _dead(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def _wait_for(path: Path, seconds: float = 30) -> None:
+    deadline = time.monotonic() + seconds
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
 def test_compile_probe_is_recorded_separately_and_never_changes_the_arms(
     tmp_path: Path,
 ) -> None:
     eager = worker(tmp_path / "eager").execute()
     assert eager["compile_probe"] == {"status": "disabled"}
-    pilot = worker(tmp_path / "compiled", compile_spec())
+    pilot = worker(tmp_path / "compiled", compile_spec(), compile_poll_seconds=0.05)
     result = pilot.execute()
     row = result["compile_probe"]
     _require_compiler(row)
     assert row["status"] == "completed", row
     assert row["microbatch"] == result["chosen_microbatch"] == eager["chosen_microbatch"] == 4
     assert row["updates"] == row["steps_requested"] == 3
-    assert row["warmup_updates_excluded"] == 1
+    assert row["warmup_updates_excluded"] == 1 and row["exit_code"] == 0
+    assert row["compile"] is True and row["peak_allocated_bytes"] == 0  # CPU: no GPU evidence.
     assert row["speedup"] == pytest.approx(
         row["tokens_per_second"] / row["eager_tokens_per_second"]
     )
     assert row["speedup"] > 0 and row["first_update_seconds"] > 0
-    assert row["peak_allocated_bytes"] == 0  # CPU fixture: no GPU evidence.
+    assert row["tokens_per_probe_update"] == 4 * 8 * 2
+    if row["break_even_tokens"] is not None:
+        assert row["break_even_training_updates"] == pytest.approx(row["break_even_tokens"] / 32)
+        assert row["break_even_tokens"] == pytest.approx(row["break_even_probe_updates"] * 64)
+    # The parent never compiles: every parent run record trains eagerly ...
+    records = {
+        path.parent.name: json.loads(path.read_text()) for path in pilot.root.glob("*/record.json")
+    }
+    assert {"probe-2", "probe-4", "probe-1", "lr-0", "lr-1", "lr-2"} <= set(records)
+    assert any(name.endswith("-continued") for name in records)
+    assert all(record["config"]["train"]["compile"] is False for record in records.values())
+    # ... and only the child's trainer, built from the same probe configuration, compiles.
+    child = pilot.root / "compile-probe" / "run" / "probe-compiled-4" / "record.json"
+    assert json.loads(child.read_text())["config"]["train"]["compile"] is True
+    request = json.loads((pilot.root / "compile-probe" / "request.json").read_text())
+    train = request["config"]["train"]
+    assert (train["compile"], train["batch_size"], train["accumulation_steps"], train["steps"]) == (
+        True,
+        4,
+        2,
+        3,
+    )
+    assert {**train, "compile": False, "steps": 2, "warmup_steps": 2} == {
+        **records["probe-4"]["config"]["train"],
+        "warmup_steps": 2,
+    }
     # The eager probe table, the arms and the continuation are untouched.
     assert [r["status"] for r in result["probes"]] == [r["status"] for r in eager["probes"]]
     assert [a["validation"] for a in result["arms"]] == [a["validation"] for a in eager["arms"]]
@@ -476,69 +575,133 @@ def test_compile_probe_is_recorded_separately_and_never_changes_the_arms(
 def test_compile_failure_is_recorded_and_the_pilot_trains_eagerly(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    pilot = worker(tmp_path, compile_spec())
-    original = pilot.trainer
-
-    def broken(
-        name: str, size: int, rate: float, *, probe: bool = False, compiled: bool = False
-    ) -> Trainer:
-        if compiled:
-            raise RuntimeError("backend compiler failed: no working C++ compiler")
-        return original(name, size, rate, probe=probe, compiled=compiled)
-
-    monkeypatch.setattr(pilot, "trainer", broken)
+    pilot = fake_child_worker(tmp_path, monkeypatch, "fail")
     result = pilot.execute()
     row = result["compile_probe"]
-    assert row["status"] == "failed" and row["error_type"] == "RuntimeError"
-    assert "compiler" in row["error"] and row["updates"] == 0
+    assert row["status"] == "failed" and row["error_type"] == "ChildExit"
+    assert "compiler" in row["error"] and row["updates"] == 0 and row["exit_code"] == 1
     assert result["status"] == "completed" and len(result["arms"]) == 3
     assert "stop_reason" not in result
 
 
-def test_compile_probe_window_is_soft_and_separate_from_the_probe_window(
-    tmp_path: Path,
+def test_compile_probe_timeout_kills_the_child_and_the_pilot_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = [1000.0]
-    pilot = worker(tmp_path, compile_spec(), clock=lambda: now[0])
-    original = pilot.on_step
+    pilot: Worker
 
-    def advance(trainer: Trainer, metrics: dict[str, float]) -> None:
-        if pilot.phase.startswith("probe-compiled-") and trainer.step == 1:
-            now[0] += 61  # The compile window (60 s) expires after the first compiled update.
-        original(trainer, metrics)
+    def sleep(_: float) -> None:
+        time.sleep(0.02)
+        if (pilot.root / "compile-probe" / "child.pid").exists():
+            now[0] += 61  # The 60 s hard window expires while the child is still running.
 
-    pilot.on_step = advance  # type: ignore[method-assign]
+    pilot = fake_child_worker(tmp_path, monkeypatch, "sleep", clock=lambda: now[0], sleep=sleep)
     result = pilot.execute()
     row = result["compile_probe"]
-    _require_compiler(row)
-    assert row["status"] == "incomplete" and row["updates"] == 1
-    assert row["first_update_seconds"] > 0 and "speedup" not in row
-    assert row["elapsed_seconds"] >= 61
-    assert result["probe_window_expired"] is False  # The eager window was not involved.
+    assert row["status"] == "timeout" and row["updates"] == 0
+    assert "did not finish within the window" in row["note"]
+    assert row["elapsed_seconds"] >= 60 and row["exit_code"] is None
+    assert _dead(int((pilot.root / "compile-probe" / "child.pid").read_text()))
     assert result["status"] == "completed" and len(result["arms"]) == 3
     assert "stop_reason" not in result
 
 
-def test_wall_limit_during_the_compile_probe_stops_the_pilot(tmp_path: Path) -> None:
+def test_compile_probe_window_keeps_every_finished_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     now = [1000.0]
-    pilot = worker(tmp_path, compile_spec(), clock=lambda: now[0])
-    original = pilot.on_step
+    pilot: Worker
 
-    def advance(trainer: Trainer, metrics: dict[str, float]) -> None:
-        if pilot.phase.startswith("probe-compiled-"):
-            now[0] += 400  # Past the 300 s pod wall.
-        original(trainer, metrics)
+    def sleep(_: float) -> None:
+        time.sleep(0.02)
+        rows = pilot.root / "compile-probe" / "rows.jsonl"
+        if rows.exists() and rows.read_text().count("\n") >= 1:
+            now[0] += 61
 
-    pilot.on_step = advance  # type: ignore[method-assign]
+    pilot = fake_child_worker(
+        tmp_path, monkeypatch, "one-then-sleep", clock=lambda: now[0], sleep=sleep
+    )
     result = pilot.execute()
     row = result["compile_probe"]
-    _require_compiler(row)
-    assert row["status"] == "stopped"
+    assert row["status"] == "incomplete" and row["updates"] == 1
+    assert row["first_update_seconds"] == 3.0 and "speedup" not in row
+    assert len(result["loss_curves"]["probe-compiled-4"]) == 1
+    assert _dead(int((pilot.root / "compile-probe" / "child.pid").read_text()))
+    assert result["status"] == "completed" and len(result["arms"]) == 3
+
+
+def test_wall_limit_during_the_compile_probe_stops_the_pilot_and_kills_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [1000.0]
+    pilot: Worker
+
+    def sleep(_: float) -> None:
+        time.sleep(0.02)
+        if (pilot.root / "compile-probe" / "child.pid").exists():
+            now[0] += 400  # Past the 300 s pod wall; the compile window is not the cause.
+
+    pilot = fake_child_worker(tmp_path, monkeypatch, "sleep", clock=lambda: now[0], sleep=sleep)
+    result = pilot.execute()
+    row = result["compile_probe"]
+    assert row["status"] == "stopped" and row["stop_reason"] == "pod_wall_limit"
     assert result["status"] == "stopped" and result["stop_reason"] == "pod_wall_limit"
     assert not result["arms"]
+    assert _dead(int((pilot.root / "compile-probe" / "child.pid").read_text()))
 
 
-def test_compile_probe_specification_rules(tmp_path: Path) -> None:
+def test_compile_probe_refreshes_the_idle_clock_and_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 200 s of budgeted compile time exceeds the 180 s idle limit: without the refresh,
+    # the first arm would stop on idle_gpu_limit.
+    now = [1000.0]
+    seen: list[tuple[float, dict[str, Any]]] = []
+    pilot: Worker
+    directory = tmp_path / "pilot" / "compile-probe"
+
+    def sleep(_: float) -> None:
+        seen.append((now[0], json.loads((pilot.root / "heartbeat.json").read_text())))
+        now[0] += 50
+        if len(seen) == 4:
+            (directory / "go").write_text("go")
+            _wait_for(directory / "result.json")
+            time.sleep(0.3)  # The child exits right after writing its result.
+        time.sleep(0.01)
+
+    pilot = fake_child_worker(
+        tmp_path,
+        monkeypatch,
+        "complete-on-go",
+        spec=compile_spec(compile_probe_seconds=230),
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+    result = pilot.execute()
+    assert len(seen) >= 4
+    for when, beat in seen:
+        assert beat["compile_probe_active"] is True and beat["phase"] == "probe-compiled-4"
+        assert beat["last_gpu_activity_unix"] == when
+    row = result["compile_probe"]
+    assert row["status"] == "completed" and row["updates"] == 3, row
+    assert row["first_update_seconds"] == 3.0 and row["compile"] is True
+    assert result["status"] == "completed" and len(result["arms"]) == 3
+    assert "stop_reason" not in result
+    final = json.loads((pilot.root / "heartbeat.json").read_text())
+    assert final["compile_probe_active"] is False
+
+
+def test_completed_rows_ignore_a_torn_final_line(tmp_path: Path) -> None:
+    path = tmp_path / "rows.jsonl"
+    good = [{"loss": 1.0, "tokens": 8.0, "step_seconds": 0.1, "step": float(i)} for i in (1, 2)]
+    path.write_text("".join(json.dumps(row) + "\n" for row in good) + '{"loss": 1.0, "tok')
+    assert _completed_rows(path) == good
+    path.write_text(json.dumps({**good[0], "step": 2.0}) + "\n")
+    assert _completed_rows(path) == []  # Steps must start at 1 and increase by one.
+    assert _completed_rows(tmp_path / "missing.jsonl") == []
+
+
+def test_compile_probe_specification_rules() -> None:
     base = specification()
     compiled_training = replace(base.config, train=replace(base.config.train, compile=True))
     with pytest.raises(ValueError, match="keep compile off"):
@@ -554,7 +717,9 @@ def test_compile_probe_specification_rules(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="exceed the pod lifetime"):
         compile_spec(compile_probe_seconds=240)
     with pytest.raises(ValueError, match="measured only by the compile probe"):
-        worker(tmp_path).trainer("arm", 2, 0.0003, compiled=True)
+        trainer_config(base, 2, 0.0003, probe=False, compiled=True)
+    assert trainer_config(compile_spec(), 2, 0.0003, probe=True, compiled=True).train.compile
+    assert not trainer_config(compile_spec(), 2, 0.0003, probe=True).train.compile
 
 
 def test_readiness_reserves_the_compile_probe_window() -> None:

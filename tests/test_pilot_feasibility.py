@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -123,32 +124,67 @@ def test_flops_per_token_and_utilization(flops_token: int) -> None:
     )
 
 
+def bare(spec: PilotSpecification) -> PilotSpecification:
+    """The checked-in specification without the measurement-only compile probe."""
+    return replace(spec, compile_probe_steps=0, compile_probe_seconds=0.0)
+
+
 def test_schedule_at_required_throughput_completes_the_pilot(
     spec: PilotSpecification, flops_token: int
 ) -> None:
     rate = required_throughput(spec.tokens_per_update, 700, spec.training_seconds)
-    plan = schedule(spec, rate, probe_microbatches=[8, 4], flops_token=flops_token)
+    plan = schedule(bare(spec), rate, probe_microbatches=[8, 4], flops_token=flops_token)
     assert plan.updates_total == 700
     assert plan.updates_reached == 700
     assert plan.screens_completed == 3
     assert plan.outcome == "complete 500"
     assert plan.training_deadline_seconds == 3600
     assert plan.training_seconds_used == pytest.approx(3600, abs=1e-6)
-    # Each probe update accumulates two microbatches; the compile probe is charged its window.
+    # Each probe update accumulates two microbatches.
     assert plan.probe_seconds == pytest.approx(20 * 2 * (8 + 4) * 1024 / rate)
-    assert plan.compile_probe_seconds == 240
-    assert plan.probe_within_limit
+    assert plan.probe_within_limit and plan.compile_probe_seconds == 0
+    assert plan.pod_lifetime_seconds == 5400 - 180  # The armed self-destruct margin.
     assert plan.fits_pod and plan.fits_cost_cap
+
+
+def test_fully_used_compile_window_costs_updates_at_the_required_speed(
+    spec: PilotSpecification, flops_token: int
+) -> None:
+    rate = required_throughput(spec.tokens_per_update, 700, spec.training_seconds)
+    charged = schedule(spec, rate, probe_microbatches=[8, 4], flops_token=flops_token)
+    assert charged.compile_probe_seconds == 240
+    assert charged.training_deadline_seconds == pytest.approx(
+        5400 - 180 - 600 - charged.probe_seconds - 240 - 900
+    )
+    assert charged.updates_reached == 672
+    assert charged.outcome == "partial continuation to step 472"
+    # Without the margin the same window still fits inside the 3,600 s training budget.
+    unmargined = schedule(
+        spec,
+        rate,
+        probe_microbatches=[8, 4],
+        flops_token=flops_token,
+        self_destruct_margin_seconds=0,
+    )
+    assert unmargined.updates_reached == 700 and unmargined.pod_lifetime_seconds == 5400
+    with pytest.raises(ValueError, match="self-destruct margin"):
+        schedule(
+            spec,
+            rate,
+            probe_microbatches=[8, 4],
+            flops_token=flops_token,
+            self_destruct_margin_seconds=5400,
+        )
 
 
 def test_schedule_at_5000_tokens_per_second(spec: PilotSpecification, flops_token: int) -> None:
     plan = schedule(spec, 5000, probe_microbatches=[8, 4], flops_token=flops_token)
     assert plan.seconds_per_update == pytest.approx(26.2144)
-    # The pod budget binds before the training budget at this speed.
-    assert plan.updates_reached == 135
+    # The usable pod lifetime binds before the training budget at this speed.
+    assert plan.updates_reached == 129
     assert plan.screens_completed == 1
     assert plan.outcome == "no complete screen"
-    assert plan.training_seconds_used == pytest.approx(135 * 26.2144)
+    assert plan.training_seconds_used == pytest.approx(129 * 26.2144)
     assert plan.finalization_seconds == pytest.approx(finalization_seconds(1_623_502_465))
     assert plan.transfer_seconds == pytest.approx(649.4, abs=0.01)
     assert plan.total_pod_seconds == pytest.approx(
@@ -159,19 +195,42 @@ def test_schedule_at_5000_tokens_per_second(spec: PilotSpecification, flops_toke
         + plan.finalization_seconds
         + plan.transfer_seconds
     )
-    assert plan.total_pod_seconds < 5400 and plan.fits_pod
+    assert plan.total_pod_seconds < plan.pod_lifetime_seconds == 5220 and plan.fits_pod
     assert plan.cost_dollars == pytest.approx(plan.total_pod_seconds / 3600 * 0.6)
     assert plan.fits_cost_cap
 
 
 def test_schedule_outcomes_at_screen_boundaries(spec: PilotSpecification, flops_token: int) -> None:
+    # Boundary semantics with the training budget binding: no compile window, no margin.
+    def plan(rate: float) -> object:
+        return schedule(
+            bare(spec),
+            rate,
+            probe_microbatches=[8, 4],
+            flops_token=flops_token,
+            self_destruct_margin_seconds=0,
+        )
+
     screens_only = required_throughput(spec.tokens_per_update, 300, spec.training_seconds)
-    plan = schedule(spec, screens_only, probe_microbatches=[8, 4], flops_token=flops_token)
-    assert plan.updates_reached == 300
-    assert plan.outcome == "screens only (no winner continuation)"
-    partial = schedule(spec, 25000, probe_microbatches=[8, 4], flops_token=flops_token)
+    boundary = schedule(
+        bare(spec),
+        screens_only,
+        probe_microbatches=[8, 4],
+        flops_token=flops_token,
+        self_destruct_margin_seconds=0,
+    )
+    assert boundary.updates_reached == 300
+    assert boundary.outcome == "screens only (no winner continuation)"
+    partial = schedule(
+        bare(spec),
+        25000,
+        probe_microbatches=[8, 4],
+        flops_token=flops_token,
+        self_destruct_margin_seconds=0,
+    )
     assert partial.updates_reached == 686
     assert partial.outcome == "partial continuation to step 486"
+    assert plan(25000) == partial
     assert outcome_label(299, 3, 100, 500, 700) == "no complete screen"
     assert outcome_label(301, 3, 100, 500, 700) == "partial continuation to step 101"
     assert outcome_label(700, 3, 100, 500, 700) == "complete 500"
@@ -183,12 +242,12 @@ def test_schedule_deadline_is_bounded_by_pod_budget(flops_token: int) -> None:
     tight = PilotSpecification.from_mapping(raw)
     plan = schedule(tight, 40000, probe_microbatches=[8, 4], flops_token=flops_token)
     assert plan.training_deadline_seconds == pytest.approx(
-        3000 - 600 - plan.probe_seconds - 240 - 900
+        3000 - 180 - 600 - plan.probe_seconds - 240 - 900
     )
-    assert plan.updates_reached == 380 < 700
-    assert plan.outcome == "partial continuation to step 180"
+    assert plan.updates_reached == 325 < 700
+    assert plan.outcome == "partial continuation to step 125"
     # The 900 s reserve exceeds actual finalization + transfer, so the pod still fits.
-    assert plan.total_pod_seconds <= 3000 and plan.fits_pod
+    assert plan.total_pod_seconds <= plan.pod_lifetime_seconds == 2820 and plan.fits_pod
 
 
 def test_slow_transfer_breaks_the_pod_budget(spec: PilotSpecification, flops_token: int) -> None:
@@ -266,7 +325,16 @@ def test_report_and_markdown_carry_the_disclaimer(spec: PilotSpecification) -> N
     assert report["disclaimer"] == GPU_DISCLAIMER
     assert report["probe_microbatches"] == [16, 8, 4]
     assert [item["updates"] for item in report["requirements"]] == [300, 700]
-    assert report["requirements"][1]["schedule"]["outcome"] == "complete 500"
+    # With the armed margin and a fully used compile window, exactly-required speed falls short.
+    assert report["requirements"][1]["schedule"]["outcome"] == "partial continuation to step 467"
+    assert report["pod_lifetime_seconds"] == 5220 and report["compile_probe_seconds"] == 240
+    required = report["compile_probe_cost"][0]
+    assert required["throughput"] == pytest.approx(25486.22, abs=0.01)
+    assert (required["updates_with_compile_probe"], required["updates_without_compile_probe"]) == (
+        667,
+        700,
+    )
+    assert required["updates_lost"] == 33
     assert [item["throughput"] for item in report["scenarios"]] == [
         5000,
         10000,
@@ -280,6 +348,7 @@ def test_report_and_markdown_carry_the_disclaimer(spec: PilotSpecification) -> N
         "## Microbatch table",
         "## Throughput requirements",
         "## Scenario table",
+        "## Compile probe cost",
         "## Disk",
         "## Storage decision",
     ):
@@ -287,6 +356,8 @@ def test_report_and_markdown_carry_the_disclaimer(spec: PilotSpecification) -> N
     assert GPU_DISCLAIMER in markdown
     assert "10,922.67" in markdown and "25,486.22" in markdown
     assert "not a CUDA measurement" in markdown
+    assert "32 validation windows" in markdown and "{" not in markdown
+    assert "costs 33 of 700 updates" in markdown and "5220 s" in markdown
 
 
 def test_cli_writes_json_and_prints_disclaimer(

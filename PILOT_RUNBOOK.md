@@ -24,10 +24,10 @@ Expected: `make check` green; the smoke report ends `Pilot completed`; the prefl
 set -a; source .env; set +a            # .env is git-ignored; it holds RUNPOD_API_KEY=... only
 test -n "$RUNPOD_API_KEY" && echo "RUNPOD_API_KEY is set"   # never echo the value
 gh auth status                          # needed for the private record/log archive
-ls -l ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub
-export PILOT_SSH_KEY=~/.ssh/id_ed25519
+ls -l ~/.ssh/runpod_ed25519 ~/.ssh/runpod_ed25519.pub   # the key registered in Runpod
+export PILOT_SSH_KEY=~/.ssh/runpod_ed25519
 export CTRL=runs/pilot-controller && mkdir -p "$CTRL"
-export PRIVATE_REPO=OWNER/PRIVATE_RECORDS_REPOSITORY   # must be private; the supervisor verifies this
+export PRIVATE_REPO=kudratsingh/personal-coding-agent-artifacts   # must be private; the supervisor verifies this
 ```
 
 Requirements: the Runpod API key must have Pod read and terminate permissions (the console shows key scopes); the SSH public key must be registered under Runpod account settings so the Pod injects it; the working directory must not sit under a symlinked path (macOS `/tmp` is a symlink; `tools/pilot_data.py` rejects symlinked components).
@@ -174,7 +174,7 @@ uv run --locked python -m tools.pilot_supervisor --identity "$CTRL/pod-identity.
   --transfer-timeout 1800 --poll-seconds 15 2>&1 | tee "$CTRL/supervisor.log"
 ```
 
-After the eager probes pick the microbatch, one compiled probe runs 20 updates at that size with `torch.compile` on, inside its own 240-second window (`compile_probe_seconds`). It is measurement only: it never changes the chosen microbatch, the arms or the continuation, and its compiled graphs are discarded before the first real update. A compiler failure is recorded as `failed` and the pilot continues eagerly; a window that expires records `incomplete`. Its `compile_probe` row in `report.json` holds the steady-state `speedup` against the eager probe at the same size, both first-update times, `one_off_compile_seconds_estimate`, `break_even_tokens` and its peak memory.
+After the eager probes pick the microbatch, one compiled probe runs 20 updates at that size with `torch.compile` on, in a child process with a hard 240-second window (`compile_probe_seconds`). It is measurement only: it never changes the chosen microbatch, the arms or the continuation, and the worker process itself never compiles. At the window the worker kills the child's whole process group and keeps every finished update. While the child runs, the heartbeat shows `compile_probe_active: true` and the idle clock is refreshed, so neither the worker nor the Mac watchdog reads compile time as an idle GPU; wall and cost limits still apply. Statuses: `completed`, `incomplete`, `timeout` (the first compiled update did not finish within the window), `failed` (child error, sanitized tail in `error`), `oom` or `stopped`; none of them except a wall or cost stop ends the pilot. The `compile_probe` row in `report.json` holds the steady-state `speedup` against the eager probe at the same size, both first-update times, `one_off_compile_seconds_estimate`, `break_even_tokens`, `break_even_training_updates` and the child's peak memory; the child's files are under `/workspace/pilot-run/compile-probe/`. A fully used window costs training time: at exactly the required 25,486 tokens per second it reaches 667 of the 700 updates instead of 700 (`tools/pilot_feasibility.py` prints this for each scenario).
 
 Watch the probe table: `podssh 'python3 -c "import json; r=json.load(open(\"/workspace/pilot-run/report.json\")); print(r[\"probes\"], r.get(\"chosen_microbatch\"), r.get(\"accumulation_steps\"), r.get(\"compile_probe\"))"'`. Each row records status (`completed`, `oom`, `incomplete`, `skipped`), updates, tokens per second and peak allocated/reserved bytes. The worker picks the largest completed size whose reserved peak stays below 90% of device memory. `no measured microbatch fits` ends the pilot with status `stopped` and no training charge beyond the probes.
 

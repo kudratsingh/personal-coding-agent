@@ -13,7 +13,7 @@ import argparse
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +63,9 @@ VERDICT_OOM = "likely OOM"
 DEFAULT_THROUGHPUTS = (5000.0, 10000.0, 15000.0, 25000.0, 40000.0)
 DEFAULT_STARTUP_SECONDS = 600.0  # image pull, bootstrap, data staging, preflight
 DEFAULT_TRANSFER_MBPS = 20.0
+# The runbook arms the in-Pod timer at ORIGIN + pod_seconds - 180, and the worker plans
+# against that earlier deadline, so the usable lifetime is 180 s short of the wall.
+DEFAULT_SELF_DESTRUCT_MARGIN_SECONDS = 180.0
 DEFAULT_PEAK_TFLOPS = 149.7  # A40 dense bf16 tensor-core peak
 
 CHECKPOINT_IO_BYTES_PER_SECOND = 1e9
@@ -383,6 +386,7 @@ class Schedule:
     probe_seconds: float
     probe_within_limit: bool
     compile_probe_seconds: float
+    pod_lifetime_seconds: float
     screens_seconds: float
     continuation_seconds: float
     training_deadline_seconds: float
@@ -434,6 +438,7 @@ def schedule(
     startup_seconds: float = DEFAULT_STARTUP_SECONDS,
     transfer_mbps: float = DEFAULT_TRANSFER_MBPS,
     checkpoint_bytes: int = MEASURED_UNTRAINED_CHECKPOINT_BYTES,
+    self_destruct_margin_seconds: float = DEFAULT_SELF_DESTRUCT_MARGIN_SECONDS,
 ) -> Schedule:
     """Wall-clock, pod and cost arithmetic for one assumed token throughput.
 
@@ -441,10 +446,15 @@ def schedule(
     likely-OOM are omitted by the caller because they fail before doing work.
     Each probe update accumulates `probe_accumulation_steps` microbatches. An
     enabled compile probe is charged its whole window, because compilation time
-    is unknown until the A40 measures it.
+    is unknown until the A40 measures it. The usable pod lifetime is the wall
+    minus the armed self-destruct margin, which the worker plans against.
     """
     if not math.isfinite(throughput) or throughput <= 0:
         raise ValueError("throughput must be a finite positive number")
+    margin = self_destruct_margin_seconds
+    if not math.isfinite(margin) or not 0 <= margin < spec.pod_seconds:
+        raise ValueError("self-destruct margin must be finite and inside the pod wall")
+    lifetime = spec.pod_seconds - margin
     per_update = spec.tokens_per_update / throughput
     probe = sum(
         spec.probe_steps * spec.probe_accumulation_steps * b * spec.sequence_length / throughput
@@ -455,11 +465,7 @@ def schedule(
     continuation = (spec.steps - spec.screen_steps) * per_update
     deadline = min(
         spec.training_seconds,
-        spec.pod_seconds
-        - startup_seconds
-        - probe
-        - compile_probe
-        - spec.finalization_reserve_seconds,
+        lifetime - startup_seconds - probe - compile_probe - spec.finalization_reserve_seconds,
     )
     deadline = max(deadline, 0.0)
     updates_all = total_updates(spec)
@@ -478,6 +484,7 @@ def schedule(
         probe_seconds=probe,
         probe_within_limit=probe <= spec.probe_seconds,
         compile_probe_seconds=compile_probe,
+        pod_lifetime_seconds=lifetime,
         screens_seconds=screens,
         continuation_seconds=continuation,
         training_deadline_seconds=deadline,
@@ -491,7 +498,7 @@ def schedule(
         startup_seconds=startup_seconds,
         total_pod_seconds=total,
         cost_dollars=cost,
-        fits_pod=total <= spec.pod_seconds,
+        fits_pod=total <= lifetime,
         fits_cost_cap=cost <= spec.approved_cost_cap,
     )
 
@@ -585,6 +592,7 @@ class FeasibilityOptions:
     startup_seconds: float = DEFAULT_STARTUP_SECONDS
     transfer_mbps: float = DEFAULT_TRANSFER_MBPS
     peak_tflops: float = DEFAULT_PEAK_TFLOPS
+    self_destruct_margin_seconds: float = DEFAULT_SELF_DESTRUCT_MARGIN_SECONDS
 
     def __post_init__(self) -> None:
         for name in ("activation_gib_per_sequence", "transfer_mbps", "peak_tflops"):
@@ -595,6 +603,9 @@ class FeasibilityOptions:
             raise ValueError("usable_gpu_memory_gib must not exceed gpu_memory_gib")
         if not math.isfinite(self.startup_seconds) or self.startup_seconds < 0:
             raise ValueError("startup_seconds must be a finite nonnegative number")
+        margin = self.self_destruct_margin_seconds
+        if isinstance(margin, bool) or not math.isfinite(margin) or margin < 0:
+            raise ValueError("self_destruct_margin_seconds must be a finite nonnegative number")
         if not self.throughputs:
             raise ValueError("at least one throughput scenario is required")
         for value in self.throughputs:
@@ -629,16 +640,29 @@ def build_report(
         for rate in (required_throughput(spec.tokens_per_update, updates, spec.training_seconds),)
     ]
 
-    def plan(rate: float) -> Schedule:
+    def plan(rate: float, plan_spec: PilotSpecification = spec) -> Schedule:
         return schedule(
-            spec,
+            plan_spec,
             rate,
             probe_microbatches=probe_microbatches,
             flops_token=flops_token,
             peak_tflops=options.peak_tflops,
             startup_seconds=options.startup_seconds,
             transfer_mbps=options.transfer_mbps,
+            self_destruct_margin_seconds=options.self_destruct_margin_seconds,
         )
+
+    without_compile = replace(spec, compile_probe_steps=0, compile_probe_seconds=0.0)
+    compile_cost = [
+        {
+            "throughput": rate,
+            "updates_with_compile_probe": plan(rate).updates_reached,
+            "updates_without_compile_probe": plan(rate, without_compile).updates_reached,
+            "updates_lost": plan(rate, without_compile).updates_reached
+            - plan(rate).updates_reached,
+        }
+        for rate in (requirements[-1].throughput, *options.throughputs)
+    ]
 
     return {
         "disclaimer": GPU_DISCLAIMER,
@@ -672,6 +696,8 @@ def build_report(
         "microbatches": [asdict(row) for row in table],
         "probe_microbatches": probe_microbatches,
         "compile_probe_seconds": spec.compile_probe_seconds if spec.compile_probe_steps else 0.0,
+        "pod_lifetime_seconds": spec.pod_seconds - options.self_destruct_margin_seconds,
+        "compile_probe_cost": compile_cost,
         "requirements": [
             {**asdict(item), "schedule": asdict(plan(item.throughput))} for item in requirements
         ],
@@ -762,9 +788,11 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         "",
         "## Scenario table",
         "",
-        f"Startup {options['startup_seconds']:.0f} s (image pull, bootstrap, data staging, "
+        f"Usable pod lifetime {report['pod_lifetime_seconds']:.0f} s (the wall minus the "
+        f"{options['self_destruct_margin_seconds']:.0f} s self-destruct margin). Startup "
+        f"{options['startup_seconds']:.0f} s (image pull, bootstrap, data staging, "
         f"preflight); compile probe charged its full {report['compile_probe_seconds']:.0f} s "
-        "window; finalization = 2 x checkpoint at 1 GB/s + {FINAL_VALIDATION_WINDOWS} "
+        f"window; finalization = 2 x checkpoint at 1 GB/s + {FINAL_VALIDATION_WINDOWS} "
         f"validation windows ({FINAL_VALIDATION_SECONDS:.0f} s); transfer at "
         f"{options['transfer_mbps']:.0f} Mbps; cost at the quoted total hourly rate.",
         "",
@@ -781,6 +809,27 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"{_minutes(item['total_pod_seconds'])} | ${item['cost_dollars']:.2f} | "
             f"{'yes' if item['fits_pod'] else 'no'} | {'yes' if item['fits_cost_cap'] else 'no'} |"
         )
+    if report["compile_probe_seconds"]:
+        required = report["compile_probe_cost"][0]
+        lines += [
+            "",
+            "## Compile probe cost",
+            "",
+            f"At the required {required['throughput']:,.0f} tok/s the "
+            f"{report['compile_probe_seconds']:.0f} s compile window, if fully used, costs "
+            f"{required['updates_lost']} of {report['model']['updates_total']} updates "
+            f"({required['updates_with_compile_probe']} reachable with it, "
+            f"{required['updates_without_compile_probe']} without). A compile that finishes "
+            "early returns the unused time to training.",
+            "",
+            "| tok/s | updates with compile probe | updates without | updates lost |",
+            "| --- | --- | --- | --- |",
+        ]
+        for item in report["compile_probe_cost"][1:]:
+            lines.append(
+                f"| {item['throughput']:,.0f} | {item['updates_with_compile_probe']} | "
+                f"{item['updates_without_compile_probe']} | {item['updates_lost']} |"
+            )
     lines += [
         "",
         "## Disk",
@@ -853,6 +902,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--transfer-mbps", type=float, default=DEFAULT_TRANSFER_MBPS)
     parser.add_argument(
+        "--self-destruct-margin-seconds",
+        type=float,
+        default=DEFAULT_SELF_DESTRUCT_MARGIN_SECONDS,
+        help="seconds the armed in-Pod timer fires before the wall (runbook: 180)",
+    )
+    parser.add_argument(
         "--peak-tflops",
         type=float,
         default=DEFAULT_PEAK_TFLOPS,
@@ -875,6 +930,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             startup_seconds=args.startup_seconds,
             transfer_mbps=args.transfer_mbps,
             peak_tflops=args.peak_tflops,
+            self_destruct_margin_seconds=args.self_destruct_margin_seconds,
         )
         report = build_report(spec, options, str(args.specification))
     except (OSError, ValueError, json.JSONDecodeError) as error:
