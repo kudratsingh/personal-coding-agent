@@ -1,9 +1,11 @@
+import functools
 import json
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -16,11 +18,15 @@ from scratchcoder.train.pilot import Limits
 from scratchcoder.train.trainer import Trainer
 from scratchcoder.train.validation import ValidationWindow
 from tools.gpu_pilot import (
+    COMPILE_SOFT_STOP_SECONDS,
     Specification,
     Worker,
     _completed_rows,
+    _kill_group,
     check_preflight,
     check_readiness,
+    document_source,
+    run_compile_probe_child,
     trainer_config,
 )
 
@@ -445,41 +451,69 @@ def compile_spec(**overrides: Any) -> Specification:
     return replace(specification(), **settings)
 
 
-def _require_compiler(row: dict[str, Any]) -> None:
-    message = str(row.get("error", "")).lower()
-    if row.get("status") == "failed" and ("inductor" in message or "compiler" in message):
-        pytest.skip(f"torch.compile backend unavailable here: {row.get('error_type')}")
+@functools.lru_cache(maxsize=1)
+def _toolchain_available() -> bool:
+    """Whether torch.compile can build even a trivial CPU function on this machine."""
+    try:
+        compiled = torch.compile(lambda x: x * 2 + 1)
+        return bool(torch.equal(compiled(torch.ones(4)), torch.full((4,), 3.0)))
+    except Exception:
+        return False
 
+
+SECRET = "rpa_ABCDEFGH12345678"
 
 # A stand-in for the compile probe child: real compilation is slow, so these
 # tests drive the parent's supervision with a tiny script that obeys the same
 # request/rows/result protocol. One test below runs the real compiled child.
 FAKE_CHILD = """
-import json, os, sys, time
+import json, os, subprocess, sys, time
 from pathlib import Path
 request = json.loads(Path(sys.argv[sys.argv.index("--request") + 1]).read_text())
 rows, result = Path(request["rows_path"]), Path(request["result_path"])
 (rows.parent / "child.pid").write_text(str(os.getpid()))
 mode = os.environ["FAKE_COMPILE_CHILD"]
+SECRET = "rpa_ABCDEFGH12345678"
 def row(step):
     seconds = 3.0 if step == 1 else 0.5
     return json.dumps({"loss": 5.0, "tokens": 64.0, "step_seconds": seconds, "step": float(step)})
-if mode == "fail":
-    sys.stderr.write("backend compiler failed: no working C++ compiler\\n")
-    raise SystemExit(1)
-if mode == "one-then-sleep":
-    with rows.open("a") as stream:
-        stream.write(row(1) + "\\n")
-if mode == "complete-on-go":
-    while not (rows.parent / "go").exists():
-        time.sleep(0.01)
+def complete():
     with rows.open("a") as stream:
         stream.write("".join(row(step) + "\\n" for step in range(1, 4)))
     result.write_text(json.dumps({
         "status": "completed", "updates": 3, "peak_allocated_bytes": 0,
         "peak_reserved_bytes": 0, "torch_version": "fake", "compile": True,
     }))
+if mode == "fail":
+    sys.stderr.write("backend compiler failed: no working C++ compiler; key " + SECRET + "\\n")
+    raise SystemExit(1)
+if mode in ("result-oom", "result-failed"):
+    error_type = "OutOfMemoryError" if mode == "result-oom" else "BackendCompilerFailed"
+    result.write_text(json.dumps({
+        "status": "oom" if mode == "result-oom" else "failed", "updates": 0,
+        "error_type": error_type, "error": "boom with " + SECRET + " and Bearer abcdefghijkl",
+        "peak_allocated_bytes": 7, "peak_reserved_bytes": 9, "torch_version": "fake",
+        "compile": True,
+    }))
+    raise SystemExit(1)
+if mode == "complete":
+    complete()
     raise SystemExit(0)
+if mode == "complete-then-abort":
+    complete()
+    os.abort()
+if mode == "one-then-sleep":
+    with rows.open("a") as stream:
+        stream.write(row(1) + "\\n")
+if mode == "complete-on-go":
+    while not (rows.parent / "go").exists():
+        time.sleep(0.01)
+    complete()
+    raise SystemExit(0)
+if mode == "sleep":
+    # Like an inductor compile worker: a grandchild in the same process group.
+    grandchild = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    (rows.parent / "grandchild.pid").write_text(str(grandchild.pid))
 time.sleep(120)
 """
 
@@ -500,12 +534,19 @@ def fake_child_worker(
     )
 
 
-def _dead(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    return False
+def _dead(pid: int, seconds: float = 10) -> bool:
+    """True once the process is gone; an orphaned zombie is reaped by init shortly."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return True  # macOS: only a zombie awaiting its reaper remains.
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def _wait_for(path: Path, seconds: float = 30) -> None:
@@ -519,33 +560,24 @@ def test_compile_probe_is_recorded_separately_and_never_changes_the_arms(
 ) -> None:
     eager = worker(tmp_path / "eager").execute()
     assert eager["compile_probe"] == {"status": "disabled"}
-    pilot = worker(tmp_path / "compiled", compile_spec(), compile_poll_seconds=0.05)
-    result = pilot.execute()
-    row = result["compile_probe"]
-    _require_compiler(row)
-    assert row["status"] == "completed", row
-    assert row["microbatch"] == result["chosen_microbatch"] == eager["chosen_microbatch"] == 4
-    assert row["updates"] == row["steps_requested"] == 3
-    assert row["warmup_updates_excluded"] == 1 and row["exit_code"] == 0
-    assert row["compile"] is True and row["peak_allocated_bytes"] == 0  # CPU: no GPU evidence.
-    assert row["speedup"] == pytest.approx(
-        row["tokens_per_second"] / row["eager_tokens_per_second"]
+    # A real advancing clock, so the hard window would end a hung child.
+    started = time.time()
+    pilot = worker(
+        tmp_path / "compiled",
+        compile_spec(),
+        clock=time.time,
+        pod_created=started,
+        compile_poll_seconds=0.05,
     )
-    assert row["speedup"] > 0 and row["first_update_seconds"] > 0
-    assert row["tokens_per_probe_update"] == 4 * 8 * 2
-    if row["break_even_tokens"] is not None:
-        assert row["break_even_training_updates"] == pytest.approx(row["break_even_tokens"] / 32)
-        assert row["break_even_tokens"] == pytest.approx(row["break_even_probe_updates"] * 64)
-    # The parent never compiles: every parent run record trains eagerly ...
+    result = pilot.execute()
+    # Compiler-independent guarantees first: the parent never compiles ...
     records = {
         path.parent.name: json.loads(path.read_text()) for path in pilot.root.glob("*/record.json")
     }
     assert {"probe-2", "probe-4", "probe-1", "lr-0", "lr-1", "lr-2"} <= set(records)
     assert any(name.endswith("-continued") for name in records)
     assert all(record["config"]["train"]["compile"] is False for record in records.values())
-    # ... and only the child's trainer, built from the same probe configuration, compiles.
-    child = pilot.root / "compile-probe" / "run" / "probe-compiled-4" / "record.json"
-    assert json.loads(child.read_text())["config"]["train"]["compile"] is True
+    # ... the child is asked for exactly the eager probe's configuration with compile on ...
     request = json.loads((pilot.root / "compile-probe" / "request.json").read_text())
     train = request["config"]["train"]
     assert (train["compile"], train["batch_size"], train["accumulation_steps"], train["steps"]) == (
@@ -558,7 +590,7 @@ def test_compile_probe_is_recorded_separately_and_never_changes_the_arms(
         **records["probe-4"]["config"]["train"],
         "warmup_steps": 2,
     }
-    # The eager probe table, the arms and the continuation are untouched.
+    # ... and the eager probe table, the arms and the continuation are untouched.
     assert [r["status"] for r in result["probes"]] == [r["status"] for r in eager["probes"]]
     assert [a["validation"] for a in result["arms"]] == [a["validation"] for a in eager["arms"]]
     assert result["winner"] == eager["winner"]
@@ -567,9 +599,55 @@ def test_compile_probe_is_recorded_separately_and_never_changes_the_arms(
         assert compiled_losses == [r["loss"] for r in eager["loss_curves"][arm]]
     assert result["training_tokens_processed"] == eager["training_tokens_processed"]
     assert result["training_throughput"]["tokens"] == 9 * 32
-    assert len(result["loss_curves"]["probe-compiled-4"]) == 3
     assert result["status"] == "completed"
     assert result["last_checkpoint_resume"]["tested"] is True
+    row = result["compile_probe"]
+    if row["status"] != "completed" and not _toolchain_available():
+        pytest.skip("torch.compile cannot build even a trivial CPU function here")
+    assert row["status"] == "completed", row
+    child = pilot.root / "compile-probe" / "run" / "probe-compiled-4" / "record.json"
+    assert json.loads(child.read_text())["config"]["train"]["compile"] is True
+    assert row["microbatch"] == result["chosen_microbatch"] == eager["chosen_microbatch"] == 4
+    assert row["updates"] == row["steps_requested"] == 3
+    assert row["warmup_updates_excluded"] == 1 and row["exit_code"] == 0
+    assert row["compile"] is True and row["peak_allocated_bytes"] == 0  # CPU: no GPU evidence.
+    assert "teardown_error" not in row and "kill_error" not in row
+    assert row["speedup"] == pytest.approx(
+        row["tokens_per_second"] / row["eager_tokens_per_second"]
+    )
+    assert row["speedup"] > 0 and row["first_update_seconds"] > 0
+    assert row["tokens_per_probe_update"] == 4 * 8 * 2
+    if row["break_even_tokens"] is not None:
+        assert row["break_even_training_updates"] == pytest.approx(row["break_even_tokens"] / 32)
+        assert row["break_even_tokens"] == pytest.approx(row["break_even_probe_updates"] * 64)
+    assert len(result["loss_curves"]["probe-compiled-4"]) == 3
+    assert row["elapsed_seconds"] < 60
+
+
+def test_expired_eager_probe_window_never_stops_the_compile_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The soft eager window expires during the second probe, as in the probe-window
+    # test above; the measurement-only compile probe must neither inherit it nor stop
+    # the pilot.
+    now = [5000.0]
+    pilot = fake_child_worker(
+        tmp_path, monkeypatch, "complete", clock=lambda: now[0], pod_created=4850
+    )
+    original = pilot.on_step
+
+    def advance(trainer: Trainer, metrics: dict[str, float]) -> None:
+        if pilot.phase == "probe-4" and trainer.step == 1:
+            now[0] += 70
+        original(trainer, metrics)
+
+    pilot.on_step = advance  # type: ignore[method-assign]
+    result = pilot.execute()
+    assert result["probe_window_expired"] is True and result["chosen_microbatch"] == 2
+    row = result["compile_probe"]
+    assert row["status"] == "completed" and row["microbatch"] == 2 and row["updates"] == 3
+    assert result["status"] == "completed" and len(result["arms"]) == 3
+    assert "stop_reason" not in result
 
 
 def test_compile_failure_is_recorded_and_the_pilot_trains_eagerly(
@@ -579,29 +657,74 @@ def test_compile_failure_is_recorded_and_the_pilot_trains_eagerly(
     result = pilot.execute()
     row = result["compile_probe"]
     assert row["status"] == "failed" and row["error_type"] == "ChildExit"
-    assert "compiler" in row["error"] and row["updates"] == 0 and row["exit_code"] == 1
+    assert row["error_source"] == "stderr tail" and "compiler" in row["error"]
+    assert SECRET not in row["error"] and "[REDACTED]" in row["error"]
+    assert SECRET not in (pilot.root / "report.json").read_text()
+    assert row["updates"] == 0 and row["exit_code"] == 1
     assert result["status"] == "completed" and len(result["arms"]) == 3
     assert "stop_reason" not in result
 
 
-def test_compile_probe_timeout_kills_the_child_and_the_pilot_continues(
+@pytest.mark.parametrize(
+    ("mode", "status", "error_type"),
+    [
+        ("result-oom", "oom", "OutOfMemoryError"),
+        ("result-failed", "failed", "BackendCompilerFailed"),
+    ],
+)
+def test_child_recorded_failures_map_status_and_redact_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, status: str, error_type: str
+) -> None:
+    pilot = fake_child_worker(tmp_path, monkeypatch, mode)
+    result = pilot.execute()
+    row = result["compile_probe"]
+    assert (row["status"], row["error_type"], row["error_source"]) == (
+        status,
+        error_type,
+        "child exception",
+    )
+    assert row["error"].startswith("boom with ")
+    assert SECRET not in row["error"] and "abcdefghijkl" not in row["error"]
+    report_text = (pilot.root / "report.json").read_text()
+    assert SECRET not in report_text and "abcdefghijkl" not in report_text
+    assert (row["peak_allocated_bytes"], row["peak_reserved_bytes"]) == (7, 9)
+    assert result["status"] == "completed" and len(result["arms"]) == 3
+
+
+def test_completed_child_that_crashes_in_teardown_keeps_its_measurement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pilot = fake_child_worker(tmp_path, monkeypatch, "complete-then-abort")
+    result = pilot.execute()
+    row = result["compile_probe"]
+    assert row["status"] == "completed" and row["updates"] == 3, row
+    assert row["speedup"] > 0 and row["exit_code"] != 0
+    assert row["teardown_error"]["exit_code"] == row["exit_code"]
+    assert result["status"] == "completed" and len(result["arms"]) == 3
+
+
+def test_compile_probe_timeout_kills_the_group_and_restarts_the_idle_clock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = [1000.0]
     pilot: Worker
+    directory = tmp_path / "pilot" / "compile-probe"
 
     def sleep(_: float) -> None:
         time.sleep(0.02)
-        if (pilot.root / "compile-probe" / "child.pid").exists():
-            now[0] += 61  # The 60 s hard window expires while the child is still running.
+        if (directory / "grandchild.pid").exists():
+            # One jump past both the 60 s window and the 180 s idle limit: the arms
+            # only run if the idle clock restarts when the probe ends.
+            now[0] += 200
 
     pilot = fake_child_worker(tmp_path, monkeypatch, "sleep", clock=lambda: now[0], sleep=sleep)
     result = pilot.execute()
     row = result["compile_probe"]
     assert row["status"] == "timeout" and row["updates"] == 0
     assert "did not finish within the window" in row["note"]
-    assert row["elapsed_seconds"] >= 60 and row["exit_code"] is None
-    assert _dead(int((pilot.root / "compile-probe" / "child.pid").read_text()))
+    assert row["elapsed_seconds"] >= 200 and row["exit_code"] is None
+    assert _dead(int((directory / "child.pid").read_text()))
+    assert _dead(int((directory / "grandchild.pid").read_text()))
     assert result["status"] == "completed" and len(result["arms"]) == 3
     assert "stop_reason" not in result
 
@@ -630,15 +753,16 @@ def test_compile_probe_window_keeps_every_finished_update(
     assert result["status"] == "completed" and len(result["arms"]) == 3
 
 
-def test_wall_limit_during_the_compile_probe_stops_the_pilot_and_kills_the_child(
+def test_wall_limit_during_the_compile_probe_stops_the_pilot_and_kills_the_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = [1000.0]
     pilot: Worker
+    directory = tmp_path / "pilot" / "compile-probe"
 
     def sleep(_: float) -> None:
         time.sleep(0.02)
-        if (pilot.root / "compile-probe" / "child.pid").exists():
+        if (directory / "grandchild.pid").exists():
             now[0] += 400  # Past the 300 s pod wall; the compile window is not the cause.
 
     pilot = fake_child_worker(tmp_path, monkeypatch, "sleep", clock=lambda: now[0], sleep=sleep)
@@ -647,14 +771,13 @@ def test_wall_limit_during_the_compile_probe_stops_the_pilot_and_kills_the_child
     assert row["status"] == "stopped" and row["stop_reason"] == "pod_wall_limit"
     assert result["status"] == "stopped" and result["stop_reason"] == "pod_wall_limit"
     assert not result["arms"]
-    assert _dead(int((pilot.root / "compile-probe" / "child.pid").read_text()))
+    assert _dead(int((directory / "child.pid").read_text()))
+    assert _dead(int((directory / "grandchild.pid").read_text()))
 
 
-def test_compile_probe_refreshes_the_idle_clock_and_heartbeat(
+def test_compile_probe_refreshes_the_idle_clock_and_heartbeat_while_the_child_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # 200 s of budgeted compile time exceeds the 180 s idle limit: without the refresh,
-    # the first arm would stop on idle_gpu_limit.
     now = [1000.0]
     seen: list[tuple[float, dict[str, Any]]] = []
     pilot: Worker
@@ -662,7 +785,8 @@ def test_compile_probe_refreshes_the_idle_clock_and_heartbeat(
 
     def sleep(_: float) -> None:
         seen.append((now[0], json.loads((pilot.root / "heartbeat.json").read_text())))
-        now[0] += 50
+        assert pilot.last_activity == now[0]  # Refreshed on every poll inside the window.
+        now[0] += 40
         if len(seen) == 4:
             (directory / "go").write_text("go")
             _wait_for(directory / "result.json")
@@ -673,7 +797,7 @@ def test_compile_probe_refreshes_the_idle_clock_and_heartbeat(
         tmp_path,
         monkeypatch,
         "complete-on-go",
-        spec=compile_spec(compile_probe_seconds=230),
+        spec=compile_spec(compile_probe_seconds=170),
         clock=lambda: now[0],
         sleep=sleep,
     )
@@ -689,6 +813,84 @@ def test_compile_probe_refreshes_the_idle_clock_and_heartbeat(
     assert "stop_reason" not in result
     final = json.loads((pilot.root / "heartbeat.json").read_text())
     assert final["compile_probe_active"] is False
+
+
+def _unreaped_exited_child() -> subprocess.Popen[bytes]:
+    """A new-session child that has exited but was never reaped: a zombie group leader."""
+    process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(process.pid)], capture_output=True, text=True
+        ).stdout.strip()
+        if state.startswith("Z"):
+            return process
+        time.sleep(0.02)
+    raise AssertionError("child did not exit")
+
+
+def test_kill_group_tolerates_an_exited_unreaped_leader(monkeypatch: pytest.MonkeyPatch) -> None:
+    # On macOS killpg on a group whose only member is a zombie leader raises EPERM.
+    process = _unreaped_exited_child()
+    assert _kill_group(process) is None and process.returncode == 0
+    assert _kill_group(process) is None  # Idempotent after reaping.
+    # The race itself: the child exits after the last poll and before the kill.
+    raced = _unreaped_exited_child()
+    monkeypatch.setattr(raced, "poll", lambda: None)
+    assert _kill_group(raced) is None and raced.returncode == 0
+
+
+def _child_request(tmp_path: Path, *, launched: float, window: float = 60) -> Path:
+    """A compile-probe request for an eager CPU child: fast and deterministic."""
+    request = {
+        "schema_version": 1,
+        "config": asdict(trainer_config(compile_spec(), 4, 0.0003, probe=True)),
+        "documents": document_source([[256, 1, 2, 3] * 32]),
+        "run_id": "probe-compiled-4",
+        "run_root": str(tmp_path / "run"),
+        "data_hash": "authored",
+        "tokenizer_hash": "authored",
+        "device": "cpu",
+        "num_threads": torch.get_num_threads(),
+        "launched_unix": launched,
+        "window_seconds": window,
+        "rows_path": str(tmp_path / "rows.jsonl"),
+        "result_path": str(tmp_path / "result.json"),
+    }
+    path = tmp_path / "request.json"
+    path.write_text(json.dumps(request))
+    return path
+
+
+def test_child_soft_stops_at_an_update_boundary_before_the_window(tmp_path: Path) -> None:
+    # The soft stop point (window minus the margin) has already passed, so the child
+    # keeps its first update and stops before the second.
+    path = _child_request(tmp_path, launched=time.time() - 60 + COMPILE_SOFT_STOP_SECONDS)
+    assert run_compile_probe_child(path) == 0
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert (result["status"], result["updates"]) == ("incomplete", 1)
+    assert (result["peak_allocated_bytes"], result["peak_reserved_bytes"]) == (0, 0)
+    assert result["torch_version"] == torch.__version__ and result["compile"] is False
+    assert len(_completed_rows(tmp_path / "rows.jsonl")) == 1
+
+
+def test_child_records_a_sanitized_failure_and_exits_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*args: Any, **kwargs: Any) -> Trainer:
+        raise RuntimeError("inductor exploded holding " + SECRET)
+
+    monkeypatch.setattr("tools.gpu_pilot.Trainer", broken)
+    path = _child_request(tmp_path, launched=time.time())
+    assert run_compile_probe_child(path) == 1
+    result = json.loads((tmp_path / "result.json").read_text())
+    assert (result["status"], result["error_type"], result["updates"]) == (
+        "failed",
+        "RuntimeError",
+        0,
+    )
+    assert SECRET not in result["error"] and "[REDACTED]" in result["error"]
+    assert (result["peak_allocated_bytes"], result["peak_reserved_bytes"]) == (0, 0)
 
 
 def test_completed_rows_ignore_a_torn_final_line(tmp_path: Path) -> None:
@@ -714,8 +916,15 @@ def test_compile_probe_specification_rules() -> None:
         replace(base, compile_probe_seconds=60)
     with pytest.raises(ValueError, match="nonnegative integer"):
         replace(base, compile_probe_steps=-1)
+    # The budgeted window is the only idle exception, so it may not exceed the idle limit.
+    assert compile_spec(compile_probe_seconds=180).compile_probe_seconds == 180
+    with pytest.raises(ValueError, match="must not exceed the idle limit"):
+        compile_spec(compile_probe_seconds=181)
     with pytest.raises(ValueError, match="exceed the pod lifetime"):
-        compile_spec(compile_probe_seconds=240)
+        compile_spec(
+            compile_probe_seconds=180,
+            limits=replace(base.limits, finalization_reserve_seconds=100),
+        )
     with pytest.raises(ValueError, match="measured only by the compile probe"):
         trainer_config(base, 2, 0.0003, probe=False, compiled=True)
     assert trainer_config(compile_spec(), 2, 0.0003, probe=True, compiled=True).train.compile
@@ -726,7 +935,16 @@ def test_readiness_reserves_the_compile_probe_window() -> None:
     assert check_readiness(receipt(), now=1200, spec=specification()) == 1000
     with pytest.raises(ValueError, match="too short"):
         check_readiness(receipt(), now=1200, spec=compile_spec())
-    assert check_readiness(receipt(), now=1170, spec=compile_spec()) == 1000
+    assert check_readiness(receipt(), now=1165, spec=compile_spec()) == 1000
+
+
+def test_readiness_measures_remaining_lifetime_to_the_armed_deadline() -> None:
+    # 120 s are needed. At 1175 the 1300 s wall leaves 125 s but the timer armed for
+    # 1290 leaves only 115 s, and the worker plans against the armed deadline.
+    with pytest.raises(ValueError, match="too short"):
+        check_readiness(receipt(), now=1175, spec=compile_spec())
+    at_the_wall = {**receipt(), "self_destruct_deadline_unix": 1300}
+    assert check_readiness(at_the_wall, now=1175, spec=compile_spec()) == 1000
 
 
 def test_preflight_gate_requires_the_on_device_fused_attention_check() -> None:

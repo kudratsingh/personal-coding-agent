@@ -213,16 +213,28 @@ def run_compile_probe_child(request_path: Path) -> int:
     return code
 
 
-def _kill_group(process: subprocess.Popen[bytes]) -> None:
-    """Kill the child and every compile worker it started; reap the child."""
+def _kill_group(process: subprocess.Popen[bytes]) -> str | None:
+    """Kill the child and every compile worker it started, reap the child, never raise.
+
+    An exited leader is reaped first. ``killpg`` then reaches any surviving group
+    member; it fails with ``ProcessLookupError`` when none is left and, on macOS,
+    with ``PermissionError`` when only an unreaped zombie remains. Returns a
+    description of anything unexpected instead of raising.
+    """
+    problem: str | None = None
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=30)
-    except subprocess.TimeoutExpired:  # pragma: no cover - a SIGKILLed child exits promptly.
-        pass
+        process.poll()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass  # Nothing left to signal.
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:  # pragma: no cover - SIGKILL ends a process.
+            problem = "child did not exit after SIGKILL"
+    except Exception as error:  # pragma: no cover - defensive; teardown must not raise.
+        problem = f"{type(error).__name__}: {error}"
+    return problem
 
 
 def _completed_rows(path: Path) -> list[dict[str, float]]:
@@ -303,6 +315,10 @@ class Specification:
                 )
             if seconds <= 0:
                 raise ValueError("an enabled compile probe needs a positive time window")
+            if seconds > self.limits.idle_seconds:
+                # The budgeted compile window is the only exception to the idle limit;
+                # it can never hold an idle GPU longer than the idle limit itself.
+                raise ValueError("the compile probe window must not exceed the idle limit")
             if not self.compile_probe_warmup_updates < min(
                 self.compile_probe_steps, self.probe_steps
             ):
@@ -428,7 +444,8 @@ def check_readiness(receipt: dict[str, Any], *, now: float, spec: Specification)
         raise ValueError("pod creation timestamp is invalid")
     if spec.limits.stop_reason(pod_elapsed=now - origin):
         raise ValueError("pod already exceeds an operating limit")
-    remaining = origin + spec.limits.pod_seconds - now
+    # The worker plans against the earlier of the wall and the armed in-pod deadline.
+    remaining = min(origin + spec.limits.pod_seconds, termination) - now
     needed = (
         spec.limits.probe_seconds
         + spec.compile_probe_seconds
@@ -586,9 +603,11 @@ class Worker:
             self.stop_reason = reason
         elif (
             self.phase.startswith("probe")
+            and not self.phase.startswith(COMPILE_PROBE_PREFIX)
             and self.probe_started is not None
             and now - self.probe_started >= self.spec.limits.probe_seconds
         ):
+            # Soft eager-probe window; the compile probe has its own hard window.
             self.stop_reason = "probe_time_limit"
         elif (
             self.training_started is not None
@@ -878,7 +897,15 @@ class Worker:
                 "continuation or checkpoints; the pilot trains eagerly"
             ),
         }
-        self.require_time()
+        # Only the hard limits apply here: the eager probe window is soft and over.
+        now = self.clock()
+        reason = self.spec.limits.stop_reason(
+            pod_elapsed=max(0, now - self.pod_created),
+            idle_elapsed=max(0, now - self.last_activity),
+        )
+        if reason:
+            self.stop_reason = reason
+            raise PilotStop(reason)
         directory = self.root / "compile-probe"
         directory.mkdir()
         rows_path, result_path = directory / "rows.jsonl", directory / "result.json"
@@ -940,7 +967,9 @@ class Worker:
                     self.last_activity = now  # Budgeted, bounded by the hard window.
                     self.heartbeat(len(_completed_rows(rows_path)))
                     self.sleep(self.compile_poll_seconds)
-            _kill_group(process)  # Also reaps compile workers left behind by a clean exit.
+            problem = _kill_group(process)  # Also ends compile workers left by a clean exit.
+            if problem:
+                row["kill_error"] = problem
             compiled_rows = _completed_rows(rows_path)
             self.rows[self.phase] = compiled_rows
             with (self.root / "updates.jsonl").open("a", encoding="utf-8") as stream:
@@ -953,23 +982,42 @@ class Worker:
                 row[key] = result.get(key)
             if compiled_rows:
                 row["first_update_seconds"] = compiled_rows[0]["step_seconds"]
-            if outcome == "exited" and process.returncode != 0:
-                tail = (directory / "child.stderr").read_bytes()[-2000:].decode("utf-8", "replace")
-                row.update(
-                    status="oom" if result.get("status") == "oom" else "failed",
-                    error_type=result.get("error_type", "ChildExit"),
-                    error=str(sanitize(result.get("error") or tail))[-500:],
-                )
-            elif len(compiled_rows) == steps and result.get("status") == "completed":
+            crashed = outcome == "exited" and process.returncode != 0
+            tail = (directory / "child.stderr").read_bytes()[-2000:].decode("utf-8", "replace")
+            if len(compiled_rows) == steps and result.get("status") == "completed":
+                # Durable evidence first: every row and the completed result are on disk.
                 row["status"] = "completed"
                 row.update(self._compile_comparison(size, warmup))
+                if crashed:
+                    row["teardown_error"] = {
+                        "exit_code": process.returncode,
+                        "stderr_tail": str(sanitize(tail))[-500:],
+                    }
+            elif crashed:
+                status = result.get("status")
+                row.update(
+                    status="oom" if status == "oom" else "failed",
+                    error_type=result.get("error_type", "ChildExit"),
+                    # The child's exception message (its head) when it recorded one,
+                    # otherwise the tail of its standard error.
+                    error=str(sanitize(result["error"]))[:500]
+                    if result.get("error")
+                    else str(sanitize(tail))[-500:],
+                    error_source="child exception" if result.get("error") else "stderr tail",
+                )
             elif compiled_rows:
                 row["status"] = "incomplete"
+            elif outcome == "exited":
+                row.update(
+                    status="failed",
+                    error_type="NoUpdates",
+                    error="the child exited cleanly without recording an update",
+                )
             else:
                 row["status"] = "timeout"
                 row["note"] = (
-                    "the first compiled update did not finish within the window; "
-                    "the one-off compile cost exceeds window_seconds"
+                    "child startup plus the first compiled update did not finish within "
+                    "the window, so compilation and startup together exceed window_seconds"
                 )
         except TrainingStop:
             row.setdefault("status", "stopped")
@@ -982,7 +1030,9 @@ class Worker:
             )
         finally:
             if process is not None:
-                _kill_group(process)
+                problem = _kill_group(process)  # Never raises.
+                if problem:
+                    row.setdefault("kill_error", problem)
             row.setdefault("status", "interrupted")
             row.setdefault("updates", len(self.rows.get(self.phase, [])))
             row["elapsed_seconds"] = max(0.0, self.clock() - started)
@@ -1031,8 +1081,10 @@ class Worker:
             else tokens / self.spec.tokens_per_update,
             "comparison_basis": (
                 "same microbatch, accumulation, seed and data order as the eager probe; "
-                "both exclude the same warmup updates; the compiled child also pays its own "
-                "process start and CUDA context inside its first update"
+                "both exclude the same warmup updates; the child's process start, torch "
+                "import, CUDA context and model build happen before its first timed update "
+                "and count only in elapsed_seconds; its first update carries compilation "
+                "plus per-process library warmup"
             ),
         }
 
