@@ -46,19 +46,25 @@ here. Copyleft, restrictive and unrecognized headers are separately dropped;
 an "all rights reserved" line does not override a recognized BSD grant. Header
 recognition is not a comprehensive component-rights warranty or full-build approval.
 
-The repository fallback correction separates **185,680 files / 786,817,959
-bytes** with no inline license and no repository metadata from **8,737 files /
-69,830,333 bytes** with unrecognized inline licensing. The actual five-column
-Parquet has no repository-license field. No such files are admitted by inference;
-off-allowlist repository-ID counts are empty because metadata is absent. When
-verified metadata is supplied, retained no-header files record its allowlisted
-ID for attribution. The current sample still retains the same 13,833 files and
-the ID counts above. See the [current class table](real-samples.md).
+The 2026-10-20 repository fallback correction separated **185,680 files /
+786,817,959 bytes** with no inline license and no repository metadata from
+**8,737 files / 69,830,333 bytes** with unrecognized inline licensing. On
+2026-10-24 the owner directed recovering that metadata from The Stack dedup v1.2
+`max_stars_repo_licenses`, joined on each file's exact repository and path; all
+**209,914** sample files matched. A no-header file is kept only when every listed
+repository ID is on the D-05 allowlist, which the owner corrected to include ISC
+and Unlicense. The current review keeps **189,647 Python files / 827,125,527
+bytes**: the same 13,833 header-licensed files plus **175,814 / 704,424,153** on
+repository metadata, each recording its repository IDs for attribution. **5,730
+files / 33,116,026 bytes** with off-allowlist repository IDs are dropped pending
+an owner decision. See the [current class table](real-samples.md).
 
-With the replacement 65,536-entry tokenizer, this review contains
-**26,328,493 Python tokens / 122,701,374 bytes** and **100,709,712 web tokens /
-498,123,158 bytes**, excluding BOS. Its newer Python validation selection is
-**52 files / 475,430 bytes / 108,883 tokens**. The original 45-file holdout
+With the replacement 65,536-entry tokenizer, the current review contains
+**198,034,636 Python tokens / 827,125,527 bytes** and **100,709,712 web tokens /
+498,123,158 bytes**, excluding BOS. The 2026-10-20 header-only review contained
+**26,328,493 Python tokens / 122,701,374 bytes**. The current Python validation
+selection is **915 files / 3,624,819 bytes / 913,153 tokens**; the 2026-10-20 one
+was **52 files / 475,430 bytes / 108,883 tokens**. The original 45-file holdout
 remains the compression comparison above; see [P1-6](full-build-plan.md) for
 the revised conditional capacity forecast.
 
