@@ -26,6 +26,10 @@ def test_specification_matches_the_agreed_experiment() -> None:
     assert spec.config.train.optimizer_foreach is True  # Bitwise-identical update, fewer kernels.
     assert spec.config.train.z_loss == 0 and spec.config.model.qk_norm is False  # Agreed recipe.
     assert spec.config.train.compile is False and spec.config.train.schedule == "cosine"
+    # Owner decision 2026-10-24: probes and arms train eagerly; one separate 20-update
+    # compiled probe at the chosen microbatch measures the speedup and compile cost.
+    assert spec.compile_probe_steps == 20 and spec.compile_probe_warmup_updates == 2
+    assert spec.compile_probe_seconds == 240
     assert spec.config.train.sequence_length == 1024
     assert spec.config.train.validation_interval == 0
     assert spec.config.train.validation_documents == 32
@@ -63,6 +67,7 @@ def test_improved_variant_changes_only_the_declared_recipe_options() -> None:
     assert expected_parameters(improved.config.model) == 135_285_504 + 12 * 2 * 64
     assert improved.config.train.z_loss == 0.0001
     assert improved.config.train.compile is True and improved.config.train.attention == "fused"
+    assert improved.compile_probe_steps == 0  # Compiles every phase; no eager comparison.
     assert improved.config.train.schedule == "cosine"
     for name in ("steps", "sequence_length", "learning_rate", "warmup_steps", "precision"):
         assert getattr(improved.config.train, name) == getattr(base.config.train, name)

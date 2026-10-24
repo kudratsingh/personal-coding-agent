@@ -17,8 +17,10 @@ from tools.runpod_watchdog import (
     RunpodClient,
     _NoRedirectHandler,
     atomic_receipt,
+    build_parser,
     check_once,
     parse_timestamp,
+    policy_from_args,
 )
 
 NOW = 1_800_000_000.0
@@ -611,3 +613,81 @@ class ObservationAndTransferTests(unittest.TestCase):
             replace(POLICY, max_transfer_seconds=-1)
         with self.assertRaises(ValueError):
             RunpodClient("k", FakeTransport([])).request_path("GET", "pods/../x", 1)
+
+
+class IdleBaselineTests(unittest.TestCase):
+    """Before the first heartbeat, an explicit idle baseline postpones only the idle limit."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.heartbeat_path = Path(self.temp.name) / "heartbeat.json"  # No heartbeat yet.
+
+    def check(self, policy: Policy, now: float, responses: list[tuple[int, bytes]]) -> Outcome:
+        client = RunpodClient("secret-placeholder", FakeTransport(responses))
+        return check_once(
+            client, IDENTITY, policy, self.heartbeat_path, now=lambda: now, sleep=lambda _: None
+        )
+
+    def deletes(self) -> list[tuple[int, bytes]]:
+        return [json_response(200, pod()), (204, b""), (404, b"")]
+
+    def test_baseline_postpones_the_first_heartbeat_idle_limit(self) -> None:
+        with_baseline = replace(POLICY, idle_baseline_unix=NOW + 500)
+        result = self.check(with_baseline, NOW + 700, [json_response(200, pod())])
+        self.assertEqual((result.state, result.reason), ("watching", "within_limits"))
+        # The same moment is 700 s after creation, so without a baseline it is idle.
+        result = self.check(POLICY, NOW + 700, self.deletes())
+        self.assertEqual(result.reason, "idle_gpu_limit_delete_204_get_404")
+
+    def test_baseline_still_expires_and_never_precedes_creation(self) -> None:
+        result = self.check(
+            replace(POLICY, idle_baseline_unix=NOW + 500), NOW + 1100, self.deletes()
+        )
+        self.assertEqual(result.reason, "idle_gpu_limit_delete_204_get_404")
+        early = replace(POLICY, idle_baseline_unix=NOW - 5000)  # Clamped to Pod creation.
+        result = self.check(early, NOW + 700, self.deletes())
+        self.assertEqual(result.reason, "idle_gpu_limit_delete_204_get_404")
+
+    def test_future_baseline_fails_closed(self) -> None:
+        result = self.check(
+            replace(POLICY, idle_baseline_unix=NOW + 900), NOW + 100, self.deletes()
+        )
+        self.assertEqual(result.reason, "idle_baseline_invalid_delete_204_get_404")
+
+    def test_baseline_never_extends_the_wall_limit(self) -> None:
+        late = replace(POLICY, idle_baseline_unix=NOW + 5000)
+        result = self.check(late, NOW + 5400, self.deletes())
+        self.assertEqual(result.reason, "wall_limit_delete_204_get_404")
+
+    def test_baseline_is_ignored_once_a_heartbeat_exists(self) -> None:
+        heartbeat(self.heartbeat_path, activity=NOW + 10, updated=NOW + 690)
+        policy = replace(POLICY, idle_baseline_unix=NOW + 500)
+        result = self.check(policy, NOW + 700, self.deletes())
+        self.assertEqual(result.reason, "idle_gpu_limit_delete_204_get_404")
+
+    def test_policy_validates_the_baseline(self) -> None:
+        for bad in (float("nan"), float("inf"), 0.0, -1.0, True, "1"):
+            with self.assertRaises(ValueError):
+                replace(POLICY, idle_baseline_unix=bad)  # type: ignore[arg-type]
+
+    def test_cli_accepts_the_baseline(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--identity",
+                "i.json",
+                "--heartbeat",
+                "h.json",
+                "--receipt",
+                "r.json",
+                "--max-wall-seconds",
+                "5400",
+                "--max-cost-usd",
+                "1.08",
+                "--quoted-total-hourly",
+                "0.6",
+                "--idle-baseline-unix",
+                str(NOW + 30),
+            ]
+        )
+        self.assertEqual(policy_from_args(args).idle_baseline_unix, NOW + 30)

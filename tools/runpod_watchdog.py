@@ -142,6 +142,10 @@ class Policy:
     delete_verify_delay_seconds: float = 1.0
     starting_cost_usd: float = 0.0
     max_transfer_seconds: float = 0.0
+    # Before the worker's first heartbeat the idle clock starts at Pod creation, or
+    # at this later moment (the watchdog's own start), so image pull and bootstrap
+    # are not read as an idle GPU. Wall and cost limits are unaffected.
+    idle_baseline_unix: float | None = None
 
     def __post_init__(self) -> None:
         for key in (
@@ -175,6 +179,12 @@ class Policy:
             or not math.isfinite(self.billing_started_at_unix)
         ):
             raise ValueError("billing_started_at_unix must be finite when provided")
+        if self.idle_baseline_unix is not None and (
+            not _is_number(self.idle_baseline_unix)
+            or not math.isfinite(self.idle_baseline_unix)
+            or self.idle_baseline_unix <= 0
+        ):
+            raise ValueError("idle_baseline_unix must be a finite positive time when provided")
         if type(self.delete_verify_attempts) is not int or self.delete_verify_attempts < 1:
             raise ValueError("delete_verify_attempts must be a positive integer")
         if (
@@ -358,6 +368,19 @@ def _outcome(
     return Outcome(state, reason, identity.pod_id, now, detail)
 
 
+def _first_heartbeat_trigger(policy: Policy, created_at: float, checked_at: float) -> str:
+    """Idle decision before any heartbeat exists; a baseline can never be in the future."""
+    baseline = created_at
+    if policy.idle_baseline_unix is not None:
+        if (
+            policy.idle_baseline_unix > checked_at + CLOCK_SKEW_SECONDS
+            or policy.idle_baseline_unix > created_at + policy.max_wall_seconds
+        ):
+            return "idle_baseline_invalid"
+        baseline = max(created_at, min(policy.idle_baseline_unix, checked_at))
+    return "idle_gpu_limit" if checked_at - baseline >= policy.max_idle_seconds else ""
+
+
 def check_once(
     client: RunpodClient,
     identity: PodIdentity,
@@ -437,11 +460,9 @@ def check_once(
                 elif heartbeat.status == "shutdown_ready" and heartbeat.shutdown_receipts_verified:
                     trigger = "shutdown_ready_verified_receipts"
                 elif heartbeat.last_gpu_activity_unix == 0.0:
-                    # On first launch, no heartbeat yet: use Pod creation as idle baseline.
-                    if checked_at - created_at >= policy.max_idle_seconds:
-                        trigger = "idle_gpu_limit"
-                    else:
-                        trigger = ""
+                    # On first launch, no heartbeat yet: the idle clock starts at Pod
+                    # creation or at the later explicit idle baseline.
+                    trigger = _first_heartbeat_trigger(policy, created_at, checked_at)
                 elif (
                     not math.isfinite(heartbeat.last_gpu_activity_unix)
                     or heartbeat.last_gpu_activity_unix > checked_at + CLOCK_SKEW_SECONDS
@@ -526,7 +547,8 @@ def _load_identity(path: Path) -> PodIdentity:
     return PodIdentity.from_dict(value)
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The watchdog command line; the runbook's launch command is tested against it."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--identity", type=Path, required=True, help="captured Pod identity JSON")
     parser.add_argument("--heartbeat", type=Path, required=True, help="worker heartbeat JSON")
@@ -539,6 +561,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quoted-total-hourly", type=float, required=True)
     parser.add_argument("--starting-cost-usd", type=float, default=0.0)
     parser.add_argument("--billing-started-at-unix", type=float)
+    parser.add_argument(
+        "--idle-baseline-unix",
+        type=float,
+        help="before the first heartbeat, start the idle clock here instead of at Pod creation",
+    )
     parser.add_argument("--max-transfer-seconds", type=float, default=0.0)
     parser.add_argument("--poll-seconds", type=float, default=15.0)
     parser.add_argument("--request-timeout-seconds", type=float, default=5.0)
@@ -549,6 +576,26 @@ def main(argv: list[str] | None = None) -> int:
         default=900.0,
         help="exit with status 3 if the captured identity is never seen alive within this time",
     )
+    return parser
+
+
+def policy_from_args(args: argparse.Namespace) -> Policy:
+    return Policy(
+        args.max_wall_seconds,
+        args.max_cost_usd,
+        args.max_idle_seconds,
+        args.quoted_total_hourly,
+        args.billing_started_at_unix,
+        args.request_timeout_seconds,
+        args.delete_verify_attempts,
+        starting_cost_usd=args.starting_cost_usd,
+        max_transfer_seconds=args.max_transfer_seconds,
+        idle_baseline_unix=args.idle_baseline_unix,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     if not math.isfinite(args.poll_seconds) or args.poll_seconds <= 0:
         parser.error("--poll-seconds must be finite and positive")
@@ -557,17 +604,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"set {API_KEY_ENV} in the local environment")
     try:
         identity = _load_identity(args.identity)
-        policy = Policy(
-            args.max_wall_seconds,
-            args.max_cost_usd,
-            args.max_idle_seconds,
-            args.quoted_total_hourly,
-            args.billing_started_at_unix,
-            args.request_timeout_seconds,
-            args.delete_verify_attempts,
-            starting_cost_usd=args.starting_cost_usd,
-            max_transfer_seconds=args.max_transfer_seconds,
-        )
+        policy = policy_from_args(args)
     except ValueError as error:
         parser.error(str(error))
     client = RunpodClient(token, UrllibTransport())

@@ -24,10 +24,10 @@ Expected: `make check` green; the smoke report ends `Pilot completed`; the prefl
 set -a; source .env; set +a            # .env is git-ignored; it holds RUNPOD_API_KEY=... only
 test -n "$RUNPOD_API_KEY" && echo "RUNPOD_API_KEY is set"   # never echo the value
 gh auth status                          # needed for the private record/log archive
-ls -l ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub
-export PILOT_SSH_KEY=~/.ssh/id_ed25519
+ls -l ~/.ssh/runpod_ed25519 ~/.ssh/runpod_ed25519.pub   # the key registered in Runpod
+export PILOT_SSH_KEY=~/.ssh/runpod_ed25519
 export CTRL=runs/pilot-controller && mkdir -p "$CTRL"
-export PRIVATE_REPO=OWNER/PRIVATE_RECORDS_REPOSITORY   # must be private; the supervisor verifies this
+export PRIVATE_REPO=kudratsingh/personal-coding-agent-artifacts   # must be private; the supervisor verifies this
 ```
 
 Requirements: the Runpod API key must have Pod read and terminate permissions (the console shows key scopes); the SSH public key must be registered under Runpod account settings so the Pod injects it; the working directory must not sit under a symlinked path (macOS `/tmp` is a symlink; `tools/pilot_data.py` rejects symlinked components).
@@ -45,7 +45,7 @@ PY
 
 If the console price exceeds `quoted_gpu_hourly` (0.59), edit both `quoted_gpu_hourly` and `limits.quoted_total_hourly` in `configs/pilot-a40-s.json` (total = GPU price + 20 GB x $0.10 / 730 h, rounded up to the cent), commit the change, and rerun `tests/test_pilot_specification.py`. The spending ceiling of $5 and the 1.2 x estimate cost stop ($1.08, the budget rule of 120% of the estimate) stay as they are. Confirm the account balance covers at least one hour at the quoted rate (Runpod refuses to deploy otherwise) and that no network volume exists on the account.
 
-Decide which specification the run uses before building the receipt: `configs/pilot-a40-s.json` is the agreed pilot of record; `configs/pilot-a40-s-improved.json` adds z-loss, QK-normalization and `torch.compile` (see [docs/training-recipe.md](docs/training-recipe.md)) and changes the parameter count to 135,287,040, so it is an owner decision. Use the chosen path everywhere `configs/pilot-a40-s.json` appears below.
+**Owner decision (2026-10-24):** the pilot runs `configs/pilot-a40-s.json`, the agreed specification: depth-scaled initialization, single-copy cross-entropy and fused attention behind its flag, with the on-device fused-attention equivalence check required in the preflight. QK-normalization, z-loss and the warmup-stable-decay schedule stay off. `torch.compile` stays off for the probes and all three arms; one extra measurement-only probe with compile on runs 20 updates at the chosen microbatch and is recorded separately as `compile_probe`. The 120% cost stop stands. `configs/pilot-a40-s-improved.json` remains for a later experiment and is not used here.
 
 ## 4. Dataset staging and checksum verification (Mac, free)
 
@@ -174,7 +174,9 @@ uv run --locked python -m tools.pilot_supervisor --identity "$CTRL/pod-identity.
   --transfer-timeout 1800 --poll-seconds 15 2>&1 | tee "$CTRL/supervisor.log"
 ```
 
-Watch the probe table: `podssh 'python3 -c "import json; r=json.load(open(\"/workspace/pilot-run/report.json\")); print(r[\"probes\"], r.get(\"chosen_microbatch\"), r.get(\"accumulation_steps\"))"'`. Each row records status (`completed`, `oom`, `incomplete`, `skipped`), updates, tokens per second and peak allocated/reserved bytes. The worker picks the largest completed size whose reserved peak stays below 90% of device memory. `no measured microbatch fits` ends the pilot with status `stopped` and no training charge beyond the probes.
+After the eager probes pick the microbatch, one compiled probe runs 20 updates at that size with `torch.compile` on, in a child process with a hard 240-second window (`compile_probe_seconds`). It is measurement only: it never changes the chosen microbatch, the arms or the continuation, and the worker process itself never compiles. At the window the worker kills the child's whole process group and keeps every finished update. While the child runs, the heartbeat shows `compile_probe_active: true` and the idle clock is refreshed, so neither the worker nor the Mac watchdog reads compile time as an idle GPU; wall and cost limits still apply. Statuses: `completed` (a child that crashes on exit after recording every update keeps its measurement and gains `teardown_error`), `incomplete`, `timeout` (child startup plus the first compiled update did not finish within the window), `failed` (the child's sanitized exception message in `error`, or its stderr tail when it left no result), `oom` or `stopped`; none of them except a wall or cost stop ends the pilot, and an expired eager probe window never stops it. The `compile_probe` row in `report.json` holds the steady-state `speedup` against the eager probe at the same size, both first-update times, `one_off_compile_seconds_estimate`, `break_even_tokens`, `break_even_training_updates` and the child's peak memory; the child's files are under `/workspace/pilot-run/compile-probe/`. A fully used window costs training time: at exactly the required 25,486 tokens per second it reaches 667 of the 700 updates instead of 700 (`tools/pilot_feasibility.py` prints this for each scenario).
+
+Watch the probe table: `podssh 'python3 -c "import json; r=json.load(open(\"/workspace/pilot-run/report.json\")); print(r[\"probes\"], r.get(\"chosen_microbatch\"), r.get(\"accumulation_steps\"), r.get(\"compile_probe\"))"'`. Each row records status (`completed`, `oom`, `incomplete`, `skipped`), updates, tokens per second and peak allocated/reserved bytes. The worker picks the largest completed size whose reserved peak stays below 90% of device memory. `no measured microbatch fits` ends the pilot with status `stopped` and no training charge beyond the probes.
 
 ## 8. Learning-rate screens (Pod, automatic)
 
