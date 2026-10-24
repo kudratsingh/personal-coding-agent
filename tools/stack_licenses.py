@@ -6,8 +6,9 @@ same files. This tool reads only the join keys (``max_stars_repo_name``,
 ``max_stars_repo_path``) and that license column from the pinned ``data/python``
 Parquet files with HTTPS range requests. Every fetched byte range is checked
 against the ``content`` column chunks and the run fails if any byte overlaps
-one, so file contents are never downloaded. Bytes outside the three selected
-column chunks (Parquet's speculative 64 KiB footer read) are counted and reported.
+one, so file contents are never downloaded. The footer is fetched exactly (its
+length from the final eight bytes), so no speculative read-ahead is issued; any
+byte outside the footer and the three selected column chunks is counted.
 
 The join is the exact (repository, path) key. Several upstream rows with one key
 are admitted only when their license lists agree. A sample file whose path is
@@ -192,6 +193,24 @@ class RangeFile(io.RawIOBase):
         return count
 
 
+def read_footer(url: str, size: int, fetch: Fetch) -> tuple[Any, bytes, tuple[int, int]]:
+    """Fetch exactly the Parquet footer and parse it without touching column data."""
+    if size < 12:
+        raise ValueError("file is too small to be Parquet")
+    tail = fetch(url, size - 8, size - 1)
+    if tail[4:] != b"PAR1":
+        raise ValueError("missing Parquet magic at the end of the file")
+    length = int.from_bytes(tail[:4], "little")
+    first = size - 8 - length
+    if first < 4:
+        raise ValueError("Parquet footer length exceeds the file")
+    footer = fetch(url, first, size - 9)
+    pyarrow = importlib.import_module("pyarrow")
+    parquet = importlib.import_module("pyarrow.parquet")
+    shell = pyarrow.py_buffer(b"PAR1" + footer + tail)
+    return parquet.read_metadata(pyarrow.BufferReader(shell)), footer + tail, (first, size - 1)
+
+
 def footer_range(metadata: Any, size: int) -> tuple[int, int]:
     """Bytes of the serialized footer, its length field and the trailing magic."""
     return size - 8 - int(metadata.serialized_size), size - 1
@@ -258,12 +277,13 @@ def scan_file(
     pyarrow = importlib.import_module("pyarrow")
     source = RangeFile(url, remote.size, fetch)
     result = FileScan(remote.path)
-    reader = parquet.ParquetFile(source, pre_buffer=True)
-    metadata = reader.metadata
+    metadata, footer_bytes, footer = read_footer(url, remote.size, fetch)
+    reader = parquet.ParquetFile(source, metadata=metadata, pre_buffer=True)
     names = set(reader.schema_arrow.names)
     if not set(COLUMNS) <= names:
         raise ValueError(f"{remote.path} lacks the expected key/license columns")
-    footer = footer_range(metadata, remote.size)
+    if footer != footer_range(metadata, remote.size):
+        raise ValueError(f"{remote.path}: footer length disagrees with its metadata")
     selected_ranges = [footer, *column_ranges(metadata, COLUMNS)]
     content_ranges = column_ranges(metadata, [CONTENT_COLUMN])
     if CONTENT_COLUMN in names and not content_ranges:
@@ -303,8 +323,7 @@ def scan_file(
     leaked = overlapping(source.ranges, content_ranges)
     if leaked:
         raise RuntimeError(f"{remote.path}: fetched bytes overlap the content column: {leaked[:3]}")
-    footer_bytes = fetch(url, footer[0], footer[1])
-    source.ranges.append(footer)
+    source.ranges.extend([(remote.size - 8, remote.size - 1), (footer[0], remote.size - 9)])
     result.footer_sha256 = hashlib.sha256(footer_bytes).hexdigest()
     result.bytes_fetched = sum(last - first + 1 for first, last in source.ranges)
     result.bytes_outside_selected_columns = bytes_outside(source.ranges, selected_ranges)
@@ -332,7 +351,7 @@ def list_python_files(client: HuggingFaceClient, revision: str) -> tuple[str, li
 
 
 def sample_keys_from_receipts(
-    receipts_path: Path,
+    receipts_path: Path, target: int = PYTHON_SAMPLE_TARGET
 ) -> tuple[dict[Key, int], list[dict[str, Any]], dict[str, Any]]:
     """The exact ordered Python prefix `tools.real_samples` reviews, after hash checks."""
     receipts = json.loads(receipts_path.read_text())
@@ -345,7 +364,7 @@ def sample_keys_from_receipts(
     keys: dict[Key, int] = {}
     rows: list[dict[str, Any]] = []
     text_bytes = 0
-    for index, row in enumerate(sample_rows(parquet_rows(path), "python", PYTHON_SAMPLE_TARGET)):
+    for index, row in enumerate(sample_rows(parquet_rows(path), "python", target)):
         key = (str(row[NAME_COLUMN]), str(row[PATH_COLUMN]))
         if key in keys:
             raise ValueError("sample (repository, path) keys must be unique")
@@ -369,7 +388,7 @@ def sample_keys_from_receipts(
         "parquet_sha256": entry["sha256"],
         "rows": len(rows),
         "text_bytes": text_bytes,
-        "target_text_bytes": PYTHON_SAMPLE_TARGET,
+        "target_text_bytes": target,
     }
     return keys, rows, identity
 
@@ -500,11 +519,12 @@ def recover(
     client: HuggingFaceClient,
     workers: int = 4,
     progress: Callable[[str], None] = print,
+    target: int = PYTHON_SAMPLE_TARGET,
 ) -> dict[str, Any]:
     if output.exists():
         raise FileExistsError("license recovery output must be a new directory")
     started = time.perf_counter()
-    keys, sample, sample_identity = sample_keys_from_receipts(receipts)
+    keys, sample, sample_identity = sample_keys_from_receipts(receipts, target)
     resolved, files = list_python_files(client, revision)
     repositories = frozenset(key[0] for key in keys)
     output.mkdir(parents=True)
@@ -547,8 +567,8 @@ def recover(
         "columns_read": list(COLUMNS),
         "content_downloaded": False,
         "byte_range_guard": (
-            "the run fails if any fetched byte overlaps a content column chunk; bytes outside "
-            "the selected column chunks and footer are counted per file"
+            "the footer is read exactly; the run fails if any fetched byte overlaps a content "
+            "column chunk; bytes outside the selected column chunks and footer are counted"
         ),
         "join_rule": (
             "exact (max_stars_repo_name, max_stars_repo_path); duplicate keys admitted only with "

@@ -4,7 +4,12 @@ from pathlib import Path
 import pytest
 
 from scratchcoder.data.filters import ContaminationIndex
-from tools.header_licenses import PERMISSIVE, classify_file, classify_header
+from tools.header_licenses import (
+    PERMISSIVE,
+    classify_file,
+    classify_header,
+    repository_license_ids,
+)
 from tools.real_samples import process_sample
 
 BSD = """# Copyright fixture. All rights reserved.
@@ -155,3 +160,33 @@ def test_sample_class_attribution_examples_and_per_file_credit(tmp_path: Path) -
     row = json.loads((tmp_path / "sample/documents.jsonl").read_text())
     assert row["provenance"]["license"] == "ISC"
     assert row["provenance"]["license_class"] == "permissive"
+
+
+def test_repository_license_lists_need_every_id_on_the_allowlist() -> None:
+    text = "answer = 123456789\n"
+    both = classify_file(text, ["MIT", "Apache-2.0", "MIT"])
+    assert both.category == "permissive" and both.license_id == "Apache-2.0 AND MIT"
+    assert both.evidence == "upstream repository license metadata"
+    mixed = classify_file(text, ("MIT", "ISC", "Unlicense"))
+    assert mixed.category == "repository_disallowed"
+    assert mixed.license_id == "ISC AND MIT AND Unlicense"
+    assert mixed.evidence.endswith("ISC, Unlicense")  # Only the blocking IDs are named.
+    # An empty upstream list is no verified repository license, not an approval.
+    assert classify_file(text, []).category == "missing_repository_license"
+    assert classify_file(text, ["", "  "]).category == "missing_repository_license"
+
+
+def test_explicit_header_still_wins_over_a_repository_list() -> None:
+    copyleft = "# SPDX-License-Identifier: GPL-3.0-only\npass\n"
+    assert classify_file(copyleft, ["MIT", "Apache-2.0"]).category == "copyleft"
+    inline = "# SPDX-License-Identifier: BSD-3-Clause\npass\n"
+    result = classify_file(inline, ["MIT"])
+    assert result.license_id == "BSD-3-Clause" and "repository" not in result.evidence
+
+
+def test_repository_license_ids_normalize_and_reject_non_text() -> None:
+    assert repository_license_ids(None) == ()
+    assert repository_license_ids("MIT") == ("MIT",)
+    assert repository_license_ids([" MIT ", "Apache-2.0", "MIT"]) == ("Apache-2.0", "MIT")
+    with pytest.raises(ValueError, match="strings"):
+        repository_license_ids(["MIT", 3])  # type: ignore[list-item]
