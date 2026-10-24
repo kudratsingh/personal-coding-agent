@@ -12,12 +12,16 @@ PERMISSIVE = frozenset(
 HEADER_CHARACTERS = 16384
 # D-05 repository-level allowlist; the separately approved inline grants above
 # remain valid. This is an explicit repository field, never a dataset license tag.
+# ISC and Unlicense were always allowed under D-05; the written list omitted them
+# until the owner's 2026-10-24 correction (not a new decision).
 REPOSITORY_ALLOWLIST = frozenset(
     {
         "MIT",
         "Apache-2.0",
         "BSD-2-Clause",
         "BSD-3-Clause",
+        "ISC",
+        "Unlicense",
         "CC0-1.0",
         "CC-BY-4.0",
         "ODC-By-1.0",

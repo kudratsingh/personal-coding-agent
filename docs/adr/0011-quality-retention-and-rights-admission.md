@@ -66,3 +66,35 @@ Arrow/Hugging Face schema metadata adds no license mapping. The earlier text
 prefix parsing fix did not supply licenses. Do not infer original rights from
 the dataset tag or a present-day repository lookup. A provenance-backed local
 mapping is needed to admit the currently unresolved no-header files.
+
+## Owner amendment: upstream repository licenses (2026-10-24)
+
+The owner directed recovering the missing repository metadata from upstream and
+confirmed gated access to `bigcode/the-stack-dedup`, which carries the same Terms
+of Use for The Stack as StarCoderData. Its v1.2 `data/python` files (revision
+`17cad72c886a2858e08d4c349a00d6466f54df63`, byte-identical to the v1.2 release
+candidate) record `max_stars_repo_licenses` for each file. `tools/stack_licenses.py`
+reads only `max_stars_repo_name`, `max_stars_repo_path` and that license column
+with HTTPS range requests. The run fails if any fetched byte overlaps a `content`
+column chunk, so no file contents are downloaded.
+
+The join key is the exact (repository, path) pair from StarCoderData's own
+provenance. Duplicate upstream keys are admitted only when their license lists
+agree. A file whose path is absent upstream but whose repository is present is a
+diagnostic, never an admission, and neither is any present-day repository lookup.
+The raw detector candidates in `bigcode/the-stack-metadata` are not used: one
+license file yields several look-alike IDs there, and choosing among them would be
+a new attribution rule.
+
+The D-05 allowlist applies to every listed ID: a repository list is admitted only
+when all of its IDs are allowed, because the repository may hold code under each
+one. The admitted ID is the IDs joined with " AND ". Off-allowlist IDs are counted
+per ID. Explicit headers keep precedence: copyleft, restricted and unrecognized
+headers are still rejected.
+
+**Correction, not a new decision (2026-10-24):** ISC and Unlicense were always
+allowed under D-05. The allowlist written in the 2026-10-20 amendment above, in
+the private data rules and in the code omitted them. The repository allowlist and
+the manifest's training-license list now read MIT, Apache-2.0, BSD-2-Clause,
+BSD-3-Clause, ISC, Unlicense, CC0-1.0, CC-BY-4.0, ODC-By-1.0 and
+CDLA-Permissive-2.0. PSF-2.0 remains an inline-header grant only.

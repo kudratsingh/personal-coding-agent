@@ -167,10 +167,14 @@ def test_repository_license_lists_need_every_id_on_the_allowlist() -> None:
     both = classify_file(text, ["MIT", "Apache-2.0", "MIT"])
     assert both.category == "permissive" and both.license_id == "Apache-2.0 AND MIT"
     assert both.evidence == "upstream repository license metadata"
-    mixed = classify_file(text, ("MIT", "ISC", "Unlicense"))
+    mixed = classify_file(text, ("MIT", "Zlib", "BSL-1.0"))
     assert mixed.category == "repository_disallowed"
-    assert mixed.license_id == "ISC AND MIT AND Unlicense"
-    assert mixed.evidence.endswith("ISC, Unlicense")  # Only the blocking IDs are named.
+    assert mixed.license_id == "BSL-1.0 AND MIT AND Zlib"
+    assert mixed.evidence.endswith("BSL-1.0, Zlib")  # Only the blocking IDs are named.
+    # D-05 correction (2026-10-24): ISC and Unlicense were always allowed.
+    corrected = classify_file(text, ["ISC", "Unlicense", "MIT"])
+    assert corrected.category == "permissive"
+    assert corrected.license_id == "ISC AND MIT AND Unlicense"
     # An empty upstream list is no verified repository license, not an approval.
     assert classify_file(text, []).category == "missing_repository_license"
     assert classify_file(text, ["", "  "]).category == "missing_repository_license"

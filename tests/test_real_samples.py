@@ -201,7 +201,7 @@ def test_verified_mapping_supplies_repository_licenses_by_exact_key(tmp_path: Pa
     ]
     mapping = {
         ("o/r", "a.py"): ("Apache-2.0", "MIT"),
-        ("o/r", "b.py"): ("ISC", "MIT"),
+        ("o/r", "b.py"): ("MIT", "Zlib"),
         ("o/r", "c.py"): (),
     }
     report = process_sample(
@@ -218,11 +218,11 @@ def test_verified_mapping_supplies_repository_licenses_by_exact_key(tmp_path: Pa
     assert report["file_license_counts"] == {"Apache-2.0 AND MIT": 1, "MIT": 1}
     assert report["kept_license_id_counts"] == {"MIT": 2, "Apache-2.0": 1}
     assert set(report["kept_license_basis"]) == {"repository_metadata", "inline_or_source_terms"}
-    assert report["rejected_repository_license_counts"] == {"ISC AND MIT": 1}
-    assert report["rejected_repository_license_id_counts"] == {"ISC": 1}
+    assert report["rejected_repository_license_counts"] == {"MIT AND Zlib": 1}
+    assert report["rejected_repository_license_id_counts"] == {"Zlib": 1}
     outcomes = report["repository_license_id_outcomes"]
     assert outcomes["MIT"]["admitted_files"] == 1 and outcomes["MIT"]["rejected_files"] == 1
-    assert outcomes["ISC"]["rejected_files"] == 1 and "admitted_files" not in outcomes["ISC"]
+    assert outcomes["Zlib"]["rejected_files"] == 1 and "admitted_files" not in outcomes["Zlib"]
     decisions = report["primary_decisions"]
     assert decisions["license_missing_repository_license"]["files"] == 2  # c (empty) and e
     assert decisions["license_repository_disallowed"]["files"] == 1
