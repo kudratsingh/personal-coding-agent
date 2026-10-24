@@ -35,7 +35,7 @@
     "quoted_total_hourly": 0.6,
     "estimated_total_cost": 0.9,
     "approved_cost_cap": 5.0,
-    "cost_multiplier": 1.5,
+    "cost_multiplier": 1.2,
     "minimum_speed_fraction": 0.5,
     "speed_check_seconds": 600,
     "idle_seconds": 600,

@@ -7,7 +7,7 @@ Nothing in steps 1 to 4 costs money. Step 5 creates the Pod and starts billing; 
 ## 1. Prelaunch checks (Mac, free)
 
 ```sh
-git fetch origin && git checkout pilot-readiness-audit
+git fetch origin && git checkout main && git pull --ff-only origin main   # the audit branch is merged (PR #81)
 make setup && make check && make smoke
 uv run --locked python -m tools.gpu_pilot smoke --output runs/pilot-smoke
 uv run --locked python -m tools.pilot_preflight --output runs/pilot-preflight-cpu --device cpu
@@ -43,7 +43,7 @@ print("specification GPU $/h:", spec["quoted_gpu_hourly"], "total $/h:", spec["l
 PY
 ```
 
-If the console price exceeds `quoted_gpu_hourly` (0.59), edit both `quoted_gpu_hourly` and `limits.quoted_total_hourly` in `configs/pilot-a40-s.json` (total = GPU price + 20 GB x $0.10 / 730 h, rounded up to the cent), commit the change, and rerun `tests/test_pilot_specification.py`. The spending ceiling of $5 and the 1.5 x estimate cost stop ($1.35) stay as they are. Confirm the account balance covers at least one hour at the quoted rate (Runpod refuses to deploy otherwise) and that no network volume exists on the account.
+If the console price exceeds `quoted_gpu_hourly` (0.59), edit both `quoted_gpu_hourly` and `limits.quoted_total_hourly` in `configs/pilot-a40-s.json` (total = GPU price + 20 GB x $0.10 / 730 h, rounded up to the cent), commit the change, and rerun `tests/test_pilot_specification.py`. The spending ceiling of $5 and the 1.2 x estimate cost stop ($1.08, the budget rule of 120% of the estimate) stay as they are. Confirm the account balance covers at least one hour at the quoted rate (Runpod refuses to deploy otherwise) and that no network volume exists on the account.
 
 Decide which specification the run uses before building the receipt: `configs/pilot-a40-s.json` is the agreed pilot of record; `configs/pilot-a40-s-improved.json` adds z-loss, QK-normalization and `torch.compile` (see [docs/training-recipe.md](docs/training-recipe.md)) and changes the parameter count to 135,287,040, so it is an owner decision. Use the chosen path everywhere `configs/pilot-a40-s.json` appears below.
 
@@ -52,11 +52,11 @@ Decide which specification the run uses before building the receipt: `configs/pi
 The reviewed binding was built earlier with `tools/pilot_data.py`; do not rebuild it. Verify it, run the token-level leakage audit, and pin its hash:
 
 ```sh
-export BINDING_DIR=runs/pilot-data
+export BINDING_DIR=runs/gpu-pilot-artifacts/data-reviewed-20261021   # reviewed v2 binding; runs/ is git-ignored
 uv run --locked python -m tools.pilot_data_audit --binding "$BINDING_DIR/binding.json" --output "$CTRL/leakage-audit.json"
 export BINDING_SHA256=$(shasum -a 256 "$BINDING_DIR/binding.json" | cut -d' ' -f1) && echo "$BINDING_SHA256"
 uv run --locked python - <<'PY'
-import json; b = json.load(open("runs/pilot-data/binding.json"))
+import json, os; b = json.load(open(os.path.join(os.environ["BINDING_DIR"], "binding.json")))
 print("train tokens incl. BOS:", b["train"]["tokens_including_bos"], "docs:", b["train"]["documents"])
 print("validation docs:", b["validation"]["documents"], "tokenizer:", b["tokenizer"]["identity"][:16])
 PY
@@ -83,12 +83,12 @@ The request body is `configs/runpod-pod-a40-s.json` (A40, Secure Cloud, template
 uv run --locked python -m tools.runpod_pod_identity capture --pod-id "$POD_ID" \
   --identity "$CTRL/pod-identity.json" --connection "$CTRL/pod-connection.json"
 cat > "$CTRL/policy.json" <<EOF
-{"max_wall_seconds": 5400, "max_cost_usd": 1.35, "max_idle_seconds": 600,
+{"max_wall_seconds": 5400, "max_cost_usd": 1.08, "max_idle_seconds": 600,
  "quoted_total_hourly": 0.60, "max_transfer_seconds": 1500, "idle_baseline_unix": $(date +%s)}
 EOF
 uv run --locked python -m tools.runpod_watchdog --identity "$CTRL/pod-identity.json" \
   --heartbeat "$CTRL/heartbeat.json" --receipt "$CTRL/watchdog-receipt.json" \
-  --max-wall-seconds 5400 --max-idle-seconds 600 --max-cost-usd 1.35 --quoted-total-hourly 0.60 \
+  --max-wall-seconds 5400 --max-idle-seconds 600 --max-cost-usd 1.08 --quoted-total-hourly 0.60 \
   --billing-started-at-unix "$ORIGIN" --idle-baseline-unix "$(date +%s)" --max-transfer-seconds 1500 \
   > "$CTRL/watchdog.log" 2>&1 &
 ```
