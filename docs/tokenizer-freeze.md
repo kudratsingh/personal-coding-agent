@@ -73,7 +73,11 @@ document BOS: **100,813,575 / 20,400,543**. Web stage1 **89,902,727**, stage2
 These original-corpus counts are distinct from the newer classifier recount
 used in [P1-6](full-build-plan.md).
 
-The completed **current repository-license-review recount** contains
+The **2026-10-24 upstream-license review recount** supersedes the next paragraph for
+capacity: **197,448,213 Python tokens / 824,650,726 bytes = 4.1765418561 BPT**
+(see [sample evidence](real-samples.md)). The frozen tokenizer was not changed.
+
+The completed **2026-10-20 header-only review recount** contained
 **26,328,493 Python tokens / 122,701,374 bytes = 4.6604024773 BPT**,
 or **26,342,326 tokens with BOS**. Python train/validation totals are
 **26,219,610 / 108,883**; the newer validation selection is **52 files /

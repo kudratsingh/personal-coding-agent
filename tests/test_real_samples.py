@@ -162,3 +162,74 @@ def test_contamination_inputs_include_original_hidden_tests_separately(
     assert "original solution" in texts and "choice question" in texts
     assert coverage["humaneval"]["tasks"] == 1
     assert coverage["final_pool_holdout"]["available"] is False
+
+
+def test_verified_mapping_supplies_repository_licenses_by_exact_key(tmp_path: Path) -> None:
+    rows = [
+        dict(
+            id="a",
+            content="alpha_value = 12345678901234567890123456\n",
+            max_stars_repo_name="o/r",
+            max_stars_repo_path="a.py",
+        ),
+        dict(
+            id="b",
+            content="beta_value = 12345678901234567890123456\n",
+            max_stars_repo_name="o/r",
+            max_stars_repo_path="b.py",
+        ),
+        dict(
+            id="c",
+            content="gamma_value = 12345678901234567890123456\n",
+            max_stars_repo_name="o/r",
+            max_stars_repo_path="c.py",
+        ),
+        dict(
+            id="d",
+            content="# SPDX-License-Identifier: MIT\ndelta = 1234567890123\n",
+            max_stars_repo_name="o/s",
+            max_stars_repo_path="d.py",
+            repository_license="GPL-3.0-only",  # Ignored: only the verified mapping counts.
+        ),
+        dict(
+            id="e",
+            content="epsilon_value = 12345678901234567890123456\n",
+            max_stars_repo_name="o/t",
+            max_stars_repo_path="e.py",
+            repository_license="MIT",  # Ignored too: absent from the mapping.
+        ),
+    ]
+    mapping = {
+        ("o/r", "a.py"): ("Apache-2.0", "MIT"),
+        ("o/r", "b.py"): ("MIT", "Zlib"),
+        ("o/r", "c.py"): (),
+    }
+    report = process_sample(
+        rows,
+        domain="python",
+        source="fixture",
+        target=sum(len(row["content"].encode()) for row in rows),
+        contamination=ContaminationIndex([]),
+        output=tmp_path / "review",
+        repository_licenses=mapping,
+    )
+    assert report["repository_metadata_lookups"] == {"found": 3, "absent": 2}
+    assert report["kept_documents"] == 2
+    assert report["file_license_counts"] == {"Apache-2.0 AND MIT": 1, "MIT": 1}
+    assert report["kept_license_id_counts"] == {"MIT": 2, "Apache-2.0": 1}
+    assert set(report["kept_license_basis"]) == {"repository_metadata", "inline_or_source_terms"}
+    assert report["rejected_repository_license_counts"] == {"MIT AND Zlib": 1}
+    assert report["rejected_repository_license_id_counts"] == {"Zlib": 1}
+    outcomes = report["repository_license_id_outcomes"]
+    assert outcomes["MIT"]["admitted_files"] == 1 and outcomes["MIT"]["rejected_files"] == 1
+    assert outcomes["Zlib"]["rejected_files"] == 1 and "admitted_files" not in outcomes["Zlib"]
+    decisions = report["primary_decisions"]
+    assert decisions["license_missing_repository_license"]["files"] == 2  # c (empty) and e
+    assert decisions["license_repository_disallowed"]["files"] == 1
+    kept = [
+        json.loads(line) for line in (tmp_path / "review/documents.jsonl").read_text().splitlines()
+    ]
+    by_id = {row["id"]: row["provenance"] for row in kept}
+    assert by_id["a"]["license_basis"] == "repository_metadata"
+    assert by_id["a"]["repository_licenses"] == ["Apache-2.0", "MIT"]
+    assert by_id["d"]["license"] == "MIT" and by_id["d"]["repository_licenses"] is None

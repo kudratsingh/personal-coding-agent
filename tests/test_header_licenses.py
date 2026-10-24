@@ -4,7 +4,12 @@ from pathlib import Path
 import pytest
 
 from scratchcoder.data.filters import ContaminationIndex
-from tools.header_licenses import PERMISSIVE, classify_file, classify_header
+from tools.header_licenses import (
+    PERMISSIVE,
+    classify_file,
+    classify_header,
+    repository_license_ids,
+)
 from tools.real_samples import process_sample
 
 BSD = """# Copyright fixture. All rights reserved.
@@ -155,3 +160,99 @@ def test_sample_class_attribution_examples_and_per_file_credit(tmp_path: Path) -
     row = json.loads((tmp_path / "sample/documents.jsonl").read_text())
     assert row["provenance"]["license"] == "ISC"
     assert row["provenance"]["license_class"] == "permissive"
+
+
+def test_repository_license_lists_need_every_id_on_the_allowlist() -> None:
+    text = "answer = 123456789\n"
+    both = classify_file(text, ["MIT", "Apache-2.0", "MIT"])
+    assert both.category == "permissive" and both.license_id == "Apache-2.0 AND MIT"
+    assert both.evidence == "upstream repository license metadata"
+    mixed = classify_file(text, ("MIT", "Zlib", "BSL-1.0"))
+    assert mixed.category == "repository_disallowed"
+    assert mixed.license_id == "BSL-1.0 AND MIT AND Zlib"
+    assert mixed.evidence.endswith("BSL-1.0, Zlib")  # Only the blocking IDs are named.
+    # D-05 correction (2026-10-24): ISC and Unlicense were always allowed.
+    corrected = classify_file(text, ["ISC", "Unlicense", "MIT"])
+    assert corrected.category == "permissive"
+    assert corrected.license_id == "ISC AND MIT AND Unlicense"
+    # An empty upstream list is no verified repository license, not an approval.
+    assert classify_file(text, []).category == "missing_repository_license"
+    assert classify_file(text, ["", "  "]).category == "missing_repository_license"
+
+
+def test_explicit_header_still_wins_over_a_repository_list() -> None:
+    copyleft = "# SPDX-License-Identifier: GPL-3.0-only\npass\n"
+    assert classify_file(copyleft, ["MIT", "Apache-2.0"]).category == "copyleft"
+    inline = "# SPDX-License-Identifier: BSD-3-Clause\npass\n"
+    result = classify_file(inline, ["MIT"])
+    assert result.license_id == "BSD-3-Clause" and "repository" not in result.evidence
+
+
+def test_repository_license_ids_normalize_and_reject_non_text() -> None:
+    assert repository_license_ids(None) == ()
+    assert repository_license_ids("MIT") == ("MIT",)
+    assert repository_license_ids([" MIT ", "Apache-2.0", "MIT"]) == ("Apache-2.0", "MIT")
+    with pytest.raises(ValueError, match="strings"):
+        repository_license_ids(["MIT", 3])  # type: ignore[list-item]
+
+
+def test_a_byte_order_mark_never_hides_an_explicit_header() -> None:
+    agpl = "\ufeff# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).\n"
+    agpl += "from odoo import models\n"
+    assert classify_file(agpl, ["MIT"]).category == "copyleft"
+    mit = "\ufeff# SPDX-License-Identifier: MIT\nanswer = 1\n"
+    result = classify_file(mit, ["Apache-2.0"])
+    assert result.category == "permissive" and result.license_id == "MIT"
+    assert "repository" not in result.evidence
+
+
+def test_an_unreadable_leading_header_is_unrecognized_not_absent() -> None:
+    truncated = '"""' + "x" * 20000 + '\n"""\nanswer = 1\n'  # Cut by the 16,384-character window.
+    result = classify_file(truncated, ["MIT"])
+    assert result.category == "unrecognized" and result.evidence == "unreadable leading header"
+    assert (
+        classify_file("import os\n", ["MIT"]).category == "permissive"
+    )  # Ordinary code still falls back.
+    assert classify_file("", None).category == "missing_repository_license"
+
+
+def test_license_blocks_after_future_imports_are_read() -> None:
+    text = (
+        "#!/usr/bin/python\nfrom __future__ import (absolute_import, division)\n"
+        "# SPDX-License-Identifier: GPL-3.0-only\nimport os\n"
+    )
+    assert classify_file(text, ["MIT"]).category == "copyleft"
+    plain = "from __future__ import annotations\nimport os\n"
+    assert classify_file(plain, ["MIT"]).category == "permissive"
+
+
+@pytest.mark.parametrize(
+    ("value", "category"),
+    [
+        ("GPL", "copyleft"),
+        ("GPLv3", "copyleft"),
+        ("Proprietary", "restricted"),
+        ("Mystery", "unrecognized"),
+    ],
+)
+def test_module_license_dunder_is_an_explicit_declaration(value: str, category: str) -> None:
+    text = f'#encoding: utf8\n__author__ = "someone"\n__license__ = "{value}"\nimport os\n'
+    result = classify_file(text, ["MIT"])
+    assert result.category == category
+    assert "repository" not in result.evidence
+
+
+def test_permissive_license_dunder_keeps_its_own_id() -> None:
+    result = classify_file('__license__ = "MIT"\nimport os\n', ["Apache-2.0"])
+    assert (result.category, result.license_id, result.evidence) == (
+        "permissive",
+        "MIT",
+        "__license__ declaration",
+    )
+
+
+@pytest.mark.parametrize(
+    "header", ["# License: GPLv3", "# Licensed under the AGPLv3", "# LGPL-2.1"]
+)
+def test_versioned_copyleft_spellings_are_copyleft(header: str) -> None:
+    assert classify_header(header + "\nimport os\n").category == "copyleft"

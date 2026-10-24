@@ -6,7 +6,7 @@ import importlib
 import json
 import time
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -23,7 +23,13 @@ from scratchcoder.data.filters import (
     filter_documents,
 )
 from scratchcoder.data.shards import file_sha256
-from tools.header_licenses import HeaderLicense, classify_file, classify_header
+from tools.header_licenses import (
+    REPOSITORY_ALLOWLIST,
+    HeaderLicense,
+    classify_file,
+    classify_header,
+    repository_license_ids,
+)
 
 HUMANEVAL_SHA256 = "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef"
 
@@ -90,6 +96,12 @@ def contamination_inputs(
     return texts, identities
 
 
+RepositoryLicenses = Mapping[tuple[str, str], tuple[str, ...]]
+"""Verified (max_stars_repo_name, max_stars_repo_path) -> upstream license IDs."""
+
+REPOSITORY_EVIDENCE = "upstream repository license metadata"
+
+
 def process_sample(
     rows: Iterable[dict[str, Any]],
     *,
@@ -98,7 +110,15 @@ def process_sample(
     target: int,
     contamination: ContaminationIndex,
     output: Path,
+    repository_licenses: RepositoryLicenses | None = None,
 ) -> dict[str, Any]:
+    """Review one ordered prefix.
+
+    With ``repository_licenses``, a Python file's repository metadata comes only
+    from that verified mapping, keyed by its exact repository and path; a file
+    absent from it has no repository metadata. Without it, an explicit
+    ``repository_license`` row field is used, as before.
+    """
     output.mkdir(parents=True, exist_ok=False)
     documents = []
     provenance: dict[str, dict[str, Any]] = {}
@@ -107,6 +127,9 @@ def process_sample(
     rule_files: Counter[str] = Counter()
     license_classes: dict[str, Counter[str]] = {}
     rejected_repository_licenses: Counter[str] = Counter()
+    rejected_repository_license_ids: Counter[str] = Counter()
+    repository_id_outcomes: dict[str, Counter[str]] = {}
+    repository_lookups: Counter[str] = Counter()
     examples: list[dict[str, Any]] = []
 
     def audit(document: Document, reason: str) -> None:
@@ -118,11 +141,31 @@ def process_sample(
         counts["sample_documents"] += 1
         counts["sample_text_bytes"] += len(text.encode())
         identifier = str(row.get("id", number))
+        listed: Any = None
+        if domain != "web":
+            if repository_licenses is None:
+                listed = row.get("repository_license")
+            else:
+                key = (str(row.get("max_stars_repo_name")), str(row.get("max_stars_repo_path")))
+                listed = repository_licenses.get(key)
+                repository_lookups["found" if listed is not None else "absent"] += 1
         classification = (
             HeaderLicense("permissive", "ODC-By-1.0", "owner-reviewed web source terms")
             if domain == "web"
-            else classify_file(text, row.get("repository_license"))
+            else classify_file(text, listed)
         )
+        size = len(text.encode())
+        via_repository = classification.category == "repository_disallowed" or (
+            classification.evidence == REPOSITORY_EVIDENCE
+        )
+        if via_repository:
+            outcome = "admitted" if classification.category == "permissive" else "rejected"
+            for item in repository_license_ids(listed):
+                tally = repository_id_outcomes.setdefault(item, Counter())
+                tally[outcome + "_files"] += 1
+                tally[outcome + "_text_bytes"] += size
+                if outcome == "rejected" and item not in REPOSITORY_ALLOWLIST:
+                    rejected_repository_license_ids[item] += 1
         license_name = classification.license_id
         license_counts = license_classes.setdefault(classification.category, Counter())
         license_counts["files"] += 1
@@ -153,6 +196,8 @@ def process_sample(
             license=license_name,
             license_class=classification.category,
             license_evidence=classification.evidence,
+            license_basis="repository_metadata" if via_repository else "inline_or_source_terms",
+            repository_licenses=list(repository_license_ids(listed)) if via_repository else None,
             sha256=content_hash(text),
             repository=row.get("max_stars_repo_name"),
             path=row.get("max_stars_repo_path"),
@@ -164,6 +209,8 @@ def process_sample(
     )
     splits: dict[str, Counter[str]] = {}
     licenses: Counter[str] = Counter()
+    kept_license_ids: Counter[str] = Counter()
+    kept_basis: dict[str, Counter[str]] = {}
     with (output / "documents.jsonl").open("x", encoding="utf-8") as stream:
         for document in kept:
             split = document_split(content_hash(document.text), web=domain == "web")
@@ -171,7 +218,13 @@ def process_sample(
             size = len(document.text.encode())
             split_counts["documents"] += 1
             split_counts["text_bytes"] += size
-            licenses[provenance[document.id]["license"] or "unresolved"] += 1
+            record = provenance[document.id]
+            licenses[record["license"] or "unresolved"] += 1
+            for item in (record["license"] or "unresolved").split(" AND "):
+                kept_license_ids[item] += 1
+            basis = kept_basis.setdefault(record["license_basis"], Counter())
+            basis["files"] += 1
+            basis["text_bytes"] += size
             stream.write(
                 json.dumps(
                     dict(asdict(document), split=split, provenance=provenance[document.id]),
@@ -215,10 +268,22 @@ def process_sample(
         },
         license_classes={name: dict(value) for name, value in license_classes.items()},
         rejected_repository_license_counts=dict(rejected_repository_licenses),
+        rejected_repository_license_id_counts=dict(
+            sorted(rejected_repository_license_ids.items(), key=lambda x: (-x[1], x[0]))
+        ),
+        repository_license_id_outcomes={
+            name: dict(value)
+            for name, value in sorted(
+                repository_id_outcomes.items(),
+                key=lambda x: (-(x[1]["admitted_files"] + x[1]["rejected_files"]), x[0]),
+            )
+        },
+        repository_metadata_lookups=dict(repository_lookups),
         final_training_admission=False,
         license_policy=(
-            "header-classifier-v2; explicit header first; absent header uses verified "
-            "repository_license field and D-05 allowlist; missing metadata is separate"
+            "header-classifier-v3; explicit header first; absent header uses verified "
+            "repository license metadata, admitted only when every listed ID is on the D-05 "
+            "allowlist; missing metadata is separate"
         ),
         contamination_ngram_words=contamination.n,
         contamination_short_fields="complete normalized fields shorter than n are also indexed",
@@ -226,6 +291,8 @@ def process_sample(
         kept_documents=len(kept),
         kept_text_bytes=sum(len(doc.text.encode()) for doc in kept),
         file_license_counts=dict(licenses),
+        kept_license_id_counts=dict(sorted(kept_license_ids.items(), key=lambda x: (-x[1], x[0]))),
+        kept_license_basis={name: dict(value) for name, value in kept_basis.items()},
         splits={name: dict(value) for name, value in splits.items()},
         document_file_sha256=file_sha256(output / "documents.jsonl"),
         # ByteBPE's pre-merge alphabet represents each UTF-8 byte as one token, no BOS.
@@ -246,6 +313,11 @@ def main() -> int:
     parser.add_argument("--arc-directory", type=Path, required=True)
     parser.add_argument("--humaneval-path", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--repository-licenses",
+        type=Path,
+        help="report.json of a completed tools.stack_licenses recovery for this Python sample",
+    )
     args = parser.parse_args()
     receipts = json.loads(args.receipts.read_text())
     if receipts["status"] != "completed" or args.output.exists():
@@ -254,6 +326,15 @@ def main() -> int:
         path = Path(entry["path"])
         if path.stat().st_size != entry["size_bytes"] or file_sha256(path) != entry["sha256"]:
             raise ValueError("raw source size/hash differs before parsing")
+    mapping: RepositoryLicenses | None = None
+    mapping_identity: dict[str, Any] | None = None
+    if args.repository_licenses is not None:
+        from tools.stack_licenses import load_mapping
+
+        mapping, mapping_identity = load_mapping(args.repository_licenses)
+        python_entry = next(item for item in receipts["files"] if item["domain"] == "python")
+        if mapping_identity["sample_parquet_sha256"] != python_entry["sha256"]:
+            raise ValueError("license mapping was built for a different Python sample")
     started = time.perf_counter()
     texts, coverage = contamination_inputs(
         args.evalplus_directory, args.arc_directory, args.humaneval_path
@@ -269,6 +350,7 @@ def main() -> int:
             target=500_000_000 if domain == "web" else 1_000_000_000,
             contamination=index,
             output=args.output / domain,
+            repository_licenses=mapping if domain == "python" else None,
         )
         reports.append(report)
         print(json.dumps(report, sort_keys=True), flush=True)
@@ -281,6 +363,7 @@ def main() -> int:
             dirty=dirty,
             sources=reports,
             download_receipts=receipts,
+            repository_license_mapping=mapping_identity,
             contamination_coverage=coverage,
             elapsed_seconds=time.perf_counter() - started,
             paid_runs=0,

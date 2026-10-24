@@ -128,3 +128,9 @@ def test_terms_date_validation_and_evaluation_policy_unchanged() -> None:
     replace(fixture_entry(), purpose="eval", license="synthetic-evaluation-only").validate()
     with pytest.raises(ValueError, match="allowlisted"):
         replace(fixture_entry(), license="synthetic-evaluation-only").validate()
+
+
+@pytest.mark.parametrize("name", ["ISC", "Unlicense"])
+def test_d05_correction_allows_isc_and_unlicense_for_training(name: str) -> None:
+    # Owner correction 2026-10-24: both were always allowed under D-05.
+    replace(fixture_entry(), license=name).validate()
