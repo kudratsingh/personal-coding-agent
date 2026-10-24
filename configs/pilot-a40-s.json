@@ -63,5 +63,8 @@
   "screen_steps": 100,
   "checkpoint_seconds": 300,
   "expected_tokens_per_second": null,
-  "quoted_gpu_hourly": 0.59
+  "quoted_gpu_hourly": 0.59,
+  "compile_probe_steps": 20,
+  "compile_probe_seconds": 240,
+  "compile_probe_warmup_updates": 2
 }

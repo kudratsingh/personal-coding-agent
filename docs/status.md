@@ -1,6 +1,6 @@
 # Public project status
 
-**Updated:** 2026-10-22
+**Updated:** 2026-10-24
 **Real-source sample evidence updated:** 2026-10-20
 **Stage:** Local research pipeline; phase acceptance incomplete
 
@@ -90,7 +90,7 @@ the October 19 artifact is preserved with legacy behavior. **No further
 retraining without approval.** All specials fit inside IDs **0–65,535**;
 [model counts](model.md) now include the **135,285,504-parameter S shape**.
 
-The [four gate reports](gates/g0-foundation.md) and [12 Phase 4 work orders](rehearsal-plan.md) remain prepared, not blanket phase acceptance. HumanEval+ scoring still uses **163 tasks with task 32 explicitly excluded**; reference G3 stays closed. No further reference variants or task-32 investigations were run. The [GPU pilot](gpu-pilot-plan.md) has conditional owner approval and a completed readiness audit ([verdict and blockers](../PILOT_LAUNCH_READINESS.md), [runbook](../PILOT_RUNBOOK.md)); launch still awaits the owner's explicit authorization, the real A40 preflight and acceptance of best-effort termination. **0 GPU-hours / 0 paid resources**.
+The [four gate reports](gates/g0-foundation.md) and [12 Phase 4 work orders](rehearsal-plan.md) remain prepared, not blanket phase acceptance. HumanEval+ scoring still uses **163 tasks with task 32 explicitly excluded**; reference G3 stays closed. No further reference variants or task-32 investigations were run. The [GPU pilot](gpu-pilot-plan.md) has conditional owner approval and a completed readiness audit ([verdict and blockers](../PILOT_LAUNCH_READINESS.md), [runbook](../PILOT_RUNBOOK.md)); the owner selected the agreed specification on 2026-10-24, with `torch.compile` off for training and one separate 20-update compiled probe that measures the speedup. Launch still awaits the owner's Runpod setup confirmation and explicit authorization, the real A40 preflight and acceptance of best-effort termination. **0 GPU-hours / 0 paid resources**.
 
 The [revised P1-6 estimate](full-build-plan.md) remains **not approved**. The replacement-tokenizer recount gives **26,328,493 Python tokens / 122,701,374 bytes**, predicting **1.68502B Python tokens over 64GB**, or **1.67660B after validation reserve**, conditionally—not a measured full-source count. The old 2.24058B forecast used the superseded tokenizer. Cached-source timing covers **80 isolated partition calls**, with unmeasured sources/proxies explicit. The small rehearsal remains selected, but full builds and Phase 4 model runs are **0**. Owner review and the pilot's separate launch prerequisites remain outstanding.
 

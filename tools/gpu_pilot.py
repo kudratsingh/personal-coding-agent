@@ -14,6 +14,9 @@ import json
 import math
 import os
 import shutil
+import signal
+import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -55,12 +58,206 @@ _CUDA_MEMORY_MARKERS = (
 )
 
 
+COMPILE_PROBE_PREFIX = "probe-compiled-"
+"""Phase prefix of the measurement-only ``torch.compile`` probe (a probe for every other rule)."""
+COMPILE_SOFT_STOP_SECONDS = 10.0
+"""The child stops at an update boundary this long before the hard window, once it has data."""
+COMPILE_CHILD_SECRETS = ("RUNPOD_API_KEY", "HF_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+
+
 def _is_cuda_memory_error(error: BaseException) -> bool:
     """Recognize allocation failures that CUDA libraries raise as plain RuntimeError."""
     if isinstance(error, torch.cuda.OutOfMemoryError):
         return True
     message = str(error)
     return any(marker in message for marker in _CUDA_MEMORY_MARKERS)
+
+
+def trainer_config(
+    spec: Specification, size: int, rate: float, *, probe: bool, compiled: bool = False
+) -> RunConfig:
+    """The run configuration of one probe, arm or the compile probe's child trainer."""
+    if compiled and not probe:
+        raise ValueError("compiled training is measured only by the compile probe")
+    probe_steps = spec.compile_probe_steps if compiled else spec.probe_steps
+    return replace(
+        spec.config,
+        train=replace(
+            spec.config.train,
+            batch_size=size,
+            accumulation_steps=spec.probe_accumulation_steps
+            if probe
+            else accumulation_steps(
+                size, spec.config.train.sequence_length, spec.tokens_per_update
+            ),
+            learning_rate=rate,
+            steps=probe_steps if probe else spec.config.train.steps,
+            warmup_steps=min(spec.config.train.warmup_steps, probe_steps)
+            if probe
+            else spec.config.train.warmup_steps,
+            compile=spec.config.train.compile or compiled,
+        ),
+    )
+
+
+def document_source(documents: Documents) -> dict[str, Any]:
+    """Serialize the training documents so a child process reads the identical stream."""
+    if isinstance(documents, TokenShard):
+        metadata = json.loads(
+            documents.path.with_suffix(documents.path.suffix + ".json").read_text()
+        )
+        return {
+            "kind": "shard",
+            "path": str(documents.path.resolve()),
+            "tokenizer_hash": metadata["tokenizer_hash"],
+            "vocab_size": documents.vocab_size,
+            "bos_id": documents.bos_id,
+            "identity": documents.identity,
+        }
+    return {"kind": "inline", "documents": [list(documents[i]) for i in range(len(documents))]}
+
+
+def load_document_source(source: dict[str, Any]) -> Documents:
+    """Rebuild the parent's training documents inside the compile probe child."""
+    if source.get("kind") == "shard":
+        shard = TokenShard(
+            Path(source["path"]),
+            tokenizer_hash=source["tokenizer_hash"],
+            vocab_size=source["vocab_size"],
+            bos_id=source["bos_id"],
+        )
+        if shard.identity != source["identity"]:
+            raise ValueError("compile probe child sees a different training shard")
+        return shard
+    if source.get("kind") == "inline":
+        return [[int(token) for token in document] for document in source["documents"]]
+    raise ValueError("unknown compile probe document source")
+
+
+def run_compile_probe_child(request_path: Path) -> int:
+    """Child entry point: train the compiled probe and record each update as it lands.
+
+    One JSON row per completed update is appended and fsynced immediately, so a
+    parent that kills this process at the hard window keeps every finished
+    update. The child soft-stops at an update boundary shortly before the
+    window once it has at least one update, and exits 1 after recording a failure.
+    """
+    request = json.loads(request_path.read_text())
+    rows_path, result_path = Path(request["rows_path"]), Path(request["result_path"])
+    torch.set_num_threads(int(request["num_threads"]))
+    deadline = float(request["launched_unix"]) + float(request["window_seconds"])
+    device = training_device(request["device"])
+    result: dict[str, Any] = {"torch_version": torch.__version__, "device": str(device)}
+    trainer: Trainer | None = None
+    code = 1
+    try:
+        raw = request["config"]
+        config = RunConfig(
+            model=ModelConfig(**raw["model"]),
+            train=TrainConfig(**raw["train"]),
+            data_mix=raw["data_mix"],
+            parent_checkpoint=raw["parent_checkpoint"],
+        )
+        result["compile"] = config.train.compile
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+            torch.cuda.reset_peak_memory_stats(device)
+        trainer = Trainer(
+            config,
+            MixedLoader(
+                {"web": load_document_source(request["documents"])},
+                {"web": 1.0},
+                sequence_length=config.train.sequence_length,
+                batch_size=config.train.batch_size,
+                seed=config.train.seed,
+            ),
+            run_id=request["run_id"],
+            run_root=Path(request["run_root"]),
+            data_hash=request["data_hash"],
+            tokenizer_hash=request["tokenizer_hash"],
+            device=str(device),
+        )
+        current = trainer
+
+        def soft_stop() -> bool:
+            return current.step >= 1 and time.time() >= deadline - COMPILE_SOFT_STOP_SECONDS
+
+        with rows_path.open("a", encoding="utf-8") as stream:
+
+            def record(model: Trainer, metrics: dict[str, float]) -> None:
+                row = {**metrics, "step": float(model.step)}
+                stream.write(json.dumps(row, allow_nan=False) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            trainer.train(should_stop=soft_stop, on_step=record)
+        result.update(
+            status="completed" if trainer.step == config.train.steps else "incomplete",
+            updates=trainer.step,
+        )
+        code = 0
+    except BaseException as error:
+        memory = device.type == "cuda" and _is_cuda_memory_error(error)
+        result.update(
+            status="oom" if memory else "failed",
+            updates=0 if trainer is None else trainer.step,
+            error_type=type(error).__name__,
+            error=str(sanitize(str(error)))[:500],
+        )
+    finally:
+        cuda = device.type == "cuda"
+        result["peak_allocated_bytes"] = torch.cuda.max_memory_allocated(device) if cuda else 0
+        result["peak_reserved_bytes"] = torch.cuda.max_memory_reserved(device) if cuda else 0
+        atomic_json(result_path, result)
+    return code
+
+
+def _kill_group(process: subprocess.Popen[bytes]) -> str | None:
+    """Kill the child and every compile worker it started, reap the child, never raise.
+
+    An exited leader is reaped first. ``killpg`` then reaches any surviving group
+    member; it fails with ``ProcessLookupError`` when none is left and, on macOS,
+    with ``PermissionError`` when only an unreaped zombie remains. Returns a
+    description of anything unexpected instead of raising.
+    """
+    problem: str | None = None
+    try:
+        process.poll()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass  # Nothing left to signal.
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:  # pragma: no cover - SIGKILL ends a process.
+            problem = "child did not exit after SIGKILL"
+    except Exception as error:  # pragma: no cover - defensive; teardown must not raise.
+        problem = f"{type(error).__name__}: {error}"
+    return problem
+
+
+def _completed_rows(path: Path) -> list[dict[str, float]]:
+    """Rows the child finished, in order; a torn final line from a kill is ignored."""
+    if not path.exists():
+        return []
+    rows: list[dict[str, float]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            break
+        if (
+            not isinstance(row, dict)
+            or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                for v in row.values()
+            )
+            or row.get("step") != len(rows) + 1
+        ):
+            break
+        rows.append({key: float(value) for key, value in row.items()})
+    return rows
 
 
 def cpu_tree(value: Any) -> Any:
@@ -92,6 +289,12 @@ class Specification:
     quoted_gpu_hourly: float
     probe_accumulation_steps: int = 2
     memory_headroom_fraction: float = 0.9
+    # One extra measurement-only probe with ``torch.compile`` on, at the chosen
+    # microbatch, after the eager probes and before the first real update. It never
+    # selects the microbatch and never trains an arm; 0 steps disables it.
+    compile_probe_steps: int = 0
+    compile_probe_seconds: float = 0.0
+    compile_probe_warmup_updates: int = 2
 
     def __post_init__(self) -> None:
         if type(self.probe_accumulation_steps) is not int or self.probe_accumulation_steps < 2:
@@ -100,6 +303,33 @@ class Specification:
             raise ValueError("probe_accumulation_steps must be an integer of at least 2")
         if not 0 < finite_number(self.memory_headroom_fraction, "memory headroom") <= 1:
             raise ValueError("memory_headroom_fraction must be in (0, 1]")
+        for name in ("compile_probe_steps", "compile_probe_warmup_updates"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        seconds = finite_number(self.compile_probe_seconds, "compile probe seconds")
+        if self.compile_probe_steps:
+            if self.config.train.compile:
+                raise ValueError(
+                    "the compile probe compares against eager training; keep compile off"
+                )
+            if seconds <= 0:
+                raise ValueError("an enabled compile probe needs a positive time window")
+            if seconds > self.limits.idle_seconds:
+                # The budgeted compile window is the only exception to the idle limit;
+                # it can never hold an idle GPU longer than the idle limit itself.
+                raise ValueError("the compile probe window must not exceed the idle limit")
+            if not self.compile_probe_warmup_updates < min(
+                self.compile_probe_steps, self.probe_steps
+            ):
+                raise ValueError("compile probe warmup must leave measured updates in both probes")
+        elif seconds != 0:
+            raise ValueError("a disabled compile probe must not reserve pod time")
+        reserved = self.limits.probe_seconds + seconds + self.limits.finalization_reserve_seconds
+        if reserved >= self.limits.pod_seconds:
+            raise ValueError(
+                "probe, compile probe and finalization windows exceed the pod lifetime"
+            )
         if (
             not self.microbatches
             or len(set(self.microbatches)) != len(self.microbatches)
@@ -214,10 +444,37 @@ def check_readiness(receipt: dict[str, Any], *, now: float, spec: Specification)
         raise ValueError("pod creation timestamp is invalid")
     if spec.limits.stop_reason(pod_elapsed=now - origin):
         raise ValueError("pod already exceeds an operating limit")
-    remaining = origin + spec.limits.pod_seconds - now
-    if remaining <= spec.limits.probe_seconds + spec.limits.finalization_reserve_seconds:
+    # The worker plans against the earlier of the wall and the armed in-pod deadline.
+    remaining = min(origin + spec.limits.pod_seconds, termination) - now
+    needed = (
+        spec.limits.probe_seconds
+        + spec.compile_probe_seconds
+        + spec.limits.finalization_reserve_seconds
+    )
+    if remaining <= needed:
         raise ValueError("pod lifetime left is too short for probes and finalization")
     return origin
+
+
+def check_preflight(
+    preflight: dict[str, Any], *, hardware: dict[str, Any], spec: Specification
+) -> None:
+    """Require a completed on-device preflight, including the fused-attention check."""
+    if (
+        preflight.get("status") != "completed"
+        or preflight.get("hardware_precision_and_resume_checked") is not True
+        or preflight.get("device") != "cuda:0"
+        or preflight.get("hardware") != hardware
+    ):
+        raise ValueError("a matching A40 hardware precision/resume preflight is required")
+    fused = preflight.get("fused_attention")
+    if spec.config.train.attention == "fused" and (
+        not isinstance(fused, dict) or fused.get("status") != "passed"
+    ):
+        raise ValueError(
+            "a fused-attention specification needs the on-device fused attention "
+            "equivalence check to have passed in the preflight"
+        )
 
 
 class Worker:
@@ -234,8 +491,19 @@ class Worker:
         pod_created: float,
         clock: Callable[[], float] = time.time,
         data_kind: str = "hash-bound-reviewed-source",
+        sleep: Callable[[float], None] = time.sleep,
+        compile_probe_command: Sequence[str] | None = None,
+        compile_poll_seconds: float = 2.0,
     ) -> None:
         self.spec, self.root, self.documents, self.windows = spec, root, documents, windows
+        self.sleep = sleep
+        self.compile_probe_command = tuple(
+            compile_probe_command or (sys.executable, "-m", "tools.gpu_pilot", "compile-probe")
+        )
+        if finite_number(compile_poll_seconds, "compile poll seconds") <= 0:
+            raise ValueError("compile poll interval must be positive")
+        self.compile_poll_seconds = compile_poll_seconds
+        self.compile_probe_active = False
         self.data_hash, self.tokenizer_hash = data_hash, tokenizer_hash
         self.device = training_device(device)
         if not windows:
@@ -252,6 +520,7 @@ class Worker:
             raise FileExistsError("pilot output must be a new directory")
         self.clock, self.pod_created = clock, pod_created
         self.probe_started: float | None = None
+        self.compile_probe_started: float | None = None
         self.training_started: float | None = None
         self.training_deadline: float | None = None
         self.tokens_processed = 0
@@ -281,6 +550,7 @@ class Worker:
             "validation_identity": self.validation_identity,
             "probes": [],
             "probe_window_expired": False,
+            "compile_probe": None,
             "arms": [],
             "training_tokens_processed": 0,
             "checkpoints": self.checkpoints,
@@ -315,6 +585,8 @@ class Worker:
                 "phase": self.phase,
                 "step": step,
                 "training_tokens_processed": self.tokens_processed,
+                # Budgeted compile-probe time, bounded by a hard kill at its window.
+                "compile_probe_active": self.compile_probe_active,
                 "status": "awaiting_transfer"
                 if self.report["status"] in {"completed", "time_limited"}
                 else self.report["status"],
@@ -331,9 +603,11 @@ class Worker:
             self.stop_reason = reason
         elif (
             self.phase.startswith("probe")
+            and not self.phase.startswith(COMPILE_PROBE_PREFIX)
             and self.probe_started is not None
             and now - self.probe_started >= self.spec.limits.probe_seconds
         ):
+            # Soft eager-probe window; the compile probe has its own hard window.
             self.stop_reason = "probe_time_limit"
         elif (
             self.training_started is not None
@@ -353,23 +627,7 @@ class Worker:
             raise PilotStop(str(self.stop_reason))
 
     def trainer(self, name: str, size: int, rate: float, *, probe: bool = False) -> Trainer:
-        config = replace(
-            self.spec.config,
-            train=replace(
-                self.spec.config.train,
-                batch_size=size,
-                accumulation_steps=self.spec.probe_accumulation_steps
-                if probe
-                else accumulation_steps(
-                    size, self.spec.config.train.sequence_length, self.spec.tokens_per_update
-                ),
-                learning_rate=rate,
-                steps=self.spec.probe_steps if probe else self.spec.config.train.steps,
-                warmup_steps=min(self.spec.config.train.warmup_steps, self.spec.probe_steps)
-                if probe
-                else self.spec.config.train.warmup_steps,
-            ),
-        )
+        config = trainer_config(self.spec, size, rate, probe=probe)
         return Trainer(
             config,
             MixedLoader(
@@ -602,6 +860,234 @@ class Worker:
         print(json.dumps({"chosen_microbatch": size, "probes": self.report["probes"]}), flush=True)
         return size
 
+    def compile_probe(self, size: int) -> None:
+        """Time ``torch.compile`` once at the chosen microbatch, in a child process.
+
+        Measurement only: the row is recorded under ``compile_probe``, separate
+        from the eager probe table, and never influences the microbatch, the
+        learning-rate arms or the continuation. The parent never calls
+        ``torch.compile``, so no compiled graph, guard or compile worker reaches
+        the arms. The child rebuilds the eager probe's exact trainer with compile
+        on (same microbatch, accumulation, seed, data order and attention kernel)
+        and records each finished update immediately. The window
+        (``compile_probe_seconds``) is a hard limit: the parent kills the child's
+        whole process group when it expires, keeping every finished update.
+        While the child runs inside its window the parent refreshes the idle
+        clock and heartbeat, because that time is budgeted and bounded; wall and
+        cost limits still stop the pilot. A failure is recorded and the pilot
+        continues eagerly.
+        """
+        steps = self.spec.compile_probe_steps
+        if steps == 0:
+            self.report["compile_probe"] = {"status": "disabled"}
+            self.publish()
+            return
+        warmup = self.spec.compile_probe_warmup_updates
+        self.phase = COMPILE_PROBE_PREFIX + str(size)
+        row: dict[str, Any] = {
+            "microbatch": size,
+            "accumulation_steps": self.spec.probe_accumulation_steps,
+            "steps_requested": steps,
+            "warmup_updates_excluded": warmup,
+            "window_seconds": self.spec.compile_probe_seconds,
+            "compile_mode": "torch.compile(model, dynamic=True), default backend",
+            "isolation": "child process; whole process group killed at the window",
+            "scope": (
+                "measurement only: not used for microbatch choice, learning-rate arms, "
+                "continuation or checkpoints; the pilot trains eagerly"
+            ),
+        }
+        # Only the hard limits apply here: the eager probe window is soft and over.
+        now = self.clock()
+        reason = self.spec.limits.stop_reason(
+            pod_elapsed=max(0, now - self.pod_created),
+            idle_elapsed=max(0, now - self.last_activity),
+        )
+        if reason:
+            self.stop_reason = reason
+            raise PilotStop(reason)
+        directory = self.root / "compile-probe"
+        directory.mkdir()
+        rows_path, result_path = directory / "rows.jsonl", directory / "result.json"
+        request = {
+            "schema_version": 1,
+            "config": asdict(
+                trainer_config(
+                    self.spec, size, self.spec.learning_rates[0], probe=True, compiled=True
+                )
+            ),
+            "documents": document_source(self.documents),
+            "run_id": self.phase,
+            "run_root": str(directory / "run"),
+            "data_hash": self.data_hash,
+            "tokenizer_hash": self.tokenizer_hash,
+            "device": str(self.device),
+            "num_threads": torch.get_num_threads(),
+            "launched_unix": time.time(),
+            "window_seconds": self.spec.compile_probe_seconds,
+            "rows_path": str(rows_path),
+            "result_path": str(result_path),
+        }
+        atomic_json(directory / "request.json", request)
+        environment = {
+            key: value for key, value in os.environ.items() if key not in COMPILE_CHILD_SECRETS
+        }
+        started = self.compile_probe_started = self.clock()
+        process: subprocess.Popen[bytes] | None = None
+        outcome = "window"
+        try:
+            with (
+                (directory / "child.stdout").open("wb") as out,
+                (directory / "child.stderr").open("wb") as err,
+            ):
+                process = subprocess.Popen(
+                    [*self.compile_probe_command, "--request", str(directory / "request.json")],
+                    cwd=REPOSITORY_ROOT,
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=out,
+                    stderr=err,
+                    start_new_session=True,
+                )
+                self.compile_probe_active = True
+                while True:
+                    if process.poll() is not None:
+                        outcome = "exited"
+                        break
+                    now = self.clock()
+                    reason = self.spec.limits.stop_reason(
+                        pod_elapsed=max(0, now - self.pod_created)
+                    )
+                    if reason:
+                        self.stop_reason = reason
+                        row.update(status="stopped", stop_reason=reason)
+                        raise PilotStop(reason)
+                    if now - started >= self.spec.compile_probe_seconds:
+                        break
+                    self.last_activity = now  # Budgeted, bounded by the hard window.
+                    self.heartbeat(len(_completed_rows(rows_path)))
+                    self.sleep(self.compile_poll_seconds)
+            problem = _kill_group(process)  # Also ends compile workers left by a clean exit.
+            if problem:
+                row["kill_error"] = problem
+            compiled_rows = _completed_rows(rows_path)
+            self.rows[self.phase] = compiled_rows
+            with (self.root / "updates.jsonl").open("a", encoding="utf-8") as stream:
+                for item in compiled_rows:
+                    stream.write(json.dumps({"arm": self.phase, **item}, allow_nan=False) + "\n")
+            result = json.loads(result_path.read_text()) if result_path.exists() else {}
+            row["updates"] = len(compiled_rows)
+            row["exit_code"] = process.returncode if outcome == "exited" else None
+            for key in ("peak_allocated_bytes", "peak_reserved_bytes", "torch_version", "compile"):
+                row[key] = result.get(key)
+            if compiled_rows:
+                row["first_update_seconds"] = compiled_rows[0]["step_seconds"]
+            crashed = outcome == "exited" and process.returncode != 0
+            tail = (directory / "child.stderr").read_bytes()[-2000:].decode("utf-8", "replace")
+            if len(compiled_rows) == steps and result.get("status") == "completed":
+                # Durable evidence first: every row and the completed result are on disk.
+                row["status"] = "completed"
+                row.update(self._compile_comparison(size, warmup))
+                if crashed:
+                    row["teardown_error"] = {
+                        "exit_code": process.returncode,
+                        "stderr_tail": str(sanitize(tail))[-500:],
+                    }
+            elif crashed:
+                status = result.get("status")
+                row.update(
+                    status="oom" if status == "oom" else "failed",
+                    error_type=result.get("error_type", "ChildExit"),
+                    # The child's exception message (its head) when it recorded one,
+                    # otherwise the tail of its standard error.
+                    error=str(sanitize(result["error"]))[:500]
+                    if result.get("error")
+                    else str(sanitize(tail))[-500:],
+                    error_source="child exception" if result.get("error") else "stderr tail",
+                )
+            elif compiled_rows:
+                row["status"] = "incomplete"
+            elif outcome == "exited":
+                row.update(
+                    status="failed",
+                    error_type="NoUpdates",
+                    error="the child exited cleanly without recording an update",
+                )
+            else:
+                row["status"] = "timeout"
+                row["note"] = (
+                    "child startup plus the first compiled update did not finish within "
+                    "the window, so compilation and startup together exceed window_seconds"
+                )
+        except TrainingStop:
+            row.setdefault("status", "stopped")
+            raise  # A recorded safety stop is never a compiler failure.
+        except Exception as error:
+            row.update(
+                status="failed",
+                error_type=type(error).__name__,
+                error=str(sanitize(str(error)))[:500],
+            )
+        finally:
+            if process is not None:
+                problem = _kill_group(process)  # Never raises.
+                if problem:
+                    row.setdefault("kill_error", problem)
+            row.setdefault("status", "interrupted")
+            row.setdefault("updates", len(self.rows.get(self.phase, [])))
+            row["elapsed_seconds"] = max(0.0, self.clock() - started)
+            self.compile_probe_active = False
+            self.last_activity = self.clock()  # The first arm never inherits a stale idle clock.
+            self.report["compile_probe"] = row
+            self.publish()
+            self.heartbeat(0)
+        print(json.dumps({"compile_probe": row}), flush=True)
+
+    def _compile_comparison(self, size: int, warmup: int) -> dict[str, Any]:
+        """Steady-state speedup and one-off compile cost against the eager probe."""
+        compiled_rows = self.rows[self.phase]
+        eager_rows = self.rows[f"probe-{size}"]
+        compiled = throughput(compiled_rows, warmup_steps=warmup)
+        eager = throughput(eager_rows, warmup_steps=warmup)
+        compiled_mean = compiled["step_seconds"] / (len(compiled_rows) - warmup)
+        eager_mean = eager["step_seconds"] / (len(eager_rows) - warmup)
+        # Time spent above each probe's own steady state during its warmup updates;
+        # the difference estimates what compilation costs once.
+        compiled_excess = math.fsum(r["step_seconds"] for r in compiled_rows[:warmup]) - (
+            warmup * compiled_mean
+        )
+        eager_excess = math.fsum(r["step_seconds"] for r in eager_rows[:warmup]) - (
+            warmup * eager_mean
+        )
+        one_off = compiled_excess - eager_excess
+        saving = eager_mean - compiled_mean
+        break_even = max(0.0, one_off) / saving if saving > 0 else None
+        tokens_per_probe_update = compiled_rows[0]["tokens"]
+        tokens = None if break_even is None else break_even * tokens_per_probe_update
+        return {
+            "tokens_per_second": compiled["tokens_per_second"],
+            "eager_tokens_per_second": eager["tokens_per_second"],
+            "speedup": compiled["tokens_per_second"] / eager["tokens_per_second"],
+            "tokens_per_probe_update": tokens_per_probe_update,
+            "steady_probe_update_seconds": compiled_mean,
+            "eager_steady_probe_update_seconds": eager_mean,
+            "first_update_seconds": compiled_rows[0]["step_seconds"],
+            "eager_first_update_seconds": eager_rows[0]["step_seconds"],
+            "one_off_compile_seconds_estimate": one_off,
+            "break_even_probe_updates": break_even,
+            "break_even_tokens": tokens,
+            "break_even_training_updates": None
+            if tokens is None
+            else tokens / self.spec.tokens_per_update,
+            "comparison_basis": (
+                "same microbatch, accumulation, seed and data order as the eager probe; "
+                "both exclude the same warmup updates; the child's process start, torch "
+                "import, CUDA context and model build happen before its first timed update "
+                "and count only in elapsed_seconds; its first update carries compilation "
+                "plus per-process library warmup"
+            ),
+        }
+
     def verify_checkpoint(self, checkpoint: Path) -> str:
         """Reject a checkpoint whose bytes differ from its recorded save identity."""
         sidecar = checkpoint.with_name(checkpoint.name + ".sha256.json")
@@ -660,6 +1146,7 @@ class Worker:
         final_checkpoint: tuple[Path, str, int] | None = None
         try:
             size = self.probe()
+            self.compile_probe(size)
             self.phase = "screen"
             self.training_started = self.clock()
             self.training_deadline = self.spec.limits.training_deadline(
@@ -786,6 +1273,9 @@ def smoke(root: Path) -> dict[str, Any]:
         30,
         1,
         1,
+        compile_probe_steps=3,
+        compile_probe_seconds=120,
+        compile_probe_warmup_updates=1,
     )
     return Worker(
         spec,
@@ -810,7 +1300,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         run.add_argument(f"--{name}", type=Path, required=True)
     run.add_argument("--preflight", type=Path, required=True)
     run.add_argument("--binding-sha256", required=True)
+    child = sub.add_parser("compile-probe", help="internal: the compile probe's child process")
+    child.add_argument("--request", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.command == "compile-probe":
+        raise SystemExit(run_compile_probe_child(args.request))
     if args.command == "smoke":
         report = smoke(args.output)
     else:
@@ -841,13 +1335,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise ValueError("preflight report differs from bound receipt")
         preflight = json.loads(args.preflight.read_text())
         hardware = hardware_description(training_device("cuda:0"))
-        if (
-            preflight.get("status") != "completed"
-            or preflight.get("hardware_precision_and_resume_checked") is not True
-            or preflight.get("device") != "cuda:0"
-            or preflight.get("hardware") != hardware
-        ):
-            raise ValueError("a matching A40 hardware precision/resume preflight is required")
+        check_preflight(preflight, hardware=hardware, spec=spec)
         if file_sha256(args.binding) != args.binding_sha256:
             raise ValueError("data binding differs from externally recorded SHA-256")
         binding = verify_binding(
