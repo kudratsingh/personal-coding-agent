@@ -228,15 +228,22 @@ classifier reads text/token syntax only and never executes corpus programs.
 The owner directed recovering the missing repository metadata from upstream and
 confirmed gated access to `bigcode/the-stack-dedup`, which StarCoderData was
 built from and which carries the same Terms of Use for The Stack.
-`tools/stack_licenses.py` read only `max_stars_repo_name`, `max_stars_repo_path`
-and `max_stars_repo_licenses` from all **144** `data/python` files at revision
+`tools/stack_licenses.py` read `max_stars_repo_name`, `max_stars_repo_path` and
+`max_stars_repo_licenses` from all **144** `data/python` files at revision
 `17cad72c886a2858e08d4c349a00d6466f54df63`, whose Python files are byte-identical
 to the v1.2 release candidate. It used HTTPS range requests and fetched
 **822,321,592 of 28,596,682,891 upstream bytes (2.876%)** in **26,497 requests**
-over **2,046.9 seconds**. No fetched byte overlapped a `content` column chunk;
-**2,447,609 bytes** (about 17 KiB per file, this run's speculative footer read)
-fell outside the three columns. The tool now reads footers exactly. The
-**12,962,249** upstream rows all carried a license list.
+over **2,046.9 seconds**: the three columns' chunks, each file's Parquet footer,
+**2,447,609 bytes** of other non-content columns from this run's speculative
+footer read (about 17 KiB per file, since removed) and a **1,253,743-byte** file
+listing. No fetched byte overlapped a `content` column chunk. Parquet footers,
+which any column-projected read needs, store per-row-group min/max statistics for
+every column, so short complete files from `content` arrived inside them: one
+measured footer is 169,400 of 545,052 bytes such text, about **24 MB** across the
+144 footers. Footers were parsed in memory and never stored. The tool now refuses
+content-overlapping requests before sending them and reports each footer's
+content-statistics bytes exactly. The **12,962,249** upstream rows all carried a
+license list.
 
 The exact (repository, path) join is clean: all **209,914** sample files matched,
 **209,909** to one upstream row and **5** to duplicate rows with identical license
@@ -244,60 +251,66 @@ lists. Conflicting duplicates, path-only repository matches and absent
 repositories were all **0**, so no repository-only fallback was needed. See
 [ADR 0011](adr/0011-quality-retention-and-rights-admission.md) for the policy,
 including the owner's correction that ISC and Unlicense were always on the D-05
-allowlist. Every listed ID must be allowed; explicit headers keep precedence.
+allowlist. Every listed ID must be allowed, and explicit headers keep precedence:
+a byte-order mark, a license block after `from __future__` imports, a module
+`__license__` string or an unreadable leading header can no longer hand a file to
+repository metadata.
 
 The rerun used the identical containers, prefix, contamination inputs and filters.
 Python primary classes, compared with the 2026-10-20 run:
 
 | Final primary class | 2026-10-24 files | UTF-8 bytes | Share of bytes | 2026-10-20 files | UTF-8 bytes |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Kept after quality | 189,647 | 827,125,527 | 82.71253% | 13,833 | 122,701,374 |
-| Dropped copyleft header | 1,220 | 13,290,562 | 1.32906% | 1,220 | 13,290,562 |
-| Dropped restricted header | 125 | 928,113 | 0.09281% | 125 | 928,113 |
-| Dropped unrecognized inline header | 8,737 | 69,830,333 | 6.98303% | 8,737 | 69,830,333 |
-| Dropped off-allowlist repository license | 5,730 | 33,116,026 | 3.31160% | 0 | 0 |
+| Kept after quality | 189,369 | 824,650,726 | 82.46505% | 13,833 | 122,701,374 |
+| Dropped copyleft header | 1,363 | 14,609,465 | 1.46095% | 1,220 | 13,290,562 |
+| Dropped restricted header | 128 | 973,542 | 0.09735% | 125 | 928,113 |
+| Dropped unrecognized inline header | 8,909 | 71,345,855 | 7.13458% | 8,737 | 69,830,333 |
+| Dropped off-allowlist repository license | 5,695 | 32,732,643 | 3.27326% | 0 | 0 |
 | Unresolved: no header, no repository license | 0 | 0 | 0% | 185,680 | 786,817,959 |
-| Dropped generated marker | 1,359 | 22,108,353 | 2.21083% | 116 | 2,204,697 |
-| Dropped contamination | 2,451 | 33,585,770 | 3.35858% | 203 | 4,227,188 |
+| Dropped generated marker | 1,357 | 22,100,601 | 2.21006% | 116 | 2,204,697 |
+| Dropped contamination | 2,448 | 33,571,852 | 3.35718% | 203 | 4,227,188 |
 | Dropped too short | 645 | 15,542 | 0.00155% | 0 | 0 |
 | Total | 209,914 | 1,000,000,226 | 100% | 209,914 | 1,000,000,226 |
 
-Byte retention is **82.71253%** (**90.34509%** of files). The 13,833 files kept
-on an inline header are unchanged; **175,814 files / 704,424,153 bytes** are kept
-on repository metadata. Quality rules now examine **194,102** files instead of
-14,152, so the generated-marker and contamination drops grow to a scale close to
-the historical quality-only rerun. Long-line, size, alphanumeric and duplicate
-drops are **0**.
+Byte retention is **82.46505%** (**90.21266%** of files). **14,252 files /
+125,774,954 bytes** are kept on an inline header and **175,117 / 698,875,772** on
+repository metadata. An earlier same-day run before the header hardening kept
+189,647 files; the hardening moved 143 files to copyleft, 172 to unrecognized and
+3 to restricted, and recognized permissive headers that a byte-order mark had
+hidden. Quality rules now examine **193,819** files instead of 14,152, so the
+generated-marker and contamination drops grow to a scale close to the historical
+quality-only rerun. Long-line, too-large, alphanumeric and duplicate drops are **0**.
 
 Kept files per license ID, counting a multi-license file under each ID: MIT
-**124,454**, Apache-2.0 **42,228**, BSD-3-Clause **14,641**, BSD-2-Clause
-**3,658**, Unlicense **3,119**, CC0-1.0 **1,671**, CC-BY-4.0 **628**, ISC **220**.
-The most common single lists are MIT **123,759**, Apache-2.0 **41,866** and
-BSD-3-Clause **14,345** files.
+**124,381**, Apache-2.0 **42,122**, BSD-3-Clause **14,561**, BSD-2-Clause
+**3,646**, Unlicense **3,111**, CC0-1.0 **1,668**, CC-BY-4.0 **623**, ISC **222**.
+The most common single lists are MIT **123,693**, Apache-2.0 **41,761** and
+BSD-3-Clause **14,267** files.
 
 The off-allowlist drops are an owner decision; none is admitted. Their most
-common blocking IDs, in files, are ECL-2.0 **454** (390 of them listed together
-with Apache-2.0), WTFPL **453**, 0BSD **437**, CC-BY-3.0 **339**, CNRI-Python
-**305**, BSD-3-Clause-LBNL **288**, bzip2-1.0.6 **270**, BSD-2-Clause-FreeBSD
-**262**, RSA-MD **251**, PSF-2.0 **167** and MIT-0 **152**. The ignored report
-holds the full per-ID and per-list counts.
+common blocking IDs, in files, are ECL-2.0 **453** (440 of them also list
+Apache-2.0; 389 exactly as Apache-2.0 AND ECL-2.0), WTFPL **448**, 0BSD **435**,
+CC-BY-3.0 **337**, CNRI-Python **303**, BSD-3-Clause-LBNL **287**, bzip2-1.0.6
+**270**, BSD-2-Clause-FreeBSD **262**, RSA-MD **248**, PSF-2.0 **167** and MIT-0
+**148**. The ignored report holds the full per-ID and per-list counts.
 
 With the frozen 65,536-entry tokenizer, the kept Python selection is
-**198,034,636 tokens / 827,125,527 bytes = 4.1766710294 bytes per token**
-(**198,224,283** with BOS). Train and validation hold **197,121,483 / 913,153**
-tokens; the validation selection is **915 files / 3,624,819 bytes = 3.9695636985
+**197,448,213 tokens / 824,650,726 bytes = 4.1765418561 bytes per token**
+(**197,637,582** with BOS). Train and validation hold **196,535,126 / 913,087**
+tokens; the validation selection is **914 files / 3,624,598 bytes = 3.9696085915
 bytes per token**. Web is unchanged at **103,863 files / 498,123,158 bytes /
 100,709,712 tokens**. The recount fitted nothing.
 
 Current JSONL hashes: Python
-`d6a35ddac8ced899958f0de72edcded5020ac812067d27d1870e5ea526c2feea`; web
+`37a3b2c245e10dbbd25b44cc63867c4d86b89e90672a4d177b97151043639aca`; web
 `3b7c4469f2a072d562908b3e096fb140d706b11a32420f4f197573de01c1dcbd`. Web text,
 counts and splits are identical to 2026-10-20; its hash changes because each row
 now records its license basis. The license mapping hash is
 `eac02cff966510ef961d35c34df308a17f59d6e8ac80b948d0196ea0b2ac8fcb`. The recovery
-ran at commit `f7ec654` and the review at `903be7a`, both with clean trees; local
-outputs are under ignored `runs/stack-dedup-licenses-20261024/` and
-`runs/repository-license-review-v3-20261024/`.
+ran at commit `f7ec654` with a clean tree, and the review at `e91ec36`; the
+review's dirty flag reflects documentation edited while it ran, not tool code.
+Local outputs are under ignored `runs/stack-dedup-licenses-20261024/` and
+`runs/repository-license-review-v4-20261024/`.
 
 ```sh
 export HF_TOKEN=...   # from the ignored .env; never printed
@@ -315,5 +328,5 @@ random sample. `max_stars_repo_licenses` is The Stack's detected repository
 license list, not a legal warranty. StarCoderData applied PII redaction and
 near-deduplication after The Stack, so the join relies on provenance keys rather
 than content hashes. Final task-pool holdout coverage is still **0** and
-`final_training_admission` stays false. No content, model, training run or paid
-resource was involved.
+`final_training_admission` stays false. No model, training run or paid resource
+was involved.

@@ -75,8 +75,13 @@ of Use for The Stack as StarCoderData. Its v1.2 `data/python` files (revision
 `17cad72c886a2858e08d4c349a00d6466f54df63`, byte-identical to the v1.2 release
 candidate) record `max_stars_repo_licenses` for each file. `tools/stack_licenses.py`
 reads only `max_stars_repo_name`, `max_stars_repo_path` and that license column
-with HTTPS range requests. The run fails if any fetched byte overlaps a `content`
-column chunk, so no file contents are downloaded.
+with HTTPS range requests. A request that would overlap a `content` column chunk
+is refused before it is sent. Every column-projected read must also fetch the
+Parquet footer, which stores per-row-group min/max statistics for every column;
+for `content` those values can be short complete files. The 2026-10-24 run held
+footers in memory only and stored none of their text; one measured footer is
+169,400 of 545,052 bytes such text, about 24 MB across the 144 footers. Later
+runs report the exact content-statistics bytes per footer.
 
 The join key is the exact (repository, path) pair from StarCoderData's own
 provenance. Duplicate upstream keys are admitted only when their license lists
@@ -90,7 +95,10 @@ The D-05 allowlist applies to every listed ID: a repository list is admitted onl
 when all of its IDs are allowed, because the repository may hold code under each
 one. The admitted ID is the IDs joined with " AND ". Off-allowlist IDs are counted
 per ID. Explicit headers keep precedence: copyleft, restricted and unrecognized
-headers are still rejected.
+headers are still rejected. A leading byte-order mark is ignored, a license block
+after `from __future__` imports is read, a module-level `__license__` string is an
+explicit declaration, and a leading header that cannot be tokenized is
+unrecognized rather than absent, so repository metadata never overrides it.
 
 **Correction, not a new decision (2026-10-24):** ISC and Unlicense were always
 allowed under D-05. The allowlist written in the 2026-10-20 amendment above, in

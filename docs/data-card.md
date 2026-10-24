@@ -15,7 +15,7 @@ Real-source sample review is complete, but no full production training corpus ha
 
 `data/manifest.json` intentionally contains no full-build-approved sources. The real sample review keeps its raw-container manifests/terms receipts local and ignored, with public source/hash evidence below. External sources require a pinned immutable revision, a verified license and attribution, SHA-256, exact byte count, declared purpose, and owner terms acceptance where applicable. An unverified or incomplete downloader entry fails before a network request.
 
-The [real sample review](real-samples.md) records FineWeb-Edu `sample-10BT` (Hugging Face; Lozhkov et al., 2024; ODC-By 1.0 plus Common Crawl terms) and StarCoderData Python (BigCode/The Stack plus original repository authors; accepted dataset terms and original file licenses). Original notices and repository/path provenance are retained locally; data is not redistributed here. Kept text is **498,123,158 web bytes** and **96,638,864 Python bytes**. Python admission is limited to explicit allowlisted declarations in each retained original file, not a dataset license tag. The final pool holdout does not exist yet, so its exclusion coverage is explicitly **0**. These samples support the separately authorized tokenizer work, not a full data build. Production BPE counts/freeze are reported separately once measured.
+The [real sample review](real-samples.md) records FineWeb-Edu `sample-10BT` (Hugging Face; Lozhkov et al., 2024; ODC-By 1.0 plus Common Crawl terms) and StarCoderData Python (BigCode/The Stack plus original repository authors; accepted dataset terms and original file licenses). Original notices and repository/path provenance are retained locally; data is not redistributed here. The original 2026-10-19 fit review kept **498,123,158 web bytes** and **96,638,864 Python bytes**, admitting Python only on explicit allowlisted declarations in each file. The current review admits a Python file on an explicit allowlisted header first or, when the file has no header, on verified upstream repository license metadata in which every listed ID is allowlisted; never on a dataset license tag. The final pool holdout does not exist yet, so its exclusion coverage is explicitly **0**. These samples support the separately authorized tokenizer work, not a full data build. Production BPE counts/freeze are reported separately once measured.
 
 The [OpenCodeInstruct component pilot](opencode-pilot.md) separately hash/schema-verified one 133,476,478-byte shard for evaluation-only inspection of its first 200 ordered rows. Actual isolated execution retained 60 references passing both partitions after 35 unsupported-schema, 13 contamination/duplicate and 92 failing-reference rejections. This is not a representative sample, training admission or full-source build. The guide records explicit governing terms, source credit, artifact identity, observed schema, fixed runtime profile and limitations. No source program has run on the host or entered tokenizer/training data.
 
@@ -23,7 +23,7 @@ The downloader verifies size and hash before atomically replacing the target. Te
 
 ## Header-classified sample revision (2026-10-20)
 
-The current [header-classifier review](real-samples.md) retains **13,833 Python
+The 2026-10-20 [header-classifier review](real-samples.md), since superseded, retained **13,833 Python
 files / 122,701,374 UTF-8 bytes**, not the earlier 96,638,864-byte selection used
 to fit the already-frozen tokenizer. This is a new review output, not retroactive
 relabeling of the tokenizer's training corpus. Each retained row carries a
@@ -53,17 +53,17 @@ The 2026-10-20 repository fallback correction separated **185,680 files /
 `max_stars_repo_licenses`, joined on each file's exact repository and path; all
 **209,914** sample files matched. A no-header file is kept only when every listed
 repository ID is on the D-05 allowlist, which the owner corrected to include ISC
-and Unlicense. The current review keeps **189,647 Python files / 827,125,527
-bytes**: the same 13,833 header-licensed files plus **175,814 / 704,424,153** on
-repository metadata, each recording its repository IDs for attribution. **5,730
-files / 33,116,026 bytes** with off-allowlist repository IDs are dropped pending
+and Unlicense. The current review keeps **189,369 Python files / 824,650,726
+bytes**: **14,252** header-licensed files plus **175,117 / 698,875,772** on
+repository metadata, each recording its repository IDs for attribution. **5,695
+files / 32,732,643 bytes** with off-allowlist repository IDs are dropped pending
 an owner decision. See the [current class table](real-samples.md).
 
 With the replacement 65,536-entry tokenizer, the current review contains
-**198,034,636 Python tokens / 827,125,527 bytes** and **100,709,712 web tokens /
+**197,448,213 Python tokens / 824,650,726 bytes** and **100,709,712 web tokens /
 498,123,158 bytes**, excluding BOS. The 2026-10-20 header-only review contained
 **26,328,493 Python tokens / 122,701,374 bytes**. The current Python validation
-selection is **915 files / 3,624,819 bytes / 913,153 tokens**; the 2026-10-20 one
+selection is **914 files / 3,624,598 bytes / 913,087 tokens**; the 2026-10-20 one
 was **52 files / 475,430 bytes / 108,883 tokens**. The original 45-file holdout
 remains the compression comparison above; see [P1-6](full-build-plan.md) for
 the revised conditional capacity forecast.
