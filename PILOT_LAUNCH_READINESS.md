@@ -123,7 +123,7 @@ Net: the 90-minute limit is enforced redundantly but is **not guaranteed**. Netw
 
 ## 10. Budget and cost safeguard status
 
-Quoted $0.59/hour GPU plus container disk (20 GB at $0.10/GB-month, about $0.003/hour) gives $0.60/hour in the specification; 90 minutes cost $0.90. The cost stop is `min($5, 1.5 x $0.90) = $1.35` and binds after the wall limit at this price. The watchdog floors the accrued cost at the quoted rate even if the API reports a lower rate. Provider billing is fetched after termination with `tools/runpod_pod_identity.py billing`. Expected spend for a complete run: $0.80 to $0.90; absolute ceiling $5.
+Quoted $0.59/hour GPU plus container disk (20 GB at $0.10/GB-month, about $0.003/hour) gives $0.60/hour in the specification; 90 minutes cost $0.90. The cost stop is `min($5, 1.2 x $0.90) = $1.08` (the owner's budget rule stops a run above 120% of its estimate; corrected 2026-10-24 from the audited 1.5 x) and binds after the wall limit at this price. The watchdog floors the accrued cost at the quoted rate even if the API reports a lower rate. Provider billing is fetched after termination with `tools/runpod_pod_identity.py billing`. Expected spend for a complete run: $0.80 to $0.90; absolute ceiling $5.
 
 ## 11. Mac transfer requirements
 
