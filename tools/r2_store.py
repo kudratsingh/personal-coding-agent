@@ -1,12 +1,15 @@
 """Durable artifact storage in one Cloudflare R2 bucket, under a monthly cost cap.
 
-R2 speaks the S3 API, signed with AWS Signature Version 4. This client does three things:
+R2 speaks the S3 API, signed with AWS Signature Version 4. This client does four things:
 
 - ``status`` lists the bucket and prices what it holds.
 - ``upload`` refuses any upload that would push the bucket's priced storage over the
   cap, then PUTs each file with its SHA-256 as the signed payload hash, so R2 itself
   rejects corrupted bytes. The digest is also stored as object metadata.
 - A file already stored under the same key with the same digest is skipped.
+- ``CheckpointUploader`` does the same for training checkpoints on one background
+  thread, keeps the newest rolling checkpoints plus every milestone, and records
+  failures instead of raising them into the training loop.
 
 Credentials come only from ``R2_ENDPOINT``, ``R2_ACCESS_KEY_ID``,
 ``R2_SECRET_ACCESS_KEY`` and ``R2_BUCKET``; they are never printed or written. Prices
@@ -22,13 +25,16 @@ import hmac
 import json
 import os
 import re
+import threading
 import time
 import xml.etree.ElementTree as ElementTree
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
+from http.client import HTTPException
 from pathlib import Path
 from typing import IO, Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -41,6 +47,8 @@ PRICES_CHECKED_ON = "2026-10-25"
 REGION = "auto"
 SERVICE = "s3"
 S3_NAMESPACE = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def monthly_storage_usd(total_bytes: int) -> float:
@@ -127,6 +135,23 @@ def signature_headers(
         **{name: signed[name] for name in names if name != "host"},
         "Authorization": authorization,
     }
+
+
+class TransientError(RuntimeError):
+    """An R2 answer worth retrying (HTTP 5xx); still a ``RuntimeError`` for older callers."""
+
+
+def _status_error(status: int) -> type[RuntimeError]:
+    return TransientError if status >= 500 else RuntimeError
+
+
+def _transient(error: Exception) -> bool:
+    """Retry 5xx answers, timeouts and connection failures; never a 4xx."""
+    if isinstance(error, HTTPError):
+        return error.code >= 500
+    return isinstance(
+        error, (TransientError, URLError, TimeoutError, ConnectionError, HTTPException)
+    )
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -225,10 +250,25 @@ class Store:
                 self.sleep(min(30.0, 2.0**attempt))
         raise RuntimeError("unreachable")
 
+    def retry[T](self, action: Callable[[], T]) -> tuple[T, int]:
+        """Run ``action`` until it succeeds; return its value and the attempts it took.
+
+        Only transient failures retry, with the same capped backoff as ``download``.
+        Anything else, and the last transient failure, is raised.
+        """
+        for attempt in range(1, self.attempts + 1):
+            try:
+                return action(), attempt
+            except Exception as error:
+                if attempt == self.attempts or not _transient(error):
+                    raise
+            self.sleep(min(30.0, 2.0**attempt))
+        raise RuntimeError("unreachable")
+
     def delete(self, key: str) -> None:
         status, _, _ = self._request("DELETE", key)
         if status not in (200, 204):
-            raise RuntimeError(f"R2 DELETE {key} failed with HTTP {status}")
+            raise _status_error(status)(f"R2 DELETE {key} failed with HTTP {status}")
 
     def _request(
         self,
@@ -260,7 +300,7 @@ class Store:
             query = {"list-type": "2", **({"continuation-token": token} if token else {})}
             status, _, body = self._request("GET", query=query)
             if status != 200:
-                raise RuntimeError(f"R2 list failed with HTTP {status}")
+                raise _status_error(status)(f"R2 list failed with HTTP {status}")
             root = ElementTree.fromstring(body)
             for item in root.findall(f"{S3_NAMESPACE}Contents"):
                 found.append(
@@ -273,17 +313,20 @@ class Store:
                 return found
             token = root.findtext(f"{S3_NAMESPACE}NextContinuationToken")
 
-    def stored_sha256(self, key: str) -> str | None:
+    def head(self, key: str) -> dict[str, str] | None:
+        """One HEAD request: the object's headers with lower-case names, or None if absent."""
         status, headers, _ = self._request("HEAD", key)
         if status == 404:
             return None
         if status != 200:
-            raise RuntimeError(f"R2 HEAD failed with HTTP {status}")
-        lowered = {name.lower(): value for name, value in headers.items()}
-        return lowered.get("x-amz-meta-sha256")
+            raise _status_error(status)(f"R2 HEAD failed with HTTP {status}")
+        return {name.lower(): value for name, value in headers.items()}
 
-    def put(self, key: str, path: Path, sha256: str) -> None:
-        size = path.stat().st_size
+    def stored_sha256(self, key: str) -> str | None:
+        headers = self.head(key)
+        return None if headers is None else headers.get("x-amz-meta-sha256")
+
+    def _put(self, key: str, path: Path, sha256: str, size: int) -> None:
         with path.open("rb") as stream:
             status, _, body = self._request(
                 "PUT",
@@ -293,7 +336,24 @@ class Store:
                 payload_sha256=sha256,
             )
         if status != 200:
-            raise RuntimeError(f"R2 PUT {key} failed with HTTP {status}: {body[:200]!r}")
+            raise _status_error(status)(f"R2 PUT {key} failed with HTTP {status}: {body[:200]!r}")
+
+    def put(self, key: str, path: Path, sha256: str) -> None:
+        self._put(key, path, sha256, path.stat().st_size)
+
+    def put_known(self, key: str, path: Path, sha256: str, size: int) -> int:
+        """PUT a file whose digest the caller already holds; return the attempts it took.
+
+        The file is not read to hash it again. ``sha256`` is signed as the payload hash,
+        so R2 rejects any bytes that differ (a 4xx, never retried). HTTP 5xx answers,
+        timeouts and connection errors retry with backoff, reopening the file each time.
+        """
+        if not SHA256_HEX.fullmatch(sha256):
+            raise ValueError(f"{key}: sha256 must be 64 lower-case hex digits")
+        if path.stat().st_size != size:
+            raise ValueError(f"{key}: {path} is not the declared {size:,} bytes")
+        _, attempts = self.retry(partial(self._put, key, path, sha256, size))
+        return attempts
 
 
 def upload(
@@ -344,6 +404,270 @@ def upload(
     }
     atomic_json(receipt, record)
     return record
+
+
+@dataclass(frozen=True)
+class _Job:
+    label: str
+    files: tuple[tuple[str, Path, str], ...]
+    milestone: bool
+
+
+@dataclass(frozen=True)
+class _Rolling:
+    """A rolling label's keys in the bucket; ``receipt`` is None if it never verified."""
+
+    label: str
+    keys: tuple[str, ...]
+    receipt: dict[str, Any] | None
+
+
+class CheckpointUploader:
+    """Upload checkpoints to R2 on one background thread, so training never waits.
+
+    ``submit`` only queues work. A rolling submission replaces any older rolling one
+    still waiting, which is recorded as superseded; milestones always wait their turn.
+    Each label is checked against the cost cap, uploaded, verified with HEAD and given
+    a receipt. Then older rolling labels beyond ``keep_rolling`` are deleted, as are the
+    keys any older failed rolling label managed to store. Milestones are never deleted.
+    Worker errors are recorded in ``status()``; they are never raised on the caller's
+    thread.
+
+    Submitted files must stay unchanged until their label leaves the queue. Retention
+    only knows the labels this instance uploaded; earlier processes' are left alone.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        *,
+        prefix: str,
+        cap_usd: float,
+        receipt_dir: Path,
+        keep_rolling: int = 2,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if prefix.startswith("/") or (prefix and not prefix.endswith("/")):
+            raise ValueError("prefix must be empty or a relative path ending in '/'")
+        if keep_rolling < 1:
+            raise ValueError("keep_rolling must be at least 1")
+        self.store, self.prefix, self.cap_usd = store, prefix, cap_usd
+        self.receipt_dir, self.keep_rolling, self.clock = receipt_dir, keep_rolling, clock
+        # Everything below is shared with the caller's thread: touch it only under the lock.
+        self._condition = threading.Condition()
+        self._pending: list[_Job] = []
+        self._in_flight: _Job | None = None
+        self._closed = False
+        self._last_verified: str | None = None
+        self._verified: list[str] = []
+        self._milestones: set[str] = set()
+        self._rolling: list[_Rolling] = []
+        self._superseded: list[str] = []
+        self._cancelled: list[str] = []
+        self._deleted: list[str] = []
+        self._failures: list[dict[str, str]] = []
+        self._refused: list[dict[str, Any]] = []
+        self._thread = threading.Thread(target=self._work, name="r2-uploader", daemon=True)
+        self._thread.start()
+
+    def submit(
+        self, label: str, files: Sequence[tuple[str, Path, str]], *, milestone: bool
+    ) -> None:
+        """Queue (relative key, path, SHA-256) files under ``prefix + label + "/"``.
+
+        Malformed arguments raise here; nothing else does, and no I/O happens.
+        """
+        if not LABEL.fullmatch(label):
+            raise ValueError(f"invalid label {label!r}")
+        job = _Job(
+            label, tuple((key, Path(path), digest) for key, path, digest in files), milestone
+        )
+        keys = [key for key, _, _ in job.files]
+        if not keys or len(set(keys)) != len(keys):
+            raise ValueError(f"{label}: needs at least one file and distinct keys")
+        for key, _, digest in job.files:
+            if key.startswith("/") or any(part in ("", ".", "..") for part in key.split("/")):
+                raise ValueError(f"{label}: invalid key {key!r}")
+            if not SHA256_HEX.fullmatch(digest):
+                raise ValueError(f"{label}: {key} sha256 must be 64 lower-case hex digits")
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("the uploader is closed")
+            if not milestone:
+                self._superseded += [older.label for older in self._pending if not older.milestone]
+                self._pending = [older for older in self._pending if older.milestone]
+            self._pending.append(job)
+            self._condition.notify_all()
+
+    def status(self) -> dict[str, Any]:
+        """A snapshot that is safe to log: labels, failures and refusals so far."""
+        with self._condition:
+            return {
+                "last_verified": self._last_verified,
+                "in_flight": None if self._in_flight is None else self._in_flight.label,
+                "pending": [job.label for job in self._pending],
+                "verified": list(self._verified),
+                "rolling": [item.label for item in self._rolling if item.receipt is not None],
+                "superseded": list(self._superseded),
+                "deleted": list(self._deleted),
+                "cancelled": list(self._cancelled),
+                "failures": [dict(item) for item in self._failures],
+                "refused": [dict(item) for item in self._refused],
+                "closed": self._closed,
+            }
+
+    def drain(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for all queued work; False if it is still running."""
+        with self._condition:
+            return self._condition.wait_for(
+                lambda: not self._pending and self._in_flight is None, timeout
+            )
+
+    def close(self, timeout: float | None = None) -> bool:
+        """Refuse new work, cancel uploads not yet started and wait for the one in flight.
+
+        Call ``drain`` first to keep queued work. True once the worker has exited.
+        """
+        with self._condition:
+            if not self._closed:
+                self._closed = True
+                self._cancelled += [job.label for job in self._pending]
+                self._pending.clear()
+                self._condition.notify_all()
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def _work(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: bool(self._pending) or self._closed)
+                if not self._pending:
+                    return
+                job = self._in_flight = self._pending.pop(0)
+            stored: list[str] = []
+            try:
+                self._upload(job, stored)
+            except Exception as error:  # recorded, never raised: the caller is training
+                self._fail(job.label, "upload", error)
+                if stored and not job.milestone:
+                    self._remember(_Rolling(job.label, tuple(stored), None))
+            finally:
+                with self._condition:
+                    self._in_flight = None
+                    self._condition.notify_all()
+
+    def _keys(self, job: _Job) -> tuple[str, ...]:
+        return tuple(self.prefix + job.label + "/" + key for key, _, _ in job.files)
+
+    def _fail(self, label: str, stage: str, error: Exception) -> None:
+        with self._condition:
+            self._failures.append(
+                {"label": label, "stage": stage, "error": f"{type(error).__name__}: {error}"}
+            )
+
+    def _remember(self, item: _Rolling) -> bool:
+        """List a rolling label for retention, unless its keys now hold a milestone."""
+        with self._condition:
+            self._rolling = [old for old in self._rolling if old.label != item.label]
+            if item.label in self._milestones:
+                return False
+            self._rolling.append(item)
+            return True
+
+    def _upload(self, job: _Job, stored: list[str]) -> None:
+        planned = [
+            (key, path, digest, path.stat().st_size)
+            for key, (_, path, digest) in zip(self._keys(job), job.files, strict=True)
+        ]
+        held, _ = self.store.retry(self.store.objects)
+        # A key already held is replaced; rolling labels due for deletion still count.
+        after = {item["key"]: item["bytes"] for item in held}
+        after.update({key: size for key, _, _, size in planned})
+        bucket_bytes = sum(after.values())
+        projected = monthly_storage_usd(bucket_bytes)
+        if projected > self.cap_usd:
+            with self._condition:
+                self._refused.append(
+                    {
+                        "label": job.label,
+                        "bytes": sum(size for _, _, _, size in planned),
+                        "bucket_bytes_after": bucket_bytes,
+                        "monthly_storage_usd_after": projected,
+                        "cap_usd_per_month": self.cap_usd,
+                    }
+                )
+            return
+        started = self.clock()
+        rows: list[dict[str, Any]] = []
+        for key, path, digest, size in planned:
+            began = self.clock()
+            attempts = self.store.put_known(key, path, digest, size)
+            stored.append(key)
+            found, _ = self.store.retry(partial(self.store.stored_sha256, key))
+            if found != digest:
+                raise RuntimeError(f"{key}: stored digest differs after upload")
+            rows.append(
+                {
+                    "key": key,
+                    "path": str(path),
+                    "bytes": size,
+                    "sha256": digest,
+                    "attempts": attempts,
+                    "seconds": self.clock() - began,
+                }
+            )
+        record: dict[str, Any] = {
+            "schema_version": 1,
+            "created_at": utc_now(),
+            "bucket": self.store.credentials.bucket,
+            "label": job.label,
+            "milestone": job.milestone,
+            "keys": [row["key"] for row in rows],
+            "files": rows,
+            "bytes": sum(size for _, _, _, size in planned),
+            "attempts": sum(row["attempts"] for row in rows),
+            "seconds": self.clock() - started,
+            "bucket_bytes_after": bucket_bytes,
+            "monthly_storage_usd_after": projected,
+            "cap_usd_per_month": self.cap_usd,
+            "prices": {
+                "storage_usd_per_gb_month": STORAGE_USD_PER_GB_MONTH,
+                "free_gb_month": FREE_GB_MONTH,
+                "checked_on": PRICES_CHECKED_ON,
+            },
+        }
+        atomic_json(self.receipt_dir / f"{job.label}.json", record)
+        with self._condition:
+            self._last_verified = job.label
+            self._verified.append(job.label)
+            if job.milestone:
+                self._milestones.add(job.label)
+                self._rolling = [old for old in self._rolling if old.label != job.label]
+        if not job.milestone and self._remember(_Rolling(job.label, tuple(stored), record)):
+            self._retain()
+
+    def _retain(self) -> None:
+        """Delete failed rolling labels and verified ones beyond ``keep_rolling``, oldest first."""
+        with self._condition:
+            older = self._rolling[:-1]  # the last one was just verified and always stays
+        kept = sum(item.receipt is not None for item in older) + 1
+        for item in older:
+            if item.receipt is not None:
+                if kept <= self.keep_rolling:
+                    continue
+                kept -= 1
+            try:
+                for key in item.keys:
+                    self.store.retry(partial(self.store.delete, key))
+                if item.receipt is not None:
+                    deleted = {**item.receipt, "deleted_at": utc_now()}
+                    atomic_json(self.receipt_dir / f"{item.label}.json", deleted)
+            except Exception as error:  # left listed, so the next verified label retries it
+                self._fail(item.label, "retention", error)
+                continue
+            with self._condition:
+                self._rolling.remove(item)
+                self._deleted.append(item.label)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
