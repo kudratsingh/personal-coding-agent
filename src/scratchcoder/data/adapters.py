@@ -12,6 +12,19 @@ from scratchcoder.eval.tasks import Task
 
 # Where TACO removed a figure from a problem statement it left one of these markers.
 IMAGE_PLACEHOLDER = re.compile(r"\[image\]|<image>|<img\b|!\[", re.IGNORECASE)
+# With picture_num unrecorded, statements that still point at a figure are excluded.
+FIGURE_REFERENCE = re.compile(
+    r"\b(?:figure|picture|image|diagram|illustration)s?\s+(?:below|above)\b"
+    r"|\bshown\s+in\s+the\s+(?:following\s+)?(?:figure|picture|image|diagram)",
+    re.IGNORECASE,
+)
+# Exact output comparison cannot grade problems with several valid answers or a tolerance.
+ANY_ANSWER = re.compile(
+    r"\b(?:print|output)\s+any\b|\bany\s+of\s+them\b"
+    r"|\b(?:multiple|several|many)\s+(?:possible\s+|valid\s+|correct\s+)?(?:answers|solutions)\b"
+    r"|\b(?:absolute|relative)\s+(?:or\s+(?:absolute|relative)\s+)?error\b",
+    re.IGNORECASE,
+)
 IO_CASE_LIMIT = 100
 """The sandbox runs at most this many I/O cases in one call."""
 
@@ -45,8 +58,11 @@ def adapt_taco_io_row(
         or row.get("picture_num") not in (None, "0")
         or not isinstance(question, str)
         or IMAGE_PLACEHOLDER.search(question)
+        or (row.get("picture_num") is None and FIGURE_REFERENCE.search(question))
     ):
         raise ValueError("only EASY standalone text I/O tasks are supported")
+    if ANY_ANSWER.search(question):
+        raise ValueError("TACO tasks with several valid answers need a checker, not exact match")
     cases = json.loads(row["input_output"])
     solutions = json.loads(row["solutions"])
     if (

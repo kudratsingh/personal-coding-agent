@@ -11,9 +11,9 @@ from scratchcoder.eval.tasks import Task
 from scratchcoder.sandbox.runner import Result
 
 
-def shingles(text: str) -> frozenset[tuple[str, ...]]:
+def shingles(text: str, width: int = 5) -> frozenset[tuple[str, ...]]:
     tokens = words(text)
-    size = min(5, len(tokens))
+    size = min(width, len(tokens))
     return (
         frozenset(tuple(tokens[i : i + size]) for i in range(len(tokens) - size + 1))
         if size
@@ -24,10 +24,11 @@ def shingles(text: str) -> frozenset[tuple[str, ...]]:
 class SimilarityIndex:
     """Exact Jaccard check after a shared-order prefix candidate filter."""
 
-    def __init__(self, threshold: float = 0.85) -> None:
-        if not 0 < threshold <= 1:
-            raise ValueError("invalid similarity threshold")
+    def __init__(self, threshold: float = 0.85, *, width: int = 5) -> None:
+        if not 0 < threshold <= 1 or width < 1:
+            raise ValueError("invalid similarity threshold or shingle width")
         self.threshold = threshold
+        self.width = width
         self.items: list[frozenset[tuple[str, ...]]] = []
         self.prefixes: dict[tuple[str, ...], set[int]] = defaultdict(set)
 
@@ -35,7 +36,7 @@ class SimilarityIndex:
         return sorted(value)[: len(value) - math.ceil(self.threshold * len(value)) + 1]
 
     def contains(self, text: str) -> bool:
-        value = shingles(text)
+        value = shingles(text, self.width)
         candidates = set().union(*(self.prefixes.get(item, set()) for item in self._prefix(value)))
         return any(
             len(value & self.items[index]) / max(len(value | self.items[index]), 1)
@@ -44,24 +45,34 @@ class SimilarityIndex:
         )
 
     def add(self, text: str) -> None:
-        value = shingles(text)
+        value = shingles(text, self.width)
         for item in self._prefix(value):
             self.prefixes[item].add(len(self.items))
         self.items.append(value)
 
 
 def build_pool(
-    tasks: Iterable[Task], benchmarks: Iterable[Task], *, execute: Callable[[str, str, str], Result]
+    tasks: Iterable[Task],
+    benchmarks: Iterable[Task],
+    *,
+    execute: Callable[[str, str, str], Result],
+    min_alpha_tokens: int = 0,
 ) -> tuple[list[Task], dict[str, int]]:
-    """Admit only passing references; unavailable isolation aborts admission."""
+    """Admit only passing references; unavailable isolation aborts admission.
+
+    ``min_alpha_tokens`` is passed to the benchmark ``ContaminationIndex``.
+    """
     protected = list(benchmarks)
     index = SimilarityIndex()
     for task in protected:
         index.add(task.prompt)
     contamination = ContaminationIndex(
-        part
-        for task in protected
-        for part in (task.prompt, task.solution or "", task.public_tests, task.hidden_tests)
+        (
+            part
+            for task in protected
+            for part in (task.prompt, task.solution or "", task.public_tests, task.hidden_tests)
+        ),
+        min_alpha_tokens=min_alpha_tokens,
     )
     benchmark_ids = {canonical_id(task.id) for task in protected}
     report: Counter[str] = Counter()

@@ -59,7 +59,7 @@ def opencode_file(count: int) -> bytes:
 
 
 def acecode_file(count: int, first: int) -> bytes:
-    rows = [function_task(f"acecode_{first + i}", first + i) for i in range(count)]
+    rows = [function_task(f"acecode_{first + i}", 100 + first + i) for i in range(count)]
     return parquet(
         {
             "id": [f"ac{first + i}" for i in range(count)],
@@ -68,13 +68,25 @@ def acecode_file(count: int, first: int) -> bytes:
             "test_cases": [tests for _, _, tests in rows],
             "inferences": [
                 [
+                    *(
+                        [
+                            {
+                                "completion": solution.replace("+", "-"),
+                                "completion_id": 1,
+                                "model_name": "fixture",
+                                "pass_rate": 1.0,
+                            }
+                        ]
+                        if first + i == 5
+                        else []
+                    ),
                     {
                         "completion": solution,
                         "completion_id": 0,
                         "model_name": "fixture",
                         # The first row has no attempt that passed every test.
                         "pass_rate": 0.5 if first + i == 0 else 1.0,
-                    }
+                    },
                 ]
                 for i, (_, solution, _) in enumerate(rows)
             ],
@@ -115,7 +127,7 @@ def taco_row(index: int, *, source: str = "codeforces", difficulty: str = "EASY"
 def mbpp_rows() -> list[dict[str, Any]]:
     rows = []
     for task_id in range(1, 9):
-        prompt, solution, tests = function_task(f"mbpp_{task_id}", task_id)
+        prompt, solution, tests = function_task(f"mbpp_{task_id}", 200 + task_id)
         rows.append(
             {
                 "task_id": task_id,
@@ -253,8 +265,20 @@ class Fixture:
                     "size_bytes": len(MBPP_BYTES),
                 },
             ],
-            "protection": {"humaneval": "x", "evalplus_directory": "x", "arc_directory": "x"},
-            "splits": {"dev": 3, "test": 3, "human_holdout_minimum": 4, **splits},
+            "protection": {
+                "humaneval": "x",
+                "evalplus_directory": "x",
+                "arc_directory": "x",
+                "min_alpha_tokens": 3,
+            },
+            "splits": {
+                "dev": 3,
+                "test": 3,
+                "human_holdout_minimum": 4,
+                "model_holdout_sources": ["opencode"],
+                "rl_prompt_tokens": 400,
+                **splits,
+            },
             "verification": {
                 "timeout_seconds": 2.0,
                 "io_seconds_per_case": 0.25,
@@ -348,6 +372,16 @@ def test_build_verifies_references_records_every_drop_and_assigns_exact_holdouts
     assert intake["taco"]["excluded_component"] == 1 and intake["taco"]["not_easy"] == 1
     assert intake["mbpp"]["mbpp_plus_id_excluded"] == 1
     assert report["kept_by_source"] == {"opencode": 8, "acecode": 7, "taco": 8, "mbpp": 7}
+    # The fifth AceCode row's first recorded attempt fails here; its second passes.
+    assert report["acecode_attempts"]["solution_from"] == {
+        "none": 1,
+        "attempt_1": 6,
+        "attempt_2": 1,
+    }
+    assert report["rl_only"]["kept"] == 1
+    rl_only = list(load_tasks(fixture.directory / "pool" / "rl_only.jsonl"))
+    assert [t.id for t in rl_only] == ["TIGER-Lab/AceCode-87K/ac0"] and rl_only[0].solution is None
+    assert report["holdouts"]["model_holdout_sources"] == ["opencode"]
     pool = fixture.directory / "pool"
     splits = {name: list(load_tasks(pool / f"{name}.jsonl")) for name in ("train", "dev", "test")}
     assert len(splits["dev"]) == len(splits["test"]) == 3
@@ -358,7 +392,9 @@ def test_build_verifies_references_records_every_drop_and_assigns_exact_holdouts
     assert sum(t.written_by == "human" for t in held) == 4
     assert not any(t.prompt.startswith(("Problem 100 ", "Problem 101 ")) for t in splits["train"])
     assert {t.id for t in load_tasks(pool / "holdout.jsonl")} == {t.id for t in held}
-    assert sandbox.calls == 2 * (8 + 1 + 7 + 8 + 7)
+    assert sandbox.calls == 2 * (8 + 1 + 7 + 1 + 8 + 7)
+    held_model = [t for t in held if t.written_by == "model"]
+    assert held_model and all(t.source == "nvidia/OpenCodeInstruct" for t in held_model)
 
 
 def test_verdicts_are_cached_for_resume_and_unavailable_isolation_stops_the_build(
@@ -391,3 +427,96 @@ def test_io_deadlines_grow_with_the_case_count_up_to_the_runner_maximum() -> Non
     assert task_pool.policy_hash({**verification, "workers": 1}) == task_pool.policy_hash(
         {**verification, "workers": 8}
     )
+
+
+def test_stalled_calls_and_torn_cache_rows_are_redone_not_cached(
+    fixture: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(task_pool, "RETRY_DELAY_SECONDS", 0.0)
+    cache = fixture.root / "cache.jsonl"
+    deadline = lambda tests, mode: 2.0  # noqa: E731
+    stalls = {"left": 1}
+
+    def execute(code: str, tests: str, mode: str) -> Result:
+        if stalls["left"]:
+            stalls["left"] -= 1
+            return Result("timeout", "", -9, 12.5)
+        return Result("passed")
+
+    found, counters = task_pool.verify(
+        [("a", "b", "function")], cache, execute=execute, deadline=deadline, workers=1
+    )
+    assert found[task_pool.call_key("a", "b", "function")].passed
+    assert counters["retried_calls"] == 1
+    # A pre-rule row with a stall signature, and a torn last line, are both redone.
+    key = task_pool.call_key("c", "d", "function")
+    stalled = {
+        "key": key,
+        "status": "timeout",
+        "stdout": "",
+        "exit_code": -9,
+        "elapsed_seconds": 40,
+    }
+    with cache.open("a") as stream:
+        stream.write(json.dumps(stalled) + "\n" + '{"key": "torn')
+    found, counters = task_pool.verify(
+        [("c", "d", "function")], cache, execute=execute, deadline=deadline, workers=1
+    )
+    assert found[key].passed and counters["cached_host_timeouts_redone"] == 1
+    assert cache.read_text().endswith("\n")
+
+
+def test_a_held_lock_or_an_unrecorded_cache_policy_stops_the_build(fixture: Fixture) -> None:
+    spec = fixture.load(fixture.spec())
+    fixture.fetch(spec)
+    (fixture.directory / "build.lock").write_text("123")
+    with pytest.raises(RuntimeError, match="another build"):
+        task_pool.build(spec, fixture.directory, execute=Sandbox(), runtime={}, progress=quiet)
+    (fixture.directory / "build.lock").unlink()
+    cache = fixture.directory / "verification"
+    cache.mkdir()
+    name = f"results-{task_pool.policy_hash(spec['verification'])}.jsonl"
+    (cache / name).write_text("")
+    with pytest.raises(ValueError, match="adopt-cache-policy"):
+        task_pool.build(spec, fixture.directory, execute=Sandbox(), runtime={}, progress=quiet)
+    report = task_pool.build(
+        spec,
+        fixture.directory,
+        execute=Sandbox(),
+        runtime={},
+        adopt_cache_policy=True,
+        progress=quiet,
+    )
+    assert report["sandbox"]["cache_policy_adopted"] is True
+    assert not (fixture.directory / "build.lock").exists()
+
+
+def test_paraphrases_of_holdouts_leave_training() -> None:
+    def task(identifier: str, prompt: str, split: str, solution: str = "x = 1") -> Task:
+        return Task(
+            id=identifier,
+            prompt=prompt,
+            public_tests="assert True",
+            hidden_tests="assert 1",
+            source="nvidia/OpenCodeInstruct",
+            license="CC-BY-4.0",
+            written_by="model",
+            split=split,
+            solution=solution,
+        )
+
+    named = "def next_prime(n):\n    return n\n"
+    held = task(
+        "h", "Return the smallest prime number greater than the integer n given", "dev", named
+    )
+    near = task(
+        "a", "Return the smallest prime number greater than a given integer n", "train", named
+    )
+    reworded = task("c", "Return the smallest prime number greater than a given integer n", "train")
+    close = task(
+        "d", "Return the smallest prime number greater than the integer n given here", "train"
+    )
+    far = task("b", "Count the vowels that appear in a lowercase English word", "train", named)
+    kept, dropped = task_pool.drop_holdout_paraphrases([held, near, reworded, close, far])
+    # Same function name and a loose rewording, or a close rewording: dropped.
+    assert [t.id for t in kept] == ["h", "c", "b"] and dropped == {"opencode": 2}

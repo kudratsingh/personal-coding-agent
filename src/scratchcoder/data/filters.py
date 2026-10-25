@@ -15,18 +15,33 @@ def words(text: str) -> list[str]:
     return re.findall(r"\w+", text.casefold())
 
 
+def _alphabetic(token: str) -> bool:
+    return len(token) > 1 and any(character.isalpha() for character in token)
+
+
 class ContaminationIndex:
-    def __init__(self, held_out: Iterable[str], n: int = 13) -> None:
-        if n < 1:
-            raise ValueError("n must be positive")
+    """Normalized word n-grams of held-out text; shorter complete fields are indexed whole.
+
+    With ``min_alpha_tokens``, an n-gram is indexed only if at least that many of its
+    tokens are words (two or more characters, at least one letter). This keeps runs of
+    numbers, such as test data, from matching unrelated text.
+    """
+
+    def __init__(self, held_out: Iterable[str], n: int = 13, *, min_alpha_tokens: int = 0) -> None:
+        if n < 1 or min_alpha_tokens < 0:
+            raise ValueError("n must be positive and min_alpha_tokens nonnegative")
         self.n = n
+        self.min_alpha_tokens = min_alpha_tokens
         self.ngrams: dict[int, set[tuple[str, ...]]] = {}
         for text in held_out:
             tokens = words(text)
             size = min(n, len(tokens))
             if size:
+                grams = (tuple(tokens[i : i + size]) for i in range(len(tokens) - size + 1))
                 self.ngrams.setdefault(size, set()).update(
-                    tuple(tokens[i : i + size]) for i in range(len(tokens) - size + 1)
+                    gram
+                    for gram in grams
+                    if not min_alpha_tokens or sum(map(_alphabetic, gram)) >= min_alpha_tokens
                 )
 
     def contains(self, text: str) -> bool:

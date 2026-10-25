@@ -61,9 +61,11 @@ from scratchcoder.data.filters import (
     content_hash,
     document_split,
     rule_reason,
+    words,
 )
 from scratchcoder.data.manifest import TRAINING_LICENSES, HTTPSOnlyRedirectHandler
 from scratchcoder.data.shards import TokenShard, file_sha256, write_shard
+from scratchcoder.eval.tasks import load_tasks
 from scratchcoder.tokenizer.bpe import ByteBPE
 from scratchcoder.tokenizer.bulk import FastEncoder
 from tools.header_licenses import (
@@ -97,6 +99,7 @@ FILTER_REASONS = (
     "generated",
     "duplicate",
     "contamination",
+    "holdout_contamination",
 )
 PROVENANCE = (
     "row",
@@ -865,6 +868,123 @@ def review(
     return [done[unit.name] for unit in units]
 
 
+HOLDOUT_WORDS = 13
+"""Holdout fields are indexed as 13-word spans; shorter fields are not indexed."""
+
+
+def holdout_texts(path: Path) -> tuple[list[str], dict[str, Any]]:
+    """The dev and test tasks' text to exclude from pretraining, and its identity.
+
+    Prompts and reference solutions are indexed for every task, and tests for
+    assert-style tasks. I/O case data (mostly short numbers) and any field shorter
+    than ``HOLDOUT_WORDS`` words are not, since they would match unrelated documents.
+    """
+    tasks = list(load_tasks(path))
+    if not tasks or any(task.split not in {"dev", "test"} for task in tasks):
+        raise ValueError("the holdout file must hold dev and test tasks only")
+    texts: list[str] = []
+    indexed: Counter[str] = Counter()
+    skipped: Counter[str] = Counter()
+    for task in tasks:
+        parts = [("prompt", task.prompt), ("solution", task.solution or "")]
+        if task.mode == "function":
+            parts += [("public_tests", task.public_tests), ("hidden_tests", task.hidden_tests)]
+        for name, text in parts:
+            if len(words(text)) >= HOLDOUT_WORDS:
+                texts.append(text)
+                indexed[name] += 1
+            elif text.strip():
+                skipped[name] += 1
+    identity = {
+        "file": str(path),
+        "sha256": file_sha256(path),
+        "tasks": len(tasks),
+        "splits": dict(Counter(task.split for task in tasks)),
+        "authorship": dict(Counter(task.written_by for task in tasks)),
+        "sources": dict(Counter(task.source for task in tasks)),
+        "indexed_fields": dict(indexed),
+        "skipped_short_fields": dict(skipped),
+        "policy": (
+            f"normalized {HOLDOUT_WORDS}-word spans of prompts, reference solutions and "
+            "assert-style tests; I/O case data and shorter fields are not indexed"
+        ),
+        "key": _sha256_json(texts)[:16],
+    }
+    return texts, identity
+
+
+def _initialize_holdout(texts: list[str]) -> None:
+    _worker["holdout"] = ContaminationIndex(texts, n=HOLDOUT_WORDS)
+
+
+def scan_unit(unit: Unit, directory: str, key: str) -> dict[str, Any]:
+    """Re-read one unit's surviving documents and list those matching the holdout."""
+    out = Path(directory)
+    rows_path = out / f"{unit.name}.jsonl"
+    candidates: dict[int, str] = {}
+    with rows_path.open(encoding="utf-8") as lines:
+        for line in lines:
+            row = json.loads(line)
+            if row["reason"] == "kept" and not row["contaminated"]:
+                candidates[row["row"]] = row["sha256"]
+    index: ContaminationIndex = _worker["holdout"]
+    matched = [
+        {"row": row, "sha256": candidates[row]}
+        for row, item in _unit_rows(unit)
+        if row in candidates and index.contains(item[TEXT_COLUMNS[unit.domain]])
+    ]
+    record = {
+        "unit": unit.name,
+        "key": key,
+        "rows_sha256": file_sha256(rows_path),
+        "candidates": len(candidates),
+        "matched": matched,
+    }
+    atomic_json(out / f"{unit.name}.holdout-{key}.json", record)
+    return record
+
+
+def scan_holdout(
+    units: Sequence[Unit],
+    records: Sequence[Mapping[str, Any]],
+    directory: Path,
+    texts: list[str],
+    key: str,
+    *,
+    workers: int,
+    progress: Callable[[str], None] = print,
+) -> list[dict[str, Any]]:
+    """Holdout matches per unit, reusing a unit's scan when its rows are unchanged."""
+    done: dict[str, dict[str, Any]] = {}
+    pending = []
+    for unit, record in zip(units, records, strict=True):
+        path = directory / f"{unit.name}.holdout-{key}.json"
+        if path.is_file():
+            scan = json.loads(path.read_text())
+            if scan.get("key") == key and scan.get("rows_sha256") == record["rows_sha256"]:
+                done[unit.name] = scan
+                continue
+        pending.append(unit)
+    if pending:
+        progress(f"scanning {len(pending)} of {len(units)} units against the holdout")
+        module = importlib.import_module("tools.rehearsal_build")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=module._initialize_holdout,
+            initargs=(texts,),
+        ) as pool:
+            futures = [pool.submit(module.scan_unit, u, str(directory), key) for u in pending]
+            try:
+                for future in concurrent.futures.as_completed(futures):
+                    scan = future.result()
+                    done[scan["unit"]] = scan
+            except BaseException:
+                pool.shutdown(wait=True, cancel_futures=True)
+                raise
+    return [done[unit.name] for unit in units]
+
+
 @dataclass
 class Pick:
     unit: str
@@ -901,9 +1021,16 @@ def _credits() -> dict[str, Any]:
 
 
 def assemble(
-    spec: Spec, units: Sequence[Unit], records: Sequence[Mapping[str, Any]], directory: Path
+    spec: Spec,
+    units: Sequence[Unit],
+    records: Sequence[Mapping[str, Any]],
+    directory: Path,
+    holdout: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, list[Pick]], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
-    """Global dedup, hash splits and exact quotas, in spec order."""
+    """Global dedup, hash splits and exact quotas, in spec order.
+
+    ``holdout`` holds the content hashes of documents that match the task-pool holdout.
+    """
     seen: set[str] = set()
     tallies = {domain: _tally() for domain in DOMAINS}
     picks: dict[str, list[Pick]] = {stream.name: [] for stream in spec.streams}
@@ -941,6 +1068,8 @@ def assemble(
                         reason = "duplicate"
                     elif row["contaminated"]:
                         reason = "contamination"
+                    elif row["sha256"] in holdout:
+                        reason = "holdout_contamination"
                 decision = tally["decisions"][reason]
                 decision["files"] += 1
                 decision["text_bytes"] += row["bytes"]
@@ -1204,6 +1333,8 @@ def identities(spec: Spec, report: Mapping[str, Any]) -> dict[str, str]:
             "license_mapping_sha256": report["license_mapping"]["mapping_sha256"],
             "contamination_coverage": report["contamination_coverage"],
             "filter_configuration": report["filter_configuration"],
+            # Present only for builds that applied a task-pool holdout.
+            **({"holdout": report["holdout"]} if "holdout" in report else {}),
         }
     )
     return {"tokens_identity": tokens, "build_identity": whole}
@@ -1214,11 +1345,21 @@ def build(
     build_dir: Path,
     *,
     workers: int,
+    holdout: Path | None = None,
+    admitted_on: str | None = None,
     progress: Callable[[str], None] = print,
 ) -> dict[str, Any]:
+    """Review, assemble, write and verify; with ``holdout``, also drop holdout matches.
+
+    ``admitted_on`` records the owner's training admission; it needs a holdout.
+    """
     output = build_dir / "output"
     if output.exists():
         raise FileExistsError("the build output already exists; verify it instead")
+    if admitted_on is not None:
+        if holdout is None:
+            raise ValueError("training admission needs the task-pool holdout exclusion")
+        _accepted(admitted_on, "admission")
     started = time.perf_counter()
     receipts = completed_receipts(spec, build_dir)
     for item in receipts["files"]:
@@ -1259,8 +1400,30 @@ def build(
     )
     del mapping
     timings["review"] = time.perf_counter() - began
+    holdout_identity: dict[str, Any] | None = None
+    matched: frozenset[str] = frozenset()
+    if holdout is not None:
+        began = time.perf_counter()
+        holdout_text, holdout_identity = holdout_texts(holdout)
+        scans = scan_holdout(
+            units,
+            records,
+            unit_dir,
+            holdout_text,
+            holdout_identity["key"],
+            workers=workers,
+            progress=progress,
+        )
+        matched = frozenset(item["sha256"] for scan in scans for item in scan["matched"])
+        holdout_identity.update(
+            scanned_documents=sum(scan["candidates"] for scan in scans),
+            matched_rows=sum(len(scan["matched"]) for scan in scans),
+            matched_documents=len(matched),
+        )
+        coverage = {**coverage, "final_pool_holdout": holdout_identity}
+        timings["holdout_scan"] = time.perf_counter() - began
     began = time.perf_counter()
-    picks, streams, domains, excluded = assemble(spec, units, records, unit_dir)
+    picks, streams, domains, excluded = assemble(spec, units, records, unit_dir, matched)
     timings["assemble"] = time.perf_counter() - began
     progress("assembled: " + json.dumps({k: v["tokens"] for k, v in streams.items()}))
     began = time.perf_counter()
@@ -1340,14 +1503,29 @@ def build(
         "free_bytes_before": free_before,
         "timings_seconds": timings,
         "paid_runs": 0,
-        "final_training_admission": False,
+        "final_training_admission": admitted_on is not None,
+        "admission": None
+        if admitted_on is None
+        else {
+            "admitted_on": admitted_on,
+            "basis": "owner instruction: admit the shards after the task-pool holdout exclusion",
+            "holdout_sha256": holdout_identity["sha256"] if holdout_identity else None,
+        },
         "limitations": [
-            "the final verified task-pool holdout is not built; repeat its exclusion before "
-            "training and rebuild if it removes any document",
+            *(
+                []
+                if holdout_identity
+                else [
+                    "the final verified task-pool holdout is not applied; repeat its exclusion "
+                    "before training and rebuild if it removes any document"
+                ]
+            ),
             "repository license lists are The Stack's detected licenses, not a legal warranty",
             "exact-hash deduplication only; the sources' own near-deduplication is relied on",
         ],
     }
+    if holdout_identity is not None:
+        report["holdout"] = holdout_identity
     report.update(identities(spec, report))
     report["elapsed_seconds_before_verification"] = time.perf_counter() - started
     atomic_json(staging / "report.json", report)
@@ -1521,6 +1699,22 @@ def verify(spec: Spec, build_dir: Path, *, directory: Path | None = None) -> dic
         ):
             raise ValueError(f"{stream.name}: the cut document breaks the boundary rule")
     names = [stream.name for stream in spec.streams]
+    listed_hashes = set().union(*hashes.values())
+    with (output / "exclusions.jsonl").open(encoding="utf-8") as lines:
+        for line in lines:
+            row = json.loads(line)
+            # A duplicate shares its hash with the first, kept copy; any other drop must not.
+            if row["reason"] != "duplicate" and row["sha256"] in listed_hashes:
+                raise ValueError(f"an excluded document ({row['reason']}) reached a shard")
+            checks["exclusions"] += 1
+    if report["final_training_admission"] != (report.get("admission") is not None) or (
+        report["final_training_admission"] and "holdout" not in report
+    ):
+        raise ValueError("training admission needs a recorded holdout exclusion")
+    if "holdout" in report:
+        held = Path(report["holdout"]["file"])
+        if held.is_file() and file_sha256(held) != report["holdout"]["sha256"]:
+            raise ValueError("the holdout file differs from the one the build used")
     overlaps = {
         f"{a}|{b}": len(hashes[a] & hashes[b]) for i, a in enumerate(names) for b in names[i + 1 :]
     }
@@ -1534,6 +1728,7 @@ def verify(spec: Spec, build_dir: Path, *, directory: Path | None = None) -> dic
     result = {
         "status": "passed",
         "created_at": utc_now(),
+        "final_training_admission": report["final_training_admission"],
         "report_sha256": file_sha256(output / "report.json"),
         "tokens_identity": report["tokens_identity"],
         "build_identity": report["build_identity"],
@@ -1558,6 +1753,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="earlier verified download receipts whose files may be hard-linked",
     )
     parser.add_argument("--workers", type=int, default=max(1, min(10, (os.cpu_count() or 2) - 2)))
+    parser.add_argument("--holdout", type=Path, help="task-pool holdout.jsonl to exclude")
+    parser.add_argument("--admitted-on", help="owner's training admission date, YYYY-MM-DD")
     args = parser.parse_args(argv)
     spec = load_spec(args.spec)
     token = os.environ.get("HF_TOKEN") or None
@@ -1570,7 +1767,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(json.dumps({k: recovered[k] for k in ("totals", "join", "mapping")}, indent=1))
     elif args.stage == "build":
-        report = build(spec, args.build, workers=args.workers)
+        report = build(
+            spec,
+            args.build,
+            workers=args.workers,
+            holdout=args.holdout,
+            admitted_on=args.admitted_on,
+        )
         print(
             json.dumps(
                 {key: report[key] for key in ("tokens_identity", "build_identity", "verification")}

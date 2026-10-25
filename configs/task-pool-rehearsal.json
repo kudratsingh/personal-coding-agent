@@ -86,12 +86,17 @@
   "protection": {
     "humaneval": "runs/real-samples-20261019/HumanEval.jsonl.gz",
     "evalplus_directory": "runs/evalplus-review",
-    "arc_directory": "runs/arc-review"
+    "arc_directory": "runs/arc-review",
+    "min_alpha_tokens": 3
   },
   "splits": {
     "dev": 2000,
     "test": 2000,
-    "human_holdout_minimum": 300
+    "human_holdout_minimum": 300,
+    "model_holdout_sources": [
+      "opencode"
+    ],
+    "rl_prompt_tokens": 480
   },
   "verification": {
     "timeout_seconds": 2.0,

@@ -61,3 +61,12 @@ def test_rule_reason_is_the_per_document_part_of_filter_documents() -> None:
     )
     assert [rule_reason(doc, config) for doc in docs] == decisions
     assert decisions == ["kept", "generated", "too_short", "long_line", "unknown_domain"]
+
+
+def test_min_alpha_tokens_keeps_number_runs_from_matching() -> None:
+    numbers = " ".join(["1"] * 20)
+    statement = "Write a function that returns the sum of all distinct positive elements in a list"
+    plain = ContaminationIndex([numbers, statement])
+    worded = ContaminationIndex([numbers, statement], min_alpha_tokens=3)
+    assert plain.contains("input: " + numbers) and not worded.contains("input: " + numbers)
+    assert worded.contains("Task: " + statement.upper() + " please")
