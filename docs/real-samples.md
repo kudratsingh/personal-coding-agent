@@ -250,8 +250,8 @@ The exact (repository, path) join is clean: all **209,914** sample files matched
 lists. Conflicting duplicates, path-only repository matches and absent
 repositories were all **0**, so no repository-only fallback was needed. See
 [ADR 0011](adr/0011-quality-retention-and-rights-admission.md) for the policy,
-including the owner's correction that ISC and Unlicense were always on the D-05
-allowlist. Every listed ID must be allowed, and explicit headers keep precedence:
+including the owner's corrections that ISC, Unlicense, 0BSD and WTFPL were
+always on the D-05 allowlist. Every listed ID must be allowed, and explicit headers keep precedence:
 a byte-order mark, a license block after `from __future__` imports, a module
 `__license__` string or an unreadable leading header can no longer hand a file to
 repository metadata.
@@ -261,56 +261,61 @@ Python primary classes, compared with the 2026-10-20 run:
 
 | Final primary class | 2026-10-24 files | UTF-8 bytes | Share of bytes | 2026-10-20 files | UTF-8 bytes |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Kept after quality | 189,369 | 824,650,726 | 82.46505% | 13,833 | 122,701,374 |
+| Kept after quality | 190,222 | 828,088,405 | 82.80882% | 13,833 | 122,701,374 |
 | Dropped copyleft header | 1,363 | 14,609,465 | 1.46095% | 1,220 | 13,290,562 |
 | Dropped restricted header | 128 | 973,542 | 0.09735% | 125 | 928,113 |
 | Dropped unrecognized inline header | 8,909 | 71,345,855 | 7.13458% | 8,737 | 69,830,333 |
-| Dropped off-allowlist repository license | 5,695 | 32,732,643 | 3.27326% | 0 | 0 |
+| Dropped off-allowlist repository license | 4,828 | 29,270,798 | 2.92708% | 0 | 0 |
 | Unresolved: no header, no repository license | 0 | 0 | 0% | 185,680 | 786,817,959 |
-| Dropped generated marker | 1,357 | 22,100,601 | 2.21006% | 116 | 2,204,697 |
-| Dropped contamination | 2,448 | 33,571,852 | 3.35718% | 203 | 4,227,188 |
-| Dropped too short | 645 | 15,542 | 0.00155% | 0 | 0 |
+| Dropped generated marker | 1,359 | 22,108,173 | 2.21082% | 116 | 2,204,697 |
+| Dropped contamination | 2,454 | 33,588,303 | 3.35883% | 203 | 4,227,188 |
+| Dropped too short | 651 | 15,685 | 0.00157% | 0 | 0 |
 | Total | 209,914 | 1,000,000,226 | 100% | 209,914 | 1,000,000,226 |
 
-Byte retention is **82.46505%** (**90.21266%** of files). **14,252 files /
-125,774,954 bytes** are kept on an inline header and **175,117 / 698,875,772** on
-repository metadata. An earlier same-day run before the header hardening kept
-189,647 files; the hardening moved 143 files to copyleft, 172 to unrecognized and
-3 to restricted, and recognized permissive headers that a byte-order mark had
-hidden. Quality rules now examine **193,819** files instead of 14,152, so the
+Byte retention is **82.80882%** (**90.61902%** of files). **14,252 files /
+125,774,954 bytes** are kept on an inline header and **175,970 / 702,313,451** on
+repository metadata. Two same-day runs preceded this one. The first, before the
+header hardening, kept 189,647 files; the hardening moved 143 files to copyleft,
+172 to unrecognized and 3 to restricted, and recognized permissive headers that a
+byte-order mark had hidden, leaving 189,369. The owner's second D-05 correction,
+adding 0BSD and WTFPL, then admitted **867** more files to the quality filters,
+of which **853 / 3,437,679 bytes** were kept and 14 were dropped as generated,
+contaminated or too short. Quality rules now examine **194,686** files instead of 14,152, so the
 generated-marker and contamination drops grow to a scale close to the historical
 quality-only rerun. Long-line, too-large, alphanumeric and duplicate drops are **0**.
 
 Kept files per license ID, counting a multi-license file under each ID: MIT
-**124,381**, Apache-2.0 **42,122**, BSD-3-Clause **14,561**, BSD-2-Clause
-**3,646**, Unlicense **3,111**, CC0-1.0 **1,668**, CC-BY-4.0 **623**, ISC **222**.
+**124,383**, Apache-2.0 **42,124**, BSD-3-Clause **14,569**, BSD-2-Clause
+**3,646**, Unlicense **3,114**, CC0-1.0 **1,669**, CC-BY-4.0 **623**, WTFPL
+**442**, 0BSD **411**, ISC **222**.
 The most common single lists are MIT **123,693**, Apache-2.0 **41,761** and
 BSD-3-Clause **14,267** files.
 
 The off-allowlist drops are an owner decision; none is admitted. Their most
 common blocking IDs, in files, are ECL-2.0 **453** (440 of them also list
-Apache-2.0; 389 exactly as Apache-2.0 AND ECL-2.0), WTFPL **448**, 0BSD **435**,
-CC-BY-3.0 **337**, CNRI-Python **303**, BSD-3-Clause-LBNL **287**, bzip2-1.0.6
-**270**, BSD-2-Clause-FreeBSD **262**, RSA-MD **248**, PSF-2.0 **167** and MIT-0
-**148**. The ignored report holds the full per-ID and per-list counts.
+Apache-2.0; 389 exactly as Apache-2.0 AND ECL-2.0), CC-BY-3.0 **337**,
+CNRI-Python **303**, BSD-3-Clause-LBNL **287**, bzip2-1.0.6 **270**,
+BSD-2-Clause-FreeBSD **262**, RSA-MD **248**, PSF-2.0 **167**, MIT-0 **148**,
+BSD-3-Clause-Clear **142** and Zlib **136**. **16** files list 0BSD together with
+another off-allowlist ID and stay dropped. The ignored report holds the full per-ID
+and per-list counts.
 
 With the frozen 65,536-entry tokenizer, the kept Python selection is
-**197,448,213 tokens / 824,650,726 bytes = 4.1765418561 bytes per token**
-(**197,637,582** with BOS). Train and validation hold **196,535,126 / 913,087**
-tokens; the validation selection is **914 files / 3,624,598 bytes = 3.9696085915
+**198,273,119 tokens / 828,088,405 bytes = 4.1765036490 bytes per token**
+(**198,463,341** with BOS). Train and validation hold **197,358,842 / 914,277**
+tokens; the validation selection is **917 files / 3,629,110 bytes = 3.9693768956
 bytes per token**. Web is unchanged at **103,863 files / 498,123,158 bytes /
 100,709,712 tokens**. The recount fitted nothing.
 
 Current JSONL hashes: Python
-`37a3b2c245e10dbbd25b44cc63867c4d86b89e90672a4d177b97151043639aca`; web
+`63eb48acfd825c6c63e931455e5641af7f6c78251da27307d22b20c7321b8ccf`; web
 `3b7c4469f2a072d562908b3e096fb140d706b11a32420f4f197573de01c1dcbd`. Web text,
 counts and splits are identical to 2026-10-20; its hash changes because each row
 now records its license basis. The license mapping hash is
 `eac02cff966510ef961d35c34df308a17f59d6e8ac80b948d0196ea0b2ac8fcb`. The recovery
-ran at commit `f7ec654` with a clean tree, and the review at `e91ec36`; the
-review's dirty flag reflects documentation edited while it ran, not tool code.
+ran at commit `f7ec654` and the review at `3d9fe93`, both with clean trees.
 Local outputs are under ignored `runs/stack-dedup-licenses-20261024/` and
-`runs/repository-license-review-v4-20261024/`.
+`runs/repository-license-review-v5-20261024/`.
 
 ```sh
 export HF_TOKEN=...   # from the ignored .env; never printed
@@ -327,6 +332,6 @@ Limitations: the sample is an ordered prefix of one StarCoderData shard, not a
 random sample. `max_stars_repo_licenses` is The Stack's detected repository
 license list, not a legal warranty. StarCoderData applied PII redaction and
 near-deduplication after The Stack, so the join relies on provenance keys rather
-than content hashes. Final task-pool holdout coverage is still **0** and
-`final_training_admission` stays false. No model, training run or paid resource
+than content hashes. The owner accepted the footer-statistics exposure. Final
+task-pool holdout coverage is still **0** and `final_training_admission` stays false. No model, training run or paid resource
 was involved.

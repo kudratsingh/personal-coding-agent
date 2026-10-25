@@ -52,18 +52,18 @@ The 2026-10-20 repository fallback correction separated **185,680 files /
 2026-10-24 the owner directed recovering that metadata from The Stack dedup v1.2
 `max_stars_repo_licenses`, joined on each file's exact repository and path; all
 **209,914** sample files matched. A no-header file is kept only when every listed
-repository ID is on the D-05 allowlist, which the owner corrected to include ISC
-and Unlicense. The current review keeps **189,369 Python files / 824,650,726
-bytes**: **14,252** header-licensed files plus **175,117 / 698,875,772** on
-repository metadata, each recording its repository IDs for attribution. **5,695
-files / 32,732,643 bytes** with off-allowlist repository IDs are dropped pending
+repository ID is on the D-05 allowlist, which the owner corrected to include ISC,
+Unlicense, 0BSD and WTFPL. The current review keeps **190,222 Python files / 828,088,405
+bytes**: **14,252** header-licensed files plus **175,970 / 702,313,451** on
+repository metadata, each recording its repository IDs for attribution. **4,828
+files / 29,270,798 bytes** with off-allowlist repository IDs are dropped pending
 an owner decision. See the [current class table](real-samples.md).
 
 With the replacement 65,536-entry tokenizer, the current review contains
-**197,448,213 Python tokens / 824,650,726 bytes** and **100,709,712 web tokens /
+**198,273,119 Python tokens / 828,088,405 bytes** and **100,709,712 web tokens /
 498,123,158 bytes**, excluding BOS. The 2026-10-20 header-only review contained
 **26,328,493 Python tokens / 122,701,374 bytes**. The current Python validation
-selection is **914 files / 3,624,598 bytes / 913,087 tokens**; the 2026-10-20 one
+selection is **917 files / 3,629,110 bytes / 914,277 tokens**; the 2026-10-20 one
 was **52 files / 475,430 bytes / 108,883 tokens**. The original 45-file holdout
 remains the compression comparison above; see [P1-6](full-build-plan.md) for
 the revised conditional capacity forecast.
