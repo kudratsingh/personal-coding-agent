@@ -31,7 +31,15 @@ LOSS_RTOL = 0.001
 GRADIENT_RELATIVE_NORM_MAX = 0.03
 RESUME_STEPS = 4
 A40_MIN_MEMORY_BYTES = 44 * 1024**3
-MEMORY_REPORT_TOLERANCE_BYTES = 256 * 1024**2
+# The A40 Pod (driver 595.91.07, torch 2.9.1) reports 45,490 MiB to PyTorch and 46,068 MiB to
+# nvidia-smi: the driver reserves about 578 MiB. 768 MiB still rejects a 1 GiB mismatch.
+MEMORY_REPORT_TOLERANCE_BYTES = 768 * 1024**2
+
+
+def _bare_gpu_uuid(value: str) -> str:
+    """Compare UUIDs without nvidia-smi's "GPU-" prefix, which PyTorch omits."""
+    text = value.strip().casefold()
+    return text[4:] if text.startswith("gpu-") else text
 
 
 def hardware_description(device: torch.device) -> dict[str, Any]:
@@ -77,7 +85,7 @@ def hardware_description(device: torch.device) -> dict[str, Any]:
     smi_name, smi_uuid, driver_version, memory_mib_text = (field.strip() for field in rows[0])
     if smi_name.casefold() not in {"nvidia a40", "a40"}:
         raise ValueError(f"nvidia-smi reports a non-A40 device: {smi_name!r}")
-    if smi_uuid.casefold() != torch_uuid.casefold():
+    if _bare_gpu_uuid(smi_uuid) != _bare_gpu_uuid(torch_uuid):
         raise ValueError("PyTorch and nvidia-smi report different CUDA device UUIDs")
     try:
         memory_mib = int(memory_mib_text)
