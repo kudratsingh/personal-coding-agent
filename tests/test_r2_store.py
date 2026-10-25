@@ -2,6 +2,7 @@
 
 import datetime as dt
 import hashlib
+import io
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -139,3 +140,26 @@ def test_a_digest_that_does_not_read_back_stops_the_upload(tmp_path: Path) -> No
     with pytest.raises(RuntimeError, match="digest differs"):
         upload(store(fake), [("a.bin", path)], cap_usd=5.0, receipt=tmp_path / "r.json")
     assert r2_store.PRICES_CHECKED_ON == "2026-10-25"
+
+
+class Reply(io.BytesIO):
+    status = 200
+
+
+def test_download_publishes_only_bytes_matching_the_pinned_digest(tmp_path: Path) -> None:
+    data = b"shard bytes"
+    calls: list[str] = []
+
+    def opener(request: Request) -> Reply:
+        calls.append(request.get_method())
+        assert "Authorization" in dict(request.header_items())
+        return Reply(data)
+
+    credentials = Credentials("https://acct.r2.cloudflarestorage.com", "id", "secret", "bucket-a")
+    store = Store(credentials, opener=opener, sleep=lambda _: None)
+    target = tmp_path / "out" / "a.bin"
+    receipt = store.download("k/a.bin", target, sha256=hashlib.sha256(data).hexdigest(), size=11)
+    assert target.read_bytes() == data and receipt["bytes"] == 11 and calls == ["GET"]
+    with pytest.raises(ValueError, match="differs"):
+        store.download("k/a.bin", tmp_path / "bad.bin", sha256="0" * 64, size=11)
+    assert not (tmp_path / "bad.bin").exists() and not (tmp_path / "bad.bin.part").exists()

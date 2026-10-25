@@ -22,6 +22,7 @@ import hmac
 import json
 import os
 import re
+import time
 import xml.etree.ElementTree as ElementTree
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -134,6 +135,12 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 Transport = Callable[[Request], tuple[int, Mapping[str, str], bytes]]
+Opener = Callable[[Request], Any]
+"""Opens a request and returns a response with ``status``, ``headers`` and ``read(n)``."""
+
+
+def _urllib_open(request: Request) -> Any:
+    return build_opener(_NoRedirect()).open(request, timeout=300)
 
 
 def _urllib_transport(request: Request) -> tuple[int, Mapping[str, str], bytes]:
@@ -153,9 +160,75 @@ class Store:
         credentials: Credentials,
         *,
         transport: Transport = _urllib_transport,
+        opener: Opener = _urllib_open,
         clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
+        attempts: int = 4,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.credentials, self.transport, self.clock = credentials, transport, clock
+        self.opener, self.attempts, self.sleep = opener, attempts, sleep
+
+    def _signed(self, method: str, key: str, headers: Mapping[str, str] | None = None) -> Request:
+        path = "/" + quote(self.credentials.bucket) + "/" + quote(key, safe="/")
+        signed = signature_headers(
+            self.credentials,
+            method,
+            path,
+            {},
+            dict(headers or {}),
+            hashlib.sha256(b"").hexdigest(),
+            self.clock(),
+        )
+        return Request(self.credentials.endpoint + path, method=method, headers=signed)
+
+    def download(self, key: str, destination: Path, *, sha256: str, size: int) -> dict[str, Any]:
+        """Stream one object to ``destination``, publishing it only if size and hash match.
+
+        The digest is checked against the caller's pinned value, not the object's
+        metadata, which any holder of a write key could set. Transient failures retry.
+        """
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        partial = destination.with_name(destination.name + ".part")
+        started = time.monotonic()
+        for attempt in range(1, self.attempts + 1):
+            partial.unlink(missing_ok=True)
+            digest, count = hashlib.sha256(), 0
+            try:
+                with self.opener(self._signed("GET", key)) as reply, partial.open("xb") as out:
+                    if getattr(reply, "status", 200) != 200:
+                        raise RuntimeError(f"R2 GET {key} answered HTTP {reply.status}")
+                    while block := reply.read(8 * 1024 * 1024):
+                        count += len(block)
+                        if count > size:
+                            raise ValueError(f"{key}: more bytes than the pinned size")
+                        digest.update(block)
+                        out.write(block)
+                    out.flush()
+                    os.fsync(out.fileno())
+                if count != size or digest.hexdigest() != sha256:
+                    raise ValueError(f"{key}: size or SHA-256 differs from the pinned value")
+                partial.replace(destination)
+                return {
+                    "key": key,
+                    "bytes": count,
+                    "sha256": sha256,
+                    "attempts": attempt,
+                    "seconds": time.monotonic() - started,
+                }
+            except ValueError:
+                partial.unlink(missing_ok=True)
+                raise
+            except (OSError, RuntimeError, HTTPError):
+                partial.unlink(missing_ok=True)
+                if attempt == self.attempts:
+                    raise
+                self.sleep(min(30.0, 2.0**attempt))
+        raise RuntimeError("unreachable")
+
+    def delete(self, key: str) -> None:
+        status, _, _ = self._request("DELETE", key)
+        if status not in (200, 204):
+            raise RuntimeError(f"R2 DELETE {key} failed with HTTP {status}")
 
     def _request(
         self,
