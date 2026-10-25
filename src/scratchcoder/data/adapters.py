@@ -10,6 +10,11 @@ from typing import Any
 from scratchcoder.data.manifest import ManifestEntry
 from scratchcoder.eval.tasks import Task
 
+# Where TACO removed a figure from a problem statement it left one of these markers.
+IMAGE_PLACEHOLDER = re.compile(r"\[image\]|<image>|<img\b|!\[", re.IGNORECASE)
+IO_CASE_LIMIT = 100
+"""The sandbox runs at most this many I/O cases in one call."""
+
 
 def adapt_taco_io_row(
     row: Mapping[str, Any],
@@ -18,8 +23,14 @@ def adapt_taco_io_row(
     upstream_split: str,
     split: str,
     public_count: int = 1,
+    truncate_cases: bool = False,
 ) -> Task:
-    """Conservative EASY stdin/stdout subset; no execution or metadata eval."""
+    """Conservative EASY stdin/stdout subset; no execution or metadata eval.
+
+    A figure-free statement has ``picture_num`` "0" or unrecorded (null) and no image
+    placeholder. Rows with more than ``IO_CASE_LIMIT`` cases are rejected unless
+    ``truncate_cases`` keeps the first ``IO_CASE_LIMIT`` distinct inputs, in upstream order.
+    """
     provenance.validate()
     if provenance.source != "BAAI/TACO" or upstream_split not in {"train", "test"}:
         raise ValueError("TACO provenance and explicit original split are required")
@@ -27,10 +38,13 @@ def adapt_taco_io_row(
         raise ValueError("evaluation-only provenance cannot become training data")
     if upstream_split == "test" and split == "train":
         raise ValueError("upstream TACO test tasks cannot become training data")
+    question = row["question"]
     if (
         row["difficulty"] != "EASY"
         or row["starter_code"]
-        or str(row.get("picture_num", "0")) != "0"
+        or row.get("picture_num") not in (None, "0")
+        or not isinstance(question, str)
+        or IMAGE_PLACEHOLDER.search(question)
     ):
         raise ValueError("only EASY standalone text I/O tasks are supported")
     cases = json.loads(row["input_output"])
@@ -42,7 +56,8 @@ def adapt_taco_io_row(
         or not isinstance(cases.get("inputs"), list)
         or not isinstance(cases.get("outputs"), list)
         or len(cases["inputs"]) != len(cases["outputs"])
-        or not 2 <= len(cases["inputs"]) <= 100
+        or len(cases["inputs"]) < 2
+        or (len(cases["inputs"]) > IO_CASE_LIMIT and not truncate_cases)
         or not all(isinstance(value, str) for value in [*cases["inputs"], *cases["outputs"]])
     ):
         raise ValueError("unsupported TACO I/O tests")
@@ -58,10 +73,10 @@ def adapt_taco_io_row(
             raise ValueError("conflicting outputs for identical TACO input")
         unique[given] = expected
     items = [{"input": given, "output": expected} for given, expected in unique.items()]
+    items = items[:IO_CASE_LIMIT]
     if type(public_count) is not int or not 1 <= public_count < len(items):
         raise ValueError("distinct public and hidden I/O cases required")
-    question = row["question"]
-    if not isinstance(question, str) or not isinstance(row["url"], str):
+    if not isinstance(row["url"], str):
         raise ValueError("TACO question and stable source URL must be strings")
     identity = hashlib.sha256((row["url"] + "\n" + question).encode()).hexdigest()
     return Task(
