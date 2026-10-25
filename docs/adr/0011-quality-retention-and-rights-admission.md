@@ -100,9 +100,13 @@ after `from __future__` imports is read, a module-level `__license__` string is 
 explicit declaration, and a leading header that cannot be tokenized is
 unrecognized rather than absent, so repository metadata never overrides it.
 
-**Correction, not a new decision (2026-10-24):** ISC and Unlicense were always
-allowed under D-05. The allowlist written in the 2026-10-20 amendment above, in
-the private data rules and in the code omitted them. The repository allowlist and
-the manifest's training-license list now read MIT, Apache-2.0, BSD-2-Clause,
-BSD-3-Clause, ISC, Unlicense, CC0-1.0, CC-BY-4.0, ODC-By-1.0 and
-CDLA-Permissive-2.0. PSF-2.0 remains an inline-header grant only.
+**Corrections, not new decisions (2026-10-24):** ISC and Unlicense, and in a
+second owner correction the same day 0BSD and WTFPL, were always allowed under
+D-05. The allowlist written in the 2026-10-20 amendment above, in the private data
+rules and in the code omitted them. The repository allowlist and the manifest's
+training-license list now read MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC,
+Unlicense, 0BSD, WTFPL, CC0-1.0, CC-BY-4.0, ODC-By-1.0 and CDLA-Permissive-2.0.
+Every other off-allowlist repository ID stays out. PSF-2.0 remains an inline-header
+grant only, and the inline header classifier is unchanged by these corrections.
+The owner accepted the Parquet footer-statistics exposure described above for this
+recovery; the tool is unchanged.

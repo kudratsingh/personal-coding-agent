@@ -130,7 +130,7 @@ def test_terms_date_validation_and_evaluation_policy_unchanged() -> None:
         replace(fixture_entry(), license="synthetic-evaluation-only").validate()
 
 
-@pytest.mark.parametrize("name", ["ISC", "Unlicense"])
-def test_d05_correction_allows_isc_and_unlicense_for_training(name: str) -> None:
-    # Owner correction 2026-10-24: both were always allowed under D-05.
+@pytest.mark.parametrize("name", ["ISC", "Unlicense", "0BSD", "WTFPL"])
+def test_d05_corrections_allow_the_omitted_ids_for_training(name: str) -> None:
+    # Owner corrections 2026-10-24: all four were always allowed under D-05.
     replace(fixture_entry(), license=name).validate()

@@ -13,8 +13,9 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-# D-05 training-data allowlist. ISC and Unlicense were always allowed; the written
-# list omitted them until the owner's 2026-10-24 correction (not a new decision).
+# D-05 training-data allowlist. ISC, Unlicense, 0BSD and WTFPL were always allowed;
+# the written list omitted them until the owner's 2026-10-24 corrections (not new
+# decisions).
 TRAINING_LICENSES = frozenset(
     {
         "MIT",
@@ -23,6 +24,8 @@ TRAINING_LICENSES = frozenset(
         "BSD-3-Clause",
         "ISC",
         "Unlicense",
+        "0BSD",
+        "WTFPL",
         "CC0-1.0",
         "CC-BY-4.0",
         "ODC-By-1.0",

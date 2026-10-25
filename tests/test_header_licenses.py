@@ -256,3 +256,15 @@ def test_permissive_license_dunder_keeps_its_own_id() -> None:
 )
 def test_versioned_copyleft_spellings_are_copyleft(header: str) -> None:
     assert classify_header(header + "\nimport os\n").category == "copyleft"
+
+
+def test_d05_correction_admits_0bsd_and_wtfpl_repository_licenses() -> None:
+    # Owner correction 2026-10-24 (not a new decision): both were always allowed.
+    text = "answer = 123456789\n"
+    for listed, joined in ((["0BSD"], "0BSD"), (["WTFPL", "MIT"], "MIT AND WTFPL")):
+        result = classify_file(text, listed)
+        assert result.category == "permissive" and result.license_id == joined
+    # The other off-allowlist IDs stay out.
+    assert classify_file(text, ["0BSD", "ECL-2.0"]).category == "repository_disallowed"
+    # The inline header classifier is unchanged by this correction.
+    assert classify_header("# SPDX-License-Identifier: 0BSD\nanswer = 1\n").category != "permissive"
