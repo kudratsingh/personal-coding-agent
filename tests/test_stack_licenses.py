@@ -475,3 +475,67 @@ def test_legacy_recovery_reports_still_load(tmp_path: Path) -> None:
     report.write_text(json.dumps(raw))
     with pytest.raises(ValueError, match="no content column chunk"):
         load_mapping(report)
+
+
+def test_recover_joins_every_row_of_whole_containers(tmp_path: Path) -> None:
+    def container(name: str, rows: list[tuple[str, str]]) -> dict[str, Any]:
+        table = pa.table(
+            {
+                "max_stars_repo_path": [path for _, path in rows],
+                "max_stars_repo_name": [repository for repository, _ in rows],
+                "max_stars_count": [1 for _ in rows],
+                "id": [f"{name}-{i}" for i in range(len(rows))],
+                "content": [f"value_{i} = {i}\n" for i in range(len(rows))],
+            }
+        )
+        path = tmp_path / f"{name}.parquet"
+        pq.write_table(table, path, row_group_size=1)
+        return {
+            "filename": f"python/{name}.parquet",
+            "path": str(path),
+            "size_bytes": path.stat().st_size,
+            "sha256": file_sha256(path),
+        }
+
+    # The same key in both containers is joined once and counted as repeated.
+    containers = [
+        container("train-0", [("o/r", "a.py"), ("o/r", "q.py")]),
+        container("train-1", [("o/r", "b.py"), ("o/r", "a.py")]),
+    ]
+    hub = FakeHub({"data/python/data-00000-of-00001.parquet": upstream_parquet(ROWS)})
+    report = recover(
+        containers=containers,
+        revision=REVISION,
+        output=tmp_path / "recovery",
+        terms_accepted_on="2026-10-24",
+        client=hub,
+        workers=1,
+        progress=lambda _: None,
+    )
+    sample = report["sample"]
+    assert sample["mode"] == "containers" and sample["parquet_sha256"] is None
+    assert [item["rows"] for item in sample["containers"]] == [2, 2]
+    assert sample["unique_keys"] == 3 and sample["repeated_keys"] == 1
+    assert report["join"]["by_status"]["matched"]["files"] == 2
+    assert report["join"]["by_status"]["path_absent_repository_present"]["files"] == 1
+    mapping, identity = load_mapping(tmp_path / "recovery" / "report.json")
+    assert mapping == {("o/r", "a.py"): ("MIT",), ("o/r", "b.py"): ("Apache-2.0", "MIT")}
+    assert [item["sha256"] for item in identity["containers"]] == [
+        item["sha256"] for item in containers
+    ]
+    with pytest.raises(ValueError, match="exactly one"):
+        recover(
+            revision=REVISION,
+            output=tmp_path / "neither",
+            terms_accepted_on="2026-10-24",
+            client=hub,
+        )
+    containers[0]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="size/hash"):
+        recover(
+            containers=containers,
+            revision=REVISION,
+            output=tmp_path / "tampered",
+            terms_accepted_on="2026-10-24",
+            client=hub,
+        )

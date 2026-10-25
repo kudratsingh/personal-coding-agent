@@ -1,4 +1,4 @@
-"""Recover upstream repository licenses for the local StarCoderData Python sample.
+"""Recover upstream repository licenses for local StarCoderData Python files.
 
 StarCoderData keeps repository/path provenance but no license column. The Stack
 dedup v1.2, from which it was built, records ``max_stars_repo_licenses`` for the
@@ -18,7 +18,8 @@ The join is the exact (repository, path) key. Several upstream rows with one key
 are admitted only when their license lists agree. A sample file whose path is
 absent upstream but whose repository is present is reported as a diagnostic and
 is never admitted. The output mapping feeds ``tools.real_samples
---repository-licenses``; the D-05 allowlist is applied there, not here.
+--repository-licenses`` (the ordered 1 GB sample) or ``tools.rehearsal_build``
+(every row of whole containers); the D-05 allowlist is applied there, not here.
 
 The Hugging Face token is read from ``HF_TOKEN``, sent only to huggingface.co
 (never across a redirect to the storage CDN) and never written or printed.
@@ -571,6 +572,77 @@ def sample_keys_from_receipts(
     return keys, rows, identity
 
 
+def container_keys(
+    containers: Sequence[Mapping[str, Any]],
+) -> tuple[dict[Key, int], list[dict[str, Any]], dict[str, Any]]:
+    """The exact keys of every row of whole local Python containers, after hash checks.
+
+    Each container is ``{"filename", "path", "size_bytes", "sha256"}``. A key that
+    repeats, within or across containers, is joined once; the repeats are counted.
+    """
+    parquet = importlib.import_module("pyarrow.parquet")
+    compute = importlib.import_module("pyarrow.compute")
+    keys: dict[Key, int] = {}
+    rows: list[dict[str, Any]] = []
+    described: list[dict[str, Any]] = []
+    repeated = 0
+    for entry in containers:
+        path = Path(entry["path"])
+        if path.stat().st_size != entry["size_bytes"] or file_sha256(path) != entry["sha256"]:
+            raise ValueError(f"{entry['filename']}: size/hash differs before parsing")
+        count = text_bytes = 0
+        columns = [NAME_COLUMN, PATH_COLUMN, "id", "content"]
+        with parquet.ParquetFile(path, arrow_extensions_enabled=False) as source:
+            for group in range(source.metadata.num_row_groups):
+                table = source.read_row_group(group, columns=columns, use_threads=False)
+                sizes = compute.binary_length(table.column("content")).to_pylist()
+                for repository, name, identifier, size in zip(
+                    table.column(NAME_COLUMN).to_pylist(),
+                    table.column(PATH_COLUMN).to_pylist(),
+                    table.column("id").to_pylist(),
+                    sizes,
+                    strict=True,
+                ):
+                    if size is None:
+                        raise ValueError(f"{entry['filename']}: a row has no content")
+                    count += 1
+                    text_bytes += size
+                    key = (str(repository), str(name))
+                    if key in keys:
+                        repeated += 1
+                        continue
+                    keys[key] = len(rows)
+                    rows.append(
+                        {
+                            "index": len(rows),
+                            "id": str(identifier),
+                            "repository": key[0],
+                            "path": key[1],
+                            "text_bytes": size,
+                            "container": entry["filename"],
+                        }
+                    )
+        described.append(
+            {
+                "filename": entry["filename"],
+                "sha256": entry["sha256"],
+                "size_bytes": entry["size_bytes"],
+                "rows": count,
+                "text_bytes": text_bytes,
+            }
+        )
+    identity = {
+        "mode": "containers",
+        "containers": described,
+        "parquet_sha256": None,
+        "rows": sum(item["rows"] for item in described),
+        "unique_keys": len(rows),
+        "repeated_keys": repeated,
+        "text_bytes": sum(item["text_bytes"] for item in described),
+    }
+    return keys, rows, identity
+
+
 def join(
     scans: Sequence[FileScan], sample: Sequence[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -688,6 +760,7 @@ def load_mapping(report_path: Path) -> tuple[dict[Key, tuple[str, ...]], dict[st
         "revision": report["revision"],
         "columns_read": report["columns_read"],
         "sample_parquet_sha256": report["sample"]["parquet_sha256"],
+        "containers": report["sample"].get("containers"),
         "join_rule": report["join_rule"],
     }
     return mapping, identity
@@ -695,7 +768,7 @@ def load_mapping(report_path: Path) -> tuple[dict[Key, tuple[str, ...]], dict[st
 
 def recover(
     *,
-    receipts: Path,
+    receipts: Path | None = None,
     revision: str,
     output: Path,
     terms_accepted_on: str,
@@ -703,11 +776,19 @@ def recover(
     workers: int = 4,
     progress: Callable[[str], None] = print,
     target: int = PYTHON_SAMPLE_TARGET,
+    containers: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Join the sample prefix in ``receipts``, or every row of ``containers``."""
+    if (receipts is None) == (containers is None):
+        raise ValueError("pass exactly one of receipts or containers")
     if output.exists():
         raise FileExistsError("license recovery output must be a new directory")
     started = time.perf_counter()
-    keys, sample, sample_identity = sample_keys_from_receipts(receipts, target)
+    if containers is not None:
+        keys, sample, sample_identity = container_keys(containers)
+    else:
+        assert receipts is not None
+        keys, sample, sample_identity = sample_keys_from_receipts(receipts, target)
     resolved, files = list_python_files(client, revision)
     repositories = frozenset(key[0] for key in keys)
     output.mkdir(parents=True)

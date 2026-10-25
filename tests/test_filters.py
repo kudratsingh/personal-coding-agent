@@ -4,6 +4,7 @@ from scratchcoder.data.filters import (
     FilterConfig,
     document_split,
     filter_documents,
+    rule_reason,
 )
 
 
@@ -43,3 +44,20 @@ def test_hash_splits_are_stable_and_disjoint() -> None:
     second = {str(i): document_split(str(i), web=True) for i in reversed(range(10000))}
     assert first == second
     assert set(first.values()) == {"stage1", "stage2", "validation"}
+
+
+def test_rule_reason_is_the_per_document_part_of_filter_documents() -> None:
+    config = FilterConfig(max_line_length=60)
+    docs = [
+        Document("1", "s", "def compute(value):\n    return value + 1\n", "python"),
+        Document("2", "s", "# auto-generated\ndef compute(value):\n    return 2\n", "python"),
+        Document("3", "s", "x", "web"),
+        Document("4", "s", "x" * 100, "python"),
+        Document("5", "s", "A plain English paragraph about rivers and valleys.", "other"),
+    ]
+    decisions: list[str] = []
+    filter_documents(
+        docs, ContaminationIndex([]), config, on_decision=lambda _, why: decisions.append(why)
+    )
+    assert [rule_reason(doc, config) for doc in docs] == decisions
+    assert decisions == ["kept", "generated", "too_short", "long_line", "unknown_domain"]
