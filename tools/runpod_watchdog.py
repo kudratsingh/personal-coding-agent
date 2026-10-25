@@ -27,6 +27,8 @@ API_BASE = "https://api.runpod.io/v2"
 API_KEY_ENV = "RUNPOD_API_KEY"
 MAX_RESPONSE_BYTES = 1_048_576
 MAX_POD_WALL_SECONDS = 5_400
+# The owner-approved rehearsal runs (D-35) have a 12.5-hour Pod limit; the pilot keeps 5,400.
+MODE_WALL_SECONDS = {"pilot": MAX_POD_WALL_SECONDS, "rehearsal": 45_000}
 MAX_GPU_IDLE_SECONDS = 600
 MAX_TRANSFER_SECONDS = 1_800
 CLOCK_SKEW_SECONDS = 60.0  # Tolerated difference between Pod, provider and Mac clocks.
@@ -146,6 +148,7 @@ class Policy:
     # at this later moment (the watchdog's own start), so image pull and bootstrap
     # are not read as an idle GPU. Wall and cost limits are unaffected.
     idle_baseline_unix: float | None = None
+    mode: str = "pilot"
 
     def __post_init__(self) -> None:
         for key in (
@@ -158,8 +161,13 @@ class Policy:
             value = getattr(self, key)
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{key} must be a finite positive number")
-        if self.max_wall_seconds > MAX_POD_WALL_SECONDS:
-            raise ValueError("max_wall_seconds cannot exceed the 5400-second pilot ceiling")
+        if self.mode not in MODE_WALL_SECONDS:
+            raise ValueError("mode must be pilot or rehearsal")
+        if self.max_wall_seconds > MODE_WALL_SECONDS[self.mode]:
+            raise ValueError(
+                f"max_wall_seconds cannot exceed the {self.mode} ceiling "
+                f"of {MODE_WALL_SECONDS[self.mode]} seconds"
+            )
         if (
             not _is_number(self.starting_cost_usd)
             or not math.isfinite(self.starting_cost_usd)
@@ -556,6 +564,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--receipt", type=Path, required=True, help="atomic local watchdog receipt path"
     )
     parser.add_argument("--max-wall-seconds", type=float, required=True)
+    parser.add_argument(
+        "--mode",
+        choices=sorted(MODE_WALL_SECONDS),
+        default="pilot",
+        help="wall ceiling: pilot 5400 s, rehearsal 45000 s",
+    )
     parser.add_argument("--max-cost-usd", type=float, required=True)
     parser.add_argument("--max-idle-seconds", type=float, default=600)
     parser.add_argument("--quoted-total-hourly", type=float, required=True)
@@ -591,6 +605,7 @@ def policy_from_args(args: argparse.Namespace) -> Policy:
         starting_cost_usd=args.starting_cost_usd,
         max_transfer_seconds=args.max_transfer_seconds,
         idle_baseline_unix=args.idle_baseline_unix,
+        mode=args.mode,
     )
 
 

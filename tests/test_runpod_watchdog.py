@@ -691,3 +691,33 @@ class IdleBaselineTests(unittest.TestCase):
             ]
         )
         self.assertEqual(policy_from_args(args).idle_baseline_unix, NOW + 30)
+
+
+class ModeCeilingTests(unittest.TestCase):
+    def test_pilot_keeps_5400_and_rehearsal_allows_45000_seconds(self) -> None:
+        with self.assertRaises(ValueError):
+            Policy(5401, 1.0, 600, 0.6)
+        self.assertEqual(Policy(45_000, 7.55, 600, 0.6, mode="rehearsal").max_wall_seconds, 45_000)
+        with self.assertRaises(ValueError):
+            Policy(45_001, 7.55, 600, 0.6, mode="rehearsal")
+        with self.assertRaises(ValueError):
+            Policy(600, 1.0, 600, 0.6, mode="other")
+        args = build_parser().parse_args(
+            [
+                "--identity",
+                "i.json",
+                "--heartbeat",
+                "h.json",
+                "--receipt",
+                "r.json",
+                "--max-wall-seconds",
+                "45000",
+                "--max-cost-usd",
+                "7.55",
+                "--quoted-total-hourly",
+                "0.6",
+                "--mode",
+                "rehearsal",
+            ]
+        )
+        self.assertEqual(policy_from_args(args).mode, "rehearsal")
