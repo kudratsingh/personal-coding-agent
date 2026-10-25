@@ -26,6 +26,7 @@ test -n "$RUNPOD_API_KEY" && echo "RUNPOD_API_KEY is set"   # never echo the val
 gh auth status                          # needed for the private record/log archive
 ls -l ~/.ssh/runpod_ed25519 ~/.ssh/runpod_ed25519.pub   # the key registered in Runpod
 export PILOT_SSH_KEY=~/.ssh/runpod_ed25519
+export KNOWN_HOSTS=~/.ssh/pilot_known_hosts   # no whitespace: ssh splits UserKnownHostsFile on spaces
 export CTRL=runs/pilot-controller && mkdir -p "$CTRL"
 export PRIVATE_REPO=kudratsingh/personal-coding-agent-artifacts   # must be private; the supervisor verifies this
 ```
@@ -87,10 +88,24 @@ cat > "$CTRL/policy.json" <<EOF
  "quoted_total_hourly": 0.60, "max_transfer_seconds": 1500, "idle_baseline_unix": $(date +%s)}
 EOF
 uv run --locked python -m tools.runpod_watchdog --identity "$CTRL/pod-identity.json" \
-  --heartbeat "$CTRL/heartbeat.json" --receipt "$CTRL/watchdog-receipt.json" \
+  --heartbeat "$CTRL/supervisor/heartbeat.json" --receipt "$CTRL/watchdog-receipt.json" \
   --max-wall-seconds 5400 --max-idle-seconds 600 --max-cost-usd 1.08 --quoted-total-hourly 0.60 \
   --billing-started-at-unix "$ORIGIN" --idle-baseline-unix "$(date +%s)" --max-transfer-seconds 1500 \
   > "$CTRL/watchdog.log" 2>&1 &
+```
+
+The watchdog reads the heartbeat the supervisor mirrors to `$CTRL/supervisor/heartbeat.json`, and that file exists only once the supervisor runs in step 7. Until then the idle clock runs from `--idle-baseline-unix`, and setup (image pull, staging, bootstrap, A40 preflight, transfer test) takes longer than the 600-second idle limit. Restart the watchdog with a fresh baseline at each setup milestone; the restart keeps its observed-identity state, wall and cost limits never pause, and 600 seconds without a restart still deletes the Pod:
+
+```sh
+rebaseline() {
+  pkill -f "tools.runpod_watchdog --identity"; sleep 2
+  BASE=$(date +%s)
+  nohup uv run --locked python -m tools.runpod_watchdog --identity "$CTRL/pod-identity.json" \
+    --heartbeat "$CTRL/supervisor/heartbeat.json" --receipt "$CTRL/watchdog-receipt.json" \
+    --max-wall-seconds 5400 --max-idle-seconds 600 --max-cost-usd 1.08 --quoted-total-hourly 0.60 \
+    --billing-started-at-unix "$ORIGIN" --idle-baseline-unix "$BASE" --max-transfer-seconds 1500 \
+    >> "$CTRL/watchdog.log" 2>&1 < /dev/null &
+}
 ```
 
 Wait until `pod-connection.json` shows `"status": "RUNNING"` and a non-null `ssh_direct` (re-run the capture command until it does). If `ssh_proxy_only` is true the Pod has no public IP and file transfer is impossible: terminate it (step 14) and deploy again in a data center with public IP support. Pin the host key before any transfer:
@@ -98,10 +113,10 @@ Wait until `pod-connection.json` shows `"status": "RUNNING"` and a non-null `ssh
 ```sh
 export POD_HOST=$(python3 -c 'import json; print(json.load(open("'"$CTRL"'/pod-connection.json"))["ssh_direct"]["host"])')
 export POD_PORT=$(python3 -c 'import json; print(json.load(open("'"$CTRL"'/pod-connection.json"))["ssh_direct"]["port"])')
-ssh-keyscan -p "$POD_PORT" "$POD_HOST" > "$CTRL/known_hosts" 2>/dev/null
-ssh-keygen -lf "$CTRL/known_hosts"      # compare with the fingerprint shown in the Pod's web terminal
-alias podssh="ssh -F /dev/null -p $POD_PORT -i $PILOT_SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$CTRL/known_hosts -o BatchMode=yes root@$POD_HOST"
-alias podscp="scp -F /dev/null -P $POD_PORT -i $PILOT_SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$CTRL/known_hosts -o BatchMode=yes"
+ssh-keyscan -p "$POD_PORT" "$POD_HOST" > "$KNOWN_HOSTS" 2>/dev/null
+ssh-keygen -lf "$KNOWN_HOSTS"      # compare with the fingerprint shown in the Pod's web terminal
+alias podssh="ssh -F /dev/null -p $POD_PORT -i $PILOT_SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o BatchMode=yes root@$POD_HOST"
+alias podscp="scp -F /dev/null -P $POD_PORT -i $PILOT_SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$KNOWN_HOSTS -o BatchMode=yes"
 ```
 
 ## 6. Container startup and dependency checks (Pod, billable)
@@ -115,7 +130,9 @@ podscp "$CTRL/repo.tar.gz" root@$POD_HOST:/workspace/repo.tar.gz
 podscp "$BINDING_DIR"/binding.json "$BINDING_DIR"/train.bin "$BINDING_DIR"/train.bin.json \
        "$BINDING_DIR"/validation.bin "$BINDING_DIR"/validation.bin.json "$BINDING_DIR"/tokenizer.json \
        root@$POD_HOST:/workspace/pilot-data/
-podssh "cd /workspace/repo && tar xzf /workspace/repo.tar.gz && bash tools/pilot_pod_bootstrap.sh --deadline-unix $SELF_DESTRUCT_DEADLINE --workspace /workspace/pilot --repo /workspace/repo" | tee "$CTRL/bootstrap.log"
+podssh "cd /workspace/repo && tar xzf /workspace/repo.tar.gz && setsid nohup bash -c 'bash tools/pilot_pod_bootstrap.sh --deadline-unix $SELF_DESTRUCT_DEADLINE --workspace /workspace/pilot --repo /workspace/repo; echo BOOTSTRAP_EXIT=\$?' > /workspace/pilot/bootstrap.log 2>&1 < /dev/null &"
+until podssh 'grep -q ^BOOTSTRAP_EXIT= /workspace/pilot/bootstrap.log'; do sleep 15; done   # detached: an SSH drop cannot kill it
+podscp root@$POD_HOST:/workspace/pilot/bootstrap.log "$CTRL/bootstrap.log"
 podscp root@$POD_HOST:/workspace/pilot/self-destruct.json "$CTRL/self-destruct.json"
 podscp root@$POD_HOST:/workspace/pilot/preflight-a40/report.json "$CTRL/preflight-a40-report.json"
 podscp root@$POD_HOST:/workspace/pilot/environment.json "$CTRL/environment.json"
@@ -128,7 +145,7 @@ Measure the real transfer path with a dummy 1.5 GiB file so the transfer window 
 ```sh
 podssh 'mkdir -p /workspace/transfer-test && head -c 1623502465 /dev/urandom > /workspace/transfer-test/checkpoint.pt && echo "{}" > /workspace/transfer-test/record.json && : > /workspace/transfer-test/training.jsonl'
 time uv run --locked python -m tools.pilot_transfer --host root@$POD_HOST --port $POD_PORT \
-  --identity-file "$PILOT_SSH_KEY" --known-hosts "$CTRL/known_hosts" --remote-dir /workspace/transfer-test \
+  --identity-file "$PILOT_SSH_KEY" --known-hosts "$KNOWN_HOSTS" --remote-dir /workspace/transfer-test \
   --destination "$CTRL/transfer-test" --bundle-name dummy --checkpoint checkpoint.pt --record --log training.jsonl --timeout 1800
 podssh 'rm -rf /workspace/transfer-test'
 ```
@@ -159,17 +176,19 @@ The four Runpod steps confirmed by the first flag are: funded balance verified, 
 Start the worker detached from the SSH session. Probes (16, 32, 8, then the 4-sequence fallback) run first, 20 optimizer updates each with two accumulated microbatches, inside a 300-second window counted from the first probe:
 
 ```sh
-podssh "cd /workspace/repo && setsid nohup python3 -m tools.gpu_pilot run \
+podssh "setsid nohup bash -c 'cd /workspace/repo && exec python3 -m tools.gpu_pilot run \
   --specification configs/pilot-a40-s.json --readiness /workspace/pilot/readiness-receipt.json \
   --preflight /workspace/pilot/preflight-a40/report.json --binding /workspace/pilot-data/binding.json \
-  --binding-sha256 $BINDING_SHA256 --output /workspace/pilot-run > /workspace/pilot/run.log 2>&1 < /dev/null &"
+  --binding-sha256 $BINDING_SHA256 --output /workspace/pilot-run' > /workspace/pilot/run.log 2>&1 < /dev/null &"
+# Wrapping in bash -c with the redirect outside keeps no SSH channel open; a bare
+# `cd ... && setsid ... &` backgrounds a subshell that holds the session until the run ends.
 ```
 
 Start the Mac-side supervisor in a second terminal right away; it mirrors the heartbeat, guards through the API, pulls every export and archives records:
 
 ```sh
 uv run --locked python -m tools.pilot_supervisor --identity "$CTRL/pod-identity.json" --policy "$CTRL/policy.json" \
-  --identity-file "$PILOT_SSH_KEY" --known-hosts "$CTRL/known_hosts" --output "$CTRL/supervisor" \
+  --identity-file "$PILOT_SSH_KEY" --known-hosts "$KNOWN_HOSTS" --output "$CTRL/supervisor" \
   --host root@$POD_HOST --remote-root /workspace/pilot-run --repository "$PRIVATE_REPO" --port $POD_PORT \
   --transfer-timeout 1800 --poll-seconds 15 2>&1 | tee "$CTRL/supervisor.log"
 ```
@@ -217,7 +236,7 @@ The supervisor pulls each export with a remote size/SHA-256 manifest, stages it,
 
 ```sh
 uv run --locked python -m tools.pilot_transfer --host root@$POD_HOST --port $POD_PORT \
-  --identity-file "$PILOT_SSH_KEY" --known-hosts "$CTRL/known_hosts" \
+  --identity-file "$PILOT_SSH_KEY" --known-hosts "$KNOWN_HOSTS" \
   --remote-dir /workspace/pilot-run/exports/<bundle-name> --destination "$CTRL/manual" \
   --bundle-name <bundle-name> --checkpoint checkpoint.pt --record --log training.jsonl --timeout 1800
 ```

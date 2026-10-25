@@ -27,6 +27,13 @@ if [[ -z "$DEADLINE" || -z "$WORKSPACE" ]]; then
   echo "usage: $0 --deadline-unix <unix> --workspace <dir> [--repo <dir>] [--skip-tests]" >&2
   exit 2
 fi
+# A non-interactive SSH command does not inherit the container's injected variables;
+# the Runpod image records them in /etc/rp_environment (observed 2026-10-24).
+if [[ ( -z "${RUNPOD_POD_ID:-}" || -z "${RUNPOD_API_KEY:-}" ) && -r /etc/rp_environment ]]; then
+  set -a; . /etc/rp_environment; set +a
+fi
+# The image's Ubuntu 24.04 system Python may be marked externally managed.
+export PIP_BREAK_SYSTEM_PACKAGES=1
 if [[ -z "${RUNPOD_POD_ID:-}" ]]; then
   echo "RUNPOD_POD_ID is not set; this script must run inside the Pod" >&2
   exit 2

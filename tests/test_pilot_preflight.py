@@ -273,3 +273,33 @@ def test_existing_output_is_not_overwritten(tmp_path: Path) -> None:
         run_preflight(output, device="cpu")
 
     assert marker.read_text() == "keep"
+
+
+def test_torch_uuid_without_the_nvidia_smi_prefix_matches(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Observed on the A40 Pod (torch 2.9.1): PyTorch omits nvidia-smi's "GPU-" prefix.
+    observed_torch_bytes = 47_699_722_240  # nvidia-smi: 46,068 MiB; ~578 MiB driver reserve.
+    _mock_a40(
+        monkeypatch, uuid="57326c38-5d89-2c6d-fae3-07072b0c3696", total_memory=observed_torch_bytes
+    )
+    smi = "NVIDIA A40, GPU-57326c38-5d89-2c6d-fae3-07072b0c3696, 595.91.07, 46068\n"
+    monkeypatch.setattr(
+        "tools.pilot_preflight.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=smi),
+    )
+    assert hardware_description(torch.device("cuda:0"))["device"] == "cuda:0"
+    _mock_a40(
+        monkeypatch, uuid="00000000-5d89-2c6d-fae3-07072b0c3696", total_memory=observed_torch_bytes
+    )
+    with pytest.raises(ValueError, match="different CUDA device UUIDs"):
+        hardware_description(torch.device("cuda:0"))
+
+
+def test_memory_cross_check_still_rejects_a_different_card(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_a40(monkeypatch, uuid="GPU-test", total_memory=44 * 1024**3 + 1)
+    smi = "NVIDIA A40, GPU-test, 595.91.07, 49152\n"  # 48 GiB: about 4 GiB apart.
+    monkeypatch.setattr(
+        "tools.pilot_preflight.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=smi),
+    )
+    with pytest.raises(ValueError, match="materially different"):
+        hardware_description(torch.device("cuda:0"))
