@@ -50,6 +50,27 @@ def cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
     return -chosen.mean()
 
 
+def cross_entropy_sum(
+    logits: Tensor, targets: Tensor, ignore_index: int = -100
+) -> tuple[Tensor, Tensor]:
+    """Summed next-token loss over targets that are not ``ignore_index``, and their count.
+
+    The caller chooses the denominator. A one-pass final update divides by its
+    full row capacity, not by the count, so a padded update gives each real target
+    the same gradient weight as every other update. Ignored positions gather class
+    zero and are then zeroed, which keeps the gather in range and gives them no
+    gradient; when every target is ignored the sum is an exact zero that still
+    backpropagates. Autograd keeps one fp32 ``[B,T,V]`` tensor, as for
+    ``cross_entropy``.
+    """
+    if logits.shape[:-1] != targets.shape or targets.numel() == 0:
+        raise ValueError("logits/target shape mismatch or empty targets")
+    keep = targets != ignore_index
+    log_probabilities = torch.log_softmax(logits.float(), dim=-1)
+    chosen = log_probabilities.gather(-1, targets.masked_fill(~keep, 0).unsqueeze(-1)).squeeze(-1)
+    return (-chosen).masked_fill(~keep, 0.0).sum(), keep.sum()
+
+
 def cross_entropy_and_z(logits: Tensor, targets: Tensor) -> tuple[Tensor, Tensor]:
     """Mean next-token loss and the z-loss term ``mean(log Z^2)``.
 

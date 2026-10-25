@@ -19,12 +19,14 @@ from scratchcoder.common.config import RunConfig
 from scratchcoder.common.logging import EventLogger, debug_logger
 from scratchcoder.common.records import RunRecord, validate_resume_details
 from scratchcoder.data.loader import BatchSource
+from scratchcoder.data.onepass import IGNORE
 from scratchcoder.model.gpt import GPT
 from scratchcoder.optim.adamw import (
     AdamW,
     clip_gradients,
     cross_entropy,
     cross_entropy_and_z,
+    cross_entropy_sum,
     learning_rate,
 )
 from scratchcoder.train.validation import ValidationWindow, validate
@@ -157,6 +159,10 @@ class Trainer:
                     self.optimizer.zero_grad()
                     loss_value = 0.0
                     z_value = 0.0
+                    # Microbatches with padded (IGNORE) targets, their summed loss and
+                    # real target count; zero masked microbatches leaves every
+                    # existing computation of this update untouched.
+                    masked, masked_sum, masked_count = 0, 0.0, 0
                     interrupted = False
                     for _ in range(options.accumulation_steps):
                         if should_stop is not None and should_stop():
@@ -165,6 +171,11 @@ class Trainer:
                         inputs, targets, _ = self.loader.next_batch()
                         x = torch.tensor(inputs, dtype=torch.long, device=self.device)
                         y = torch.tensor(targets, dtype=torch.long, device=self.device)
+                        if any(IGNORE in row for row in targets):
+                            total, count = self._masked_microbatch(x, y)
+                            masked, masked_sum = masked + 1, masked_sum + total
+                            masked_count += count
+                            continue
                         with torch.autocast(
                             device_type=self.device.type,
                             dtype=torch.bfloat16,
@@ -199,6 +210,16 @@ class Trainer:
                         self.optimizer.zero_grad()
                         logger.event("training_stopped", step=self.step, partial_update=True)
                         break
+                    if masked:
+                        # Log the mean over this update's real targets: unmasked
+                        # microbatch means become sums, and masked sums are added.
+                        full = options.batch_size * options.sequence_length
+                        real_targets = (options.accumulation_steps - masked) * full + masked_count
+                        if real_targets == 0:
+                            raise ValueError("a masked update has no real targets")
+                        loss_value = (
+                            loss_value * options.accumulation_steps * full + masked_sum
+                        ) / real_targets
                     if self.world_size > 1:
                         for parameter in self.model.parameters():
                             if parameter.grad is not None:
@@ -227,6 +248,8 @@ class Trainer:
                         * options.accumulation_steps
                         * self.world_size
                     )
+                    if masked:
+                        tokens = real_targets
                     metrics = {
                         "loss": loss_value,
                         "learning_rate": self.optimizer.lr,
@@ -265,6 +288,34 @@ class Trainer:
                 if self.rank == 0:
                     self.record.save(self.run_root)
         return losses
+
+    def _masked_microbatch(self, x: Tensor, y: Tensor) -> tuple[float, int]:
+        """Backpropagate a microbatch with IGNORE targets; return its loss sum and count.
+
+        The summed loss is divided by the update's full capacity
+        (``batch_size * sequence_length * accumulation_steps``), the same per-target
+        weight that an unmasked microbatch's ``mean / accumulation_steps`` gives.
+        """
+        options = self.config.train
+        if options.z_loss > 0:
+            raise ValueError("z-loss is not supported for microbatches with IGNORE targets")
+        if self.world_size != 1:
+            raise ValueError("microbatches with IGNORE targets require single-process training")
+        if tuple(y.shape) != (options.batch_size, options.sequence_length):
+            raise ValueError("microbatches with IGNORE targets must have the configured shape")
+        capacity = options.batch_size * options.sequence_length * options.accumulation_steps
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.bfloat16,
+            enabled=options.precision == "bfloat16",
+        ):
+            logits = self.forward(x)
+            total, count = cross_entropy_sum(logits, y, ignore_index=IGNORE)
+            loss = total / capacity
+        if not bool(torch.isfinite(loss)):
+            raise FloatingPointError("nonfinite training loss")
+        loss.backward()  # type: ignore[no-untyped-call]  # PyTorch's Tensor stub.
+        return float(total.detach()), int(count)
 
     def _log_validation(self, logger: EventLogger) -> None:
         if self.rank == 0 and self.validation:

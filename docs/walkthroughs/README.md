@@ -16,6 +16,8 @@ Implemented: [loss and optimization](optimizer.md).
 
 Implemented: [training and resume](training-loop.md).
 
+Implemented: [one-pass loader and masked final update](one-pass-loader.md).
+
 Implemented: [cached generation](kv-cache.md).
 
 Implemented: [evaluation metrics](metrics.md).
