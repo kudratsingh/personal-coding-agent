@@ -74,7 +74,7 @@ These original-corpus counts are distinct from the newer classifier recount
 used in [P1-6](full-build-plan.md).
 
 The **2026-10-24 upstream-license review recount** supersedes the next paragraph for
-capacity: **197,448,213 Python tokens / 824,650,726 bytes = 4.1765418561 BPT**
+capacity: **198,273,119 Python tokens / 828,088,405 bytes = 4.1765036490 BPT**
 (see [sample evidence](real-samples.md)). The frozen tokenizer was not changed.
 
 The completed **2026-10-20 header-only review recount** contained

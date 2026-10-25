@@ -10,10 +10,10 @@ below. The owner authorized exactly one replacement fit, not a full build.
 | Frozen tokenizer and dated decision | [Replacement freeze](../tokenizer-freeze.md), D-24: **65,536 entries / 65,264 merges**, merge SHA `b0297f478dd5172a690752ceac8f997fccbd95e36e5787ca56a2c555083c7b7b` | Met; replaces October 19 D-19 |
 | Same balanced fit selection, held-out compression | **96,223,042 bytes/domain**, original corpus hashes unchanged; English **518,340 tokens / 2,589,956 bytes = 4.9966354130 BPT**; Python **95,959 / 415,822 = 4.3333298596**; 50/50 bytes **4.6414040782** | Met at measured scope; optional 32,768 fit **0** |
 | Reference, compatibility and shard boundary | **64 targeted tests**, full **702 passed / 7 explicit NumPy skips**; maximum ID **65,535**, all **16 specials** included; legacy identities preserved | Met at CPU/fixture scope |
-| Original versus current license-review selections | Original fit-review **10,786 Python files / 96,638,864 bytes**; 2026-10-20 header-only review **13,833 / 122,701,374**; current upstream-license review **189,369 / 824,650,726** after an exact repository/path join matched all **209,914** files; **8,909 unrecognized or unreadable headers** and **5,695 off-allowlist repository files** stay dropped | Repository IDs from The Stack dedup v1.2 metadata only; no inference; data-card credits retained |
+| Original versus current license-review selections | Original fit-review **10,786 Python files / 96,638,864 bytes**; 2026-10-20 header-only review **13,833 / 122,701,374**; current upstream-license review **190,222 / 828,088,405** after an exact repository/path join matched all **209,914** files; **8,909 unrecognized or unreadable headers** and **4,828 off-allowlist repository files** stay dropped | Repository IDs from The Stack dedup v1.2 metadata only; no inference; data-card credits retained |
 | 100 MB real slow/fast identity and loader/GPU throughput | Actual real probe **512 characters**; GPU runs **0** | Still not met |
-| Current review recount and capacity | **197,448,213 Python tokens / 824,650,726 bytes**, **4.1765418561 BPT**; conditional 64GB forecast **12.63668B tokens**, **12.57350B after validation reserve** (2026-10-20 header-only: 26,328,493 tokens, 1.68502B forecast) | Encoding-only frozen-tokenizer recount; ordered single-shard prefix, not a full-source count |
-| Full-build decision | [P1-6](../full-build-plan.md), owner approvals/deferrals **0** | Still not met; overall G1 remains open |
+| Current review recount and capacity | **198,273,119 Python tokens / 828,088,405 bytes**, **4.1765036490 BPT**; conditional 64GB forecast **12.68948B tokens**, **12.62603B after validation reserve** (2026-10-20 header-only: 26,328,493 tokens, 1.68502B forecast) | Encoding-only frozen-tokenizer recount; ordered single-shard prefix, not a full-source count |
+| Full-build decision | [P1-6](../full-build-plan.md): owner approved the **S rehearsal build only**, effective after the GPU pilot report (2026-10-24); no build has run | Partly met (S only); overall G1 remains open |
 
 The following inventory preserves the original measurement scopes and historical
 October 19 freeze. It is not permission to use that superseded tokenizer for
@@ -42,5 +42,5 @@ retained license IDs**, validation **52 files / 475,430 bytes / 140,646 tokens**
 Its per-class/quality counters do not relabel the original tokenizer-fit corpus.
 Current recount times: **65.55425s web / 50.73031s Python**, four workers.
 The **100MB real reference/fast identity condition remains unmet**; no second
-production fit or full-pool exclusion is claimed. Full-build approvals/deferrals
-remain **0**, despite the owner's request to revise the draft.
+production fit or full-pool exclusion is claimed. On 2026-10-24 the owner approved
+the S rehearsal build only, effective after the pilot report; no build has run.
