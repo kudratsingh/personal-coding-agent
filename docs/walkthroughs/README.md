@@ -16,6 +16,8 @@ Implemented: [loss and optimization](optimizer.md).
 
 Implemented: [training and resume](training-loop.md).
 
+Implemented: [whole-document validation windows and batched validation](validation-windows.md).
+
 Implemented: [cached generation](kv-cache.md).
 
 Implemented: [evaluation metrics](metrics.md).
