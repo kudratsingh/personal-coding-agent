@@ -2,6 +2,8 @@
 
 Audit date: 2026-10-22. Audited revision: branch `pilot-readiness-audit` on top of `940530d` (PR #80). Environment used for verification: a CPU-only Linux container (4 vCPU, 15 GB RAM, Python 3.12.13, torch 2.14.1 CPU build). No Runpod Pod, GPU, volume or other paid resource was created, started or quoted by this audit; Runpod spending by this work is $0.
 
+**Outcome (2026-10-24):** the owner authorized launch and the pilot completed: winner 6e-4 to step 500, 91,750,400 tokens at 35,974 tok/s, checkpoint verified on the Mac, Pod deleted (204, then 404), $0.60 spent. Measured results and the fixes the live run required are in [docs/gpu-pilot-plan.md](docs/gpu-pilot-plan.md#measured-a40-pilot-2026-10-24).
+
 ## 1. Final readiness verdict
 
 **READY WITH BLOCKERS.** The engineering, tests, safeguards and runbook are complete and verified on CPU. Launch is blocked until the owner resolves the conditions in section 6, the most important being that Runpod has no provider-enforced Pod lifetime: termination within 90 minutes is layered best-effort (in-Pod timer, Mac watchdog, worker deadline), not a hard guarantee, and the owner must accept that residual risk explicitly in the readiness receipt. All A40 numbers remain unmeasured.

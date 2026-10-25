@@ -2,7 +2,9 @@
 
 Prepared 2026-10-22 alongside the pilot readiness audit. This page records what comparable
 small-model pretraining runs do, which of those practices this repository now implements,
-and which specification enables what. Everything here was verified on CPU only; no GPU run
+and which specification enables what. Everything here was verified on CPU; the 2026-10-24 A40
+pilot measured one point: the compile probe ran **1.57x** faster than eager at microbatch 16,
+after about 48 s of compilation. No other GPU run
 has produced a number yet.
 
 ## What comparable runs look like
