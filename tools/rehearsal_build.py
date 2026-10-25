@@ -45,9 +45,10 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import date
+from http.client import HTTPException
 from pathlib import Path
 from typing import IO, Any
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.request import Request, build_opener
 
 import numpy as np
@@ -356,7 +357,7 @@ class Hub:
                 error.close()
                 if error.code not in RETRY_STATUSES or attempt + 1 == self._attempts:
                     raise
-            except (URLError, TimeoutError, ConnectionError):
+            except (OSError, HTTPException):
                 if attempt + 1 == self._attempts:
                     raise
             self._sleep(min(30.0, 2.0**attempt))
@@ -392,7 +393,8 @@ class Hub:
                         error.close()
                         if error.code not in RETRY_STATUSES or attempt + 1 == self._attempts:
                             raise
-                    except (URLError, TimeoutError, ConnectionError):
+                    except (OSError, HTTPException):
+                        # URLError, timeouts, resets and TLS errors mid-body all resume.
                         if attempt + 1 == self._attempts:
                             raise
                     self._sleep(min(30.0, 2.0**attempt))
@@ -610,7 +612,11 @@ def unit_inputs(
         "contamination_sha256": _sha256_json(list(contamination)),
         "filter": asdict(FilterConfig()),
         "code": {name: file_sha256(root / name) for name in DECISION_CODE},
-        "review": inspect.getsource(review_unit) + inspect.getsource(_unit_rows),
+        "review": [
+            inspect.getsource(function)
+            for function in (_initialize, _unit_rows, unit_keys, review_unit, review)
+        ],
+        "text_columns": TEXT_COLUMNS,
     }
     return {
         "web": _sha256_json({**common, "web_license": spec.source("web").license}),
@@ -1035,6 +1041,7 @@ def assemble(
                     for name, repositories in sorted(credit["repositories_by_license_id"].items())
                 },
                 "text_bytes": credit["text_bytes"],
+                "text_bytes_note": "whole source documents, including the cut one in full",
             },
         }
     domains = {domain: _finish(tally) for domain, tally in tallies.items()}
@@ -1234,8 +1241,10 @@ def build(
     inputs = unit_inputs(spec, texts, license_identity)
     units = plan_units(spec, receipts, inputs)
     raw_bytes = sum(item["size_bytes"] for item in receipts["files"])
-    free_before = require_free(build_dir, 4 * raw_bytes, spec, "build")
     unit_dir = build_dir / "units"
+    # Units, shards and listings come to about twice the raw bytes; count units on disk.
+    written = sum(path.stat().st_size for path in unit_dir.glob("*")) if unit_dir.exists() else 0
+    free_before = require_free(build_dir, max(0, 4 * raw_bytes - written), spec, "build")
     timings: dict[str, float] = {"verify_inputs": time.perf_counter() - started}
     began = time.perf_counter()
     records = review(
@@ -1365,6 +1374,24 @@ def _source_text(path: Path, domain: str, row: int) -> str:
     raise IndexError(f"row {row} is past the end of {path}")
 
 
+def _check_rights(spec: Spec, stream: Stream, row: Mapping[str, Any]) -> None:
+    """Re-assert, per listed document, the admission rule that let it in."""
+    if row["domain"] != stream.domain or row["license_class"] != "permissive":
+        raise ValueError(f"{stream.name}: document {row['sha256']} is not admitted")
+    if stream.domain == "web":
+        if row["license"] != spec.source("web").license:
+            raise ValueError(f"{stream.name}: web document carries the wrong license")
+        return
+    if row["repository"] is None or row["path"] is None:
+        raise ValueError(f"{stream.name}: Python document without repository/path provenance")
+    if row["license_basis"] == "repository_metadata":
+        listed = row["repository_licenses"] or []
+        if not listed or not set(listed) <= REPOSITORY_ALLOWLIST:
+            raise ValueError(f"{stream.name}: repository licenses outside the allowlist")
+        if row["license"] != " AND ".join(listed):
+            raise ValueError(f"{stream.name}: license differs from its repository licenses")
+
+
 def verify(spec: Spec, build_dir: Path, *, directory: Path | None = None) -> dict[str, Any]:
     """Re-check every shard, document and stream invariant; write verification.json.
 
@@ -1445,6 +1472,7 @@ def verify(spec: Spec, build_dir: Path, *, directory: Path | None = None) -> dic
                 digest = hashlib.sha256(values[offset : offset + length].tobytes()).hexdigest()
                 if digest != row["tokens_sha256"]:
                     raise ValueError(f"{shard['file']}: document {row['index']} tokens differ")
+                _check_rights(spec, stream, row)
             total += shard["tokens"]
             documents += len(rows)
             cut_rows.extend((number, i, r) for i, r in enumerate(rows) if r["cut"])

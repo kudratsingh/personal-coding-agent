@@ -596,3 +596,23 @@ def test_the_license_mapping_must_match_the_downloaded_containers(fixture: Fixtu
     receipts["files"][2]["sha256"] = "0" * 64
     with pytest.raises(ValueError, match="different containers"):
         rehearsal_build.license_mapping(spec, fixture.build, receipts)
+
+
+def test_verify_rejects_a_listed_document_that_breaks_the_admission_rule(
+    fixture: Fixture,
+) -> None:
+    spec = prepare(fixture, fixture.spec())
+    build(spec, fixture.build, workers=1, progress=quiet)
+    output = fixture.build / "output"
+    rows = [json.loads(x) for x in (output / "documents.jsonl").read_text().splitlines()]
+    target = next(row for row in rows if row["license_basis"] == "repository_metadata")
+    target["repository_licenses"] = ["ECL-2.0"]
+    target["license"] = "ECL-2.0"
+    (output / "documents.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
+    )
+    report = json.loads((output / "report.json").read_text())
+    report["documents"]["sha256"] = file_sha256(output / "documents.jsonl")
+    (output / "report.json").write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="allowlist"):
+        verify(spec, fixture.build)
