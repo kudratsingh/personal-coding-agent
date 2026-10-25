@@ -13,7 +13,7 @@ below. The owner authorized exactly one replacement fit, not a full build.
 | Original versus current license-review selections | Original fit-review **10,786 Python files / 96,638,864 bytes**; 2026-10-20 header-only review **13,833 / 122,701,374**; current upstream-license review **190,222 / 828,088,405** after an exact repository/path join matched all **209,914** files; **8,909 unrecognized or unreadable headers** and **4,828 off-allowlist repository files** stay dropped | Repository IDs from The Stack dedup v1.2 metadata only; no inference; data-card credits retained |
 | 100 MB real slow/fast identity and loader/GPU throughput | Actual real probe **512 characters**; one A40 pilot trained at **35,974 tok/s** (2026-10-24) | 100 MB identity still not met |
 | Current review recount and capacity | **198,273,119 Python tokens / 828,088,405 bytes**, **4.1765036490 BPT**; conditional 64GB forecast **12.68948B tokens**, **12.62603B after validation reserve** (2026-10-20 header-only: 26,328,493 tokens, 1.68502B forecast) | Encoding-only frozen-tokenizer recount; ordered single-shard prefix, not a full-source count |
-| Full-build decision | [P1-6](../full-build-plan.md): owner approved the **S rehearsal build only**, effective after the GPU pilot report (2026-10-24); no build has run | Partly met (S only); overall G1 remains open |
+| Full-build decision | [P1-6](../full-build-plan.md): owner approved the **S rehearsal build only**, effective after the GPU pilot report (2026-10-24); the [S build ran on 2026-10-25](../rehearsal-data.md), quotas exact and verification passed | Partly met (S only); overall G1 remains open |
 
 The following inventory preserves the original measurement scopes and historical
 October 19 freeze. It is not permission to use that superseded tokenizer for
@@ -43,4 +43,5 @@ Its per-class/quality counters do not relabel the original tokenizer-fit corpus.
 Current recount times: **65.55425s web / 50.73031s Python**, four workers.
 The **100MB real reference/fast identity condition remains unmet**; no second
 production fit or full-pool exclusion is claimed. On 2026-10-24 the owner approved
-the S rehearsal build only, effective after the pilot report; no build has run.
+the S rehearsal build only, effective after the pilot report; it ran on 2026-10-25
+([results](../rehearsal-data.md)). Training admission still waits for the final pool holdout.

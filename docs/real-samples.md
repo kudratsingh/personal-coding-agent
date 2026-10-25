@@ -234,9 +234,10 @@ built from and which carries the same Terms of Use for The Stack.
 to the v1.2 release candidate. It used HTTPS range requests and fetched
 **822,321,592 of 28,596,682,891 upstream bytes (2.876%)** in **26,497 requests**
 over **2,046.9 seconds**: the three columns' chunks, each file's Parquet footer,
-**2,447,609 bytes** of other non-content columns from this run's speculative
-footer read (about 17 KiB per file, since removed) and a **1,253,743-byte** file
-listing. No fetched byte overlapped a `content` column chunk. Parquet footers,
+**2,447,609 bytes** outside those column chunks and footers (about 17 KiB per
+file) and a **1,253,743-byte** file listing. The 2,447,609 bytes were first
+attributed to a speculative footer read; that was wrong. The 2026-10-25 lookup,
+run without that read, counted the identical bytes per file. No fetched byte overlapped a `content` column chunk. Parquet footers,
 which any column-projected read needs, store per-row-group min/max statistics for
 every column, so short complete files from `content` arrived inside them: one
 measured footer is 169,400 of 545,052 bytes such text, about **24 MB** across the

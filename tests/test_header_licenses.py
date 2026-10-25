@@ -268,3 +268,13 @@ def test_d05_correction_admits_0bsd_and_wtfpl_repository_licenses() -> None:
     assert classify_file(text, ["0BSD", "ECL-2.0"]).category == "repository_disallowed"
     # The inline header classifier is unchanged by this correction.
     assert classify_header("# SPDX-License-Identifier: 0BSD\nanswer = 1\n").category != "permissive"
+
+
+def test_a_nul_byte_after_an_indented_block_is_a_tokenizer_failure_not_a_crash() -> None:
+    # CPython 3.12 raises SystemError, caused by a SyntaxError, for this NUL byte;
+    # two StarCoderData Python files in the S build have one.
+    body = "if ready:\n    pass\n\x00\n"
+    assert classify_file("# SPDX-License-Identifier: MIT\n" + body, None).license_id == "MIT"
+    # The leading tokens were read, so an absent header still falls back to metadata.
+    assert classify_file(body, ["Apache-2.0"]).license_id == "Apache-2.0"
+    assert classify_file("\x00import os\n", ["MIT"]).category == "unrecognized"

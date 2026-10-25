@@ -68,6 +68,14 @@ was **52 files / 475,430 bytes / 108,883 tokens**. The original 45-file holdout
 remains the compression comparison above; see [P1-6](full-build-plan.md) for
 the revised conditional capacity forecast.
 
+## S rehearsal pretraining build (2026-10-25)
+
+The owner-approved [S rehearsal build](rehearsal-data.md) is the first build from whole source files rather than samples. It used FineWeb-Edu `sample-10BT` files 000 and 001 and StarCoderData Python files 00000 to 00004, at the same pinned revisions and terms as the samples. It produced exactly **1,000,000,000** stage-1 English, **100,000,000** stage-2 English and **900,000,000** stage-2 Python shard tokens, plus validation streams.
+
+Every Python file was joined to The Stack dedup v1.2 repository licenses, and all 1,090,395 matched. The build kept **83.22674%** of Python bytes under the same header-first, D-05-allowlist rule as the samples. Each shard document's source row, repository/path and license IDs are recorded locally for attribution; per-stream credits by license ID are in the build report. Credit Hugging Face and Lozhkov et al. (2024) for FineWeb-Edu, and BigCode, The Stack and the original repository authors for the Python files.
+
+The data is not redistributed. Training admission still waits for the final task-pool holdout exclusion.
+
 ## Evaluation-only source actually used
 
 - OpenAI HumanEval: 164 tasks, [revision and MIT attribution](https://github.com/openai/human-eval/tree/6d43fb980f9fee3c892a914eda09951f772ad10d). Pinned gzip SHA-256: `b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef` (44,877 bytes).

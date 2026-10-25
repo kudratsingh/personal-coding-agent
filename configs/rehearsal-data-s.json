@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "name": "rehearsal-s",
+  "tokenizer": {
+    "path": "runs/tokenizer-freeze-65536-20261020/tokenizer.json",
+    "identity": "509ab5b810dee7ae93205721bd921728fe83dac8a857bf087296206f9de655e6",
+    "file_sha256": "13e2eb08dc4930f645d5582b23f2b39a58c3735dbc264720b8c78fef1c21c23e",
+    "vocab_size": 65536,
+    "bos_id": 256
+  },
+  "sources": [
+    {
+      "domain": "web",
+      "dataset": "HuggingFaceFW/fineweb-edu",
+      "revision": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
+      "gated": false,
+      "files": [
+        "sample/10BT/000_00000.parquet",
+        "sample/10BT/001_00000.parquet"
+      ],
+      "license": "ODC-By-1.0",
+      "terms": "ODC-By 1.0 plus the Common Crawl Terms of Use",
+      "terms_accepted_on": "2026-10-19",
+      "attribution": "Hugging Face FineWeb-Edu; Lozhkov et al. (2024)",
+      "obligations": "Attribute FineWeb-Edu under ODC-By 1.0 and keep the Common Crawl Terms of Use, which preserve third-party rights in the underlying pages"
+    },
+    {
+      "domain": "python",
+      "dataset": "bigcode/starcoderdata",
+      "revision": "9fc30b578cedaec69e47302df72cf00feed7c8c4",
+      "gated": true,
+      "files": [
+        "python/train-00000-of-00059.parquet",
+        "python/train-00001-of-00059.parquet",
+        "python/train-00002-of-00059.parquet",
+        "python/train-00003-of-00059.parquet",
+        "python/train-00004-of-00059.parquet"
+      ],
+      "license": "original file licenses, per file",
+      "terms": "Terms of Use for The Stack",
+      "terms_accepted_on": "2026-10-19",
+      "attribution": "BigCode; StarCoderData/The Stack and original repository authors",
+      "obligations": "Abide by each original file license, including attribution, using the recorded repository/path provenance; keep to the latest usable version of The Stack named by its maintainers, which carries validated removal requests"
+    }
+  ],
+  "license_metadata": {
+    "dataset": "bigcode/the-stack-dedup",
+    "revision": "17cad72c886a2858e08d4c349a00d6466f54df63",
+    "terms": "Terms of Use for The Stack",
+    "terms_accepted_on": "2026-10-24",
+    "attribution": "BigCode; The Stack dedup v1.2 (Kocetkov et al., 2022)",
+    "obligations": "Read only the repository, path and license columns plus each footer; detected repository licenses are not a legal warranty"
+  },
+  "contamination": {
+    "humaneval": "runs/real-samples-20261019/HumanEval.jsonl.gz",
+    "evalplus_directory": "runs/evalplus-review",
+    "arc_directory": "runs/arc-review"
+  },
+  "streams": [
+    {"name": "stage1-web", "domain": "web", "split": "stage1", "tokens": 1000000000},
+    {"name": "stage2-web", "domain": "web", "split": "stage2", "tokens": 100000000},
+    {"name": "stage2-python", "domain": "python", "split": "train", "tokens": 900000000},
+    {"name": "validation-web", "domain": "web", "split": "validation", "tokens": null},
+    {"name": "validation-python", "domain": "python", "split": "validation", "tokens": null}
+  ],
+  "unit_row_groups": 16,
+  "shard_max_tokens": 134217728,
+  "min_free_bytes": 21474836480,
+  "max_download_bytes": 6267680658
+}

@@ -73,6 +73,12 @@ def scan_header(text: str) -> tuple[str, bool]:
                 break
     except (tokenize.TokenError, IndentationError, SyntaxError):
         readable = bool(tokens) and any(t.type != tokenize.NL for t in tokens)
+    except SystemError as error:
+        # CPython 3.12's C tokenizer reports a NUL byte as a SyntaxError that escapes
+        # as SystemError. Treat it like any other tokenizer failure; re-raise the rest.
+        if not isinstance(error.__cause__, SyntaxError):
+            raise
+        readable = bool(tokens) and any(t.type != tokenize.NL for t in tokens)
     index = 0
     while index < len(tokens):
         token = tokens[index]
