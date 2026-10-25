@@ -21,3 +21,5 @@ Implemented: [cached generation](kv-cache.md).
 Implemented: [evaluation metrics](metrics.md).
 
 Implemented: [multiple-choice evaluation](multiple-choice.md).
+
+Implemented: [rehearsal data binding](rehearsal-binding.md).
