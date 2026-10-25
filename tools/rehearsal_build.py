@@ -35,6 +35,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import importlib
+import inspect
 import json
 import multiprocessing
 import os
@@ -43,6 +44,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from datetime import date
 from pathlib import Path
 from typing import IO, Any
 from urllib.error import HTTPError, URLError
@@ -71,7 +73,7 @@ from tools.header_licenses import (
 )
 from tools.pilot_data import _load_tokenizer
 from tools.real_samples import REPOSITORY_EVIDENCE, contamination_inputs
-from tools.stack_licenses import API_HOST, HuggingFaceClient, _require_api_url, load_mapping
+from tools.stack_licenses import API_HOST, HuggingFaceClient, Key, _require_api_url, load_mapping
 
 SCHEMA_VERSION = 1
 DOMAINS = ("web", "python")
@@ -100,12 +102,22 @@ PROVENANCE = (
     "id",
     "sha256",
     "license",
+    "license_class",
+    "license_evidence",
     "license_basis",
     "repository_licenses",
     "repository",
     "path",
     "url",
 )
+DECISION_CODE = (
+    "tools/header_licenses.py",
+    "tools/real_samples.py",
+    "src/scratchcoder/data/filters.py",
+    "src/scratchcoder/tokenizer/bpe.py",
+    "src/scratchcoder/tokenizer/bulk.py",
+)
+"""Modules whose code decides a unit's rows; a change to any of them redoes every unit."""
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 CHUNK = 8 * 1024 * 1024
 
@@ -121,6 +133,7 @@ class Source:
     terms: str
     terms_accepted_on: str
     attribution: str
+    obligations: str
 
 
 @dataclass(frozen=True)
@@ -174,6 +187,25 @@ def _positive(value: Any, name: str) -> int:
     return value
 
 
+def _text(entry: Mapping[str, Any], keys: Sequence[str], name: str) -> None:
+    for key in keys:
+        if not isinstance(entry[key], str) or not entry[key].strip():
+            raise ValueError(f"{name} {key} must be a nonempty string")
+
+
+def _accepted(value: Any, name: str) -> str:
+    """An owner terms-acceptance date: YYYY-MM-DD and not in the future."""
+    if not isinstance(value, str) or len(value) != 10:
+        raise ValueError(f"{name} terms_accepted_on must be a YYYY-MM-DD date")
+    try:
+        accepted = date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"{name} terms_accepted_on must be a YYYY-MM-DD date") from error
+    if accepted > date.today():
+        raise ValueError(f"{name} terms acceptance cannot be in the future")
+    return value
+
+
 def load_spec(path: Path) -> Spec:
     """Parse and validate a build spec; unknown or missing keys are errors."""
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -215,9 +247,12 @@ def load_spec(path: Path) -> Spec:
                 "terms",
                 "terms_accepted_on",
                 "attribution",
+                "obligations",
             },
             "source",
         )
+        _text(entry, ("dataset", "license", "terms", "attribution", "obligations"), "source")
+        _accepted(entry["terms_accepted_on"], entry["dataset"])
         files = entry["files"]
         if (
             entry["domain"] not in DOMAINS
@@ -235,15 +270,20 @@ def load_spec(path: Path) -> Spec:
     if sorted(source.domain for source in sources) != sorted(DOMAINS):
         raise ValueError("the spec needs exactly one web and one Python source")
     metadata = _exact_keys(
-        top["license_metadata"], {"dataset", "revision", "terms_accepted_on"}, "license_metadata"
+        top["license_metadata"],
+        {"dataset", "revision", "terms", "terms_accepted_on", "attribution", "obligations"},
+        "license_metadata",
     )
     _hex(metadata["revision"], 40, "license metadata revision")
+    _text(metadata, ("dataset", "terms", "attribution", "obligations"), "license_metadata")
+    _accepted(metadata["terms_accepted_on"], "license_metadata")
     contamination = _exact_keys(
         top["contamination"], {"humaneval", "evalplus_directory", "arc_directory"}, "contamination"
     )
     streams = []
     for item in top["streams"]:
         entry = _exact_keys(item, {"name", "domain", "split", "tokens"}, "stream")
+        _text(entry, ("name",), "stream")
         if entry["domain"] not in DOMAINS or entry["split"] not in SPLITS[entry["domain"]]:
             raise ValueError(f"stream {entry['name']!r} has an unknown domain or split")
         if entry["tokens"] is not None:
@@ -397,8 +437,10 @@ def download(
     progress: Callable[[str], None] = print,
 ) -> dict[str, Any]:
     receipts_path = build / "download-receipts.json"
-    if receipts_path.exists() and json.loads(receipts_path.read_text())["status"] == "completed":
-        raise FileExistsError("downloads are already complete for this build")
+    if receipts_path.exists():
+        prior_receipts = json.loads(receipts_path.read_text())
+        if prior_receipts["status"] == "completed" and prior_receipts["spec_sha256"] == spec.sha256:
+            raise FileExistsError("downloads are already complete for this spec")
     started = time.perf_counter()
     reusable: dict[tuple[str, str, str], Path] = {}
     for path in reuse:
@@ -515,9 +557,9 @@ def licenses(
 
 def license_mapping(
     spec: Spec, build: Path, receipts: Mapping[str, Any]
-) -> tuple[Path, dict[str, Any]]:
-    report = build / "licenses" / "report.json"
-    _, identity = load_mapping(report)
+) -> tuple[dict[Key, tuple[str, ...]], dict[str, Any]]:
+    """The verified mapping and its identity, which must name exactly these containers."""
+    mapping, identity = load_mapping(build / "licenses" / "report.json")
     containers = [
         {"filename": item["filename"], "sha256": item["sha256"]}
         for item in receipts["files"]
@@ -533,7 +575,7 @@ def license_mapping(
         or identity["revision"] != spec.license_metadata["revision"]
     ):
         raise ValueError("the license mapping was built for different containers or upstream")
-    return report, identity
+    return mapping, identity
 
 
 @dataclass(frozen=True)
@@ -543,11 +585,40 @@ class Unit:
     file_index: int
     filename: str
     path: str
+    sha256: str
     first_group: int
     groups: int
+    inputs: str
 
 
-def plan_units(spec: Spec, receipts: Mapping[str, Any]) -> list[Unit]:
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def unit_inputs(
+    spec: Spec, contamination: Sequence[str], license_identity: Mapping[str, Any]
+) -> dict[str, str]:
+    """Per-domain fingerprints of everything that decides a unit's rows.
+
+    A unit is reused only when its recorded fingerprint matches, so a changed
+    tokenizer, license mapping, contamination set, filter, classifier or review
+    code redoes it instead of silently keeping old decisions.
+    """
+    root = Path(__file__).resolve().parents[1]
+    common = {
+        "tokenizer": spec.tokenizer["identity"],
+        "contamination_sha256": _sha256_json(list(contamination)),
+        "filter": asdict(FilterConfig()),
+        "code": {name: file_sha256(root / name) for name in DECISION_CODE},
+        "review": inspect.getsource(review_unit) + inspect.getsource(_unit_rows),
+    }
+    return {
+        "web": _sha256_json({**common, "web_license": spec.source("web").license}),
+        "python": _sha256_json({**common, "mapping_sha256": license_identity["mapping_sha256"]}),
+    }
+
+
+def plan_units(spec: Spec, receipts: Mapping[str, Any], inputs: Mapping[str, str]) -> list[Unit]:
     parquet = importlib.import_module("pyarrow.parquet")
     units = []
     for item in receipts["files"]:
@@ -556,16 +627,17 @@ def plan_units(spec: Spec, receipts: Mapping[str, Any]) -> list[Unit]:
         with parquet.ParquetFile(item["path"]) as handle:
             count = int(handle.metadata.num_row_groups)
         for first in range(0, count, spec.unit_row_groups):
-            groups = min(spec.unit_row_groups, count - first)
             units.append(
                 Unit(
-                    f"{domain}-{index:03d}-{first:05d}",
-                    domain,
-                    index,
-                    item["filename"],
-                    item["path"],
-                    first,
-                    groups,
+                    name=f"{domain}-{index:03d}-{first:05d}",
+                    domain=domain,
+                    file_index=index,
+                    filename=item["filename"],
+                    path=item["path"],
+                    sha256=item["sha256"],
+                    first_group=first,
+                    groups=min(spec.unit_row_groups, count - first),
+                    inputs=inputs[domain],
                 )
             )
     return units
@@ -574,23 +646,10 @@ def plan_units(spec: Spec, receipts: Mapping[str, Any]) -> list[Unit]:
 _worker: dict[str, Any] = {}
 
 
-def _initialize(
-    tokenizer_path: str, contamination: list[str], license_report: str | None, web_license: str
-) -> None:
+def _initialize(tokenizer_path: str, contamination: list[str], web_license: str) -> None:
     _worker["encoder"] = FastEncoder(ByteBPE.load(Path(tokenizer_path)))
     _worker["index"] = ContaminationIndex(contamination)
-    _worker["license_report"] = license_report
     _worker["web_license"] = web_license
-    _worker["mapping"] = None
-
-
-def _mapping() -> Mapping[tuple[str, str], tuple[str, ...]]:
-    if _worker["mapping"] is None:
-        if _worker["license_report"] is None:
-            raise RuntimeError("Python units need the license mapping")
-        _worker["mapping"], _ = load_mapping(Path(_worker["license_report"]))
-    mapping: Mapping[tuple[str, str], tuple[str, ...]] = _worker["mapping"]
-    return mapping
 
 
 def _unit_rows(unit: Unit) -> Iterator[tuple[int, dict[str, Any]]]:
@@ -609,13 +668,39 @@ def _unit_rows(unit: Unit) -> Iterator[tuple[int, dict[str, Any]]]:
                 row += 1
 
 
-def review_unit(unit: Unit, directory: str) -> dict[str, Any]:
-    """Classify, filter and encode one unit; outputs are published atomically."""
+def unit_keys(unit: Unit) -> list[Key]:
+    """The (repository, path) key of every row in a Python unit, read without content."""
+    parquet = importlib.import_module("pyarrow.parquet")
+    columns = ["max_stars_repo_name", "max_stars_repo_path"]
+    keys: list[Key] = []
+    with parquet.ParquetFile(unit.path, arrow_extensions_enabled=False) as handle:
+        for group in range(unit.first_group, unit.first_group + unit.groups):
+            table = handle.read_row_group(group, columns=columns, use_threads=False)
+            keys.extend(
+                (str(name), str(path))
+                for name, path in zip(
+                    table.column(columns[0]).to_pylist(),
+                    table.column(columns[1]).to_pylist(),
+                    strict=True,
+                )
+            )
+    return keys
+
+
+def review_unit(
+    unit: Unit, directory: str, licenses: Mapping[Key, tuple[str, ...]] | None
+) -> dict[str, Any]:
+    """Classify, filter and encode one unit; outputs are published atomically.
+
+    ``licenses`` holds the verified repository licenses for this unit's rows only.
+    """
     started = time.perf_counter()
     out = Path(directory)
     encoder: FastEncoder = _worker["encoder"]
     index: ContaminationIndex = _worker["index"]
     config = FilterConfig()
+    if unit.domain == "python" and licenses is None:
+        raise ValueError("Python units need their license mapping")
     tokens_path = out / f"{unit.name}.tokens"
     rows_path = out / f"{unit.name}.jsonl"
     temporary_tokens = tokens_path.with_name(tokens_path.name + ".tmp")
@@ -637,8 +722,9 @@ def review_unit(unit: Unit, directory: str) -> dict[str, Any]:
                         "permissive", _worker["web_license"], "owner-reviewed web source terms"
                     )
                 else:
+                    assert licenses is not None
                     key = (str(item["max_stars_repo_name"]), str(item["max_stars_repo_path"]))
-                    listed = _mapping().get(key)
+                    listed = licenses.get(key)
                     classification = classify_file(text, listed)
                 via_repository = classification.category == "repository_disallowed" or (
                     classification.evidence == REPOSITORY_EVIDENCE
@@ -650,6 +736,7 @@ def review_unit(unit: Unit, directory: str) -> dict[str, Any]:
                     "bytes": size,
                     "license": classification.license_id,
                     "license_class": classification.category,
+                    "license_evidence": classification.evidence,
                     "license_basis": (
                         "repository_metadata" if via_repository else "inline_or_source_terms"
                     ),
@@ -703,15 +790,19 @@ def review_unit(unit: Unit, directory: str) -> dict[str, Any]:
 
 
 def _complete(unit: Unit, directory: Path) -> dict[str, Any] | None:
-    """A unit whose record and outputs agree; anything partial is redone."""
-    record_path = directory / f"{unit.name}.json"
-    if not record_path.exists():
+    """A unit whose record, inputs and outputs agree; anything else is redone."""
+    paths = [directory / f"{unit.name}{suffix}" for suffix in (".json", ".tokens", ".jsonl")]
+    if not all(path.is_file() for path in paths):
         return None
-    record: dict[str, Any] = json.loads(record_path.read_text())
+    try:
+        record: dict[str, Any] = json.loads(paths[0].read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
     if (
-        {key: record.get(key) for key in asdict(unit)} != asdict(unit)
-        or file_sha256(directory / f"{unit.name}.tokens") != record["tokens_sha256"]
-        or file_sha256(directory / f"{unit.name}.jsonl") != record["rows_sha256"]
+        not isinstance(record, dict)
+        or {key: record.get(key) for key in asdict(unit)} != asdict(unit)
+        or file_sha256(paths[1]) != record.get("tokens_sha256")
+        or file_sha256(paths[2]) != record.get("rows_sha256")
     ):
         return None
     return record
@@ -723,7 +814,7 @@ def review(
     *,
     tokenizer_path: Path,
     contamination: list[str],
-    license_report: Path | None,
+    mapping: Mapping[Key, tuple[str, ...]],
     web_license: str,
     workers: int,
     progress: Callable[[str], None] = print,
@@ -745,14 +836,17 @@ def review(
             max_workers=workers,
             mp_context=context,
             initializer=module._initialize,
-            initargs=(
-                str(tokenizer_path),
-                contamination,
-                None if license_report is None else str(license_report),
-                web_license,
-            ),
+            initargs=(str(tokenizer_path), contamination, web_license),
         ) as pool:
-            futures = {pool.submit(module.review_unit, u, str(directory)): u for u in pending}
+            futures = {}
+            for unit in pending:
+                # Each Python unit carries only its own rows' licenses, not the whole map.
+                subset = (
+                    {key: mapping[key] for key in unit_keys(unit) if key in mapping}
+                    if unit.domain == "python"
+                    else None
+                )
+                futures[pool.submit(module.review_unit, unit, str(directory), subset)] = unit
             try:
                 for number, future in enumerate(concurrent.futures.as_completed(futures), 1):
                     record = future.result()
@@ -791,16 +885,27 @@ def _tally() -> dict[str, Any]:
     }
 
 
+def _credits() -> dict[str, Any]:
+    return {
+        "license_id_documents": Counter(),
+        "license_basis_documents": Counter(),
+        "repositories_by_license_id": {},
+        "text_bytes": 0,
+    }
+
+
 def assemble(
     spec: Spec, units: Sequence[Unit], records: Sequence[Mapping[str, Any]], directory: Path
-) -> tuple[dict[str, list[Pick]], dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, list[Pick]], dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     """Global dedup, hash splits and exact quotas, in spec order."""
     seen: set[str] = set()
     tallies = {domain: _tally() for domain in DOMAINS}
     picks: dict[str, list[Pick]] = {stream.name: [] for stream in spec.streams}
     filled = dict.fromkeys(picks, 0)
     unused: dict[str, Counter[str]] = {name: Counter() for name in picks}
+    credits = {name: _credits() for name in picks}
     cuts: dict[str, dict[str, Any]] = {}
+    excluded: list[dict[str, Any]] = []
     for unit, record in zip(units, records, strict=True):
         count = 0
         with (directory / f"{unit.name}.jsonl").open(encoding="utf-8") as lines:
@@ -834,6 +939,13 @@ def assemble(
                 decision["files"] += 1
                 decision["text_bytes"] += row["bytes"]
                 if reason != "kept":
+                    excluded.append(
+                        {
+                            "source_file": unit.filename,
+                            "reason": reason,
+                            **{key: row[key] for key in PROVENANCE},
+                        }
+                    )
                     continue
                 seen.add(row["sha256"])
                 for item in (row["license"] or "unresolved").split(" AND "):
@@ -854,12 +966,24 @@ def assemble(
                     unused[stream.name]["tokens"] += length
                     continue
                 cut = room is not None and length > room
+                # The crossing document keeps room - 1 content tokens after its BOS; with
+                # one token of room left that is its BOS alone.
                 take = room - 1 if cut and room is not None else row["tokens"]
                 kept = {key: row[key] for key in PROVENANCE}
                 picks[stream.name].append(
                     Pick(unit.name, row["offset"], take, kept, unit.domain, unit.filename, cut)
                 )
                 filled[stream.name] += 1 + take
+                if take:
+                    credit = credits[stream.name]
+                    for item in (row["license"] or "unresolved").split(" AND "):
+                        credit["license_id_documents"][item] += 1
+                        if row["repository"] is not None:
+                            credit["repositories_by_license_id"].setdefault(item, set()).add(
+                                row["repository"]
+                            )
+                    credit["license_basis_documents"][row["license_basis"]] += 1
+                    credit["text_bytes"] += row["bytes"]
                 if cut:
                     cuts[stream.name] = {
                         "unit": unit.name,
@@ -868,6 +992,7 @@ def assemble(
                         "sha256": row["sha256"],
                         "document_tokens": length,
                         "kept_tokens": 1 + take,
+                        "discarded_tokens": length - 1 - take,
                     }
             if count != record["rows"]:
                 raise ValueError(f"{unit.name}: row count differs from its record")
@@ -878,27 +1003,51 @@ def assemble(
     }
     if short:
         raise RuntimeError(f"quotas not met; tokens missing per stream: {short}")
-    streams = {
-        s.name: {
+    streams: dict[str, Any] = {}
+    for s in spec.streams:
+        cut_record = cuts.get(s.name)
+        discarded = cut_record["discarded_tokens"] if cut_record else 0
+        split = tallies[s.domain]["splits"].get(s.split, Counter())
+        if (
+            len(picks[s.name]) + unused[s.name]["documents"] != split["documents"]
+            or filled[s.name] + discarded + unused[s.name]["tokens"]
+            != split["tokens"] + split["documents"]
+        ):
+            raise RuntimeError(f"{s.name}: selection does not reconcile with its split")
+        credit = credits[s.name]
+        streams[s.name] = {
             "domain": s.domain,
             "split": s.split,
             "quota_tokens": s.tokens,
             "tokens": filled[s.name],
             "documents": len(picks[s.name]),
             "bos_tokens": len(picks[s.name]),
-            "cut": cuts.get(s.name),
+            "cut": cut_record,
             "unused_documents": unused[s.name]["documents"],
             "unused_tokens": unused[s.name]["tokens"],
+            "credits": {
+                "license_id_documents": dict(
+                    sorted(credit["license_id_documents"].items(), key=lambda x: (-x[1], x[0]))
+                ),
+                "license_basis_documents": dict(credit["license_basis_documents"]),
+                "repositories_by_license_id": {
+                    name: len(repositories)
+                    for name, repositories in sorted(credit["repositories_by_license_id"].items())
+                },
+                "text_bytes": credit["text_bytes"],
+            },
         }
-        for s in spec.streams
-    }
     domains = {domain: _finish(tally) for domain, tally in tallies.items()}
-    return picks, streams, domains
+    return picks, streams, domains, excluded
 
 
 def _finish(tally: dict[str, Any]) -> dict[str, Any]:
     kept = tally["decisions"]["kept"]
     return {
+        "scope": (
+            "every reviewed row; kept_* and splits describe the pool after filtering and "
+            "deduplication, before quotas (per-stream credits are under streams)"
+        ),
         "sample_documents": tally["sample_documents"],
         "sample_text_bytes": tally["sample_text_bytes"],
         "primary_decisions": {
@@ -930,6 +1079,10 @@ def _finish(tally: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _document_bytes(bos: int, content: np.ndarray[Any, np.dtype[np.uint16]]) -> bytes:
+    return np.concatenate((np.array([bos], dtype="<u2"), content.astype("<u2"))).tobytes()
+
+
 def write_streams(
     spec: Spec, picks: Mapping[str, list[Pick]], units: Path, output: Path
 ) -> tuple[dict[str, list[dict[str, Any]]], str]:
@@ -938,7 +1091,7 @@ def write_streams(
     identity = spec.tokenizer["identity"]
     arrays: dict[str, np.ndarray[Any, np.dtype[np.uint16]]] = {}
 
-    def tokens(pick: Pick) -> list[int]:
+    def content(pick: Pick) -> np.ndarray[Any, np.dtype[np.uint16]]:
         if pick.unit not in arrays:
             path = units / f"{pick.unit}.tokens"
             arrays[pick.unit] = (
@@ -946,10 +1099,9 @@ def write_streams(
                 if path.stat().st_size
                 else np.zeros(0, dtype="<u2")
             )
-        values: list[int] = arrays[pick.unit][
-            pick.offset : pick.offset + pick.content_tokens
-        ].tolist()
-        return values
+        if not pick.content_tokens:
+            return np.zeros(0, dtype="<u2")
+        return arrays[pick.unit][pick.offset : pick.offset + pick.content_tokens]
 
     shards: dict[str, list[dict[str, Any]]] = {}
     documents = output / "documents.jsonl"
@@ -968,9 +1120,18 @@ def write_streams(
             for number, group in enumerate(groups):
                 name = f"{stream.name}-{number:05d}.bin"
                 path = output / "shards" / stream.name / name
+                digests: list[str] = []
+
+                def documents_of(group: list[Pick], digests: list[str]) -> Iterator[list[int]]:
+                    for pick in group:
+                        values = content(pick)
+                        digests.append(hashlib.sha256(_document_bytes(bos, values)).hexdigest())
+                        tokens: list[int] = values.tolist()
+                        yield tokens
+
                 manifest = write_shard(
                     path,
-                    (tokens(p) for p in group),
+                    documents_of(group, digests),
                     vocab_size=vocab,
                     tokenizer_hash=identity,
                     bos_id=bos,
@@ -984,8 +1145,7 @@ def write_streams(
                         "tokens": sum(1 + p.content_tokens for p in group),
                     }
                 )
-                for position, pick in enumerate(group):
-                    row = pick.row
+                for position, (pick, digest) in enumerate(zip(group, digests, strict=True)):
                     listing_stream.write(
                         json.dumps(
                             {
@@ -993,10 +1153,11 @@ def write_streams(
                                 "shard": name,
                                 "index": position,
                                 "tokens": 1 + pick.content_tokens,
+                                "tokens_sha256": digest,
                                 "cut": pick.cut,
                                 "domain": pick.domain,
                                 "source_file": pick.filename,
-                                **row,
+                                **pick.row,
                             },
                             ensure_ascii=False,
                             sort_keys=True,
@@ -1006,18 +1167,39 @@ def write_streams(
     return shards, file_sha256(documents)
 
 
-def build_identity(spec: Spec, shards: Mapping[str, list[dict[str, Any]]]) -> str:
-    """One hash naming the spec, tokenizer and every shard's bytes, in stream order."""
-    value = {
-        "spec_sha256": spec.sha256,
-        "tokenizer": spec.tokenizer["identity"],
-        "shards": [
-            [stream.name, shard["file"], shard["sha256"], shard["tokens"]]
-            for stream in spec.streams
-            for shard in shards[stream.name]
-        ],
-    }
-    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+def write_exclusions(excluded: Sequence[Mapping[str, Any]], output: Path) -> str:
+    path = output / "exclusions.jsonl"
+    with path.open("x", encoding="utf-8") as stream:
+        for row in excluded:
+            stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+    return file_sha256(path)
+
+
+def identities(spec: Spec, report: Mapping[str, Any]) -> dict[str, str]:
+    """The token multiset's identity, and one for the whole build record around it."""
+    shards = [
+        [stream.name, shard["file"], shard["sha256"], shard["tokens"]]
+        for stream in spec.streams
+        for shard in report["streams"][stream.name]["shards"]
+    ]
+    tokens = _sha256_json({"tokenizer": spec.tokenizer["identity"], "shards": shards})
+    whole = _sha256_json(
+        {
+            "spec_sha256": spec.sha256,
+            "tokens_identity": tokens,
+            "documents_sha256": report["documents"]["sha256"],
+            "exclusions_sha256": report["exclusions"]["sha256"],
+            "units": [
+                [unit["name"], unit["rows_sha256"], unit["tokens_sha256"], unit["inputs"]]
+                for unit in report["units"]["records"]
+            ],
+            "download_receipts_sha256": report["download_receipts_sha256"],
+            "license_mapping_sha256": report["license_mapping"]["mapping_sha256"],
+            "contamination_coverage": report["contamination_coverage"],
+            "filter_configuration": report["filter_configuration"],
+        }
+    )
+    return {"tokens_identity": tokens, "build_identity": whole}
 
 
 def build(
@@ -1035,7 +1217,7 @@ def build(
     for item in receipts["files"]:
         if not _verified(Path(item["path"]), item["size_bytes"], item["sha256"]):
             raise ValueError(f"{item['filename']}: raw bytes differ from the receipt")
-    report_path, license_identity = license_mapping(spec, build_dir, receipts)
+    mapping, license_identity = license_mapping(spec, build_dir, receipts)
     tokenizer_path = Path(spec.tokenizer["path"])
     tokenizer = _load_tokenizer(
         tokenizer_path,
@@ -1049,7 +1231,8 @@ def build(
         Path(spec.contamination["arc_directory"]),
         Path(spec.contamination["humaneval"]),
     )
-    units = plan_units(spec, receipts)
+    inputs = unit_inputs(spec, texts, license_identity)
+    units = plan_units(spec, receipts, inputs)
     raw_bytes = sum(item["size_bytes"] for item in receipts["files"])
     free_before = require_free(build_dir, 4 * raw_bytes, spec, "build")
     unit_dir = build_dir / "units"
@@ -1060,14 +1243,15 @@ def build(
         unit_dir,
         tokenizer_path=tokenizer_path,
         contamination=texts,
-        license_report=report_path,
+        mapping=mapping,
         web_license=spec.source("web").license,
         workers=workers,
         progress=progress,
     )
+    del mapping
     timings["review"] = time.perf_counter() - began
     began = time.perf_counter()
-    picks, streams, domains = assemble(spec, units, records, unit_dir)
+    picks, streams, domains, excluded = assemble(spec, units, records, unit_dir)
     timings["assemble"] = time.perf_counter() - began
     progress("assembled: " + json.dumps({k: v["tokens"] for k, v in streams.items()}))
     began = time.perf_counter()
@@ -1076,11 +1260,13 @@ def build(
         shutil.rmtree(staging)
     staging.mkdir()
     shards, documents_sha = write_streams(spec, picks, unit_dir, staging)
+    exclusions_sha = write_exclusions(excluded, staging)
     timings["write_shards"] = time.perf_counter() - began
     for name, value in streams.items():
         value["shards"] = shards[name]
     commit, dirty = git_state()
-    report = {
+    metadata = spec.license_metadata
+    report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": "completed",
         "name": spec.name,
@@ -1091,11 +1277,24 @@ def build(
         "tokenizer": {**spec.tokenizer, "vocab_size": tokenizer.vocab_size},
         "token_accounting": "shard tokens, one BOS per document included",
         "boundary_rule": (
-            "documents are taken whole in spec order; the one crossing a quota is cut to "
-            "the tokens that fill it exactly"
+            "documents are taken whole in spec order; the one crossing a quota keeps its BOS "
+            "and the content tokens that fill the quota exactly (its BOS alone when one token "
+            "remains); the rest of it is recorded as discarded"
         ),
         "download_receipts_sha256": file_sha256(build_dir / "download-receipts.json"),
-        "sources": [asdict(source) for source in spec.sources],
+        "sources": [
+            *(asdict(source) for source in spec.sources),
+            {
+                "domain": "python-license-metadata",
+                "dataset": metadata["dataset"],
+                "revision": metadata["revision"],
+                "use": "max_stars_repo_licenses joined on exact repository and path; no content",
+                "terms": metadata["terms"],
+                "terms_accepted_on": metadata["terms_accepted_on"],
+                "attribution": metadata["attribution"],
+                "obligations": metadata["obligations"],
+            },
+        ],
         "license_mapping": license_identity,
         "license_policy": (
             "header-classifier-v3; explicit header first; absent header uses verified "
@@ -1106,20 +1305,31 @@ def build(
         "filter_configuration": asdict(FilterConfig()),
         "dedup": "exact content SHA-256 across the whole build, first occurrence in spec order",
         "split_rule": "scratchcoder.data.filters.document_split on the content SHA-256",
+        "unit_inputs": inputs,
         "units": {
             "count": len(units),
             "row_groups_per_unit": spec.unit_row_groups,
             "tokens_written": sum(record["tokens"] for record in records),
+            "records": [
+                {
+                    key: record[key]
+                    for key in ("name", "rows", "tokens", "rows_sha256", "tokens_sha256", "inputs")
+                }
+                for record in records
+            ],
         },
         "domains": domains,
         "streams": streams,
         "documents": {"file": "documents.jsonl", "sha256": documents_sha},
-        "build_identity": build_identity(spec, shards),
+        "exclusions": {
+            "file": "exclusions.jsonl",
+            "sha256": exclusions_sha,
+            "rows": len(excluded),
+        },
         "workers": workers,
         "cpu_count": os.cpu_count(),
         "free_bytes_before": free_before,
         "timings_seconds": timings,
-        "elapsed_seconds": time.perf_counter() - started,
         "paid_runs": 0,
         "final_training_admission": False,
         "limitations": [
@@ -1129,13 +1339,15 @@ def build(
             "exact-hash deduplication only; the sources' own near-deduplication is relied on",
         ],
     }
+    report.update(identities(spec, report))
+    report["elapsed_seconds_before_verification"] = time.perf_counter() - started
     atomic_json(staging / "report.json", report)
+    began = time.perf_counter()
+    verification = verify(spec, build_dir, directory=staging)
+    timings["verify"] = time.perf_counter() - began
+    # Published only after verification passes; a failure leaves output.tmp for inspection.
     staging.replace(output)
-    verification = verify(spec, build_dir)
-    report["verification"] = {
-        "status": verification["status"],
-        "sha256": file_sha256(output / "verification.json"),
-    }
+    report["verification"] = verification
     return report
 
 
@@ -1153,39 +1365,60 @@ def _source_text(path: Path, domain: str, row: int) -> str:
     raise IndexError(f"row {row} is past the end of {path}")
 
 
-def verify(spec: Spec, build_dir: Path) -> dict[str, Any]:
-    """Re-check every shard and stream invariant; write verification.json."""
-    output = build_dir / "output"
+def verify(spec: Spec, build_dir: Path, *, directory: Path | None = None) -> dict[str, Any]:
+    """Re-check every shard, document and stream invariant; write verification.json.
+
+    Any earlier verification.json is removed first, so a failure never leaves a pass.
+    """
+    output = directory or build_dir / "output"
+    (output / "verification.json").unlink(missing_ok=True)
     report = json.loads((output / "report.json").read_text())
     if report.get("status") != "completed" or report.get("spec_sha256") != spec.sha256:
         raise ValueError("a completed build report for this exact spec is required")
     receipts = completed_receipts(spec, build_dir)
+    if file_sha256(build_dir / "download-receipts.json") != report["download_receipts_sha256"]:
+        raise ValueError("download receipts differ from the ones the build used")
+    licenses_report = build_dir / "licenses" / "report.json"
+    if file_sha256(licenses_report) != report["license_mapping"]["report_sha256"]:
+        raise ValueError("the license recovery report differs from the one the build used")
     paths = {(item["domain"], item["filename"]): Path(item["path"]) for item in receipts["files"]}
     tokenizer = ByteBPE.load(Path(spec.tokenizer["path"]))
     if tokenizer.sha256 != spec.tokenizer["identity"]:
         raise ValueError("tokenizer identity differs from the spec")
     encoder = FastEncoder(tokenizer)
     vocab, bos = spec.tokenizer["vocab_size"], spec.tokenizer["bos_id"]
-    if file_sha256(output / "documents.jsonl") != report["documents"]["sha256"]:
-        raise ValueError("documents.jsonl differs from the report")
+    for name in ("documents", "exclusions"):
+        if file_sha256(output / report[name]["file"]) != report[name]["sha256"]:
+            raise ValueError(f"{report[name]['file']} differs from the report")
+    declared = {
+        (stream.name, Path(shard["file"]).name)
+        for stream in spec.streams
+        for shard in report["streams"][stream.name]["shards"]
+    }
     listed: dict[tuple[str, str], list[dict[str, Any]]] = {}
     with (output / "documents.jsonl").open(encoding="utf-8") as lines:
         for line in lines:
             row = json.loads(line)
-            listed.setdefault((row["stream"], row["shard"]), []).append(row)
+            key = (row["stream"], row["shard"])
+            if key not in declared:
+                raise ValueError(f"documents.jsonl names an undeclared shard: {key}")
+            listed.setdefault(key, []).append(row)
     hashes: dict[str, set[str]] = {}
     checks: Counter[str] = Counter()
     for stream in spec.streams:
-        declared = report["streams"][stream.name]
-        total = 0
+        recorded = report["streams"][stream.name]
+        total = documents = 0
+        cut_rows: list[tuple[int, int, dict[str, Any]]] = []
         hashes[stream.name] = set()
-        for shard in declared["shards"]:
+        for number, shard in enumerate(recorded["shards"]):
             path = output / shard["file"]
             opened = TokenShard(
                 path, tokenizer_hash=spec.tokenizer["identity"], vocab_size=vocab, bos_id=bos
             )
             if file_sha256(path) != shard["sha256"]:
                 raise ValueError(f"{shard['file']}: SHA-256 differs from the report")
+            if file_sha256(path.with_suffix(".bin.json")) != shard["manifest_sha256"]:
+                raise ValueError(f"{shard['file']}: manifest SHA-256 differs from the report")
             values = (
                 np.memmap(path, dtype="<u2", mode="r")
                 if path.stat().st_size
@@ -1204,9 +1437,17 @@ def verify(spec: Spec, build_dir: Path) -> dict[str, Any]:
             rows = listed.get((stream.name, Path(shard["file"]).name), [])
             if [r["tokens"] for r in rows] != lengths or len(rows) != shard["documents"]:
                 raise ValueError(f"{shard['file']}: documents.jsonl disagrees with the shard")
+            if [r["index"] for r in rows] != list(range(len(rows))):
+                raise ValueError(f"{shard['file']}: documents.jsonl positions are out of order")
             if sum(lengths) != shard["tokens"]:
                 raise ValueError(f"{shard['file']}: token count differs from the report")
+            for (offset, length), row in zip(opened.offsets, rows, strict=True):
+                digest = hashlib.sha256(values[offset : offset + length].tobytes()).hexdigest()
+                if digest != row["tokens_sha256"]:
+                    raise ValueError(f"{shard['file']}: document {row['index']} tokens differ")
             total += shard["tokens"]
+            documents += len(rows)
+            cut_rows.extend((number, i, r) for i, r in enumerate(rows) if r["cut"])
             spot = {0, len(rows) - 1} | {i for i, r in enumerate(rows) if r["cut"]}
             for position in sorted(i for i in spot if 0 <= i < len(rows)):
                 row = rows[position]
@@ -1215,7 +1456,11 @@ def verify(spec: Spec, build_dir: Path) -> dict[str, Any]:
                 )
                 if content_hash(text) != row["sha256"]:
                     raise ValueError(f"{shard['file']}: source text hash differs at {position}")
-                expected = [bos, *encoder.encode(text)][: row["tokens"]]
+                expected = [bos, *encoder.encode(text)]
+                if row["cut"]:
+                    if row["tokens"] >= len(expected):
+                        raise ValueError(f"{shard['file']}: a cut document is not shorter")
+                    expected = expected[: row["tokens"]]
                 offset, length = opened.offsets[position]
                 if values[offset : offset + length].tolist() != expected:
                     raise ValueError(f"{shard['file']}: tokens differ from re-encoding")
@@ -1227,20 +1472,42 @@ def verify(spec: Spec, build_dir: Path) -> dict[str, Any]:
             checks["shards"] += 1
             checks["documents"] += len(rows)
             checks["tokens"] += sum(lengths)
-        if total != declared["tokens"] or (stream.tokens is not None and total != stream.tokens):
+        if total != recorded["tokens"] or (stream.tokens is not None and total != stream.tokens):
             raise ValueError(f"{stream.name}: {total} tokens, quota {stream.tokens}")
+        if documents != recorded["documents"] or recorded["bos_tokens"] != documents:
+            raise ValueError(f"{stream.name}: document count differs from the report")
+        cut = recorded["cut"]
+        last = (len(recorded["shards"]) - 1, recorded["shards"][-1]["documents"] - 1)
+        if (
+            len(cut_rows) > 1
+            or (cut_rows and (stream.tokens is None or cut_rows[0][:2] != last))
+            or bool(cut_rows) != (cut is not None)
+            or (
+                cut_rows
+                and cut is not None
+                and (
+                    cut_rows[0][2]["sha256"] != cut["sha256"]
+                    or cut_rows[0][2]["tokens"] != cut["kept_tokens"]
+                )
+            )
+        ):
+            raise ValueError(f"{stream.name}: the cut document breaks the boundary rule")
     names = [stream.name for stream in spec.streams]
     overlaps = {
         f"{a}|{b}": len(hashes[a] & hashes[b]) for i, a in enumerate(names) for b in names[i + 1 :]
     }
     if any(overlaps.values()):
         raise ValueError(f"streams share documents: {overlaps}")
-    shards = {name: report["streams"][name]["shards"] for name in names}
-    if build_identity(spec, shards) != report["build_identity"]:
+    if identities(spec, report) != {
+        "tokens_identity": report["tokens_identity"],
+        "build_identity": report["build_identity"],
+    }:
         raise ValueError("build identity differs from the report")
     result = {
         "status": "passed",
         "created_at": utc_now(),
+        "report_sha256": file_sha256(output / "report.json"),
+        "tokens_identity": report["tokens_identity"],
         "build_identity": report["build_identity"],
         "checks": dict(checks),
         "document_hash_overlaps": overlaps,
@@ -1278,11 +1545,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = build(spec, args.build, workers=args.workers)
         print(
             json.dumps(
-                {
-                    "build_identity": report["build_identity"],
-                    "streams": {k: v["tokens"] for k, v in report["streams"].items()},
-                    "verification": report["verification"],
-                },
+                {key: report[key] for key in ("tokens_identity", "build_identity", "verification")}
+                | {"streams": {k: v["tokens"] for k, v in report["streams"].items()}},
                 indent=1,
             )
         )

@@ -21,7 +21,8 @@
       "license": "ODC-By-1.0",
       "terms": "ODC-By 1.0 plus the Common Crawl Terms of Use",
       "terms_accepted_on": "2026-10-19",
-      "attribution": "Hugging Face FineWeb-Edu; Lozhkov et al. (2024)"
+      "attribution": "Hugging Face FineWeb-Edu; Lozhkov et al. (2024)",
+      "obligations": "Attribute FineWeb-Edu under ODC-By 1.0 and keep the Common Crawl Terms of Use, which preserve third-party rights in the underlying pages"
     },
     {
       "domain": "python",
@@ -38,13 +39,17 @@
       "license": "original file licenses, per file",
       "terms": "Terms of Use for The Stack",
       "terms_accepted_on": "2026-10-19",
-      "attribution": "BigCode; StarCoderData/The Stack and original repository authors"
+      "attribution": "BigCode; StarCoderData/The Stack and original repository authors",
+      "obligations": "Abide by each original file license, including attribution, using the recorded repository/path provenance; keep to the latest usable version of The Stack named by its maintainers, which carries validated removal requests"
     }
   ],
   "license_metadata": {
     "dataset": "bigcode/the-stack-dedup",
     "revision": "17cad72c886a2858e08d4c349a00d6466f54df63",
-    "terms_accepted_on": "2026-10-24"
+    "terms": "Terms of Use for The Stack",
+    "terms_accepted_on": "2026-10-24",
+    "attribution": "BigCode; The Stack dedup v1.2 (Kocetkov et al., 2022)",
+    "obligations": "Read only the repository, path and license columns plus each footer; detected repository licenses are not a legal warranty"
   },
   "contamination": {
     "humaneval": "runs/real-samples-20261019/HumanEval.jsonl.gz",

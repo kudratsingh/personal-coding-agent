@@ -744,8 +744,11 @@ def load_mapping(report_path: Path) -> tuple[dict[Key, tuple[str, ...]], dict[st
     if file_sha256(mapping_path) != report["mapping"]["sha256"]:
         raise ValueError("license mapping bytes differ from the recovery report")
     mapping: dict[Key, tuple[str, ...]] = {}
-    for line in mapping_path.read_text(encoding="utf-8").splitlines():
-        row = json.loads(line)
+    # Rows are written with ensure_ascii=False, so split on "\n" only: str.splitlines
+    # would also break inside a path holding U+2028, U+2029 or U+0085.
+    with mapping_path.open(encoding="utf-8", newline="\n") as lines:
+        rows = [json.loads(line) for line in lines]
+    for row in rows:
         key = (row["repository"], row["path"])
         if key in mapping:
             raise ValueError("duplicate key in license mapping")

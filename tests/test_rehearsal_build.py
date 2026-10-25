@@ -243,6 +243,7 @@ class Fixture:
                     "terms": "fixture terms",
                     "terms_accepted_on": "2026-10-19",
                     "attribution": "fixture",
+                    "obligations": "fixture obligations",
                 },
                 {
                     "domain": "python",
@@ -254,12 +255,16 @@ class Fixture:
                     "terms": "fixture terms",
                     "terms_accepted_on": "2026-10-19",
                     "attribution": "fixture",
+                    "obligations": "fixture obligations",
                 },
             ],
             "license_metadata": {
                 "dataset": "bigcode/the-stack-dedup",
                 "revision": STACK_REVISION,
+                "terms": "fixture terms",
                 "terms_accepted_on": "2026-10-24",
+                "attribution": "fixture",
+                "obligations": "fixture obligations",
             },
             "contamination": {"humaneval": "x", "evalplus_directory": "x", "arc_directory": "x"},
             "streams": [
@@ -325,6 +330,19 @@ def test_spec_rejects_unknown_keys_missing_streams_and_unlisted_web_licenses(
     (fixture.root / "spec.json").write_text(json.dumps(spec))
     with pytest.raises(ValueError, match="validation streams"):
         load_spec(fixture.root / "spec.json")
+    spec["streams"][3]["tokens"] = None
+    for section, key, value, message in [
+        (spec["sources"][1], "terms_accepted_on", None, "YYYY-MM-DD"),
+        (spec["sources"][1], "terms_accepted_on", "2999-01-01", "future"),
+        (spec["sources"][1], "attribution", " ", "nonempty"),
+        (spec["license_metadata"], "terms_accepted_on", "24/10/2026", "YYYY-MM-DD"),
+    ]:
+        original = section[key]
+        section[key] = value
+        (fixture.root / "spec.json").write_text(json.dumps(spec))
+        with pytest.raises(ValueError, match=message):
+            load_spec(fixture.root / "spec.json")
+        section[key] = original
 
 
 def test_download_verifies_hashes_keeps_the_token_off_public_sources_and_reuses(
@@ -458,6 +476,22 @@ def test_build_fills_exact_quotas_and_records_every_decision(fixture: Fixture) -
     both = next(row for row in rows if row["path"] == "both.py")
     assert both["cut"] and both["repository_licenses"] == ["Apache-2.0", "MIT"]
     assert both["license"] == "Apache-2.0 AND MIT"
+    credits = streams["stage2-python"]["credits"]
+    assert credits["license_id_documents"] == {"MIT": 2, "Apache-2.0": 1}
+    assert credits["repositories_by_license_id"] == {"Apache-2.0": 1, "MIT": 1}
+    assert streams["stage2-python"]["cut"]["discarded_tokens"] > 0
+    excluded = [json.loads(x) for x in (output / "exclusions.jsonl").read_text().splitlines()]
+    assert sorted(row["reason"] for row in excluded) == sorted(
+        [
+            "duplicate",
+            "contamination",
+            "license_copyleft",
+            "license_repository_disallowed",
+            "license_missing_repository_license",
+            "generated",
+        ]
+    )
+    assert report["exclusions"]["rows"] == 6
     verification = json.loads((output / "verification.json").read_text())
     assert verification["status"] == "passed"
     assert not any(verification["document_hash_overlaps"].values())
@@ -487,6 +521,62 @@ def test_rebuild_reuses_verified_units_redoes_damaged_ones_and_verify_catches_ta
     shard.write_bytes(bytes(data))
     with pytest.raises(ValueError):
         verify(spec, fixture.build)
+    assert not (fixture.build / "output" / "verification.json").exists()
+
+
+def test_units_are_redone_when_their_inputs_change_or_files_go_missing(
+    fixture: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = prepare(fixture, fixture.spec())
+    first = build(spec, fixture.build, workers=1, progress=quiet)
+    units = fixture.build / "units"
+    before = {path.name: json.loads(path.read_text()) for path in units.glob("*.json")}
+    # A different contamination set changes every unit's input fingerprint.
+    monkeypatch.setattr(
+        rehearsal_build, "contamination_inputs", lambda *_: ([HELD_OUT, "another phrase"], {})
+    )
+    shutil.rmtree(fixture.build / "output")
+    second = build(spec, fixture.build, workers=1, progress=quiet)
+    after = {path.name: json.loads(path.read_text()) for path in units.glob("*.json")}
+    assert all(after[name]["inputs"] != before[name]["inputs"] for name in before)
+    assert second["tokens_identity"] == first["tokens_identity"]
+    assert second["build_identity"] != first["build_identity"]
+    missing = sorted(units.glob("web-*.tokens"))[0]
+    missing.unlink()
+    shutil.rmtree(fixture.build / "output")
+    third = build(spec, fixture.build, workers=1, progress=quiet)
+    assert missing.exists() and third["tokens_identity"] == first["tokens_identity"]
+
+
+def test_one_token_of_room_takes_the_crossing_documents_bos_alone(fixture: Fixture) -> None:
+    quotas = {
+        "stage1-web": fixture.length(fixture.s1[0]) + fixture.length(fixture.s1[1]) + 1,
+        "stage2-web": fixture.length(fixture.s2[0]),
+        "stage2-python": fixture.length(fixture.mit) + 5,
+    }
+    spec = prepare(fixture, fixture.spec(quotas))
+    report = build(spec, fixture.build, workers=1, progress=quiet)
+    stage1 = report["streams"]["stage1-web"]
+    assert stage1["cut"]["kept_tokens"] == 1 and stage1["tokens"] == quotas["stage1-web"]
+    # The BOS-only document is listed, but no license credit is claimed for it.
+    assert stage1["documents"] == 3
+    assert sum(stage1["credits"]["license_id_documents"].values()) == 2
+    assert report["verification"]["status"] == "passed"
+
+
+def test_a_failed_verification_publishes_nothing(
+    fixture: Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = prepare(fixture, fixture.spec())
+
+    def fail(*_: Any, **__: Any) -> dict[str, Any]:
+        raise ValueError("planted verification failure")
+
+    monkeypatch.setattr(rehearsal_build, "verify", fail)
+    with pytest.raises(ValueError, match="planted"):
+        build(spec, fixture.build, workers=1, progress=quiet)
+    assert not (fixture.build / "output").exists()
+    assert (fixture.build / "output.tmp" / "report.json").exists()
 
 
 def test_a_quota_the_sources_cannot_fill_stops_before_any_shard(fixture: Fixture) -> None:
