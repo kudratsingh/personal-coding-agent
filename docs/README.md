@@ -17,6 +17,7 @@ Start with the [project README](../README.md), [current status](status.md), and 
 | [Data policy](data.md) | Record provenance, licensing, splits, and contamination controls. |
 | [Real samples](real-samples.md) | Inspect actual sizes, hashes, per-filter counts and exclusion coverage. |
 | [Frozen tokenizer](tokenizer-freeze.md) | Identify the immutable table and held-out compression measurements. |
+| [S rehearsal data build](rehearsal-data.md) | How the S pretraining shards were built, verified and credited, with the 2026-10-25 results. |
 | [Full-build plan status](full-build-plan.md) | Understand the estimate's scope, source-capacity limits and outstanding owner decision; no build authorization. |
 | [Rehearsal work-order outline](rehearsal-plan.md) | Review the plan-only Phase 4 sequence and unresolved execution prerequisites. |
 | [G0 evidence](gates/g0-foundation.md) / [G1 evidence](gates/g1-data-tokenizer.md) / [G2 evidence](gates/g2-model-training.md) / [G3 evidence](gates/g3-evaluation.md) | Match every original gate/work-order pass condition to existing proof, numeric values and explicit gaps. |

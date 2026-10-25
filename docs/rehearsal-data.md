@@ -57,3 +57,80 @@ A unit is reused only if its record carries the same input fingerprint. The fing
 - token handling, range-resumed downloads, unit reuse and redo;
 - a failed verification that publishes nothing;
 - tampering that verification catches.
+
+## Result of the 2026-10-25 build
+
+The build ran on the owner's Mac (12 CPUs, 10 review workers) at commit `33f7026` with a clean tree. It took about 28 minutes: 24 for review, 3 for writing shards and the rest for assembly and verification. No paid resource was used. Verification passed on the published output and again on its own. It found **0** shared documents between any two streams and re-encoded **36** documents exactly from source.
+
+| Stream | Shard tokens (BOS included) | Documents | Shards | Cut document |
+| --- | ---: | ---: | ---: | --- |
+| `stage1-web` | **1,000,000,000** | 1,037,577 | 8 | 7 of 136 tokens kept |
+| `stage2-web` | **100,000,000** | 104,472 | 1 | 929 of 6,794 tokens kept |
+| `stage2-python` | **900,000,000** | 862,499 | 7 | 18,842 of 21,311 tokens kept |
+| `validation-web` | 6,948,391 | 7,341 | 1 | none |
+| `validation-python` | 5,334,710 | 4,848 | 1 | none |
+
+`tokens_identity` is `04c51932d17e52e7fe86521c244d2f2098f97c050d6d531049b43d7d70363e74`; `build_identity` is `e91a37eb821fb1e7beb4bd5f447a392fa8ae0ceb2973d53f7db8264434200ed5`.
+
+### Sources
+
+| Item | Value |
+| --- | --- |
+| Downloads | **6,267,680,658** listed bytes, exactly the approved estimate; 3,715,728,005 transferred and two files reused from the sample review, all hash-verified |
+| License lookup | 144 The Stack files read for **738,634,555** bytes. No content column chunk was fetched; the footers carried 21,979,081 bytes of content statistics, held in memory only |
+| License join | all **1,090,395** Python files matched on exact repository and path |
+
+### What was kept
+
+| Domain | Files reviewed | UTF-8 bytes reviewed | Kept files | Kept bytes | Byte retention |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Web | 1,455,000 | 6,942,037,359 | 1,445,703 | 6,884,155,866 | 99.16622% |
+| Python | 1,090,395 | 5,155,806,150 | 989,107 | 4,291,009,543 | **83.22674%** |
+
+Python retention matches the sample review's 82.80882%, so the license join did not miss files.
+
+| Python primary decision | Files | UTF-8 bytes |
+| --- | ---: | ---: |
+| Kept | 989,107 | 4,291,009,543 |
+| Unrecognized or unreadable inline header | 45,422 | 353,187,827 |
+| Off-allowlist repository license | 24,947 | 144,622,879 |
+| Contamination | 12,764 | 167,984,272 |
+| Generated marker | 7,386 | 118,022,575 |
+| Copyleft header | 6,843 | 75,075,273 |
+| Too short | 3,199 | 76,944 |
+| Restricted header | 714 | 5,817,442 |
+| Low alphanumeric share | 7 | 8,821 |
+| Exact duplicate | 6 | 574 |
+
+The web drops are 7,766 exact duplicates and 1,531 contamination matches. Kept Python files rest on an explicit header (72,837) or on repository metadata (916,270).
+
+| Kept license IDs | Count |
+| --- | ---: |
+| MIT | 649,287 |
+| Apache-2.0 | 216,573 |
+| BSD-3-Clause | 74,946 |
+| BSD-2-Clause | 19,365 |
+| Unlicense | 16,890 |
+| CC0-1.0 | 8,620 |
+| CC-BY-4.0 | 3,213 |
+| 0BSD | 2,267 |
+| WTFPL | 2,166 |
+| ISC | 1,085 |
+| PSF-2.0 (inline only) | 9 |
+
+There are **131** distinct off-allowlist repository IDs. The largest are ECL-2.0 (2,294 files), CC-BY-3.0, BSD-3-Clause-LBNL, CNRI-Python, bzip2-1.0.6, BSD-2-Clause-FreeBSD, RSA-MD, MIT-0 and PSF-2.0 at repository level. They stay out under D-05.
+
+### What was left over
+
+After the quotas filled, **255,835** stage-1 web documents (247,541,480 tokens), **40,478** stage-2 web documents and **121,760** Python training documents (128,213,656 tokens) were left unused. That is the margin that five Python files and two web files gave over the quotas.
+
+### One fix during the run
+
+The first build attempt stopped on a Python file with a NUL byte after an indented block. CPython 3.12's tokenizer reports that as a `SystemError`, which the header classifier did not expect. The classifier now treats it like any other tokenizer failure. Two files in the build have such a byte. The failed attempt published nothing; the fix changed every unit's fingerprint, so all units were reviewed again.
+
+### Limitations
+
+- The final verified task-pool holdout does not exist yet. Its exclusion must be repeated before training, and the build rebuilt if it removes any document; `final_training_admission` is therefore false.
+- Repository license lists are The Stack's detected licenses, not a legal warranty.
+- Only exact duplicates are removed; the sources' own near-deduplication is relied on.
+- Shards, units and raw files exist only on the owner's Mac (about 17 GB); no storage account exists. They can be rebuilt from the pinned sources and this spec.
