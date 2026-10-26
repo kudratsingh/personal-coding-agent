@@ -131,7 +131,9 @@ def synthetic_binding() -> dict[str, Any]:
             "spec_sha256": digest("spec"),
             "report_sha256": digest("report"),
             "verification_sha256": digest("verification"),
-            "tokens_identity": digest("tokens"),
+            "tokens_identity": rehearsal_binding.tokens_identity(
+                digest("tokenizer"), [*STREAMS], streams
+            ),
             "build_identity": digest("build"),
             "git_commit": "1" * 40,
             "admission": {"holdout_sha256": digest("holdout")},

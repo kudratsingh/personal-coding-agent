@@ -1,20 +1,25 @@
 """Bind the admitted S rehearsal build to runs A and B; stage, fetch and verify its files.
 
 ``build`` (Mac)
-    Require a completed, clean, admitted and verified build of this exact spec, with
-    identities that recompute in spec stream order. Re-hash every shard and its
-    documents, then write the binding: each shard, manifest and the tokenizer with size,
-    SHA-256 and R2 key, and for each run stage its ordered shards, document-order
-    digest, token, window and update counts, and the order-independent digest of its
-    documents' token hashes. Run A's stage digests must combine to run B's.
+    Require a clean tree at a known commit and a completed, clean, admitted and verified
+    build of this exact spec, with identities that recompute in spec stream order.
+    Re-hash every shard and its documents, then write the binding: each shard, manifest
+    and the tokenizer with size, SHA-256 and R2 key, and for each run stage its ordered
+    shards, document-order digest, token, window and update counts, and the
+    order-independent digest of its documents' token hashes. Run A's stage digests must
+    combine to run B's.
 ``stage`` (Mac)
-    Upload the pinned files and the build records under the storage cap, the binding last.
+    Check the pinned report.json lists exactly the binding's shards, then upload the
+    pinned files and the build records under the storage cap, the binding last.
 ``fetch`` (Pod)
     Download one run's files by key, each pinned to its size and SHA-256. A file already
     present with the pinned bytes is kept; a present file with other bytes stops the fetch.
 ``verify`` (Pod or Mac)
     Check the binding's own SHA-256, re-hash every file a run needs under a root, open
     each shard and recompute each stage's order digest. The binding is only ever read.
+
+Every reader checks the binding itself (``check_binding``): its shapes and sums, a clean
+binder at a 40-hex commit, and ``tokens_identity`` recomputed from the bound shards.
 
 R2 credentials come only from the environment and are never printed.
 """
@@ -71,6 +76,7 @@ PACKING = {
 PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 """One plain path component; it cannot be empty, '.', '..' or hidden."""
 ENV_PREFIX = re.compile(r"[A-Z][A-Z0-9_]*_")
+GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
 
 BINDING_KEYS = {
     "schema_version",
@@ -283,8 +289,36 @@ def _training_streams(runs: Sequence[str] = tuple(RUNS)) -> list[str]:
     return list(dict.fromkeys(name for run in runs for _, names in RUNS[run] for name in names))
 
 
+def _commit(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not GIT_COMMIT.fullmatch(value):
+        raise ValueError(f"{name} must be a 40-digit lowercase git commit")
+    return value
+
+
+def tokens_identity(
+    tokenizer_identity: str, stream_order: Sequence[str], streams: Mapping[str, Any]
+) -> str:
+    """The build's ``tokens_identity``, recomputed from bound fields alone.
+
+    The same hash as ``rehearsal_build.identities``: the tokenizer identity and
+    ``[stream, file, sha256, tokens]`` for every shard, streams in spec (stream_order)
+    order, as ``json.dumps(..., sort_keys=True)``.
+    """
+    shards = [
+        [name, shard["file"], shard["sha256"], shard["tokens"]]
+        for name in stream_order
+        for shard in streams[name]["shards"]
+    ]
+    value = {"tokenizer": tokenizer_identity, "shards": shards}
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
 def check_binding(binding: Any) -> dict[str, Any]:
-    """Validate a binding's structure and arithmetic without touching any file."""
+    """Validate a binding's structure and arithmetic without touching any file.
+
+    Beyond the shapes and sums, it recomputes ``tokens_identity`` from the bound shards and
+    requires the binding to have been written from a clean tree at a known commit.
+    """
     top = _exact(binding, BINDING_KEYS, "binding")
     if top["schema_version"] != SCHEMA_VERSION or top["kind"] != KIND:
         raise ValueError("not a rehearsal data binding of this schema")
@@ -292,7 +326,10 @@ def check_binding(binding: Any) -> dict[str, Any]:
         raise ValueError("the binding's packing differs from the S model's")
     if not isinstance(top["created_at"], str) or not isinstance(top["written_to"], str):
         raise ValueError("the binding's creation time and path must be strings")
-    _exact(top["binder"], {"git_commit", "dirty"}, "binder")
+    binder = _exact(top["binder"], {"git_commit", "dirty"}, "binder")
+    if binder["dirty"] is not False:
+        raise ValueError("the binding was not written from a clean tree (binder.dirty)")
+    _commit(binder["git_commit"], "the binder's git_commit")
     prefix = _prefix(top["r2_prefix"])
     build = _exact(top["build"], BUILD_KEYS, "build")
     for key in (
@@ -304,8 +341,9 @@ def check_binding(binding: Any) -> dict[str, Any]:
         "holdout_sha256",
     ):
         _hex(build[key], f"build {key}")
-    if not isinstance(build["admission"], dict) or not isinstance(build["git_commit"], str):
+    if not isinstance(build["admission"], dict):
         raise ValueError("the binding must record the build's admission and commit")
+    _commit(build["git_commit"], "the build's git_commit")
     for key in ("documents", "exclusions"):
         record = _exact(build[key], {"file", "sha256"}, f"build {key}")
         _relative(record["file"], f"build {key} file")
@@ -366,6 +404,11 @@ def check_binding(binding: Any) -> dict[str, Any]:
             or stream["quota_tokens"] not in (None, tokens)
         ):
             raise ValueError(f"{name}: totals differ from its shards or its quota")
+    if build["tokens_identity"] != tokens_identity(tokenizer["identity"], order, streams):
+        raise ValueError(
+            "the build's tokens_identity differs from a recomputation over the bound shards"
+            " in stream order"
+        )
     runs = _exact(top["runs"], set(RUNS), "runs")
     for run, stages in RUNS.items():
         entry = _exact(runs[run], RUN_KEYS, f"run {run}")
@@ -516,6 +559,10 @@ def build_binding(
     prefix = _prefix(r2_prefix)
     if type(order_seed) is not int or order_seed < 0:
         raise ValueError("the order seed must be a nonnegative integer")
+    # Checked first: a reader refuses a binding from a dirty or unknown tree anyway.
+    commit, dirty = git_state()
+    if dirty or commit is None or not GIT_COMMIT.fullmatch(commit):
+        raise ValueError("a binding is written only from a clean tree at a known commit")
     spec = rehearsal_build.load_spec(spec_path)
     records = build_dir / "output"
     report_path = _regular(records, "report.json")
@@ -636,13 +683,12 @@ def build_binding(
         }
     if runs["A"]["multiset_sha256"] != runs["B"]["multiset_sha256"]:
         raise ValueError("run A's stage multisets do not combine to run B's")
-    commit, dirty = git_state()
     binding: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "kind": KIND,
         "created_at": utc_now(),
         "written_to": str(output.absolute()),
-        "binder": {"git_commit": commit, "dirty": dirty},
+        "binder": {"git_commit": commit, "dirty": False},
         "build": {
             "name": report["name"],
             "spec_sha256": spec.sha256,
@@ -829,12 +875,46 @@ def fetch(
     return record
 
 
+REPORT_SHARD_FIELDS = ("file", "sha256", "manifest_sha256", "documents", "tokens")
+"""The fields a binding shard copies from the build report's shard entry."""
+
+
+def _require_report_shards(binding: Mapping[str, Any], report: Any) -> None:
+    """The pinned report.json lists exactly the binding's streams, shards and identities."""
+    if not isinstance(report, dict) or not isinstance(report.get("streams"), dict):
+        raise ValueError("report.json has no stream records")
+    build, tokenizer = binding["build"], binding["tokenizer"]
+    if (report.get("tokens_identity"), report.get("build_identity")) != (
+        build["tokens_identity"],
+        build["build_identity"],
+    ):
+        raise ValueError("report.json records other identities than the binding")
+    recorded = report.get("tokenizer")
+    if not isinstance(recorded, dict) or (
+        recorded.get("identity"),
+        recorded.get("file_sha256"),
+    ) != (tokenizer["identity"], tokenizer["sha256"]):
+        raise ValueError("report.json records another tokenizer than the binding")
+    if set(report["streams"]) != set(binding["stream_order"]):
+        raise ValueError("report.json lists other streams than the binding")
+    for name in binding["stream_order"]:
+        stream = report["streams"][name]
+        shards = stream.get("shards") if isinstance(stream, dict) else None
+        if not isinstance(shards, list) or not all(isinstance(shard, dict) for shard in shards):
+            raise ValueError(f"report.json has no shard list for {name}")
+        listed = [[shard.get(key) for key in REPORT_SHARD_FIELDS] for shard in shards]
+        bound = binding["streams"][name]["shards"]
+        if listed != [[shard[key] for key in REPORT_SHARD_FIELDS] for shard in bound]:
+            raise ValueError(f"{name}: the binding's shard list differs from report.json's")
+
+
 def staging_files(binding: Mapping[str, Any], build_dir: Path) -> list[tuple[str, Path]]:
     """(R2 key, local path) pairs for ``r2_store.upload``, each checked against its pin.
 
     The shards, manifests and tokenizer come first, then documents.jsonl,
     exclusions.jsonl, report.json and verification.json, and the binding last, so a
-    reader never finds a binding before the files it names.
+    reader never finds a binding before the files it names. The pinned report.json must
+    list exactly the binding's streams, shards, identities and tokenizer.
     """
     checked = check_binding(binding)
     records = build_dir / "output"
@@ -877,6 +957,8 @@ def staging_files(binding: Mapping[str, Any], build_dir: Path) -> list[tuple[str
         if (size is not None and path.stat().st_size != size) or file_sha256(path) != sha256:
             raise ValueError(f"{path}: bytes differ from the binding")
         pairs.append((key, path))
+    # report.json now hashes to the binding's pin; its shard lists must be the binding's.
+    _require_report_shards(checked, json.loads(_regular(records, "report.json").read_bytes()))
     written = _plain_file(Path(checked["written_to"]))
     if written.read_bytes() != _serialized(checked):
         raise ValueError(f"{written} is not this binding")
