@@ -36,7 +36,7 @@ A language conversation uses the same turns without the python block. For `Hi` /
 
 **Generation prompts.** `task_prompt`, `benchmark_prompt` and `generation_prompt(encoder, history)` end at `<|assistant_start|>`. For a code task, generation may stop at `<|python_end|>` or `<|assistant_end|>` (`CODE_STOP_IDS`), since nothing after the first block is scored.
 
-**Extraction.** `extract_program(generated_ids, tokenizer)` looks only at the generated tokens. It finds the first `<|python_start|>` and reads up to the next special token. The text in between is the program only if that token is `<|python_end|>`. With no block, an unclosed block, or another special token first (such as `<|assistant_end|>`), there is no program and the attempt scores 0. An empty closed block is an empty program, which fails its tests.
+**Extraction.** `extract_program(generated_ids, tokenizer)` looks only at the generated tokens. It finds the first `<|python_start|>` and reads up to the next special token. The text in between is the program only if that token is `<|python_end|>`. With no block, an unclosed block, or another special token first (such as `<|assistant_end|>`), there is no program and the attempt scores 0. The block must also open inside the first assistant turn: if any special token comes before the first `<|python_start|>`, for example an `<|assistant_end|>` followed by an invented later turn, there is no program. An empty closed block is an empty program, which fails its tests.
 
 **base-pool-completion-v1.** Base-model scoring of pool tasks uses a plain completion instead:
 

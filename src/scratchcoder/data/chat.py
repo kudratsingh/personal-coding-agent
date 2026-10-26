@@ -200,11 +200,16 @@ def extract_program(generated: Iterable[int], decoder: TextDecoder) -> str | Non
     the first ``<|python_start|>`` up to the next special token. It is a program only if
     that token is ``<|python_end|>``: any other special token there (another start, an
     ``<|assistant_end|>``) or the end of the generation means no program, which scores 0.
+    The block must also open inside the first assistant turn: any special token before
+    the first ``<|python_start|>`` (such as ``<|assistant_end|>`` followed by an invented
+    later turn) means no program.
     """
     tokens = list(generated)
     if PYTHON_START not in tokens:
         return None
     start = tokens.index(PYTHON_START) + 1
+    if any(is_special(token) for token in tokens[: start - 1]):
+        return None
     for end in range(start, len(tokens)):
         if is_special(tokens[end]):
             return decoder.decode(tokens[start:end]) if tokens[end] == PYTHON_END else None

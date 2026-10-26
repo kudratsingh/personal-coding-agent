@@ -212,6 +212,23 @@ def test_benchmark_prompt_is_the_stripped_benchmark_prompt_alone() -> None:
         ([PYTHON_START, *b("x"), PYTHON_START, *b("y"), PYTHON_END], None),
         (b("<|python_start|>x<|python_end|>"), None),
         ([], None),
+        # A block after the assistant turn ended belongs to an invented later turn.
+        (
+            [
+                *b("h"),
+                ASSISTANT_END,
+                USER_START,
+                *b("q"),
+                USER_END,
+                ASSISTANT_START,
+                PYTHON_START,
+                *b("x"),
+                PYTHON_END,
+            ],
+            None,
+        ),
+        ([ASSISTANT_END, PYTHON_START, *b("x"), PYTHON_END], None),
+        ([PYTHON_END, PYTHON_START, *b("x"), PYTHON_END], None),
     ],
 )
 def test_extraction_takes_only_the_first_closed_python_block(
