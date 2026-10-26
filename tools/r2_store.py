@@ -9,7 +9,8 @@ R2 speaks the S3 API, signed with AWS Signature Version 4. This client does four
 - A file already stored under the same key with the same digest is skipped.
 - ``CheckpointUploader`` does the same for training checkpoints on one background
   thread, keeps the newest rolling checkpoints plus every milestone, and records
-  failures instead of raising them into the training loop.
+  failures instead of raising them into the training loop. A milestone that fails is
+  retried with backoff until the uploader closes.
 
 Credentials come only from ``R2_ENDPOINT``, ``R2_ACCESS_KEY_ID``,
 ``R2_SECRET_ACCESS_KEY`` and ``R2_BUCKET``; they are never printed or written. Prices
@@ -29,7 +30,7 @@ import threading
 import time
 import xml.etree.ElementTree as ElementTree
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from functools import partial
 from http.client import HTTPException
 from pathlib import Path
@@ -49,6 +50,12 @@ SERVICE = "s3"
 S3_NAMESPACE = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+MILESTONE_RETRY_SECONDS = 15.0
+"""The first wait before a failed milestone is uploaded again; it doubles per failure."""
+MILESTONE_RETRY_MAX_SECONDS = 60.0
+"""The longest wait between two uploads of a failing milestone."""
+MAX_RECORDED_FAILURES = 100
+"""``status()`` keeps the newest failures and refusals; ``failure_count`` counts them all."""
 
 
 def monthly_storage_usd(total_bytes: int) -> float:
@@ -210,7 +217,11 @@ class Store:
         """Stream one object to ``destination``, publishing it only if size and hash match.
 
         The digest is checked against the caller's pinned value, not the object's
-        metadata, which any holder of a write key could set. Transient failures retry.
+        metadata, which any holder of a write key could set. Transient failures retry
+        within the attempt budget, and so does a body that ends early: ``read`` returns
+        no more bytes on a clean early close instead of raising ``IncompleteRead``. Only
+        more bytes than the pinned size, or a full-length body with another SHA-256,
+        raise at once.
         """
         destination.parent.mkdir(parents=True, exist_ok=True)
         partial = destination.with_name(destination.name + ".part")
@@ -230,8 +241,10 @@ class Store:
                         out.write(block)
                     out.flush()
                     os.fsync(out.fileno())
-                if count != size or digest.hexdigest() != sha256:
-                    raise ValueError(f"{key}: size or SHA-256 differs from the pinned value")
+                if count < size:
+                    raise TransientError(f"{key}: the body ended after {count:,} of {size:,} bytes")
+                if digest.hexdigest() != sha256:
+                    raise ValueError(f"{key}: SHA-256 differs from the pinned value")
                 partial.replace(destination)
                 return {
                     "key": key,
@@ -243,7 +256,7 @@ class Store:
             except ValueError:
                 partial.unlink(missing_ok=True)
                 raise
-            except (OSError, RuntimeError, HTTPError):
+            except (OSError, RuntimeError, HTTPException):  # HTTPError is an OSError.
                 partial.unlink(missing_ok=True)
                 if attempt == self.attempts:
                     raise
@@ -411,6 +424,10 @@ class _Job:
     label: str
     files: tuple[tuple[str, Path, str], ...]
     milestone: bool
+    due: float = field(default=0.0, compare=False)
+    """``time.monotonic()`` before which a retried milestone waits; 0 means now."""
+    failures: int = field(default=0, compare=False)
+    """Failed uploads of this milestone so far, which set its backoff."""
 
 
 @dataclass(frozen=True)
@@ -425,13 +442,17 @@ class _Rolling:
 class CheckpointUploader:
     """Upload checkpoints to R2 on one background thread, so training never waits.
 
-    ``submit`` only queues work. A rolling submission replaces any older rolling one
-    still waiting, which is recorded as superseded; milestones always wait their turn.
-    Each label is checked against the cost cap, uploaded, verified with HEAD and given
-    a receipt. Then older rolling labels beyond ``keep_rolling`` are deleted, as are the
-    keys any older failed rolling label managed to store. Milestones are never deleted.
-    Worker errors are recorded in ``status()``; they are never raised on the caller's
-    thread.
+    ``submit`` only queues work. Any submission drops the rolling labels still waiting,
+    which are recorded as superseded: a newer rolling label or a milestone holds newer
+    weights, so a milestone never waits behind a rolling label that has not started.
+    Milestones are never dropped. Each label is checked against the cost cap, uploaded,
+    verified with HEAD and given a receipt. A milestone that fails or is refused is
+    queued again with backoff (``retry_seconds``, doubling up to ``retry_max_seconds``)
+    until the uploader closes; submitting it again makes it due at once. Due milestones
+    go before rolling labels. After a rolling label verifies, older rolling labels beyond
+    ``keep_rolling`` are deleted, as are the keys any older failed rolling label managed
+    to store. Milestones are never deleted. Worker errors are recorded in ``status()``;
+    they are never raised on the caller's thread.
 
     Submitted files must stay unchanged until their label leaves the queue. Retention
     only knows the labels this instance uploaded; earlier processes' are left alone.
@@ -446,13 +467,18 @@ class CheckpointUploader:
         receipt_dir: Path,
         keep_rolling: int = 2,
         clock: Callable[[], float] = time.monotonic,
+        retry_seconds: float = MILESTONE_RETRY_SECONDS,
+        retry_max_seconds: float = MILESTONE_RETRY_MAX_SECONDS,
     ) -> None:
         if prefix.startswith("/") or (prefix and not prefix.endswith("/")):
             raise ValueError("prefix must be empty or a relative path ending in '/'")
         if keep_rolling < 1:
             raise ValueError("keep_rolling must be at least 1")
+        if not 0 < retry_seconds <= retry_max_seconds:
+            raise ValueError("retry_seconds must be positive and at most retry_max_seconds")
         self.store, self.prefix, self.cap_usd = store, prefix, cap_usd
         self.receipt_dir, self.keep_rolling, self.clock = receipt_dir, keep_rolling, clock
+        self.retry_seconds, self.retry_max_seconds = retry_seconds, retry_max_seconds
         # Everything below is shared with the caller's thread: touch it only under the lock.
         self._condition = threading.Condition()
         self._pending: list[_Job] = []
@@ -466,6 +492,7 @@ class CheckpointUploader:
         self._cancelled: list[str] = []
         self._deleted: list[str] = []
         self._failures: list[dict[str, str]] = []
+        self._failure_count = 0
         self._refused: list[dict[str, Any]] = []
         self._thread = threading.Thread(target=self._work, name="r2-uploader", daemon=True)
         self._thread.start()
@@ -475,7 +502,10 @@ class CheckpointUploader:
     ) -> None:
         """Queue (relative key, path, SHA-256) files under ``prefix + label + "/"``.
 
-        Malformed arguments raise here; nothing else does, and no I/O happens.
+        The same label and files already waiting are replaced in place and due at once;
+        the same label and files already uploading are left to finish (a milestone is
+        retried if that upload fails). Malformed arguments raise here; nothing else
+        does, and no I/O happens.
         """
         if not LABEL.fullmatch(label):
             raise ValueError(f"invalid label {label!r}")
@@ -493,31 +523,46 @@ class CheckpointUploader:
         with self._condition:
             if self._closed:
                 raise RuntimeError("the uploader is closed")
-            if not milestone:
-                self._superseded += [older.label for older in self._pending if not older.milestone]
-                self._pending = [older for older in self._pending if older.milestone]
-            self._pending.append(job)
+            self._superseded += [
+                older.label for older in self._pending if not older.milestone and older != job
+            ]
+            self._pending = [older for older in self._pending if older.milestone or older == job]
+            if self._in_flight != job:
+                waiting = [index for index, older in enumerate(self._pending) if older == job]
+                if waiting:
+                    self._pending[waiting[0]] = job  # Due now, its backoff restarted.
+                else:
+                    self._pending.append(job)
             self._condition.notify_all()
 
     def status(self) -> dict[str, Any]:
-        """A snapshot that is safe to log: labels, failures and refusals so far."""
+        """A snapshot that is safe to log: labels, failures and refusals so far.
+
+        ``retrying`` maps each milestone waiting to be uploaded again to its failures;
+        ``failures`` and ``refused`` keep the newest ``MAX_RECORDED_FAILURES`` entries.
+        """
         with self._condition:
             return {
                 "last_verified": self._last_verified,
                 "in_flight": None if self._in_flight is None else self._in_flight.label,
                 "pending": [job.label for job in self._pending],
+                "retrying": {job.label: job.failures for job in self._pending if job.failures},
                 "verified": list(self._verified),
                 "rolling": [item.label for item in self._rolling if item.receipt is not None],
                 "superseded": list(self._superseded),
                 "deleted": list(self._deleted),
                 "cancelled": list(self._cancelled),
                 "failures": [dict(item) for item in self._failures],
+                "failure_count": self._failure_count,
                 "refused": [dict(item) for item in self._refused],
                 "closed": self._closed,
             }
 
     def drain(self, timeout: float) -> bool:
-        """Wait up to ``timeout`` seconds for all queued work; False if it is still running."""
+        """Wait up to ``timeout`` seconds for all queued work; False if it is still running.
+
+        A milestone waiting to be retried is queued work: it keeps ``drain`` waiting.
+        """
         with self._condition:
             return self._condition.wait_for(
                 lambda: not self._pending and self._in_flight is None, timeout
@@ -537,16 +582,34 @@ class CheckpointUploader:
         self._thread.join(timeout)
         return not self._thread.is_alive()
 
+    def _next(self) -> _Job | None:
+        """Under the lock: wait for the next due job, a due milestone first; None once closed."""
+        while True:
+            if not self._pending:
+                if self._closed:
+                    return None
+                self._condition.wait()
+                continue
+            now = time.monotonic()
+            due = [job for job in self._pending if job.due <= now]
+            if not due:
+                self._condition.wait(min(job.due for job in self._pending) - now)
+                continue
+            job = next((job for job in due if job.milestone), due[0])
+            self._pending = [other for other in self._pending if other is not job]
+            return job
+
     def _work(self) -> None:
         while True:
             with self._condition:
-                self._condition.wait_for(lambda: bool(self._pending) or self._closed)
-                if not self._pending:
+                job = self._next()
+                if job is None:
                     return
-                job = self._in_flight = self._pending.pop(0)
+                self._in_flight = job
             stored: list[str] = []
+            verified = False
             try:
-                self._upload(job, stored)
+                verified = self._upload(job, stored)
             except Exception as error:  # recorded, never raised: the caller is training
                 self._fail(job.label, "upload", error)
                 if stored and not job.milestone:
@@ -554,16 +617,28 @@ class CheckpointUploader:
             finally:
                 with self._condition:
                     self._in_flight = None
+                    if job.milestone and not verified:
+                        self._retry(job)
                     self._condition.notify_all()
+
+    def _retry(self, job: _Job) -> None:
+        """Under the lock: queue a failed or refused milestone again after its backoff."""
+        if self._closed or any(other == job for other in self._pending):
+            return  # Closing cancels it; a resubmission of the label already waits.
+        failures = job.failures + 1
+        delay = min(self.retry_max_seconds, self.retry_seconds * 2.0 ** (failures - 1))
+        self._pending.append(replace(job, due=time.monotonic() + delay, failures=failures))
 
     def _keys(self, job: _Job) -> tuple[str, ...]:
         return tuple(self.prefix + job.label + "/" + key for key, _, _ in job.files)
 
     def _fail(self, label: str, stage: str, error: Exception) -> None:
         with self._condition:
+            self._failure_count += 1
             self._failures.append(
                 {"label": label, "stage": stage, "error": f"{type(error).__name__}: {error}"}
             )
+            del self._failures[:-MAX_RECORDED_FAILURES]
 
     def _remember(self, item: _Rolling) -> bool:
         """List a rolling label for retention, unless its keys now hold a milestone."""
@@ -574,7 +649,8 @@ class CheckpointUploader:
             self._rolling.append(item)
             return True
 
-    def _upload(self, job: _Job, stored: list[str]) -> None:
+    def _upload(self, job: _Job, stored: list[str]) -> bool:
+        """Upload and verify one label; False if the cost cap refused it."""
         planned = [
             (key, path, digest, path.stat().st_size)
             for key, (_, path, digest) in zip(self._keys(job), job.files, strict=True)
@@ -596,7 +672,8 @@ class CheckpointUploader:
                         "cap_usd_per_month": self.cap_usd,
                     }
                 )
-            return
+                del self._refused[:-MAX_RECORDED_FAILURES]
+            return False
         started = self.clock()
         rows: list[dict[str, Any]] = []
         for key, path, digest, size in planned:
@@ -645,6 +722,7 @@ class CheckpointUploader:
                 self._rolling = [old for old in self._rolling if old.label != job.label]
         if not job.milestone and self._remember(_Rolling(job.label, tuple(stored), record)):
             self._retain()
+        return True
 
     def _retain(self) -> None:
         """Delete failed rolling labels and verified ones beyond ``keep_rolling``, oldest first."""

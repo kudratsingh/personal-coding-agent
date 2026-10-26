@@ -14,6 +14,7 @@ from urllib.request import Request
 
 import pytest
 
+from tools import r2_store
 from tools.r2_store import CheckpointUploader, Credentials, Store, TransientError
 
 Fault = int | Exception | None
@@ -302,23 +303,117 @@ def test_the_known_digest_is_signed_as_is_and_r2_rejects_other_bytes(
 def test_worker_errors_are_captured_and_later_work_continues(tmp_path: Path, make: Make) -> None:
     uploader, fake, _ = make()
     missing = [("model.pt", tmp_path / "absent.pt", "0" * 64)]
-    uploader.submit("best-1", missing, milestone=True)
+    uploader.submit("step-1", missing, milestone=False)
     assert uploader.drain(5)
     fake.corrupt = True
-    uploader.submit("best-2", checkpoint(tmp_path, "best-2"), milestone=True)
+    uploader.submit("step-2", checkpoint(tmp_path, "step-2"), milestone=False)
     assert uploader.drain(5)
     fake.corrupt = False
     fake.faults = {"GET": [ValueError("unexpected transport bug")]}
-    uploader.submit("best-3", checkpoint(tmp_path, "best-3"), milestone=True)
+    uploader.submit("step-3", checkpoint(tmp_path, "step-3"), milestone=False)
     assert uploader.drain(5)
-    uploader.submit("best-4", checkpoint(tmp_path, "best-4"), milestone=True)
+    uploader.submit("step-4", checkpoint(tmp_path, "step-4"), milestone=False)
     assert uploader.drain(5)
     status = uploader.status()
     errors = [item["error"] for item in status["failures"]]
     assert errors[0].startswith("FileNotFoundError")
-    assert errors[1] == "RuntimeError: runs/a/best-2/model.pt: stored digest differs after upload"
+    assert errors[1] == "RuntimeError: runs/a/step-2/model.pt: stored digest differs after upload"
     assert errors[2] == "ValueError: unexpected transport bug"
-    assert status["verified"] == ["best-4"] and status["deleted"] == []
+    assert status["failure_count"] == 3 and status["retrying"] == {}  # Rolling: never retried.
+    # The corrupt label's stored key is deleted once a later rolling label verifies.
+    assert status["verified"] == ["step-4"] and status["deleted"] == ["step-2"]
+
+
+def wait_for(condition: Callable[[], bool], seconds: float = 5.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline, "condition not reached"
+        time.sleep(0.005)
+
+
+def test_a_failed_milestone_is_retried_with_backoff_until_it_verifies(
+    tmp_path: Path, make: Make
+) -> None:
+    uploader, fake, _ = make(retry_seconds=0.01, retry_max_seconds=0.02)
+    fake.faults = {"PUT": [403, 403, 403]}  # Not transient: each upload attempt fails at once.
+    uploader.submit("best-1", checkpoint(tmp_path, "best-1"), milestone=True)
+    assert uploader.drain(5)
+    status = uploader.status()
+    assert status["verified"] == ["best-1"] and status["retrying"] == {}
+    assert [item["label"] for item in status["failures"]] == ["best-1"] * 3
+    assert status["failure_count"] == 3 and len(fake.requested("PUT")) == 4
+    assert receipt(tmp_path, "best-1")["milestone"] is True
+
+
+def test_a_resubmitted_milestone_is_due_at_once_and_drain_waits_for_its_retry(
+    tmp_path: Path, make: Make
+) -> None:
+    uploader, fake, _ = make(retry_seconds=60.0, retry_max_seconds=60.0)
+    files = checkpoint(tmp_path, "best-1")
+    fake.faults = {"PUT": [403]}
+    uploader.submit("best-1", files, milestone=True)
+    wait_for(lambda: uploader.status()["retrying"] == {"best-1": 1})
+    # Waiting to retry is queued work: drain does not report it done.
+    assert not uploader.drain(0.05) and uploader.status()["pending"] == ["best-1"]
+    uploader.submit("best-1", files, milestone=True)  # Due now; nothing is queued twice.
+    assert uploader.drain(5)
+    status = uploader.status()
+    assert status["verified"] == ["best-1"] and status["pending"] == []
+    assert fake.requested("PUT") == ["runs/a/best-1/model.pt"] * 2
+
+
+def test_a_refused_milestone_is_retried_once_the_cap_allows_it(tmp_path: Path, make: Make) -> None:
+    fake = FakeBucket({"other/held.bin": 10 * 10**9})
+    uploader, _, _ = make(fake, cap_usd=0.0, retry_seconds=0.01, retry_max_seconds=0.02)
+    uploader.submit("best-1", checkpoint(tmp_path, "best-1"), milestone=True)
+    wait_for(lambda: len(uploader.status()["refused"]) >= 2)
+    assert not uploader.status()["verified"] and fake.requested("PUT") == []
+    with fake.lock:
+        del fake.sizes["other/held.bin"]  # Space freed: the next retry fits the cap.
+    assert uploader.drain(5) and uploader.status()["verified"] == ["best-1"]
+
+
+def test_a_milestone_drops_waiting_rolling_labels_but_not_the_one_in_flight(
+    tmp_path: Path, make: Make
+) -> None:
+    uploader, fake, _ = make()
+    files = {label: checkpoint(tmp_path, label) for label in ("step-2", "best-1", "step-3")}
+    fake.hold.clear()
+    uploader.submit("step-1", checkpoint(tmp_path, "step-1"), milestone=False)
+    assert fake.putting.wait(5)
+    uploader.submit("step-2", files["step-2"], milestone=False)
+    uploader.submit("best-1", files["best-1"], milestone=True)
+    uploader.submit("best-1", files["best-1"], milestone=True)  # Already waiting: kept once.
+    status = uploader.status()
+    assert status["in_flight"] == "step-1" and status["pending"] == ["best-1"]
+    assert status["superseded"] == ["step-2"]
+    uploader.submit("step-3", files["step-3"], milestone=False)  # Waits behind the milestone.
+    fake.hold.set()
+    assert uploader.drain(5)
+    assert uploader.status()["verified"] == ["step-1", "best-1", "step-3"]
+
+
+def test_close_cancels_a_milestone_waiting_to_retry(tmp_path: Path, make: Make) -> None:
+    uploader, fake, _ = make(retry_seconds=60.0, retry_max_seconds=60.0)
+    fake.faults = {"PUT": [403]}
+    uploader.submit("best-1", checkpoint(tmp_path, "best-1"), milestone=True)
+    wait_for(lambda: bool(uploader.status()["retrying"]))
+    assert uploader.close(timeout=5)  # The worker never waits out the backoff.
+    status = uploader.status()
+    assert status["cancelled"] == ["best-1"] and status["pending"] == []
+    assert len(fake.requested("PUT")) == 1
+
+
+def test_recorded_failures_are_bounded(
+    tmp_path: Path, make: Make, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(r2_store, "MAX_RECORDED_FAILURES", 3)
+    uploader, fake, _ = make(retry_seconds=0.001, retry_max_seconds=0.001)
+    fake.faults = {"PUT": [403] * 5}
+    uploader.submit("best-1", checkpoint(tmp_path, "best-1"), milestone=True)
+    assert uploader.drain(5)
+    status = uploader.status()
+    assert len(status["failures"]) == 3 and status["failure_count"] == 5
 
 
 def test_receipt_records_keys_bytes_digests_attempts_and_seconds(
@@ -413,6 +508,16 @@ def test_malformed_submissions_raise_on_the_caller_and_send_nothing(
         with pytest.raises(ValueError):
             CheckpointUploader(
                 store, prefix=prefix, cap_usd=1.0, receipt_dir=tmp_path, keep_rolling=keep
+            )
+    for retry, longest in [(0.0, 1.0), (2.0, 1.0)]:
+        with pytest.raises(ValueError, match="retry_seconds"):
+            CheckpointUploader(
+                store,
+                prefix="runs/",
+                cap_usd=1.0,
+                receipt_dir=tmp_path,
+                retry_seconds=retry,
+                retry_max_seconds=longest,
             )
     assert uploader.drain(5) and fake.calls == []
 

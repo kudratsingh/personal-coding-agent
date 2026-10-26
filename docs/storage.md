@@ -11,7 +11,7 @@ uv run --locked python -m tools.r2_store upload --root runs/x --prefix x/ --rece
 
 - `status` lists the bucket and prices what it holds.
 - `upload` refuses the whole batch if the bucket's priced storage after it would exceed `--cap-usd` (default $5 a month). Otherwise it PUTs each file with its SHA-256 as the signed payload hash, so R2 itself rejects bytes that differ. The digest is also stored as object metadata, and a HEAD reads it back. A file already stored under the same key with the same digest is skipped.
-- `Store.download` streams one object and keeps it only if its size and SHA-256 match the caller's pinned values, not the object's metadata.
+- `Store.download` streams one object and keeps it only if its size and SHA-256 match the caller's pinned values, not the object's metadata. A body that ends early is retried like any transient failure, within the same four attempts: Python's HTTP client returns no more bytes on a clean early close instead of raising, and `IncompleteRead` is retried too. A body longer than the pinned size, or a full-length body with another SHA-256, is refused at once.
 
 ## Checkpoint uploads during training
 
@@ -27,14 +27,15 @@ uploader.close()
 ```
 
 - **Submit never blocks.** It checks its arguments and queues the label. The caller passes each file's SHA-256, already computed for the checkpoint sidecar; `Store.put_known` signs that digest instead of reading the file again.
-- **Newest rolling checkpoint wins.** While an upload runs, a newer rolling submission replaces any older one still waiting. The replaced label is listed as `superseded`. Milestones are never dropped; they wait their turn.
+- **Newest checkpoint wins.** While an upload runs, any newer submission drops the rolling labels still waiting: a newer rolling label replaces them, and a milestone, which holds newer weights, drops them so it never waits behind a rolling label that has not started. The dropped labels are listed as `superseded`. A rolling label already uploading finishes. Milestones are never dropped. Submitting a label that is already waiting replaces it in place; submitting the label that is uploading adds nothing.
 - **Cost cap first.** Before each label, the bucket is listed. The label is refused if the bucket's bytes plus this label's bytes would price above `cap_usd`. Rolling labels due for deletion still count, so the check is conservative. A refusal is recorded, not raised.
-- **Retries.** HTTP 5xx answers, timeouts and connection errors retry up to four attempts, with backoff of 2, 4 and 8 seconds. A 4xx is never retried; for example, R2 answers 400 when the bytes do not match the signed digest.
+- **Retries.** HTTP 5xx answers, timeouts and connection errors retry up to four attempts, with backoff of 2, 4 and 8 seconds. A 4xx is never retried within one upload; for example, R2 answers 400 when the bytes do not match the signed digest.
+- **Milestones are retried until the uploader closes.** A milestone whose upload fails for any reason, or that the cost cap refuses, is queued again after `retry_seconds` (15 s), doubling to at most `retry_max_seconds` (60 s). Submitting it again makes it due at once and restarts its backoff. When several labels are due, milestones go first. A milestone waiting to retry is queued work: `drain` keeps waiting for it, and `status()["retrying"]` maps it to its failures so far. Rolling labels are not retried; the next one replaces them.
 - **Verify, then receipt.** Each file is read back with HEAD. Only when every file of the label verifies is `receipt_dir/<label>.json` written. It lists each key with its bytes, SHA-256, attempts and seconds, plus totals and the priced bucket size. A receipt exists only for a verified label.
 - **Retention.** After a rolling label verifies, older rolling labels beyond `keep_rolling` (default 2) are deleted, oldest first. Their receipts gain a `deleted_at` time. Keys that a failed rolling label managed to store are deleted at the same point. Milestones are never deleted. A failed delete is recorded and retried after the next verified label.
-- **Errors stay on the worker.** Any exception in the worker is recorded in `status()["failures"]` with its label and stage (`upload` or `retention`). Nothing is raised into the training loop.
-- **Status.** `status()` reports `last_verified`, `in_flight`, `pending`, `verified`, `rolling`, `superseded`, `deleted`, `cancelled`, `failures` and `refused`.
-- **Teardown.** `drain(timeout)` waits for all queued work and returns False on timeout. `close()` refuses new work, cancels labels that have not started (listed as `cancelled`) and waits for the upload in flight. The worker is a daemon thread, so call `drain` before the process exits.
+- **Errors stay on the worker.** Any exception in the worker is recorded in `status()["failures"]` with its label and stage (`upload` or `retention`). Nothing is raised into the training loop. `failures` and `refused` keep the newest 100 entries, so a milestone failing for hours cannot grow the report without bound; `failure_count` counts every failure.
+- **Status.** `status()` reports `last_verified`, `in_flight`, `pending`, `retrying`, `verified`, `rolling`, `superseded`, `deleted`, `cancelled`, `failures`, `failure_count` and `refused`.
+- **Teardown.** `drain(timeout)` waits for all queued work, milestones waiting to retry included, and returns False on timeout. `close()` refuses new work, cancels labels that have not started or are waiting to retry (listed as `cancelled`) and waits for the upload in flight. The worker is a daemon thread, so call `drain` before the process exits. The rehearsal worker resubmits every unverified milestone and drains for the whole transfer window left before it closes (see the [rehearsal run walkthrough](walkthroughs/rehearsal-run.md)).
 
 Keys are `prefix + label + "/" + key`. Labels are letters, digits, `.`, `_` and `-`. Files must stay unchanged until their label leaves the queue; R2 rejects changed bytes because the digest no longer matches.
 
@@ -45,12 +46,14 @@ Keys are `prefix + label + "/" + key`. Labels are letters, digits, `.`, `_` and 
 `uv run --locked pytest tests/test_r2_store.py tests/test_r2_uploader.py` runs offline against in-memory fake buckets. The tests cover:
 
 - signing and pricing;
+- downloads that retry a truncated body or `IncompleteRead` and refuse a longer body or another digest at once;
 - non-blocking submission while a PUT is held;
-- newest-rolling-wins coalescing, with milestones kept;
+- newest-rolling-wins coalescing, a milestone dropping waiting rolling labels but not the one in flight, with milestones kept;
+- milestones retried with backoff until they verify, after a failure or a cost-cap refusal, due at once when resubmitted, and cancelled by `close`;
 - retention, including partial failures;
 - cost-cap refusal;
-- retries for 5xx answers, timeouts and connection errors, and no retries for 4xx;
-- the signed digest and receipt contents;
+- retries for 5xx answers, timeouts and connection errors, and no retries for 4xx within one upload;
+- the signed digest and receipt contents, and the bounded failure record;
 - drain timeouts, close and concurrent submissions.
 
 No test touches the network or a real bucket.

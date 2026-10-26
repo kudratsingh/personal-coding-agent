@@ -322,9 +322,9 @@ def test_receipt_binds_the_pods_evidence_and_passes_the_d35_gate(tmp_path: Path)
     plan = planned_seconds(spec, stage_targets=targets, full_validation_targets=full)
     assert fit["reference_seconds_needed"] == pytest.approx(plan["total_seconds"])
     assert fit["rule"] == LAUNCH_RULE and fit["fits_at_reference"]
-    # 43,015 s left holds the run at 56,479 tok/s (38,107 s) but not at the floor (44,401 s).
+    # 43,015 s left holds the run at 56,479 tok/s (38,843 s) but not at the floor (45,152 s).
     assert fit["fits_at_floor"] is False
-    assert fit["floor_seconds_needed"] == pytest.approx(44_401, abs=1)
+    assert fit["floor_seconds_needed"] == pytest.approx(45_152, abs=1)
     assert "ssh_transfer_tested" not in receipt
     assert check_rehearsal_readiness(receipt, now=CREATED + 1_801, run="A") == CREATED - 5
     with pytest.raises(ValueError, match="run B"):

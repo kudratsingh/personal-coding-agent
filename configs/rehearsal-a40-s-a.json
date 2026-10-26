@@ -78,7 +78,7 @@
   "r2": {
     "keep_rolling": 2,
     "storage_cap_usd_per_month": 5.0,
-    "drain_seconds": 480,
+    "rolling_skip_seconds": 900,
     "max_transfer_seconds": 900
   }
 }
