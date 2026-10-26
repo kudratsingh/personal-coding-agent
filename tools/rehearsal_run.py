@@ -36,7 +36,6 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
-from functools import partial
 from itertools import batched
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -83,6 +82,7 @@ from tools.r2_store import (
     Credentials,
     Store,
     bounded_store,
+    transient_error,
 )
 from tools.rehearsal_binding import (
     ORDER_SEED,
@@ -118,8 +118,15 @@ FINALIZE_MARGIN_SECONDS = 120.0
 The heartbeat is due ``PULL_RESERVE_SECONDS`` before the watchdog's transfer window ends,
 which leaves the Mac supervisor that long to pull an unverified milestone over SSH."""
 LAST_CALL_SECONDS = 45.0
-"""No R2 call after the drain starts later than this before the handover: each uses the
-bounded store (2 attempts of 20 s plus backoff), so the final heartbeat is not late."""
+"""No R2 check after the drain starts later than this before the handover, except the HEAD
+that verifies a ``report.json`` PUT that succeeded."""
+FINAL_WRITE_SECONDS = 10.0
+"""Kept after every R2 check for closing the uploader, ``finalization.json`` and the final
+heartbeat: each check's socket timeout is sized to end this long before the handover."""
+CHECK_TIMEOUT_SECONDS = 20.0
+"""The longest socket timeout of one R2 check attempt after the drain."""
+CHECK_ATTEMPTS = 6
+"""A check after the drain retries transient failures up to this many times while time lasts."""
 ROLLING_SKIP_SECONDS = 900.0
 """The D-35 minimum for ``rolling_skip_seconds``: no rolling save starts when the stage's
 remaining updates at the measured rate, or the training deadline, end within this long,
@@ -1072,7 +1079,8 @@ class Worker:
         secrets: Iterable[str] = (),
         extra: Mapping[str, Any] | None = None,
         upload_retry_seconds: float = MILESTONE_RETRY_SECONDS,
-        check_store: Store | None = None,
+        check_store_for: Callable[[float], Store] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if len(data.stages) != len(spec.stages) or any(
             stage.plan != plan or stage.expected["planned_updates"] != plan.updates
@@ -1090,8 +1098,12 @@ class Worker:
         if root.exists() or root.is_symlink():
             raise FileExistsError("rehearsal output must be a new directory")
         self.spec, self.root, self.data, self.store = spec, root, data, store
-        # The R2 checks after the final drain; a bounded store on the Pod (``run``).
-        self.check_store = store if check_store is None else check_store
+        # The R2 checks after the final drain take a store with the given socket timeout:
+        # a single-attempt bounded store on the Pod (``run``), the main store in tests.
+        self.check_store_for = (
+            (lambda _timeout: store) if check_store_for is None else check_store_for
+        )
+        self.sleep = sleep
         self.handover: float | None = None
         """When finalization starts: the time its final heartbeat is due."""
         self.initialization, self.initialization_sha256 = initialization, initialization_sha256
@@ -1954,34 +1966,55 @@ class Worker:
         handover (360 s after the last GPU work for D-35)."""
         return max(0.0, self.handover_due() - FINALIZE_MARGIN_SECONDS - self.clock())
 
-    def _stored(self, key: str) -> str | None:
-        """The SHA-256 R2 stores for ``key``, by the bounded check store.
+    def _checked[T](self, action: Callable[[Store], T], what: str, *, late: bool = False) -> T:
+        """One R2 check after the drain, retried on transient failures while time lasts.
 
-        During finalization no check starts within ``LAST_CALL_SECONDS`` of the handover;
-        one that would raises ``TimeoutError``, so its label counts as unverified.
+        It starts only until ``LAST_CALL_SECONDS`` before the handover (``late``: until
+        ``FINAL_WRITE_SECONDS`` before it, for the HEAD that verifies a PUT that
+        succeeded); one that cannot start raises ``TimeoutError``. Each attempt's socket
+        timeout is at most ``CHECK_TIMEOUT_SECONDS`` and a quarter of the time left until
+        ``FINAL_WRITE_SECONDS`` before the handover, so an endpoint that resolves to up to
+        four addresses still answers or fails in time; name resolution is not bounded.
         """
-        if self.handover is not None and self.clock() >= self.handover - LAST_CALL_SECONDS:
-            raise TimeoutError(f"no time left before the handover to check {key}")
-        found, _ = self.check_store.retry(partial(self.check_store.stored_sha256, key))
-        return found
+        assert self.handover is not None, "R2 checks after the drain need a handover time"
+        end = self.handover - FINAL_WRITE_SECONDS
+        start_by = end if late else self.handover - LAST_CALL_SECONDS
+        for attempt in range(1, CHECK_ATTEMPTS + 1):
+            now = self.clock()
+            if now >= start_by:
+                raise TimeoutError(f"no time left before the handover to {what}")
+            store = self.check_store_for(min(CHECK_TIMEOUT_SECONDS, (end - now) / 4))
+            try:
+                return action(store)
+            except Exception as error:
+                if attempt == CHECK_ATTEMPTS or not transient_error(error):
+                    raise
+            self.sleep(min(2.0**attempt, max(0.0, start_by - self.clock()) / 4))
+        raise RuntimeError("unreachable")
+
+    def _stored(self, key: str, *, late: bool = False) -> str | None:
+        """The SHA-256 R2 stores for ``key``, checked within the handover's time limits."""
+        return self._checked(lambda store: store.stored_sha256(key), f"check {key}", late=late)
 
     def kept_labels(self) -> set[str]:
         """Labels the uploader verified and has not deleted (no request is made)."""
         status = self.uploader.status()
         return set(status["verified"]) - set(status["deleted"])
 
-    def verified_labels(self) -> dict[str, bool]:
-        """Labels the uploader verified and kept, each file checked again by HEAD.
+    def milestone_order(self) -> list[str]:
+        """The milestones with exports, the newest first: the order they are checked in."""
+        return [*reversed([label for label in self.milestones if label in self.label_files])]
 
-        The milestones go first, the newest first, then the rolling labels. A HEAD that
-        still fails after its retries, or one there is no time left for, counts as
-        unverified; its error is kept in ``verification_errors``.
+    def verified_labels(self, labels: Iterable[str]) -> dict[str, bool]:
+        """Each of ``labels``, in order: verified and kept by the uploader, and every file
+        checked again by HEAD.
+
+        A HEAD that still fails after its retries, or one there is no time left for, counts
+        as unverified; its error is kept in ``verification_errors``.
         """
         kept = self.kept_labels()
-        order = [*reversed([label for label in self.milestones if label in self.label_files])]
-        order += [label for label in self.label_files if label not in order]
         result: dict[str, bool] = {}
-        for label in order:
+        for label in labels:
             files = self.label_files[label]
             try:
                 result[label] = label in kept and all(
@@ -2031,9 +2064,9 @@ class Worker:
 
         The first round resubmits each milestone the uploader has not verified (one
         waiting to retry becomes due at once; one uploading is left to finish). Each
-        round drains for the rest of the budget and checks every kept label by HEAD; a
-        milestone whose HEAD check fails is resubmitted in the next round, at most
-        ``SETTLE_ROUNDS`` rounds in all. Returns the HEAD-checked labels.
+        round drains for the rest of the budget and checks every milestone by HEAD, the
+        newest first; one whose HEAD check fails is resubmitted in the next round, at most
+        ``SETTLE_ROUNDS`` rounds in all. Returns the HEAD-checked milestones.
         """
         deadline = time.monotonic() + budget
         labels: dict[str, bool] = {}
@@ -2048,7 +2081,7 @@ class Worker:
             for label in missing:
                 self.uploader.submit(label, self.label_files[label], milestone=True)
             drained = self.drain(max(0.0, deadline - time.monotonic()))
-            labels = self.verified_labels()
+            labels = self.verified_labels(self.milestone_order())
             rounds.append({"resubmitted": missing, "drained": drained})
             if all(labels.get(label) for label in self.milestones):
                 break
@@ -2100,7 +2133,7 @@ class Worker:
                 labels = self.settle(budget, receipt)
             self.prune_exports()
             milestones = {label: labels.get(label, False) for label in self.milestones}
-            receipt["labels_verified"] = labels
+            receipt["labels_verified"] = labels  # Rolling labels are added at the end.
             unverified = [self.export_listing(label) for label, ok in milestones.items() if not ok]
             durable = bool(milestones) and not unverified
             if unverified and not hurry:
@@ -2118,10 +2151,13 @@ class Worker:
             if hurry:
                 return
             path = self.root / "report.json"
-            if self.clock() >= self.handover - LAST_CALL_SECONDS:
-                raise TimeoutError("no time left before the handover to upload report.json")
-            self.check_store.put_known(report_key, path, report_sha256, path.stat().st_size)
-            if self._stored(report_key) != report_sha256:
+            size = path.stat().st_size
+            self._checked(
+                lambda store: store.put_known(report_key, path, report_sha256, size),
+                "upload report.json",
+            )
+            # The PUT succeeded: its verifying HEAD may still start until the final writes.
+            if self._stored(report_key, late=True) != report_sha256:
                 raise RuntimeError("report.json differs in R2 after upload")
             receipt["report_sha256"] = report_sha256
             if durable:
@@ -2135,7 +2171,10 @@ class Worker:
                     "checkpoint_key": f"{self.prefix}{final}/checkpoint.pt",
                     "checkpoint_sha256": files["checkpoint.pt"],
                 }
-            else:
+            # Rolling labels last, for the record only: no ending depends on them.
+            rolling = [label for label in self.label_files if label not in self.milestones]
+            labels.update(self.verified_labels(rolling))
+            if not durable:
                 last = [label for label in self.labels if labels.get(label)]
                 receipt["last_verified_label"] = last[-1] if last else None
         except Exception as error:
@@ -2544,7 +2583,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         initialization=args.initialization,
         initialization_sha256=args.initialization_sha256,
         store=Store(credentials),
-        check_store=bounded_store(credentials),
+        check_store_for=lambda timeout: bounded_store(credentials, timeout=timeout, attempts=1),
         pod_id=pod_id,
         pod_created=launch.origin,
         device="cuda:0",

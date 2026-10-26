@@ -427,6 +427,12 @@ RECOVERED_ARTIFACTS = (Artifact("checkpoint", "checkpoint.pt"), Artifact("record
 """What the SSH fallback pulls from ``exports/<label>/``: the weights and the label's record."""
 EXPORT_PATH_KEYS = ("path", "export_path", "local_path", "export")
 """Keys under which ``finalization.json`` may give an unverified milestone's export path."""
+LISTED_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+"""A file name the worker lists for an unverified milestone: one plain path component."""
+MAC_CHECK_TIMEOUT_SECONDS = 5.0
+"""The socket timeout of the Mac's own R2 listings and HEAD checks (``quick_store``). The
+worker hands over 480 s after its last GPU work and the pull must stamp progress before the
+600 s idle limit, so a dead endpoint may cost the Mac seconds per check, not minutes."""
 CHECKPOINT_DIGEST_KEYS = ("checkpoint_sha256", "sha256")
 """Keys under which an unverified milestone gives its checkpoint's SHA-256: the worker's
 ``checkpoint_sha256`` (``rehearsal_run.Worker.export_listing``), else an older row's ``sha256``."""
@@ -495,11 +501,37 @@ def unverified_milestones(finalization: object, *, run: str) -> dict[str, str]:
     ``sha256`` and the ``files`` row named ``checkpoint.pt``) must be the same; the SSH
     pull always reads ``exports/<label>``.
     """
+    return {label: digest for label, digest, _ in _listed_rows(finalization, run=run)}
+
+
+def listed_files(finalization: object, *, run: str) -> dict[str, list[tuple[str, str]]]:
+    """Each unverified milestone's files as the worker lists them: (name, SHA-256).
+
+    An older row without ``files`` gives its checkpoint alone. The checkpoint is always
+    among them, with the milestone's checkpoint SHA-256.
+    """
+    found: dict[str, list[tuple[str, str]]] = {}
+    for label, digest, row in _listed_rows(finalization, run=run):
+        files = [(str(item.get("name")), item.get("sha256")) for item in row.get("files", [])]
+        files = files or [("checkpoint.pt", digest)]
+        for name, sha256 in files:
+            if not LISTED_FILE.fullmatch(name) or not isinstance(sha256, str):
+                raise ValueError(f"unverified milestone {label} lists a malformed file")
+            if not SHA256_HEX.fullmatch(sha256):
+                raise ValueError(f"unverified milestone {label} lists a malformed file")
+        if ("checkpoint.pt", digest) not in files or len({name for name, _ in files}) != len(files):
+            raise ValueError(f"unverified milestone {label} lists its files malformed")
+        found[label] = [(name, str(sha256)) for name, sha256 in files]
+    return found
+
+
+def _listed_rows(finalization: object, *, run: str) -> list[tuple[str, str, dict[Any, Any]]]:
+    """(label, checkpoint SHA-256, row) for each listed milestone, every check applied."""
     if not isinstance(finalization, dict):
         raise ValueError("finalization.json must be an object")
     raw = finalization.get("unverified_milestones")
     if raw is None:
-        return {}
+        return []
     rows: list[object]
     if isinstance(raw, dict):
         rows = [
@@ -510,6 +542,7 @@ def unverified_milestones(finalization: object, *, run: str) -> dict[str, str]:
     else:
         raise ValueError("unverified_milestones must be a list or an object")
     found: dict[str, str] = {}
+    listed: list[tuple[str, str, dict[Any, Any]]] = []
     for row in rows:
         if not isinstance(row, dict):
             raise ValueError("each unverified milestone must be an object")
@@ -522,8 +555,10 @@ def unverified_milestones(finalization: object, *, run: str) -> dict[str, str]:
         digest = _listed_digest(row, label)
         if found.get(label, digest) != digest:
             raise ValueError(f"unverified milestone {label} is listed with two SHA-256s")
+        if label not in found:
+            listed.append((label, digest, row))
         found[label] = digest
-    return found
+    return listed
 
 
 def recorded_milestones(report: dict[str, Any], *, run: str) -> dict[str, str]:
@@ -805,13 +840,17 @@ class RehearsalSupervisor(Supervisor):
     def milestones_at_risk(self, report: dict[str, Any]) -> dict[str, str] | None:
         """Milestones a stopped or failed run may hold only on the Pod (label to SHA-256).
 
-        ``None`` means none is at risk and the ordinary grace applies. After
-        ``r2_milestones_unverified`` or ``r2_finalization`` the answer is never ``None``:
-        ``finalization.json`` must be readable (an error is raised and retried each cycle),
-        and every milestone the report records that the worker did not list is checked in
-        R2 with the Mac's key, by HEAD through the bounded ``quick_store``; any that fails
-        or times out is at risk too. After any other failure, the milestones
-        ``finalization.json`` lists or the report flags as unverified are.
+        ``None`` means none is at risk and the ordinary grace applies. Each milestone
+        ``finalization.json`` lists is first checked in R2 with the Mac's key, every file
+        it lists by HEAD through the bounded ``quick_store``, stopping at the first that is
+        missing, differs or times out: the worker may only have run out of time, and a
+        milestone the Mac finds whole needs no pull. After ``r2_milestones_unverified`` or
+        ``r2_finalization`` the answer is never ``None``: ``finalization.json`` must be
+        readable (an error is raised and retried each cycle), and every milestone the
+        report records that the worker did not list is checked in R2 the same way, by its
+        checkpoint; any that fails or times out is at risk too. After any other failure,
+        the listed milestones the Mac could not find and those the report flags as
+        unverified are.
         """
         recovery = report.get("failure") in RECOVERY_FAILURES
         try:
@@ -825,12 +864,16 @@ class RehearsalSupervisor(Supervisor):
         for label, digest in listed.items():
             if recorded.get(label, digest) != digest:
                 raise ValueError(f"finalization.json and report.json give {label} two SHA-256s")
-        at_risk = dict(listed)
+        files = listed_files(finalization, run=self.run)
+        at_risk: dict[str, str] = {}
+        for label, digest in listed.items():
+            if label not in self.r2_secured and not self.secured_in_r2(label, files[label]):
+                at_risk[label] = digest
         r2 = report.get("r2")
         flags = r2.get("milestones_verified") if isinstance(r2, dict) else None
         if isinstance(flags, dict):
             for label, verified in flags.items():
-                if verified is True or label in at_risk:
+                if verified is True or label in at_risk or label in self.r2_secured:
                     continue
                 if label not in recorded:
                     raise ValueError(f"the report flags {label} unverified with no SHA-256")
@@ -849,6 +892,22 @@ class RehearsalSupervisor(Supervisor):
             else:
                 self.r2_secured[label] = row
         return at_risk
+
+    def secured_in_r2(self, label: str, files: Sequence[tuple[str, str]]) -> bool:
+        """True, and recorded in ``r2_secured``, when every listed file of ``label`` is in R2
+        with its SHA-256; checked by HEAD with the bounded store, stopping at the first
+        that is missing, differs or cannot be reached."""
+        rows = []
+        for name, digest in files:
+            try:
+                rows.append(
+                    head_sha256(self.quick_store, f"{self.prefix}{label}/{name}", expected=digest)
+                )
+            except Exception:  # missing, mismatched or unreachable: secure it over SSH
+                return False
+        checkpoint = rows[[name for name, _ in files].index("checkpoint.pt")]
+        self.r2_secured[label] = {**checkpoint, "files": rows}
+        return True
 
     def secure(
         self,
@@ -1203,9 +1262,9 @@ def _rehearsal_main(
     except ValueError as error:
         parser.error(f"Mac R2 credentials: {error}")
     store = Store(credentials)  # verify_final and its downloads.
-    # The same key, bounded to 20 s per socket operation and 2 attempts, for the checks the
-    # watchdog's transfer window depends on: the mirror's listing and the at-risk HEADs.
-    quick_store = bounded_store(credentials)
+    # The same key, bounded to 5 s per socket operation, for the checks the watchdog's
+    # transfer window depends on: the mirror's listing and the at-risk HEADs.
+    quick_store = bounded_store(credentials, timeout=MAC_CHECK_TIMEOUT_SECONDS)
     root = f"rehearsal-runs/{args.run}"
 
     def archive(bundle: Path) -> dict[str, Any]:

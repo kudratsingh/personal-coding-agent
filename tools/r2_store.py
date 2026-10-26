@@ -161,6 +161,11 @@ def _transient(error: Exception) -> bool:
     )
 
 
+def transient_error(error: Exception) -> bool:
+    """True for a failure worth retrying: an HTTP 5xx, a timeout or a connection failure."""
+    return _transient(error)
+
+
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *_: Any, **__: Any) -> None:
         return None

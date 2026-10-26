@@ -38,6 +38,7 @@ from tools.rehearsal_binding import ORDER_SEED, RUNS, SUBSET_RULE, VALIDATION_ST
 from tools.rehearsal_ops import EVIDENCE_GATES, OWNER_GATES, PULL_RESERVE_SECONDS
 from tools.rehearsal_run import (
     DEFAULT_REVISION,
+    FINAL_WRITE_SECONDS,
     FINALIZE_MARGIN_SECONDS,
     INITIALIZATION_RUN_ID,
     LAST_CALL_SECONDS,
@@ -1082,39 +1083,131 @@ def test_final_drain_ends_before_the_handover_that_leaves_the_ssh_pull_reserve(
     worker.uploader.close()
 
 
-def test_checks_after_the_drain_stop_in_time_for_the_handover(data: Authored) -> None:
+class TimedStore:
+    """A check store whose calls take time on the fake clock and may fail.
+
+    ``seconds`` maps the attempt's socket timeout to how long the call takes; ``fails``
+    says whether a call on that key raises a timeout. Every call is recorded with its key,
+    start and timeout.
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        clock: Clock,
+        calls: list[tuple[str, str, float, float]],
+        timeout: float,
+        seconds: Callable[[float], float],
+        fails: Callable[[str, str], bool],
+    ) -> None:
+        self.inner, self.clock, self.calls, self.timeout = inner, clock, calls, timeout
+        self.seconds, self.fails = seconds, fails
+
+    def _call(self, method: str, key: str) -> None:
+        self.calls.append((method, key, self.clock.now, self.timeout))
+        self.clock.now += self.seconds(self.timeout)
+        if self.fails(method, key):
+            raise TimeoutError("no answer")
+
+    def stored_sha256(self, key: str) -> str | None:
+        self._call("HEAD", key)
+        return self.inner.stored_sha256(key)  # type: ignore[no-any-return]
+
+    def put_known(self, key: str, path: Path, sha256: str, size: int) -> int:
+        self._call("PUT", key)
+        return self.inner.put_known(key, path, sha256, size)  # type: ignore[no-any-return]
+
+
+def timed_finalization(
+    data: Authored,
+    *,
+    start: float,
+    seconds: Callable[[float], float],
+    fails: Callable[[str, str], bool] = lambda method, key: False,
+) -> tuple[Worker, dict[str, Any], list[tuple[str, str, float, float]], dict[str, Any]]:
+    """Run A with the real 900 s window, finalization starting ``start`` s after GPU work."""
     clock = Clock()
     bucket = MemoryBucket()
-    worker = make_worker(data, "A", spec=short_window(data), clock=clock, bucket=bucket)
-    worker.check_store = bucket.store(CREDENTIALS)  # The uploader keeps its own store.
+    worker = make_worker(data, "A", clock=clock, bucket=bucket)
+    assert worker.spec.max_transfer_seconds == 900
+    calls: list[tuple[str, str, float, float]] = []
+    inner = bucket.store(CREDENTIALS)  # The uploader keeps its own store.
+    worker.check_store_for = lambda timeout: TimedStore(  # type: ignore[assignment]
+        inner, clock, calls, timeout, seconds, fails
+    )
+    worker.sleep = lambda pause: setattr(clock, "now", clock.now + pause)
     stepping(worker, clock)
-    checked: list[tuple[str, float]] = []
-    original = worker.check_store.stored_sha256
+    original = worker.finalize
 
-    def slow(key: str) -> str | None:
-        # An R2 that answers after 50 s: only two checks fit before the last-call time.
-        checked.append((key, clock.now))
-        clock.now += 50.0
-        return original(key)
+    def late() -> None:
+        assert worker.uploader.drain(30)  # Every upload done: only the checks remain.
+        clock.now = worker.last_activity + start
+        original()
 
-    worker.check_store.stored_sha256 = slow  # type: ignore[method-assign]
+    worker.finalize = late  # type: ignore[method-assign]
     result = worker.execute()
     record = json.loads((worker.root / "finalization.json").read_text())
-    # The newest milestone is checked first; nothing starts within 45 s of the handover.
-    assert "/stage2-final/" in checked[0][0]
-    assert checked and all(
-        start < record["handover_due_unix"] - LAST_CALL_SECONDS for _, start in checked
+    return worker, result, calls, record
+
+
+def test_checks_after_the_drain_end_in_time_even_at_the_worst_start(data: Authored) -> None:
+    # R2 never answers, each attempt takes four socket timeouts (four addresses), and the
+    # first check starts just before the last-call time: 434 s after the last GPU work.
+    worker, result, calls, record = timed_finalization(
+        data, start=434.0, seconds=lambda timeout: 4 * timeout, fails=lambda m, k: True
     )
+    handover = record["handover_due_unix"]
+    assert handover == pytest.approx(worker.last_activity + 480)
+    assert calls and all(start < handover - LAST_CALL_SECONDS for _, _, start, _ in calls)
+    assert all(
+        start + 4 * timeout <= handover - FINAL_WRITE_SECONDS + 1e-9
+        for _, _, start, timeout in calls
+    )
+    assert "/stage2-final/" in calls[0][1]  # The newest milestone first.
     assert result["status"] == "failed" and result["failure"] == "r2_milestones_unverified"
-    unchecked = [
-        label for label, error in record["verification_errors"].items() if "handover" in error
-    ]
-    assert "stage1-final" in unchecked
-    assert {row["label"] for row in record["unverified_milestones"]} >= {"stage1-final"}
+    assert {row["label"] for row in record["unverified_milestones"]} == {
+        "stage1-final",
+        "stage2-final",
+    }
     assert record["error"].startswith("TimeoutError") and "report.json" in record["error"]
-    # The final heartbeat lands before the handover, still inside the watchdog's idle limit.
+    # The final heartbeat lands by the handover, before the watchdog's 600 s idle limit.
+    final = heartbeat(worker)
+    assert final["status"] == "failed" and final["updated_at_unix"] <= handover
+    assert handover - worker.last_activity < MAX_IDLE_SECONDS
+
+
+def test_a_slow_healthy_r2_checks_milestones_then_the_report_and_completes(
+    data: Authored,
+) -> None:
+    # 4 s per request from the end of a full drain: milestones, then the report's PUT and
+    # its HEAD, then rolling labels only while time remains.
+    worker, result, calls, record = timed_finalization(data, start=359.0, seconds=lambda _: 4.0)
+    assert result["status"] == "completed" and heartbeat(worker)["r2_final"] is not None
+    order = [key.split("/")[3] for _, key, _, _ in calls]
+    report = order.index("report.json")
+    assert set(order[:report]) == {"stage2-final", "stage1-final"}
+    assert order[report : report + 2] == ["report.json", "report.json"]  # PUT, then HEAD.
+    assert all("-step" in label for label in order[report + 2 :])
+    assert record["labels_verified"]["stage2-final"] is True
     assert heartbeat(worker)["updated_at_unix"] <= record["handover_due_unix"]
-    assert heartbeat(worker)["status"] == "failed"
+
+
+def test_transient_failures_after_the_drain_are_retried_while_time_lasts(data: Authored) -> None:
+    failures = {"PUT": 3, "HEAD": 2}
+
+    def fails(method: str, key: str) -> bool:
+        if key.endswith("report.json") and failures[method]:
+            failures[method] -= 1
+            return True
+        return False
+
+    worker, result, calls, record = timed_finalization(
+        data, start=0.0, seconds=lambda _: 1.0, fails=fails
+    )
+    assert result["status"] == "completed" and "error" not in record
+    puts = [call for call in calls if call[0] == "PUT"]
+    assert len(puts) == 4  # Three timeouts, then the upload; more than one bounded store's 2.
+    assert record["report_sha256"] == heartbeat(worker)["r2_final"]["report_sha256"]
 
 
 def test_speed_check_stops_a_run_projected_to_pass_the_deadline(data: Authored) -> None:
@@ -1867,8 +1960,10 @@ def test_run_command_requires_the_receipts_code_revision_and_records_it(
     assert main(arguments) == 0
     assert started["extra"]["code_revision"] == REVISION  # report.json's code_revision.
     assert DEFAULT_REVISION == Path("/workspace/rehearsal/revision.json")
-    # The checks after the final drain use a bounded store: 2 attempts of 20 s each.
-    assert started["check_store"].attempts == 2
+    # The checks after the final drain get single-attempt stores with the timeout asked for;
+    # the worker retries them itself while time lasts.
+    bounded = started["check_store_for"](7.5)
+    assert bounded.attempts == 1 and bounded.transport.keywords == {"timeout": 7.5}
 
 
 def test_the_report_names_the_shipped_commit_not_the_pods_missing_git(data: Authored) -> None:

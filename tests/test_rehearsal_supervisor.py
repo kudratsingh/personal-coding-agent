@@ -708,6 +708,46 @@ def test_an_unverified_milestone_is_pulled_checked_and_archived_before_teardown(
     assert len(recovery.calls) == 1  # Done once.
 
 
+def put_export(r2: FakeR2, label: str, checkpoint: bytes, *, skip: str = "") -> None:
+    """Store every file ``export_row`` lists for ``label`` in R2, except ``skip``."""
+    prefix = run_prefix("A", POD)
+    for name, data in (
+        ("checkpoint.pt", checkpoint),
+        ("checkpoint.pt.sha256", sha(checkpoint).encode()),
+        ("record.json", b"{}"),
+        ("updates.jsonl", b"{}\n"),
+        ("ticket.json", b"{}"),
+    ):
+        if name != skip:
+            r2.put(f"{prefix}{label}/{name}", data)
+
+
+def test_a_listed_milestone_the_mac_finds_whole_in_r2_is_not_pulled(tmp_path: Path) -> None:
+    # The worker ran out of time to confirm stage2-final; every file did reach R2.
+    r2 = FakeR2()
+    report, disk = unverified_run(r2)
+    put_export(r2, "stage2-final", disk["stage2-final"])
+    unit, archive, recovery = recovering(tmp_path, r2, report, listing(disk, "stage2-final"), disk)
+    unit.cycle()
+    assert recovery.calls == []
+    assert unit.shutdown_ready and archive.bundles == [unit.root / "diagnostics"]
+    summary = json.loads((unit.root / "diagnostics" / "summary.json").read_text())
+    secured = summary["milestone_recovery"]["verified_in_r2_by_mac"]
+    assert [row["key"].split("/")[-2] for row in secured] == ["stage1-final", "stage2-final"]
+    assert len(secured[1]["files"]) == 5  # Every listed file, not just the checkpoint.
+
+
+@pytest.mark.parametrize("missing", ["checkpoint.pt", "ticket.json"])
+def test_a_listed_milestone_missing_any_file_in_r2_is_pulled(tmp_path: Path, missing: str) -> None:
+    r2 = FakeR2()
+    report, disk = unverified_run(r2)
+    put_export(r2, "stage2-final", disk["stage2-final"], skip=missing)
+    unit, _, recovery = recovering(tmp_path, r2, report, listing(disk, "stage2-final"), disk)
+    unit.cycle()
+    assert recovery.calls == [("exports/stage2-final", 500.0)]
+    assert unit.shutdown_ready
+
+
 def test_r2_finalization_checks_every_recorded_milestone_with_the_macs_key(
     tmp_path: Path,
 ) -> None:
@@ -915,7 +955,12 @@ def test_the_mirror_and_the_at_risk_checks_use_the_bounded_store(tmp_path: Path)
     unit.cycle()
     # The last stage first, then stage1-final, which the Mac's HEAD could not confirm.
     assert [name for name, _ in recovery.calls] == ["exports/stage2-final", "exports/stage1-final"]
-    assert stalled.calls == [("HEAD", f"{run_prefix('A', POD)}stage1-final/checkpoint.pt")]
+    # The listed stage2-final is checked first and times out at its first file; then the
+    # recorded stage1-final. Both are pulled.
+    assert stalled.calls == [
+        ("HEAD", f"{run_prefix('A', POD)}stage2-final/checkpoint.pt"),
+        ("HEAD", f"{run_prefix('A', POD)}stage1-final/checkpoint.pt"),
+    ]
     assert stalled.listings == 3  # The two mirror listings, then the diagnostics one.
     assert not r2.calls and r2.listings == 0
     assert unit.shutdown_ready and archive.bundles == [unit.root / "diagnostics"]
@@ -1034,7 +1079,10 @@ def test_the_ssh_pull_holds_the_pod_only_while_its_bytes_reach_the_mac(
     assert quick.listings == 95  # One per mirror refresh, none of them new.
     unit.now[0] = HANDOVER  # type: ignore[attr-defined]
     unit.cycle()  # Reads the final heartbeat and pulls stage2-final over SSH.
-    assert quick.calls == [("HEAD", f"{run_prefix('A', POD)}stage1-final/checkpoint.pt")]
+    assert quick.calls == [
+        ("HEAD", f"{run_prefix('A', POD)}stage2-final/checkpoint.pt"),
+        ("HEAD", f"{run_prefix('A', POD)}stage1-final/checkpoint.pt"),
+    ]
     assert not store.calls and store.listings == 0
     if pulled:
         assert seen == {
@@ -1349,7 +1397,33 @@ def test_main_bounds_the_checks_a_deadline_depends_on_with_the_macs_own_key(
     assert store.credentials.access_key_id == "placeholder-mac-key-id"
     # verify_final and its downloads keep the default timeouts and attempts.
     assert store.attempts == 4 and store.transport is r2_store._urllib_transport
-    # The listing and HEAD checks: 20 s per socket operation, at most 2 attempts.
-    assert quick.attempts == r2_store.BOUNDED_ATTEMPTS == 2
+    # The listing and HEAD checks: 5 s per socket operation, so a dead endpoint costs the
+    # Mac seconds before the pull can start stamping progress.
+    assert pilot_supervisor.MAC_CHECK_TIMEOUT_SECONDS == 5.0
     for call in (quick.transport, quick.opener):
-        assert isinstance(call, partial) and call.keywords == {"timeout": 20.0}
+        assert isinstance(call, partial) and call.keywords == {"timeout": 5.0}
+
+
+def test_listed_files_are_plain_names_with_the_checkpoint_among_them() -> None:
+    row = export_row("stage2-final", b"weights")
+    files = pilot_supervisor.listed_files({"unverified_milestones": [row]}, run="A")
+    assert [name for name, _ in files["stage2-final"]][0] == "checkpoint.pt"
+    legacy = {"label": "stage2-final", "path": "exports/stage2-final", "sha256": sha(b"w")}
+    assert pilot_supervisor.listed_files({"unverified_milestones": [legacy]}, run="A") == {
+        "stage2-final": [("checkpoint.pt", sha(b"w"))]
+    }
+    for change in (
+        {"name": "../escape"},
+        {"name": ".hidden"},
+        {"sha256": "X" * 64},
+        {"sha256": None},
+    ):
+        bad = {**row, "files": [row["files"][0], {**row["files"][1], **change}]}
+        with pytest.raises(ValueError, match="malformed"):
+            pilot_supervisor.listed_files({"unverified_milestones": [bad]}, run="A")
+    without = {**row, "files": row["files"][1:]}  # No checkpoint row: its digest is then unchecked.
+    with pytest.raises(ValueError, match="malformed"):
+        pilot_supervisor.listed_files({"unverified_milestones": [without]}, run="A")
+    twice = {**row, "files": [*row["files"], row["files"][1]]}
+    with pytest.raises(ValueError, match="malformed"):
+        pilot_supervisor.listed_files({"unverified_milestones": [twice]}, run="A")
