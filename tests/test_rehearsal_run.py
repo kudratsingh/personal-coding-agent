@@ -1381,6 +1381,15 @@ def test_finalization_reserve_ends_a_stage_early_with_a_verified_milestone(data:
     bucket = MemoryBucket()
     worker = make_worker(data, "A", spec=spec, clock=clock, bucket=bucket)
     stepping(worker, clock, seconds=20.0)
+    finalize = worker.finalize
+
+    def uploaded_first() -> None:
+        # At this scale the drain budget is 0 s (the handover is capped at the Pod's end
+        # minus 60 s), so let the background upload of stage2-final end before it.
+        assert worker.uploader.drain(30.0)
+        finalize()
+
+    worker.finalize = uploaded_first  # type: ignore[method-assign]
     result = worker.execute()
     assert result["status"] == "time_limited"
     assert result["training_stop_reason"] == "finalization_reserve"
@@ -2006,8 +2015,10 @@ def test_run_command_requires_the_receipts_code_revision_and_records_it(
     ):
         monkeypatch.setenv(variable, setting)
     readiness.write_text(json.dumps({**receipt(**identity), "revision": REVISION}))
+    # The default path exists on a rehearsal Pod, where the bootstrap runs this test.
+    monkeypatch.setattr(rehearsal_run, "DEFAULT_REVISION", tmp_path / "absent.json")
     with pytest.raises(ValueError, match="cannot read the shipped code revision"):
-        main(arguments)  # The default /workspace/rehearsal/revision.json is not here.
+        main(arguments)  # The default revision file is not here.
     arguments += ["--revision", str(revision)]
     for shipped, recorded, message in (
         ({**REVISION, "git_commit": "1" * 40}, REVISION, "differs from the readiness"),
