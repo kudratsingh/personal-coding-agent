@@ -5,9 +5,12 @@ import functools
 import hashlib
 import json
 import math
+import threading
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -27,18 +30,20 @@ from scratchcoder.model.gpt import expected_parameters
 from scratchcoder.tokenizer.bpe import ByteBPE
 from scratchcoder.train.trainer import Trainer
 from scratchcoder.train.validation import ValidationWindow
-from tools import rehearsal_binding, rehearsal_ops
+from tools import rehearsal_binding, rehearsal_ops, rehearsal_run
 from tools.pilot_preflight import run_preflight
 from tools.pod_self_destruct import ABSOLUTE_DEADLINE_SECONDS
 from tools.r2_store import Credentials
 from tools.rehearsal_binding import ORDER_SEED, RUNS, SUBSET_RULE, VALIDATION_STREAMS
 from tools.rehearsal_ops import EVIDENCE_GATES, OWNER_GATES
 from tools.rehearsal_run import (
+    DEFAULT_REVISION,
     FINALIZE_MARGIN_SECONDS,
     INITIALIZATION_RUN_ID,
     LAUNCH_RULE,
     MAX_REPORT_BYTES,
     REHEARSAL_GATES,
+    ROLLING_SKIP_SECONDS,
     SPEED_CHECK_RULE,
     Launch,
     MemoryBucket,
@@ -49,11 +54,13 @@ from tools.rehearsal_run import (
     binding_targets,
     check_preflight,
     check_readiness,
+    check_revision,
     environment_secrets,
     length_sorted,
     load_run_data,
     main,
     planned_seconds,
+    quarter_updates,
     smoke_specification,
     verify_initialization,
     write_initialization,
@@ -125,6 +132,7 @@ def make_worker(
     bucket: MemoryBucket | None = None,
     name: str | None = None,
     secrets: tuple[str, ...] = (),
+    upload_retry_seconds: float = 15.0,
 ) -> Worker:
     spec = spec or tiny_spec(data, run)
     return Worker(
@@ -138,6 +146,7 @@ def make_worker(
         pod_created=1000.0,
         clock=clock or Clock(),
         secrets=secrets,
+        upload_retry_seconds=upload_retry_seconds,
     )
 
 
@@ -209,7 +218,7 @@ def test_specifications_encode_the_approved_runs() -> None:
         assert spec.validation.subset_target_tokens == SUBSET_RULE["target_tokens_per_domain"]
         assert tuple(stream for _, stream in spec.validation.streams) == VALIDATION_STREAMS
         assert spec.checkpoint_seconds == 1800 and spec.checkpoint_save_seconds == 15
-        assert spec.drain_seconds == 480
+        assert spec.rolling_skip_seconds == ROLLING_SKIP_SECONDS == 900
         assert spec.max_transfer_seconds == rehearsal_ops.MAX_TRANSFER_SECONDS == 900
         assert (
             spec.expected_tokens_per_second == 56_479 == rehearsal_ops.REFERENCE_TOKENS_PER_SECOND
@@ -265,9 +274,11 @@ def test_launch_plan_is_the_whole_run_at_the_reference_speed() -> None:
         assert plan["tokens_per_second"] == 56_479  # The reference speed, not the floor.
         assert plan["training_seconds"] == pytest.approx(2 * 10**9 / 56_479)  # 35,411 s
         assert plan["interval_validations"] == 31  # Global updates 0, 500, ..., 15,000.
-        tokens = 31 * 2 * 1_000_000 + stages[run] * FULL_VALIDATION_TARGETS
+        # Both full streams at each quarter and end of every stage: 8 passes for A, 4 for B.
+        assert plan["full_validations"] == 4 * stages[run]
+        tokens = 31 * 2 * 1_000_000 + 4 * stages[run] * FULL_VALIDATION_TARGETS
         assert plan["validation_tokens"] == tokens
-        assert plan["validation_seconds"] == pytest.approx(tokens / 100_000)
+        assert plan["validation_seconds"] == pytest.approx(tokens / 100_000)  # 1,602 / 1,111 s
         assert plan["startup_seconds"] == 300 * stages[run]  # Once per stage.
         # One save per 1,800 s of training and validation, plus one per stage end, at 15 s.
         saves = math.floor((plan["training_seconds"] + plan["validation_seconds"]) / 1_800)
@@ -276,19 +287,36 @@ def test_launch_plan_is_the_whole_run_at_the_reference_speed() -> None:
         assert plan["finalization_reserve_seconds"] == 900
         parts = ("training", "validation", "startup", "checkpoint", "finalization_reserve")
         assert plan["total_seconds"] == pytest.approx(sum(plan[f"{p}_seconds"] for p in parts))
+    assert plans["A"]["checkpoint_saves"] == 22 and plans["B"]["checkpoint_saves"] == 21
+    assert plans["A"]["total_seconds"] == pytest.approx(38_843, abs=1)
+    assert plans["B"]["total_seconds"] == pytest.approx(38_037, abs=1)
     # Pod setup before the worker starts may take up to this long before the armed
-    # deadline 180 s inside the wall: about 112 and 119 minutes.
-    assert 44_820 - plans["A"]["total_seconds"] == pytest.approx(6_713, abs=1)
-    assert 44_820 - plans["B"]["total_seconds"] == pytest.approx(7_151, abs=1)
-    # At the speed floor the same run needs about 6,300 s more.
-    floor = planned_seconds(
-        Specification.load(SPECS["A"]),
-        stage_targets=[10**9, 10**9],
-        full_validation_targets=FULL_VALIDATION_TARGETS,
-        tokens_per_second=0.85 * 56_479,
-    )
-    assert floor["training_seconds"] == pytest.approx(41_660, abs=1)
-    assert floor["total_seconds"] < 44_820
+    # deadline 180 s inside the wall: about 100 and 113 minutes.
+    assert 44_820 - plans["A"]["total_seconds"] == pytest.approx(5_977, abs=1)
+    assert 44_820 - plans["B"]["total_seconds"] == pytest.approx(6_783, abs=1)
+    # At the speed floor the same run needs about 6,300 s more: run A no longer fits.
+    floors = {
+        run: planned_seconds(
+            Specification.load(path),
+            stage_targets=[10**9, 10**9] if run == "A" else [2 * 10**9],
+            full_validation_targets=FULL_VALIDATION_TARGETS,
+            tokens_per_second=0.85 * 56_479,
+        )
+        for run, path in SPECS.items()
+    }
+    assert floors["A"]["training_seconds"] == pytest.approx(41_660, abs=1)
+    assert floors["A"]["total_seconds"] == pytest.approx(45_152, abs=1)
+    assert floors["B"]["total_seconds"] == pytest.approx(44_331, abs=1)
+    assert floors["B"]["total_seconds"] < 44_820 < floors["A"]["total_seconds"]
+
+
+def test_quarter_updates_are_rounded_quarters_strictly_inside_the_stage() -> None:
+    assert quarter_updates(7_630) == ((1, 1_908), (2, 3_815), (3, 5_722))  # Run A's stages.
+    assert quarter_updates(15_259) == ((1, 3_815), (2, 7_630), (3, 11_444))  # Run B's.
+    assert quarter_updates(8) == ((1, 2), (2, 4), (3, 6))
+    assert quarter_updates(7) == ((1, 2), (2, 4), (3, 5))  # round(1.75), round(3.5), ...
+    assert quarter_updates(2) == ((2, 1),)  # round(0.5) = 0 and round(1.5) = 2 fall outside.
+    assert quarter_updates(5) == ((1, 1), (2, 2), (3, 4))
 
 
 def raw_spec() -> dict[str, Any]:
@@ -314,7 +342,10 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
     "interval": lambda v: v["validation"].update(interval_updates=0),
     "validation streams": lambda v: v["validation"].update(streams={"web": "validation-web"}),
     "autocast": lambda v: v["validation"].update(autocast_bf16=1),
-    "drain": lambda v: v["r2"].update(drain_seconds=800),  # 800 + 120 > the 900 s window.
+    "drain": lambda v: v["r2"].update(drain_seconds=480),  # The drain uses the window now.
+    "rolling skip": lambda v: v["r2"].update(rolling_skip_seconds=-1),
+    "rolling skip missing": lambda v: v["r2"].pop("rolling_skip_seconds"),
+    "transfer margin": lambda v: v["r2"].update(max_transfer_seconds=120),  # No drain left.
     "transfer window": lambda v: v["r2"].update(max_transfer_seconds=1_801),
     "transfer missing": lambda v: v["r2"].pop("max_transfer_seconds"),
     "save seconds": lambda v: v.update(checkpoint_save_seconds=0),
@@ -518,6 +549,44 @@ def test_readiness_refuses_a_specification_above_the_rehearsal_ceilings(
     spec = Specification.load(SPECS["A"]).with_limits(**changes)
     with pytest.raises(ValueError, match="ceiling"):
         ready(receipt(), now=1001, spec=spec)
+
+
+def test_readiness_refuses_rolling_saves_too_close_to_a_stage_end() -> None:
+    spec = replace(Specification.load(SPECS["A"]), rolling_skip_seconds=899.0)
+    with pytest.raises(ValueError, match="rolling saves must stop 900 s before a stage ends"):
+        ready(receipt(), now=1001, spec=spec)
+
+
+REVISION: dict[str, Any] = {
+    "git_commit": "c0ffee" + "0" * 34,
+    "clean": True,
+    "archive_sha256": "d" * 64,
+}
+
+
+def test_the_shipped_revision_must_equal_the_receipts() -> None:
+    assert check_revision(receipt(revision=REVISION), dict(REVISION)) == REVISION
+    others: list[Any] = [
+        {**REVISION, "git_commit": "1" * 40},
+        {**REVISION, "archive_sha256": "e" * 64},
+        {key: value for key, value in REVISION.items() if key != "clean"},
+        None,
+        [],
+    ]
+    for shipped in others:
+        with pytest.raises(ValueError, match="differs from the readiness receipt's"):
+            check_revision(receipt(revision=REVISION), shipped)
+    for recorded in (
+        None,
+        {**REVISION, "clean": False},  # A dirty tree never trains.
+        {**REVISION, "git_commit": "C0FFEE" + "0" * 34},
+        {**REVISION, "git_commit": "0" * 39},
+        {**REVISION, "archive_sha256": "d" * 63},
+        {**REVISION, "note": "x"},
+    ):
+        value = receipt(revision=recorded) if recorded is not None else receipt()
+        with pytest.raises(ValueError, match="revision of a clean tree"):
+            check_revision(value, recorded)
 
 
 def test_preflight_gate_requires_the_compile_and_fused_attention_checks() -> None:
@@ -776,13 +845,25 @@ def test_validation_runs_on_global_updates_and_full_streams_at_each_stage_end(
                     assert row[label]["tokens"] == worker.spec.validation.subset_target_tokens
             full = stage["full_validation"]
             assert full["global_update"] == end
-            for label, shard in worker.data.validation:
-                upper = sum(length - 1 for _, length in shard.offsets)
-                assert full[label]["tokens"] == upper  # Every authored token is one byte.
+            # Both full streams at each quarter of the stage too, then at its end.
+            quarters = quarter_updates(stage["planned_updates"])
+            assert stage["planned_quarter_updates"] == [update for _, update in quarters]
+            assert [
+                (row["quarter"], row["stage_update"], row["global_update"])
+                for row in stage["quarter_validations"]
+            ] == [(quarter, update, start + update) for quarter, update in quarters]
+            for row in [*stage["quarter_validations"], full]:
+                for label, shard in worker.data.validation:
+                    upper = sum(length - 1 for _, length in shard.offsets)
+                    assert row[label]["tokens"] == upper  # Every authored token is one byte.
             start = end
     # A's stage-2 cadence continues A's global count rather than restarting.
     a = completed.reports["A"]["stages"]
     assert a[1]["validations"][0]["global_update"] > a[0]["planned_updates"]
+    assert [row["global_update"] for row in a[0]["quarter_validations"]] == [2, 4, 6]
+    assert [row["global_update"] for row in a[1]["quarter_validations"]] == [10, 12, 13]
+    b = completed.reports["B"]["stages"][0]
+    assert [row["global_update"] for row in b["quarter_validations"]] == [4, 8, 11]
 
 
 def test_checkpoints_reach_r2_as_rolling_labels_and_milestones(completed: Completed) -> None:
@@ -869,9 +950,18 @@ def test_heartbeat_runs_across_the_stage_boundary_and_ends_after_r2_verification
         assert file_sha256_bytes(stored) == r2["report_sha256"]
         assert json.loads(stored)["status"] == "completed"
         assert all(type(beat["step"]) is int for beat in beats)
+        # Every heartbeat names its Pod, so a Mac-side reader can ignore another Pod's.
+        assert {beat["pod_id"] for beat in beats} == {f"pod-{run.lower()}"}
         assert {"schema_version", "phase", "last_gpu_activity_unix", "updated_at_unix"} <= set(
             final
         )
+        assert "failure" not in final
+        record = json.loads((worker.root / "finalization.json").read_text())
+        assert record["unverified_milestones"] == [] and record["status"] == "completed"
+        assert record["settle_rounds"][0]["drained"] is True
+        assert record["drain_budget_seconds"] == pytest.approx(
+            worker.spec.max_transfer_seconds - FINALIZE_MARGIN_SECONDS, abs=1
+        )  # The whole window: the last GPU work was the stage-end validation.
     a = completed.beats["A"]
     stages = [beat["stage"] for beat in a]
     boundary = stages.index("stage2")
@@ -965,12 +1055,13 @@ def test_speed_check_counts_planned_saves_before_the_first_save(data: Authored) 
     assert check["projected_seconds"]["checkpoint_seconds"] == 14.0
 
 
-def test_final_drain_waits_inside_the_watchdog_transfer_window(data: Authored) -> None:
+def test_final_drain_uses_the_whole_watchdog_transfer_window_left(data: Authored) -> None:
     clock = Clock()
-    spec = replace(tiny_spec(data, "B", finalization_reserve_seconds=600), drain_seconds=480.0)
+    spec = tiny_spec(data, "B", finalization_reserve_seconds=900)
     worker = make_worker(data, "B", spec=spec, clock=clock)
     window = spec.max_transfer_seconds - FINALIZE_MARGIN_SECONDS  # 780 s after GPU work.
-    for idle, budget in ((0, 480), (500, window - 500), (window, 0), (2_000, 0)):
+    assert window == 780
+    for idle, budget in ((0, 780), (500, 280), (window, 0), (2_000, 0)):
         clock.now = worker.last_activity + idle
         assert worker.drain_budget() == pytest.approx(budget)
     clock.now = worker.pod_end - 100  # Never past the Pod end, less a minute.
@@ -1105,22 +1196,196 @@ def refuse_put(part: str) -> Callable[[str, str], tuple[int, bytes] | None]:
     return fault
 
 
-def test_unverified_r2_copies_never_read_awaiting_transfer(data: Authored) -> None:
-    for name, broken in (("milestone", "stage2-final/"), ("report", "report.json")):
-        clock = Clock()
-        bucket = MemoryBucket()
-        bucket.fault = refuse_put(broken)
-        worker = make_worker(data, "A", clock=clock, bucket=bucket, name=name)
-        stepping(worker, clock)
-        result = worker.execute()
-        assert result["status"] == "failed" and result["training_status"] == "completed"
-        assert result["failure"] == (
-            "r2_milestones_unverified" if name == "milestone" else "r2_finalization"
-        )
-        beat = heartbeat(worker)
-        assert beat["status"] == "failed"
-        if name == "report":
-            assert "r2_final" not in beat
+def short_window(data: Authored, run: str = "A") -> Specification:
+    """A one-second transfer window after the finalize margin: a failing drain ends fast."""
+    return replace(tiny_spec(data, run), max_transfer_seconds=FINALIZE_MARGIN_SECONDS + 1)
+
+
+@pytest.mark.parametrize("broken", ["stage2-final", "stage1-final", "report"])
+def test_unverified_r2_copies_never_read_awaiting_transfer(data: Authored, broken: str) -> None:
+    clock = Clock()
+    bucket = MemoryBucket()
+    bucket.fault = refuse_put("report.json" if broken == "report" else f"{broken}/")
+    worker = make_worker(
+        data,
+        "A",
+        spec=short_window(data),
+        clock=clock,
+        bucket=bucket,
+        name=broken,
+        upload_retry_seconds=0.05,
+    )
+    stepping(worker, clock)
+    result = worker.execute()
+    assert result["status"] == "failed" and result["training_status"] == "completed"
+    beat, record = heartbeat(worker), json.loads((worker.root / "finalization.json").read_text())
+    assert beat["status"] == "failed" and "r2_final" not in beat
+    assert beat["pod_id"] == "pod-a" and beat["failure"] == result["failure"]
+    if broken == "report":
+        assert result["failure"] == "r2_finalization" and record["unverified_milestones"] == []
+        return
+    # The milestone was retried for the rest of the run and resubmitted at finalization.
+    assert result["failure"] == "r2_milestones_unverified" == record["failure"]
+    uploader = result["r2"]["uploader"]
+    assert uploader["failure_count"] >= 2
+    assert {item["label"] for item in uploader["failures"]} == {broken}
+    assert broken in record["settle_rounds"][0]["resubmitted"]
+    assert record["drained"] is False  # The retrying milestone kept the drain waiting.
+    assert result["r2"]["milestones_verified"] == {
+        "stage1-final": broken != "stage1-final",
+        "stage2-final": broken != "stage2-final",
+    }
+    # The local export the supervisor pulls over SSH: its path and every file's SHA-256.
+    (listed,) = record["unverified_milestones"]
+    assert listed == result["r2"]["unverified_milestones"][0]
+    assert listed["label"] == broken and listed["export"] == f"exports/{broken}"
+    directory = Path(listed["export_path"])
+    assert directory == worker.root / "exports" / broken and directory.is_dir()
+    stage = result["stages"][0 if broken == "stage1-final" else 1]
+    assert listed["checkpoint_sha256"] == stage["final_checkpoint_sha256"]
+    names = {"checkpoint.pt", "checkpoint.pt.sha256", "record.json", "updates.jsonl", "ticket.json"}
+    assert {row["name"] for row in listed["files"]} == names
+    for row in listed["files"]:
+        path = Path(row["path"])
+        assert path.parent == directory and file_sha256(path) == row["sha256"]
+        assert path.stat().st_size == row["size_bytes"]
+    assert listed["checkpoint_size_bytes"] == (directory / "checkpoint.pt").stat().st_size
+    # report.json still reached R2, saying failed; nothing names the missing label as kept.
+    stored = json.loads(bucket.objects[f"{worker.prefix}report.json"])
+    assert stored["failure"] == "r2_milestones_unverified"
+    assert not any(key.startswith(f"{worker.prefix}{broken}/") for key in bucket.objects)
+
+
+def test_a_stopped_run_with_an_unverified_milestone_fails_for_the_ssh_pull(
+    data: Authored,
+) -> None:
+    clock = Clock()
+    bucket = MemoryBucket()
+    bucket.fault = refuse_put("stage1-final/")
+    spec = short_window(data).with_limits(rising_steps=5)
+    worker = make_worker(
+        data, "A", spec=spec, clock=clock, bucket=bucket, upload_retry_seconds=0.05
+    )
+    stepping(
+        worker,
+        clock,
+        hook=lambda t, m: {**m, "loss": 10.0 + t.step} if worker.stage_name == "stage2" else m,
+    )
+    result = worker.execute()
+    assert result["stop_reason"] == "loss_rising" and result["training_status"] == "stopped"
+    assert result["status"] == "failed" and result["failure"] == "r2_milestones_unverified"
+    (listed,) = json.loads((worker.root / "finalization.json").read_text())["unverified_milestones"]
+    assert listed["label"] == "stage1-final" and "r2_final" not in heartbeat(worker)
+
+
+def test_a_milestone_that_fails_in_training_is_retried_and_verifies(data: Authored) -> None:
+    clock = Clock()
+    bucket = MemoryBucket()
+    refusals = [0]
+
+    def flaky(method: str, key: str) -> tuple[int, bytes] | None:
+        if method == "PUT" and "stage1-final/" in key and refusals[0] < 3:
+            refusals[0] += 1
+            return 403, b"AccessDenied"  # Not transient: each upload attempt fails at once.
+        return None
+
+    bucket.fault = flaky
+    worker = make_worker(data, "A", clock=clock, bucket=bucket, upload_retry_seconds=0.01)
+    stepping(worker, clock)
+    result = worker.execute()
+    assert result["status"] == "completed" and refusals[0] == 3
+    uploader = result["r2"]["uploader"]
+    assert uploader["failure_count"] == 3 and uploader["retrying"] == {}
+    assert result["r2"]["milestones_verified"] == {"stage1-final": True, "stage2-final": True}
+    assert heartbeat(worker)["status"] == "awaiting_transfer"
+
+
+def test_finalization_resubmits_a_milestone_waiting_out_its_backoff(data: Authored) -> None:
+    clock = Clock()
+    bucket = MemoryBucket()
+    finalizing = threading.Event()
+    bucket.fault = lambda method, key: (
+        (403, b"AccessDenied")
+        if method == "PUT" and "stage2-final/" in key and not finalizing.is_set()
+        else None
+    )
+    # A 15 s backoff, far longer than the test: only the resubmission sends it again.
+    worker = make_worker(data, "A", clock=clock, bucket=bucket, upload_retry_seconds=15.0)
+    stepping(worker, clock)
+    original = worker.settle
+
+    def settle(budget: float, receipt: dict[str, Any]) -> dict[str, bool]:
+        deadline = time.monotonic() + 30
+        while worker.uploader.status()["retrying"] != {"stage2-final": 1}:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        finalizing.set()  # R2 recovers while the milestone waits out its backoff.
+        return original(budget, receipt)
+
+    worker.settle = settle  # type: ignore[method-assign]
+    started = time.monotonic()
+    result = worker.execute()
+    assert time.monotonic() - started < 15  # It never waited for the backoff.
+    assert result["status"] == "completed"
+    record = json.loads((worker.root / "finalization.json").read_text())
+    assert record["settle_rounds"][0]["resubmitted"] == ["stage2-final"]
+    assert record["unverified_milestones"] == [] and heartbeat(worker)["status"] == (
+        "awaiting_transfer"
+    )
+
+
+def test_a_head_check_that_keeps_failing_counts_as_unverified(data: Authored) -> None:
+    clock = Clock()
+    bucket = MemoryBucket()
+    broken = threading.Event()
+    bucket.fault = lambda method, key: (
+        (403, b"") if method == "HEAD" and "stage2-final/" in key and broken.is_set() else None
+    )
+    worker = make_worker(
+        data, "A", spec=short_window(data), clock=clock, bucket=bucket, upload_retry_seconds=0.05
+    )
+    stepping(worker, clock)
+    original = worker.settle
+
+    def settle(budget: float, receipt: dict[str, Any]) -> dict[str, bool]:
+        assert worker.uploader.drain(30)  # stage2-final verified by the uploader first.
+        broken.set()  # Then R2 stops answering HEAD for it.
+        return original(budget, receipt)
+
+    worker.settle = settle  # type: ignore[method-assign]
+    result = worker.execute()
+    assert result["status"] == "failed" and result["failure"] == "r2_milestones_unverified"
+    record = json.loads((worker.root / "finalization.json").read_text())
+    assert "HTTP 403" in record["verification_errors"]["stage2-final"]
+    assert [row["label"] for row in record["unverified_milestones"]] == ["stage2-final"]
+    assert record["settle_rounds"][0]["resubmitted"] == []  # The uploader had verified it.
+    assert record["settle_rounds"][1]["resubmitted"] == ["stage2-final"]
+
+
+def test_rolling_saves_stop_near_the_stage_end(data: Authored) -> None:
+    clock = Clock()
+    # 100 s per update; the stage's last 4.5 updates fall inside the skip window.
+    spec = replace(tiny_spec(data, "B"), rolling_skip_seconds=450.0, expected_tokens_per_second=0.1)
+    worker = make_worker(data, "B", spec=spec, clock=clock)
+    stepping(worker, clock, hook=lambda t, m: {**m, "step_seconds": 100.0})
+    result = worker.execute()
+    assert result["status"] == "completed"
+    (stage,) = result["stages"]
+    updates = stage["planned_updates"]
+    rolling = [int(label.split("-step")[1]) for label in stage["r2_labels"] if "-step" in label]
+    assert rolling and all((updates - update) * 100 > 450 for update in rolling)
+    skipped = stage["rolling_saves_skipped_from_update"]
+    assert skipped is not None and (updates - skipped) * 100 <= 450
+    # Without the rule a save would have started there: the cadence had passed.
+    assert skipped - rolling[-1] >= spec.checkpoint_seconds
+    # Before any update the reference speed counts (32 targets at 0.1 tok/s: 320 s each),
+    # and the training deadline, where a time-limited stage ends, counts too.
+    worker.active = rehearsal_run._Active(0, worker.data.stages[0], 0, stage, worker.root)
+    worker.training_deadline = clock.now + 10_000
+    assert worker.near_stage_end(updates - 1) and not worker.near_stage_end(updates - 2)
+    assert not worker.near_stage_end(1)
+    worker.training_deadline = clock.now + 400
+    assert worker.near_stage_end(1)
 
 
 def test_a_tampered_stage_one_checkpoint_is_refused_as_the_stage_two_parent(
@@ -1473,6 +1738,81 @@ def test_run_command_refuses_mismatched_receipts_before_creating_output(tmp_path
         with pytest.raises(ValueError, match=message):
             main(arguments)
         assert not output.exists()
+
+
+def test_run_command_requires_the_receipts_code_revision_and_records_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every other gate is stubbed; the revision decides, and nothing starts without it."""
+    preflight = tmp_path / "preflight.json"
+    preflight.write_text("{}")
+    readiness, revision = tmp_path / "receipt.json", tmp_path / "revision.json"
+    output = tmp_path / "out"
+    arguments = ["run", "--specification", str(SPECS["A"]), "--binding", str(tmp_path / "b")]
+    arguments += ["--binding-sha256", "a" * 64, "--root", str(tmp_path)]
+    arguments += ["--initialization", str(tmp_path / "init.pt")]
+    arguments += ["--initialization-sha256", "b" * 64, "--readiness", str(readiness)]
+    arguments += ["--preflight", str(preflight), "--output", str(output)]
+    identity = {
+        "specification_sha256": file_sha256(SPECS["A"]),
+        "binding_sha256": "a" * 64,
+        "preflight_sha256": file_sha256(preflight),
+        "initialization_sha256": "b" * 64,
+    }
+    spec = Specification.load(SPECS["A"])
+    launch = Launch(1000.0, 1000.0 + 44_820, "pod123", spec, {"rule": LAUNCH_RULE})
+    started: dict[str, Any] = {}
+
+    class Started:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            started.update(kwargs)
+
+        def execute(self) -> dict[str, Any]:
+            return {"run": "A", "status": "completed"}
+
+    stubs: list[tuple[str, Any]] = [
+        ("load_binding", lambda *_, **__: BOUND),
+        ("check_readiness", lambda *_, **__: launch),
+        ("training_device", lambda _: torch.device("cpu")),
+        ("hardware_description", lambda _: {"name": "NVIDIA A40"}),
+        ("check_preflight", lambda *_, **__: None),
+        ("load_run_data", lambda *_, **__: SimpleNamespace(tokenizer=SimpleNamespace(sha256="t"))),
+        ("verify_initialization", lambda *_, **__: None),
+        ("Store", lambda credentials: None),
+        ("Worker", Started),
+    ]
+    for name, stub in stubs:
+        monkeypatch.setattr(rehearsal_run, name, stub)
+    monkeypatch.delenv("RUNPOD_POD_ID", raising=False)
+    for variable, setting in (
+        ("R2_ENDPOINT", "https://acct.r2.cloudflarestorage.com"),
+        ("R2_BUCKET", "rehearsal"),
+        ("R2_POD_ACCESS_KEY_ID", KEY_ID),
+        ("R2_POD_SECRET_ACCESS_KEY", SECRET),
+    ):
+        monkeypatch.setenv(variable, setting)
+    readiness.write_text(json.dumps({**receipt(**identity), "revision": REVISION}))
+    with pytest.raises(ValueError, match="cannot read the shipped code revision"):
+        main(arguments)  # The default /workspace/rehearsal/revision.json is not here.
+    arguments += ["--revision", str(revision)]
+    for shipped, recorded, message in (
+        ({**REVISION, "git_commit": "1" * 40}, REVISION, "differs from the readiness"),
+        (REVISION, {**REVISION, "clean": False}, "revision of a clean tree"),
+        (REVISION, None, "revision of a clean tree"),
+    ):
+        revision.write_text(json.dumps(shipped))
+        value = receipt(**identity)
+        if recorded is not None:
+            value["revision"] = recorded
+        readiness.write_text(json.dumps(value))
+        with pytest.raises(ValueError, match=message):
+            main(arguments)
+        assert not started and not output.exists()
+    revision.write_text(json.dumps(REVISION))
+    readiness.write_text(json.dumps({**receipt(**identity), "revision": REVISION}))
+    assert main(arguments) == 0
+    assert started["extra"]["code_revision"] == REVISION  # report.json's code_revision.
+    assert DEFAULT_REVISION == Path("/workspace/rehearsal/revision.json")
 
 
 def test_cli_smoke_runs_both_runs_offline(

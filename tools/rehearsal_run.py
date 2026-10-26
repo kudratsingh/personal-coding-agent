@@ -2,13 +2,16 @@
 
 ``run`` (Pod)
     Check the readiness receipt that ``python -m tools.pilot_readiness_receipt rehearsal``
-    wrote, the A40 preflight (with its compile check), the data binding and the shared
-    initialization. Then train each stage of one run over every bound document exactly
-    once, validate on a fixed subset every ``interval`` global updates and on both full
-    validation streams at each stage end, and send checkpoints to R2 in the background.
-    The heartbeat reads ``running`` throughout, across run A's stage boundary too,
-    ``uploading`` while the last checkpoints drain to R2 with the GPU idle, and
-    ``awaiting_transfer`` only once every milestone and ``report.json`` are verified in R2.
+    wrote, the shipped code revision against it, the A40 preflight (with its compile
+    check), the data binding and the shared initialization. Then train each stage of one
+    run over every bound document exactly once, validate on a fixed subset every
+    ``interval`` global updates and on both full validation streams at each quarter and
+    the end of every stage, and send checkpoints to R2 in the background. The heartbeat
+    reads ``running`` throughout, across run A's stage boundary too, ``uploading`` while
+    the last checkpoints drain to R2 with the GPU idle, and ``awaiting_transfer`` only
+    once every milestone and ``report.json`` are verified in R2. A milestone that cannot
+    be verified ends the run ``failed`` (``r2_milestones_unverified``) with its local
+    export listed in ``finalization.json`` for the supervisor to pull over SSH.
 ``smoke`` (CPU)
     Both runs on tiny authored shards with an in-memory bucket; nothing touches a network.
 ``write-initialization`` (Mac)
@@ -71,7 +74,15 @@ from scratchcoder.train.validation import (
 )
 from tools.gpu_pilot import check_termination_guarantee, termination_window
 from tools.pilot_preflight import hardware_description
-from tools.r2_store import LABEL, CheckpointUploader, Credentials, Store
+from tools.r2_store import (
+    LABEL,
+    MILESTONE_RETRY_MAX_SECONDS,
+    MILESTONE_RETRY_SECONDS,
+    SHA256_HEX,
+    CheckpointUploader,
+    Credentials,
+    Store,
+)
 from tools.rehearsal_binding import (
     ORDER_SEED,
     RUNS,
@@ -98,6 +109,18 @@ FULL_VALIDATION_SORT_WINDOWS = 512
 FINALIZE_MARGIN_SECONDS = 120.0
 """Kept free at the end of the watchdog's transfer window after the drain: the HEAD checks,
 the ``report.json`` upload and the supervisor's own verification and archive."""
+ROLLING_SKIP_SECONDS = 900.0
+"""The D-35 minimum for ``rolling_skip_seconds``: no rolling save starts when the stage's
+remaining updates at the measured rate, or the training deadline, end within this long,
+so a stage-final milestone never queues behind a fresh rolling upload."""
+SETTLE_ROUNDS = 3
+"""Finalization resubmits unverified milestones and drains at most this many times."""
+RETRY_GROWTH = MILESTONE_RETRY_MAX_SECONDS / MILESTONE_RETRY_SECONDS
+"""A failing milestone's retry wait doubles up to this multiple of the first (15 s to 60 s)."""
+DEFAULT_REVISION = Path("/workspace/rehearsal/revision.json")
+"""Where the runbook ships the Mac's ``revision.json`` on the Pod."""
+REVISION_KEYS = frozenset({"git_commit", "clean", "archive_sha256"})
+GIT_COMMIT = re.compile(r"[0-9a-f]{40}")
 HARD_STOPS = frozenset({"pod_wall_limit", "cost_limit", "idle_gpu_limit"})
 NO_FINALIZATION_STOPS = frozenset({"pod_wall_limit", "cost_limit"})
 """Stops that never wait for uploads: finalization must not extend a wall or cost limit."""
@@ -108,16 +131,17 @@ through R2, not SSH."""
 LAUNCH_RULE = (
     "at launch the Pod lifetime left, to the first of the wall, the armed in-Pod deadline, "
     "the watchdog's wall and either cost stop, must hold the whole planned run at the "
-    "reference speed: every update at expected_tokens_per_second, every validation "
-    "at validation_tokens_per_second, startup_seconds per stage, the planned checkpoint saves "
-    "and the finalization reserve"
+    "reference speed: every update at expected_tokens_per_second, every interval subset "
+    "validation and the full validation of both streams at each quarter and end of every "
+    "stage at validation_tokens_per_second, startup_seconds per stage, the planned "
+    "checkpoint saves and the finalization reserve"
 )
 SPEED_CHECK_RULE = (
     "after speed_check_seconds of training the run stops if its post-compile throughput is "
     "below minimum_speed_fraction x expected_tokens_per_second, or if its projected finish "
-    "at the measured rates (remaining updates, validations, recompilation, checkpoint saves "
-    "and the finalization reserve) passes the end of the Pod lifetime; the second rule binds "
-    "even when the throughput passes"
+    "at the measured rates (remaining updates, interval and quarter and stage-end full "
+    "validations, recompilation, checkpoint saves and the finalization reserve) passes the "
+    "end of the Pod lifetime; the second rule binds even when the throughput passes"
 )
 SECRET_VARIABLES = (
     "R2_POD_ACCESS_KEY_ID",
@@ -198,7 +222,12 @@ LIMIT_KEYS = {
     "rising_steps",
     "starting_cost_usd",
 }
-R2_KEYS = {"keep_rolling", "storage_cap_usd_per_month", "drain_seconds", "max_transfer_seconds"}
+R2_KEYS = {
+    "keep_rolling",
+    "storage_cap_usd_per_month",
+    "rolling_skip_seconds",
+    "max_transfer_seconds",
+}
 
 
 def _exact(value: Any, keys: set[str], name: str) -> dict[str, Any]:
@@ -329,10 +358,13 @@ class Specification:
     quoted_gpu_hourly: float
     keep_rolling: int
     storage_cap_usd_per_month: float
-    drain_seconds: float
+    rolling_skip_seconds: float
+    """No rolling save starts when the stage's remaining updates at the measured rate, or
+    the training deadline, end within this long (``ROLLING_SKIP_SECONDS`` for D-35)."""
     max_transfer_seconds: float
     """The watchdog policy's transfer window: an ``uploading`` heartbeat may hold the Pod
-    this long after the last GPU work. The final drain and checks end inside it."""
+    this long after the last GPU work. The final drain uses all of it except the
+    ``FINALIZE_MARGIN_SECONDS`` the checks after it need."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.run, str) or self.run not in RUNS:
@@ -373,11 +405,12 @@ class Specification:
             "validation_tokens_per_second",
             "quoted_gpu_hourly",
             "storage_cap_usd_per_month",
-            "drain_seconds",
             "max_transfer_seconds",
         ):
             if finite_number(getattr(self, name), name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if finite_number(self.rolling_skip_seconds, "rolling_skip_seconds") < 0:
+            raise ValueError("rolling_skip_seconds must not be negative")
         if self.quoted_gpu_hourly > self.limits.quoted_total_hourly:
             raise ValueError("GPU price exceeds total price")
         warmup = self.speed_check_warmup_updates
@@ -387,16 +420,10 @@ class Specification:
             raise ValueError("keep_rolling must be a positive integer")
         if self.max_transfer_seconds > MAX_TRANSFER_SECONDS:
             raise ValueError(f"max_transfer_seconds exceeds the {MAX_TRANSFER_SECONDS} s ceiling")
-        if (
-            self.drain_seconds + FINALIZE_MARGIN_SECONDS > self.max_transfer_seconds
-            or self.drain_seconds >= self.limits.finalization_reserve_seconds
-        ):
+        if self.max_transfer_seconds <= FINALIZE_MARGIN_SECONDS:
             # A final drain waits without GPU work: it and the checks after it must end
-            # inside the watchdog's transfer window, and the drain inside the reserve.
-            raise ValueError(
-                "drain_seconds plus the finalize margin must fit max_transfer_seconds, "
-                "and the drain must be shorter than the finalization reserve"
-            )
+            # inside the watchdog's transfer window.
+            raise ValueError("max_transfer_seconds must exceed the finalize margin")
 
     @property
     def tokens_per_update(self) -> int:
@@ -484,9 +511,28 @@ class Specification:
             quoted_gpu_hourly=top["quoted_gpu_hourly"],
             keep_rolling=r2["keep_rolling"],
             storage_cap_usd_per_month=r2["storage_cap_usd_per_month"],
-            drain_seconds=r2["drain_seconds"],
+            rolling_skip_seconds=r2["rolling_skip_seconds"],
             max_transfer_seconds=r2["max_transfer_seconds"],
         )
+
+
+def quarter_updates(updates: int) -> tuple[tuple[int, int], ...]:
+    """(quarter k, stage update) for the full validations inside a stage of ``updates``.
+
+    The updates are ``round(k * updates / 4)`` for k = 1, 2, 3 (Python's rounding), each
+    once and strictly inside the stage; the stage end has its own full validation.
+    """
+    found: dict[int, int] = {}
+    for quarter in (1, 2, 3):
+        update = round(quarter * updates / 4)
+        if 0 < update < updates:
+            found.setdefault(update, quarter)
+    return tuple((quarter, update) for update, quarter in found.items())
+
+
+def full_validations(stages: Iterable[StagePlan]) -> int:
+    """Full validations of both streams these stages plan: each quarter and stage end."""
+    return sum(len(quarter_updates(stage.updates)) + 1 for stage in stages)
 
 
 def planned_seconds(
@@ -500,10 +546,11 @@ def planned_seconds(
 
     ``tokens_per_second`` defaults to the reference speed, ``expected_tokens_per_second``:
     the launch rule's basis. Validation counts every interval subset (global update 0
-    included) and each stage's full validation at the planning validation rate. Startup
-    is charged once per stage. Checkpoints are one save per ``checkpoint_seconds`` of
-    training and validation plus one per stage end, each ``checkpoint_save_seconds``
-    long. The finalization reserve comes last.
+    included) and every full validation (``full_validations``: each quarter and end of
+    every stage) at the planning validation rate. Startup is charged once per stage.
+    Checkpoints are one save per ``checkpoint_seconds`` of training and validation plus
+    one per stage end, each ``checkpoint_save_seconds`` long. The finalization reserve
+    comes last.
     """
     rate = finite_number(
         spec.expected_tokens_per_second if tokens_per_second is None else tokens_per_second,
@@ -515,7 +562,8 @@ def planned_seconds(
     interval = spec.validation.interval_updates
     validations = len(range(0, spec.total_updates + 1, interval))
     subset = spec.validation.subset_target_tokens * len(spec.validation.streams)
-    validation_tokens = validations * subset + len(spec.stages) * full_validation_targets
+    full = full_validations(spec.stages)
+    validation_tokens = validations * subset + full * full_validation_targets
     training = targets / rate
     validation = validation_tokens / spec.validation_tokens_per_second
     saves = math.floor((training + validation) / spec.checkpoint_seconds) + len(spec.stages)
@@ -530,6 +578,7 @@ def planned_seconds(
         "tokens_per_second": rate,
         "training_targets": float(targets),
         "interval_validations": float(validations),
+        "full_validations": float(full),
         "validation_tokens": float(validation_tokens),
         "validation_tokens_per_second": spec.validation_tokens_per_second,
         "checkpoint_saves": float(saves),
@@ -643,6 +692,32 @@ def check_receipt_identity(
             raise ValueError(f"{message} from the readiness receipt")
 
 
+def check_revision(receipt: Mapping[str, Any], revision: Any) -> dict[str, Any]:
+    """The shipped ``revision.json`` must equal the receipt's ``revision``; return it.
+
+    The Mac writes both from one clean tree: ``git_commit`` (40 hex digits), ``clean``
+    (``true``) and ``archive_sha256``, the SHA-256 of the archive it shipped. The Pod's
+    copy of the code has no ``.git``, so this is the record of which commit trains.
+    """
+    expected = receipt.get("revision")
+    if (
+        not isinstance(expected, dict)
+        or set(expected) != REVISION_KEYS
+        or not isinstance(expected["git_commit"], str)
+        or not GIT_COMMIT.fullmatch(expected["git_commit"])
+        or expected["clean"] is not True
+        or not isinstance(expected["archive_sha256"], str)
+        or not SHA256_HEX.fullmatch(expected["archive_sha256"])
+    ):
+        raise ValueError(
+            "the readiness receipt must record the revision of a clean tree: "
+            f"exactly {sorted(REVISION_KEYS)}"
+        )
+    if revision != expected:
+        raise ValueError("the shipped code revision differs from the readiness receipt's")
+    return dict(expected)
+
+
 @dataclass(frozen=True)
 class Launch:
     """What a checked receipt fixes for the run."""
@@ -675,8 +750,10 @@ def check_readiness(
     The receipt's kind, run and the specification, binding, preflight and initialization
     SHA-256s must match; every gate must be ``true``; the termination guarantee, Pod
     identity, watchdog policy (``mode: rehearsal``, this run's transfer window) and armed
-    deadline are checked as in the pilot, and the R2 prefix must be this Pod's. Then the
-    launch rule: the lifetime left must hold the whole run at the reference speed.
+    deadline are checked as in the pilot, and the R2 prefix must be this Pod's. The
+    specification must skip rolling saves at least ``ROLLING_SKIP_SECONDS`` before a
+    stage ends. Then the launch rule: the lifetime left must hold the whole run at the
+    reference speed. ``run`` also checks the shipped code revision (``check_revision``).
     """
     check_receipt_identity(
         receipt,
@@ -697,6 +774,11 @@ def check_readiness(
         or limits.approved_cost_cap > MAX_APPROVED_COST_USD
     ):
         raise ValueError("specification exceeds the rehearsal wall, idle or cost ceiling")
+    if spec.rolling_skip_seconds < ROLLING_SKIP_SECONDS:
+        raise ValueError(
+            f"rolling saves must stop {ROLLING_SKIP_SECONDS:g} s before a stage ends, so the "
+            "stage-final milestone never queues behind one"
+        )
     origin, deadline = termination_window(receipt, now=now, limits=limits)
     policy = Policy(**receipt["watchdog_policy"])
     if policy.mode != "rehearsal":
@@ -946,12 +1028,19 @@ class _Active:
     timing: list[tuple[int, float, float]] = field(default_factory=list)
     """(stage update, tokens, step seconds) for every update."""
 
+    @property
+    def quarters(self) -> dict[int, int]:
+        """Stage update -> quarter k, for the full validations inside this stage."""
+        return {update: quarter for quarter, update in quarter_updates(self.data.plan.updates)}
+
 
 class Worker:
     """One rehearsal run on one machine; checkpoints leave through R2.
 
     ``pod_created`` is the conservative billing origin, and ``spec.limits.pod_seconds``
-    already ends at the armed in-pod deadline when that comes first.
+    already ends at the armed in-pod deadline when that comes first. A milestone that
+    fails to upload is retried for the rest of the run, first after
+    ``upload_retry_seconds`` and then doubling up to ``RETRY_GROWTH`` times that.
     """
 
     def __init__(
@@ -969,6 +1058,7 @@ class Worker:
         clock: Callable[[], float] = time.time,
         secrets: Iterable[str] = (),
         extra: Mapping[str, Any] | None = None,
+        upload_retry_seconds: float = MILESTONE_RETRY_SECONDS,
     ) -> None:
         if len(data.stages) != len(spec.stages) or any(
             stage.plan != plan or stage.expected["planned_updates"] != plan.updates
@@ -992,6 +1082,7 @@ class Worker:
         self.pod_end = pod_created + spec.limits.pod_seconds
         # Longest first, so a secret that contains another is redacted whole.
         self.secrets = tuple(sorted({s for s in secrets if len(s) >= 4}, key=len, reverse=True))
+        self.pod_id = pod_id
         self.prefix = run_prefix(spec.run, pod_id)  # The layout the Mac side verifies.
         self.last_activity = clock()
         self.last_heartbeat = 0.0
@@ -1000,8 +1091,9 @@ class Worker:
         self.training_deadline: float | None = None
         self.stop_reason: str | None = None
         self.uploading = False
-        """True while finalization drains, checks and uploads to R2: the heartbeat then
-        reads ``uploading``, which the watchdog allows for ``max_transfer_seconds``."""
+        """True while finalization resubmits, drains, checks and uploads to R2, so while
+        any milestone is still pending or in flight: the heartbeat then reads
+        ``uploading``, which the watchdog allows for ``max_transfer_seconds``."""
         self.phase = "initializing"
         self.stage_name = spec.stages[0].name
         self.global_update = 0
@@ -1018,6 +1110,7 @@ class Worker:
         self.label_files: dict[str, list[tuple[str, Path, str]]] = {}
         self.checkpoints: list[dict[str, Any]] = []
         self.r2_final: dict[str, Any] | None = None
+        self.verification_errors: dict[str, str] = {}
         self.total_targets = sum(int(stage.expected["targets"]) for stage in data.stages)
         estimate = 12 * expected_parameters(spec.model)  # fp32 weights and both moments.
         needed = (len(spec.stages) + 3) * estimate
@@ -1071,7 +1164,10 @@ class Worker:
                 "final_checkpoint_sha256": None,
                 "r2_labels": [],
                 "validations": [],
+                "planned_quarter_updates": [u for _, u in quarter_updates(stage.plan.updates)],
+                "quarter_validations": [],
                 "full_validation": None,
+                "rolling_saves_skipped_from_update": None,
             }
             for stage in data.stages
         ]
@@ -1116,10 +1212,11 @@ class Worker:
             "semantics": (
                 "every bound document of each stage is a training target exactly once; "
                 "validation runs on the fixed subset at every multiple of the interval in "
-                "global updates (0 included) and on both full validation streams at each "
-                "stage end; a stage-1 end is never run completion; training stops at the "
-                "Pod end minus the finalization reserve, and wall, cost and idle limits are "
-                "never extended"
+                "global updates (0 included) and on both full validation streams at stage "
+                "updates round(k x stage updates / 4) for k = 1, 2, 3 and at each stage "
+                "end; a stage-1 end is never run completion; training stops at the Pod end "
+                "minus the finalization reserve, and wall, cost and idle limits are never "
+                "extended"
             ),
             "limitations": [
                 "worker time checks cannot terminate a provider resource during an API outage",
@@ -1137,6 +1234,8 @@ class Worker:
             cap_usd=spec.storage_cap_usd_per_month,
             receipt_dir=root / "r2-receipts",
             keep_rolling=spec.keep_rolling,
+            retry_seconds=upload_retry_seconds,
+            retry_max_seconds=upload_retry_seconds * RETRY_GROWTH,
         )
         self.publish()
         self.heartbeat()
@@ -1179,10 +1278,13 @@ class Worker:
             "compile_probe_active": False,
             "status": status,
             "run": self.spec.run,
+            "pod_id": self.pod_id,
             "stage": self.stage_name,
         }
         if self.r2_final is not None:
             value["r2_final"] = self.r2_final
+        if not self.uploading and "failure" in self.report:
+            value["failure"] = self.report["failure"]
         self.write_json(self.root / "heartbeat.json", value, limit=MAX_HEARTBEAT_BYTES)
         self.last_heartbeat = self.clock()
 
@@ -1283,6 +1385,16 @@ class Worker:
         self.last_activity = self.clock()
         return {**results, "seconds": seconds, "global_update": self.global_update}
 
+    def validate_quarter(self, model: GPT, quarter: int, stage_update: int) -> None:
+        """Both full streams at quarter ``quarter`` of the stage, kept in its record."""
+        result = self.validate_full(model)
+        assert self.active is not None
+        self.active.record["quarter_validations"].append(
+            {"quarter": quarter, "stage_update": stage_update, **result}
+        )
+        self.phase = self.stage_name
+        self.publish()
+
     # Checkpoints -----------------------------------------------------------------------
 
     def save(
@@ -1300,6 +1412,9 @@ class Worker:
         started = synchronized_time(self.device)
         trainer.checkpoint(path)
         seconds = synchronized_time(self.device) - started
+        # Copying the state off the device is the run's last GPU work before a final
+        # drain: the transfer window then counts from the end of the final save.
+        self.last_activity = self.clock()
         digest = file_sha256(path)
         size = path.stat().st_size
         self.write_json(
@@ -1423,13 +1538,45 @@ class Worker:
             return  # The trainer stops before its next update; a limit names the reason.
         if update % self.spec.validation.interval_updates == 0:
             self.validate_subset(trainer.model, update)
+        quarter = active.quarters.get(trainer.step)
+        if quarter is not None:
+            self.validate_quarter(trainer.model, quarter, trainer.step)
         self.speed_check()
         if (
             trainer.step < active.data.plan.updates
             and not self.stopped()
             and self.clock() - self.last_saved >= self.spec.checkpoint_seconds
         ):
-            self.save(trainer, active.rolling, f"{self.stage_name}-step{update}", milestone=False)
+            if self.near_stage_end(trainer.step):
+                if active.record["rolling_saves_skipped_from_update"] is None:
+                    active.record["rolling_saves_skipped_from_update"] = update
+                    self.publish()
+            else:
+                self.save(
+                    trainer, active.rolling, f"{self.stage_name}-step{update}", milestone=False
+                )
+
+    def near_stage_end(self, stage_update: int) -> bool:
+        """Whether the stage ends within ``rolling_skip_seconds``: a rolling save is skipped.
+
+        The stage's remaining updates count at its measured seconds per update (after
+        the compile warmup when there are such updates; the reference speed before any
+        update); the training deadline, where a time-limited stage ends, counts too.
+        """
+        assert self.active is not None
+        warmup = self.spec.speed_check_warmup_updates
+        timing = self.active.timing
+        steady = [seconds for step, _, seconds in timing if step > warmup]
+        measured = steady or [seconds for _, _, seconds in timing]
+        per_update = (
+            math.fsum(measured) / len(measured)
+            if measured
+            else self.spec.tokens_per_update / self.spec.expected_tokens_per_second
+        )
+        left = (self.active.data.plan.updates - stage_update) * per_update
+        if self.training_deadline is not None:
+            left = min(left, self.training_deadline - self.clock())
+        return left <= self.spec.rolling_skip_seconds
 
     def _post_compile(self) -> list[tuple[float, float]]:
         warmup = self.spec.speed_check_warmup_updates
@@ -1451,20 +1598,26 @@ class Worker:
         return 0.0
 
     def remaining_validation_tokens(self, update: int) -> float:
-        """Subset tokens of every interval validation after ``update``, plus full validations."""
-        assert self.active is not None
+        """Subset tokens of every interval validation after global ``update``, plus every
+        full validation after it: this stage's later quarters and end, and each later
+        stage's quarters and end."""
+        active = self.active
+        assert active is not None
         interval = self.spec.validation.interval_updates
         following = (update // interval + 1) * interval
         count = len(range(following, self.spec.total_updates + 1, interval))
-        stages_left = len(self.spec.stages) - self.active.index
-        return float(count * self.subset_tokens + stages_left * self.full_targets)
+        stage_update = update - active.offset
+        full = sum(1 for later in active.quarters if later > stage_update) + 1
+        full += full_validations(self.spec.stages[active.index + 1 :])
+        return float(count * self.subset_tokens + full * self.full_targets)
 
     def speed_check(self) -> None:
         """Once, after ``speed_check_seconds`` of training: speed floor and projected finish.
 
         Throughput counts only updates after each stage's first
         ``speed_check_warmup_updates`` (compilation). The projected finish adds, at the
-        measured rates, the remaining targets, every remaining validation, a
+        measured rates, the remaining targets, every remaining validation (interval
+        subsets, and the full streams at each later quarter and stage end), a
         recompilation per later stage, the remaining checkpoint saves (at the measured
         save time, or ``checkpoint_save_seconds`` before the first save) and the
         finalization reserve; it must not pass the Pod end, the armed deadline when that
@@ -1759,29 +1912,66 @@ class Worker:
     # Finalization ----------------------------------------------------------------------
 
     def drain_budget(self) -> float:
-        """Seconds the final drain may wait: ``drain_seconds``, inside the Pod end, and
-        inside the watchdog's transfer window less the margin for the checks after it."""
+        """Seconds the final drain may wait: the whole transfer window left, less the margin
+        for the checks after it, and never past the Pod end less a minute.
+
+        The window is the watchdog's: ``max_transfer_seconds`` after the last GPU work,
+        which is the end of the final save or validation, so the start of finalization
+        for every ending that saves a milestone.
+        """
         now = self.clock()
         transfer_left = (
-            self.spec.max_transfer_seconds - (now - self.last_activity) - FINALIZE_MARGIN_SECONDS
+            self.spec.max_transfer_seconds
+            - FINALIZE_MARGIN_SECONDS
+            - max(0.0, now - self.last_activity)
         )
-        return max(0.0, min(self.spec.drain_seconds, transfer_left, self.pod_end - now - 60))
+        return max(0.0, min(transfer_left, self.pod_end - now - 60))
 
     def _stored(self, key: str) -> str | None:
         found, _ = self.store.retry(partial(self.store.stored_sha256, key))
         return found
 
-    def verified_labels(self) -> dict[str, bool]:
-        """Labels the uploader verified and kept, each file checked again by HEAD."""
+    def kept_labels(self) -> set[str]:
+        """Labels the uploader verified and has not deleted (no request is made)."""
         status = self.uploader.status()
-        kept = set(status["verified"]) - set(status["deleted"])
+        return set(status["verified"]) - set(status["deleted"])
+
+    def verified_labels(self) -> dict[str, bool]:
+        """Labels the uploader verified and kept, each file checked again by HEAD.
+
+        A HEAD that still fails after its retries counts as unverified; its error is
+        kept in ``verification_errors``.
+        """
+        kept = self.kept_labels()
+        result: dict[str, bool] = {}
+        for label, files in self.label_files.items():
+            try:
+                result[label] = label in kept and all(
+                    self._stored(self.prefix + label + "/" + name) == digest
+                    for name, _, digest in files
+                )
+            except Exception as error:  # recorded; the label is not verified
+                result[label] = False
+                self.verification_errors[label] = f"{type(error).__name__}: {error}"
+        return result
+
+    def export_listing(self, label: str) -> dict[str, Any]:
+        """A label's local export: its directory, and each file's path, SHA-256 and size."""
+        files = []
+        for name, path, digest in self.label_files[label]:
+            try:
+                size: int | None = path.stat().st_size
+            except OSError:
+                size = None
+            files.append({"name": name, "path": str(path), "sha256": digest, "size_bytes": size})
+        checkpoint = next(row for row in files if row["name"] == "checkpoint.pt")
         return {
-            label: label in kept
-            and all(
-                self._stored(self.prefix + label + "/" + name) == digest
-                for name, _, digest in files
-            )
-            for label, files in self.label_files.items()
+            "label": label,
+            "export": f"exports/{label}",
+            "export_path": str(self.root / "exports" / label),
+            "checkpoint_sha256": checkpoint["sha256"],
+            "checkpoint_size_bytes": checkpoint["size_bytes"],
+            "files": files,
         }
 
     def drain(self, budget: float) -> bool:
@@ -1798,40 +1988,89 @@ class Worker:
                 return False
             self.heartbeat()
 
+    def settle(self, budget: float, receipt: dict[str, Any]) -> dict[str, bool]:
+        """Resubmit every unverified milestone and drain until all verify or ``budget`` ends.
+
+        The first round resubmits each milestone the uploader has not verified (one
+        waiting to retry becomes due at once; one uploading is left to finish). Each
+        round drains for the rest of the budget and checks every kept label by HEAD; a
+        milestone whose HEAD check fails is resubmitted in the next round, at most
+        ``SETTLE_ROUNDS`` rounds in all. Returns the HEAD-checked labels.
+        """
+        deadline = time.monotonic() + budget
+        labels: dict[str, bool] = {}
+        rounds: list[dict[str, Any]] = []
+        drained = False
+        for index in range(SETTLE_ROUNDS):
+            if index == 0:
+                kept = self.kept_labels()
+                missing = [label for label in self.milestones if label not in kept]
+            else:
+                missing = [label for label in self.milestones if not labels.get(label)]
+            for label in missing:
+                self.uploader.submit(label, self.label_files[label], milestone=True)
+            drained = self.drain(max(0.0, deadline - time.monotonic()))
+            labels = self.verified_labels()
+            rounds.append({"resubmitted": missing, "drained": drained})
+            if all(labels.get(label) for label in self.milestones):
+                break
+            if time.monotonic() >= deadline:
+                break
+        receipt.update(drained=drained, settle_rounds=rounds)
+        return labels
+
     def finalize(self) -> None:
-        """Drain uploads, verify them, upload ``report.json`` and write the last heartbeat.
+        """Resubmit and drain uploads, verify them, upload ``report.json``, then the last
+        heartbeat.
 
         The heartbeat reads ``uploading`` until this ends, whatever the training outcome,
-        so the Mac side never reads a final status while uploads still run. A wall or cost
-        stop never waits for uploads. A completed or time-limited run whose milestones or
-        report cannot be verified in R2 ends ``failed``. ``r2_final`` is published only when
-        a verified stage-final milestone closes the run (every earlier milestone verified
-        too); a stopped run without one gets none, and the supervisor archives diagnostics.
+        so the Mac side never reads a final status while a milestone is still pending or
+        in flight inside the transfer window. A wall or cost stop never waits for uploads.
+        Otherwise every unverified milestone is resubmitted and the drain may use the
+        whole transfer window left (``drain_budget``). A run with a milestone still not
+        verified in R2 then ends ``failed`` with ``failure: r2_milestones_unverified``;
+        ``finalization.json`` and ``report.json`` (``r2.unverified_milestones``) list each
+        such milestone's local export, path and SHA-256 for the supervisor to pull over
+        SSH. A completed or time-limited run whose report cannot be verified in R2 ends
+        ``failed`` (``r2_finalization``). ``r2_final`` is published only when a verified
+        stage-final milestone closes the run and every milestone is verified; a stopped
+        run without one gets none, and the supervisor archives diagnostics.
         """
         self.phase = "finalizing"
         trained = self.report["status"]
         hurry = self.report.get("stop_reason") in NO_FINALIZATION_STOPS
-        receipt: dict[str, Any] = {"training_status": trained}
+        receipt: dict[str, Any] = {
+            "training_status": trained,
+            "started_unix": self.clock(),
+            "transfer_window_end_unix": self.last_activity + self.spec.max_transfer_seconds,
+        }
         report_key = self.prefix + "report.json"
+        unverified: list[dict[str, Any]] | None = None
         self.uploading = not hurry
         try:
             self.heartbeat()
-            budget = 0.0 if hurry else self.drain_budget()
-            receipt.update(drain_budget_seconds=budget, drained=self.drain(budget))
+            if hurry:
+                kept = self.kept_labels()
+                labels = {label: label in kept for label in self.label_files}
+                receipt.update(drain_budget_seconds=0.0, drained=self.drain(0.0))
+            else:
+                budget = self.drain_budget()
+                receipt["drain_budget_seconds"] = budget
+                labels = self.settle(budget, receipt)
             self.prune_exports()
-            labels = self.verified_labels() if not hurry else {}
             milestones = {label: labels.get(label, False) for label in self.milestones}
             receipt["labels_verified"] = labels
-            durable = bool(milestones) and all(milestones.values())
-            if trained in {"completed", "time_limited"} and not durable:
+            unverified = [self.export_listing(label) for label, ok in milestones.items() if not ok]
+            durable = bool(milestones) and not unverified
+            if unverified and not hurry:
                 self.report.update(
-                    status="failed",
-                    failure="r2_milestones_unverified",
-                    training_status=trained,
+                    status="failed", failure="r2_milestones_unverified", training_status=trained
                 )
             self.report["r2"].update(
                 uploader=self.uploader.status(),
                 milestones_verified=milestones,
+                unverified_milestones=unverified,
+                verification_errors=dict(self.verification_errors),
                 report_key=report_key,
             )
             report_sha256 = self.publish()
@@ -1858,15 +2097,33 @@ class Worker:
                 receipt["last_verified_label"] = last[-1] if last else None
         except Exception as error:
             receipt["error"] = f"{type(error).__name__}: {error}"
+            if unverified is None:
+                # Failed before the check: every milestone the uploader has not verified
+                # may exist only on this Pod.
+                kept = self.kept_labels()
+                unverified = [
+                    self.export_listing(label) for label in self.milestones if label not in kept
+                ]
+                self.report["r2"]["unverified_milestones"] = unverified
+                if unverified and not hurry:
+                    self.report.update(
+                        status="failed",
+                        failure="r2_milestones_unverified",
+                        training_status=trained,
+                    )
             if self.report["status"] in {"completed", "time_limited"}:
                 self.report.update(
                     status="failed", failure="r2_finalization", training_status=trained
                 )
             self.publish()
         finally:
+            receipt["unverified_milestones"] = unverified or []
+            receipt["verification_errors"] = dict(self.verification_errors)
             receipt["uploader_closed"] = self.uploader.close(timeout=5)
             receipt["r2_final"] = self.r2_final
             receipt["status"] = self.report["status"]
+            if "failure" in self.report:
+                receipt["failure"] = self.report["failure"]
             self.write_json(self.root / "finalization.json", receipt)
             self.uploading = False
             self.heartbeat()
@@ -2101,7 +2358,7 @@ def smoke_specification(
             "r2": {
                 "keep_rolling": 2,
                 "storage_cap_usd_per_month": 5.0,
-                "drain_seconds": 30,
+                "rolling_skip_seconds": 0.0,  # Tiny stages: every cadence save happens.
                 "max_transfer_seconds": 900,
             },
         }
@@ -2194,8 +2451,19 @@ def _object(path: Path) -> dict[str, Any]:
     return value
 
 
+def _revision(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot read the shipped code revision {path}: {error}") from error
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    """Every launch gate before any training, then one run on ``cuda:0``."""
+    """Every launch gate before any training, then one run on ``cuda:0``.
+
+    The shipped ``--revision`` must equal the receipt's ``revision``; the report records
+    it as ``code_revision``.
+    """
     spec = Specification.load(args.specification)
     if spec.train.precision != "bfloat16":
         raise ValueError("the A40 rehearsal specification must use bfloat16 autocast")
@@ -2218,6 +2486,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if os.environ.get("RUNPOD_POD_ID") not in (None, "", pod_id):
         raise ValueError("this Pod is not the one the receipt identifies")
     credentials = r2_credentials(os.environ, key_prefix="R2_POD_")
+    revision = check_revision(receipt, _revision(args.revision))
     data = load_run_data(args.binding, args.root, expected_sha256=args.binding_sha256, spec=spec)
     verify_initialization(
         args.initialization,
@@ -2241,6 +2510,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             *environment_secrets(),
         ],
         extra={
+            "code_revision": revision,
             "hardware": hardware,
             "readiness_receipt": sanitize(receipt),
             "specification_sha256": identity["specification_sha256"],
@@ -2264,6 +2534,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--output", type=Path, required=True)
     run_parser.add_argument("--binding-sha256", required=True)
     run_parser.add_argument("--initialization-sha256", required=True)
+    run_parser.add_argument(
+        "--revision",
+        type=Path,
+        default=DEFAULT_REVISION,
+        help="the Mac's revision.json shipped with the code; must equal the receipt's",
+    )
     smoke_parser = commands.add_parser("smoke", help="both runs on tiny authored data, CPU")
     smoke_parser.add_argument("--output", type=Path, required=True)
     initial = commands.add_parser("write-initialization", help="the shared initialization (Mac)")

@@ -2,6 +2,7 @@
 
 import datetime as dt
 import hashlib
+import http.client
 import io
 import json
 from collections.abc import Mapping
@@ -163,3 +164,55 @@ def test_download_publishes_only_bytes_matching_the_pinned_digest(tmp_path: Path
     with pytest.raises(ValueError, match="differs"):
         store.download("k/a.bin", tmp_path / "bad.bin", sha256="0" * 64, size=11)
     assert not (tmp_path / "bad.bin").exists() and not (tmp_path / "bad.bin.part").exists()
+    assert calls == ["GET", "GET"]  # A full-length body with another digest: no retry.
+
+
+class Failing(Reply):
+    """A 200 answer whose body read raises ``error``."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(b"")
+        self.error = error
+
+    def read(self, size: int | None = -1) -> bytes:
+        raise self.error
+
+
+def downloading(answers: list[bytes | Exception]) -> tuple[Store, list[float]]:
+    """A store whose GETs answer ``answers`` in turn: bytes as the body, or a failing read."""
+    sleeps: list[float] = []
+
+    def opener(request: Request) -> Reply:
+        answer = answers.pop(0)
+        return Failing(answer) if isinstance(answer, Exception) else Reply(answer)
+
+    credentials = Credentials("https://acct.r2.cloudflarestorage.com", "id", "secret", "bucket-a")
+    return Store(credentials, opener=opener, sleep=sleeps.append), sleeps
+
+
+def test_download_retries_a_truncated_body_within_its_attempts(tmp_path: Path) -> None:
+    data = b"shard bytes"
+    digest = hashlib.sha256(data).hexdigest()
+    # A clean early close reads as a short body; IncompleteRead is an HTTPException.
+    answers: list[bytes | Exception] = [data[:4], http.client.IncompleteRead(data[:6], 5), data]
+    store, sleeps = downloading(answers)
+    receipt = store.download("k/a.bin", tmp_path / "a.bin", sha256=digest, size=len(data))
+    assert receipt["attempts"] == 3 and sleeps == [2.0, 4.0]
+    assert (tmp_path / "a.bin").read_bytes() == data and not answers
+    store, sleeps = downloading([data[:4]] * 4)
+    with pytest.raises(r2_store.TransientError, match="ended after 4 of 11 bytes"):
+        store.download("k/b.bin", tmp_path / "b.bin", sha256=digest, size=len(data))
+    assert sleeps == [2.0, 4.0, 8.0]  # The whole budget, then the last error.
+    assert not (tmp_path / "b.bin").exists() and not (tmp_path / "b.bin.part").exists()
+
+
+def test_download_refuses_a_longer_body_at_once(tmp_path: Path) -> None:
+    data = b"shard bytes"
+    answers: list[bytes | Exception] = [data + b"!", data]
+    store, sleeps = downloading(answers)
+    with pytest.raises(ValueError, match="more bytes than the pinned size"):
+        store.download(
+            "k/a.bin", tmp_path / "a.bin", sha256=hashlib.sha256(data).hexdigest(), size=11
+        )
+    assert sleeps == [] and len(answers) == 1
+    assert not (tmp_path / "a.bin").exists() and not (tmp_path / "a.bin.part").exists()

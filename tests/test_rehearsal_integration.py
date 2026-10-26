@@ -168,6 +168,10 @@ def test_the_smoke_completes_both_runs_into_one_bucket(smoked: Smoke) -> None:
         statuses = [moment.heartbeat["status"] for moment in smoked.moments[run]]
         assert statuses[0] == "running" and statuses[-1] == "awaiting_transfer"
         assert "uploading" in statuses
+        # Each heartbeat names the Pod the supervisor below is built for.
+        assert {moment.heartbeat["pod_id"] for moment in smoked.moments[run]} == {
+            f"smoke-{run.lower()}"
+        }
 
 
 @pytest.mark.parametrize("run", sorted(RUNS))
