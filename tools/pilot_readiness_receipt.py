@@ -449,8 +449,8 @@ def build_rehearsal_receipt(
     names, the four SHA-256 bindings, the Pod identity the worker takes its Pod ID from,
     the watchdog policy with the billing origin, the armed deadline and the code
     ``revision`` (``revision.json``, which the worker compares with its own copy).
-    ``connection`` is the captured ``pod-connection.json``: its hourly cost must not
-    exceed the specification's quoted total.
+    ``connection`` is the captured ``pod-connection.json``: its hourly cost, the API's GPU
+    price alone, must not exceed the specification's GPU quote.
     """
     created_at = now if now is not None else time.time()
     # The worker's own file, parsed as the worker parses it and bound by its SHA-256.

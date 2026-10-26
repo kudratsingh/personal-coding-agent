@@ -1703,3 +1703,64 @@ def test_a_recorded_milestone_r2_lacks_is_never_checked_again_on_a_pull_retry(
         ("exports/stage1-final", handover + 1 + 5 + 1 + 1 + 5),
     ]
     assert unit.shutdown_ready and archive.bundles == [unit.root / "diagnostics"]
+
+
+def test_a_milestone_r2_holds_is_recorded_secured_after_supervision_ends(tmp_path: Path) -> None:
+    """The worker listed stage2-final, whose files all reached R2. The Mac's HEAD at the
+    handover times out and every SSH pull is refused before any byte lands, so nothing
+    stamps progress and the watchdog ends the Pod at the idle limit: no cycle runs after
+    the window. Once supervision ends, the final check in R2 needs no SSH and records the
+    milestone as secured, so the record never calls a checkpoint R2 holds unsecured."""
+    flaky = FlakyOnce()
+    report, disk = unverified_run(flaky)
+    put_export(flaky, "stage2-final", disk["stage2-final"])
+    rows = listing(disk, "stage2-final")
+    pod = Pod(heartbeat("failed", last_gpu_activity_unix=1500), report, rows)
+
+    def refused(name: str, destination: Path, timeout: float) -> Path:
+        raise RuntimeError("ssh: connect to host: Connection refused")
+
+    unit, archive = supervisor(
+        tmp_path,
+        pod,
+        flaky,
+        fetch_finalization=pod.fetch_finalization,
+        recover=refused,
+        transfer_window_seconds=900,
+    )
+    for moment in (1980.0, 1985.0, 1990.0):
+        unit.now[0] = moment  # type: ignore[attr-defined]
+        unit.cycle()
+    assert not unit.shutdown_ready and unit.milestone_error is not None
+    assert not unit.window_closed  # The Pod is deleted at the idle limit; no cycle follows.
+    pod.fetch = None  # type: ignore[assignment,method-assign]  # The Pod is gone: no SSH.
+    assert unit.final_r2_check() == {"stage2-final": True}
+    record = json.loads((unit.root / "MILESTONES-NOT-SECURED.json").read_text())
+    assert record["resolved_after_close"] is True
+    assert [row["label"] for row in record["verified_in_r2_after_close"]] == ["stage2-final"]
+    assert len(record["verified_in_r2_after_close"][0]["files"]) == 5
+    assert unit.final_r2_check() == {}  # Checked once more at most.
+
+
+def test_the_final_check_leaves_a_milestone_r2_lacks_at_risk(tmp_path: Path) -> None:
+    stalled = Stalled()
+    report, disk = unverified_run(stalled, in_r2=())
+    rows = listing(disk, "stage2-final")
+    pod = Pod(heartbeat("failed", last_gpu_activity_unix=1500), report, rows)
+
+    def refused(name: str, destination: Path, timeout: float) -> Path:
+        raise RuntimeError("ssh: connect to host: Connection refused")
+
+    unit, _ = supervisor(
+        tmp_path,
+        pod,
+        stalled,
+        fetch_finalization=pod.fetch_finalization,
+        recover=refused,
+        transfer_window_seconds=900,
+    )
+    unit.now[0] = 1980.0  # type: ignore[attr-defined]
+    unit.cycle()
+    assert unit.final_r2_check() == {"stage1-final": False, "stage2-final": False}
+    record = json.loads((unit.root / "MILESTONES-NOT-SECURED.json").read_text())
+    assert "resolved_after_close" not in record and not unit.shutdown_ready

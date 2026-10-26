@@ -1029,6 +1029,74 @@ class RehearsalSupervisor(Supervisor):
             },
         )
 
+    def final_r2_check(self) -> dict[str, bool]:
+        """Once supervision has ended, the Pod perhaps gone: check in R2 once more each
+        milestone still at risk for which R2 never answered that it is missing or different:
+        one whose check timed out or could not connect, or one never checked (the report
+        flagged it, or no cycle reached it).
+
+        The watchdog may end the Pod before any cycle runs after the transfer window, so
+        this needs no SSH: the listed files and recorded SHA-256s come from the local copies
+        of ``finalization.json`` and ``report.json``. A milestone R2 holds whole is recorded
+        in ``r2_secured``, and ``MILESTONES-NOT-SECURED.json`` gains
+        ``verified_in_r2_after_close`` (and ``resolved_after_close`` when nothing at risk
+        is left), so the record never calls a checkpoint R2 holds unsecured. Returns label
+        to whether R2 holds it.
+        """
+        at_risk_now = {row["label"] for row in (self.milestone_error or {}).get("files", [])}
+        pending = sorted(
+            (self.r2_unreachable | at_risk_now)
+            - self.r2_unconfirmed
+            - self.r2_rechecked
+            - self.r2_secured.keys()
+            - self.recovered.keys()
+        )
+        if not pending:
+            return {}
+
+        def local(name: str) -> dict[str, Any]:
+            try:
+                value = json.loads((self.root / name).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return {}
+            return value if isinstance(value, dict) else {}
+
+        try:
+            files = listed_files(local("remote-finalization.json"), run=self.run)
+            recorded = recorded_milestones(local("remote-report.json"), run=self.run)
+        except ValueError:
+            return {}
+        checked: dict[str, bool] = {}
+        for label in pending:
+            self.r2_rechecked.add(label)
+            if label in files:
+                checked[label] = self.secured_in_r2(label, files[label])
+            elif label in recorded:
+                key = f"{self.prefix}{label}/checkpoint.pt"
+                try:
+                    self.r2_secured[label] = head_sha256(
+                        self.quick_store, key, expected=recorded[label]
+                    )
+                except Exception:  # Still not confirmed: the record keeps it at risk.
+                    checked[label] = False
+                else:
+                    checked[label] = True
+        if self.milestone_error is not None and any(checked.values()):
+            at_risk = {row["label"] for row in self.milestone_error.get("files", [])}
+            secured = self.r2_secured.keys() | self.recovered.keys()
+            record = {
+                **self.milestone_error,
+                "verified_in_r2_after_close": [
+                    {"label": label, **self.r2_secured[label]}
+                    for label in sorted(checked)
+                    if checked[label]
+                ],
+                "resolved_after_close": at_risk <= secured,
+            }
+            atomic_json(self.root / MILESTONE_ERROR_FILE, record)
+            self.milestone_error = record
+        return checked
+
     def fail_milestones(self, at_risk: dict[str, str], detail: str) -> None:
         """Record, prominently, that milestones are not secured; never approve teardown."""
         files = [
@@ -1390,6 +1458,8 @@ def _rehearsal_main(
         poll_seconds=args.poll_seconds,
         cycle_seconds=args.cycle_seconds,
     )
+    # The Pod may be gone: milestones whose R2 check only timed out are checked once more.
+    after_close = supervisor.final_r2_check()
     closing = args.output / "closing"
     closing.mkdir(exist_ok=True)
     receipt = args.output / "watchdog-receipt.json"
@@ -1402,11 +1472,20 @@ def _rehearsal_main(
         "shutdown_receipt": json.loads(receipt.read_text()) if receipt.exists() else None,
         "summary": supervisor.summary,
         "milestones_not_secured": supervisor.milestone_error,
+        "milestones_checked_in_r2_after_close": after_close,
         "resource_audit": "Pod only; R2 objects, network volumes and billing need separate audit",
         "supervisor_interrupted": interrupted,
     }
     atomic_json(closing / "summary.json", record)  # Always written locally first.
-    if supervisor.milestone_error is not None:
+    if supervisor.milestone_error is not None and supervisor.milestone_error.get(
+        "resolved_after_close"
+    ):
+        print(
+            f"rehearsal supervisor: run {args.run}: every milestone at risk was verified in R2 "
+            f"by the Mac after supervision ended; see {args.output / MILESTONE_ERROR_FILE}",
+            file=sys.stderr,
+        )
+    elif supervisor.milestone_error is not None:
         print(
             f"rehearsal supervisor: run {args.run} ended with milestones NOT secured; see "
             f"{args.output / MILESTONE_ERROR_FILE}",
