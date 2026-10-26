@@ -1329,6 +1329,9 @@ def write_binding(data: Authored) -> tuple[Path, str]:
                     "holdout_sha256",
                 )
             },
+            "tokens_identity": rehearsal_binding.tokens_identity(
+                data.tokenizer.sha256, [*SPLITS], streams
+            ),
             "git_commit": "f" * 40,
             "admission": {"approved": True},
             "documents": {"file": "documents.jsonl", "sha256": "b" * 64},

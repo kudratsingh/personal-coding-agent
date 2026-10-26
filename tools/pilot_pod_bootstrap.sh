@@ -10,17 +10,24 @@
 #        --workspace /workspace/pilot [--repo /workspace/repo] [--skip-tests]
 #
 # Rehearsal mode (D-35; one Pod per run, see REHEARSAL_RUNBOOK.md) arms the timer
-# with the 45,000-second lifetime ceiling first, then loads the Pod's R2 key from a
-# 0600 file the operator delivered over SSH stdin (never echoed), tests an R2 round
-# trip, fetches and re-verifies the run's pinned data and the shared initialization,
-# runs the CPU tests including the worker's (none needs Docker or the network), and
-# runs the A40 preflight with its compile check (--compile-check):
+# with the 45,000-second lifetime ceiling first, then checks the shipped code archive
+# against the Mac's revision.json and copies that record into the workspace (the worker
+# refuses to start without it), loads the Pod's R2 key from a 0600 file the operator
+# delivered over SSH stdin (never echoed), measures an R2 round trip (its upload rate is
+# a readiness gate), fetches and re-verifies the run's pinned data and the shared
+# initialization, runs the CPU tests including the worker's (none needs Docker or the
+# network), and runs the A40 preflight with its compile check (--compile-check):
 #   bash tools/pilot_pod_bootstrap.sh --mode rehearsal --run A|B --deadline-unix <unix> \
 #        --workspace /workspace/rehearsal --repo /workspace/repo \
+#        --revision /workspace/revision.json --archive /workspace/repo.tar.gz \
 #        --r2-env /workspace/rehearsal/r2-pod.env --binding /workspace/rehearsal/binding.json \
 #        --binding-sha256 <hex> --data-root /workspace/rehearsal-data \
 #        --initialization-key <R2 key> --initialization-sha256 <hex> \
 #        --initialization-size <bytes> [--skip-tests]
+#
+# An existing self-destruct receipt counts as armed only while its timer lives: its pid
+# answers kill -0 and it rewrote checked_at_unix within the last 30 s (the timer rewrites
+# it every 5 s). Any other receipt is set aside and the timer is armed again.
 set -euo pipefail
 
 MODE="pilot"
@@ -36,6 +43,8 @@ DATA_ROOT=""
 INIT_KEY=""
 INIT_SHA256=""
 INIT_SIZE=""
+REVISION=""
+ARCHIVE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode) MODE="$2"; shift 2 ;;
@@ -51,6 +60,8 @@ while [[ $# -gt 0 ]]; do
     --initialization-key) INIT_KEY="$2"; shift 2 ;;
     --initialization-sha256) INIT_SHA256="$2"; shift 2 ;;
     --initialization-size) INIT_SIZE="$2"; shift 2 ;;
+    --revision) REVISION="$2"; shift 2 ;;
+    --archive) ARCHIVE="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -59,6 +70,7 @@ if [[ -z "$DEADLINE" || -z "$WORKSPACE" ]]; then
   exit 2
 fi
 REHEARSAL_ARGS="$RUN$R2_ENV$BINDING$BINDING_SHA256$DATA_ROOT$INIT_KEY$INIT_SHA256$INIT_SIZE"
+REHEARSAL_ARGS="$REHEARSAL_ARGS$REVISION$ARCHIVE"
 case "$MODE" in
   pilot)
     if [[ -n "$REHEARSAL_ARGS" ]]; then
@@ -69,10 +81,11 @@ case "$MODE" in
   rehearsal)
     if [[ ! "$RUN" =~ ^[AB]$ || -z "$R2_ENV" || -z "$BINDING" || -z "$DATA_ROOT" \
           || -z "$INIT_KEY" || ! "$BINDING_SHA256" =~ ^[0-9a-f]{64}$ \
-          || ! "$INIT_SHA256" =~ ^[0-9a-f]{64}$ || ! "$INIT_SIZE" =~ ^[1-9][0-9]*$ ]]; then
-      echo "rehearsal mode needs --run A|B, --r2-env, --binding, --binding-sha256 <hex>," \
-        "--data-root, --initialization-key, --initialization-sha256 <hex> and" \
-        "--initialization-size <bytes>" >&2
+          || ! "$INIT_SHA256" =~ ^[0-9a-f]{64}$ || ! "$INIT_SIZE" =~ ^[1-9][0-9]*$ \
+          || -z "$REVISION" || -z "$ARCHIVE" ]]; then
+      echo "rehearsal mode needs --run A|B, --revision, --archive, --r2-env, --binding," \
+        "--binding-sha256 <hex>, --data-root, --initialization-key," \
+        "--initialization-sha256 <hex> and --initialization-size <bytes>" >&2
       exit 2
     fi
     ;;
@@ -102,9 +115,37 @@ LIFETIME_ARGS=()
 if [[ "$MODE" == "rehearsal" ]]; then
   LIFETIME_ARGS=(--max-lifetime-seconds 45000)  # The D-35 ceiling; the pilot keeps 5400.
 fi
-if [[ -f "$RECEIPT" ]] && python3 -c "import json,sys; sys.exit(0 if json.load(open('$RECEIPT'))['state'] in ('armed','retrying','terminating') else 1)"; then
-  echo "self-destruct already armed: $RECEIPT"
+FRESH_SECONDS=30
+# Succeeds only for a receipt whose timer still runs: a live state, a pid that answers
+# kill -0 and a checked_at_unix rewritten within FRESH_SECONDS. A receipt alone is not a timer.
+timer_alive() {
+  local pid
+  [[ -f "$RECEIPT" ]] || return 1
+  pid=$(python3 -c "
+import json, sys, time
+try:
+    value = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    sys.exit(1)
+pid, checked = value.get('pid'), value.get('checked_at_unix')
+age = time.time() - checked if type(checked) in (int, float) else None
+live = value.get('state') in ('armed', 'retrying', 'terminating')
+if not (live and age is not None and -5 <= age <= float(sys.argv[2])):
+    sys.exit(1)
+if type(pid) is not int or pid <= 0:
+    sys.exit(1)
+print(pid)
+" "$RECEIPT" "$FRESH_SECONDS") || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+if timer_alive; then
+  echo "self-destruct already armed and alive: $RECEIPT"
 else
+  if [[ -e "$RECEIPT" ]]; then
+    STALE="$RECEIPT.stale-$(date +%s)"
+    mv "$RECEIPT" "$STALE"
+    echo "set aside a self-destruct receipt with no live timer: $STALE"
+  fi
   setsid nohup python3 "$REPO/tools/pod_self_destruct.py" \
     --pod-id "$RUNPOD_POD_ID" \
     --deadline-unix "$DEADLINE" \
@@ -112,17 +153,58 @@ else
     --stop-file "$WORKSPACE/TERMINATE_NOW" \
     ${LIFETIME_ARGS[@]+"${LIFETIME_ARGS[@]}"} \
     > "$WORKSPACE/self-destruct.log" 2>&1 < /dev/null &
+  ARMED="import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))['state']=='armed' else 1)"
   for _ in $(seq 1 20); do
-    if [[ -f "$RECEIPT" ]] && python3 -c "import json,sys; sys.exit(0 if json.load(open('$RECEIPT'))['state']=='armed' else 1)"; then
+    if timer_alive && python3 -c "$ARMED" "$RECEIPT"; then
       break
     fi
     sleep 0.5
   done
-  if ! python3 -c "import json,sys; sys.exit(0 if json.load(open('$RECEIPT'))['state']=='armed' else 1)" 2>/dev/null; then
+  if ! timer_alive || ! python3 -c "$ARMED" "$RECEIPT" 2>/dev/null; then
     echo "self-destruct timer failed to arm; see $WORKSPACE/self-destruct.log" >&2
     exit 3
   fi
   echo "self-destruct armed for unix deadline $DEADLINE (receipt: $RECEIPT)"
+fi
+
+# 1a. Rehearsal: the shipped archive must be the one the Mac's revision.json names (a
+#     40-hex commit from a clean tree and the archive's SHA-256). The record is copied
+#     byte for byte to $WORKSPACE/revision.json, where the worker compares it with its
+#     readiness receipt; a different record already there stops the bootstrap.
+if [[ "$MODE" == "rehearsal" ]]; then
+  if ! python3 - "$REVISION" "$ARCHIVE" "$WORKSPACE/revision.json" <<'PY'
+import hashlib, json, os, re, sys
+source, archive, target = sys.argv[1:4]
+data = open(source, "rb").read()
+value = json.loads(data)
+if not isinstance(value, dict) or set(value) != {"git_commit", "clean", "archive_sha256"}:
+    sys.exit("revision.json must hold exactly git_commit, clean and archive_sha256")
+commit = value["git_commit"]
+if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+    sys.exit("revision.json's git_commit must be 40 lowercase hex digits")
+if value["clean"] is not True:
+    sys.exit("revision.json records a dirty tree")
+digest = hashlib.sha256()
+with open(archive, "rb") as stream:
+    for block in iter(lambda: stream.read(1 << 20), b""):
+        digest.update(block)
+if digest.hexdigest() != value["archive_sha256"]:
+    sys.exit("the shipped archive's SHA-256 differs from revision.json's archive_sha256")
+if os.path.lexists(target):
+    if os.path.islink(target) or open(target, "rb").read() != data:
+        sys.exit(f"{target} already holds another revision")
+else:
+    with open(target + ".part", "wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(target + ".part", target)
+print(f"code revision {commit} (archive SHA-256 verified): {target}")
+PY
+  then
+    echo "the code revision does not match the shipped archive; see the message above" >&2
+    exit 6
+  fi
 fi
 
 # 1b. Rehearsal: load the Pod's own R2 key. The file arrived over SSH stdin; it must be
@@ -196,6 +278,8 @@ python3 -c "import scratchcoder, yaml, numpy; print('project import ok')"
 if [[ "$MODE" == "rehearsal" ]]; then
   python3 -m tools.rehearsal_ops round-trip --run "$RUN" --pod-id "$RUNPOD_POD_ID" \
     --receipt "$WORKSPACE/r2-round-trip.json" --key-prefix R2_POD_
+  # Printed only; the readiness receipt checks the upload rate against the transfer window.
+  python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print('R2 round trip bytes/s: upload', r.get('upload_bytes_per_second'), 'download', r.get('download_bytes_per_second'))" "$WORKSPACE/r2-round-trip.json"
   python3 -m tools.rehearsal_binding fetch --binding "$BINDING" --expected-sha256 "$BINDING_SHA256" \
     --root "$DATA_ROOT" --run "$RUN" --receipt "$WORKSPACE/data-fetch.json" --key-prefix R2_POD_ \
     > "$WORKSPACE/data-fetch.log"

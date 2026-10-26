@@ -2,14 +2,20 @@
 
 ``python3`` and ``setsid`` are replaced by stubs that record every call, so the script runs
 end to end without a GPU, a network or a Runpod key; the real interpreter still runs the
-script's own inline checks (the armed receipt and the 0600 key file).
+script's own inline checks (the live timer, the code revision and the 0600 key file). The
+stub timer writes a receipt with its own pid and stays alive, as the real one does.
 """
 
+import hashlib
+import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -51,16 +57,49 @@ case "$1" in
       if [[ "$1" == --receipt ]]; then receipt="$2"; fi
       shift
     done
-    printf '{"state": "armed", "pod_id": "%s"}\n' "$RUNPOD_POD_ID" > "$receipt"
-    exit 0 ;;
+    echo "$$" >> "$STUB_PIDS"
+    printf '{"state": "armed", "pod_id": "%s", "pid": %d, "checked_at_unix": %d}\n' \
+      "$RUNPOD_POD_ID" "$$" "$(date +%s)" > "$receipt"
+    exec sleep 60 ;;
   -m)
     if [[ "$2" == tools.pilot_preflight ]]; then mkdir -p "$4"; echo '{}' > "$4/report.json"; fi
+    if [[ "$2 $3" == "tools.rehearsal_ops round-trip" ]]; then
+      while [[ $# -gt 0 ]]; do
+        if [[ "$1" == --receipt ]]; then receipt="$2"; fi
+        shift
+      done
+      echo '{"status": "passed", "upload_bytes_per_second": 12000000.0,' \
+        '"download_bytes_per_second": 30000000.0}' > "$receipt"
+    fi
     exit 0 ;;
 esac
 exit 0
 """
 
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash is required")
+COMMIT = "5" * 40
+
+
+@pytest.fixture(autouse=True)
+def stop_stub_timers(tmp_path: Path) -> Iterator[None]:
+    """Stop every stub timer a test started (each sleeps in place of the real timer)."""
+    yield
+    for pids in tmp_path.rglob("stub-timer.pids"):
+        for pid in pids.read_text().split():
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
+def revision_for(archive: Path, **change: object) -> bytes:
+    value = {
+        "git_commit": COMMIT,
+        "clean": True,
+        "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        **change,
+    }
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
 
 
 def setup(tmp_path: Path, *, mode: int = 0o600, mac_key: bool = False) -> dict[str, Path]:
@@ -84,7 +123,19 @@ def setup(tmp_path: Path, *, mode: int = 0o600, mac_key: bool = False) -> dict[s
     secrets = workspace / "r2-pod.env"
     secrets.write_text(text)
     secrets.chmod(mode)
-    return {"stubs": stubs, "workspace": workspace, "env": secrets, "log": tmp_path / "calls.log"}
+    archive = tmp_path / "repo.tar.gz"
+    archive.write_bytes(b"the shipped code archive")
+    revision = tmp_path / "revision.json"
+    revision.write_bytes(revision_for(archive))
+    return {
+        "stubs": stubs,
+        "workspace": workspace,
+        "env": secrets,
+        "log": tmp_path / "calls.log",
+        "pids": tmp_path / "stub-timer.pids",
+        "archive": archive,
+        "revision": revision,
+    }
 
 
 def rehearsal_arguments(paths: dict[str, Path], **change: str) -> list[str]:
@@ -94,6 +145,8 @@ def rehearsal_arguments(paths: dict[str, Path], **change: str) -> list[str]:
         "--deadline-unix": "1800044820",
         "--workspace": str(paths["workspace"]),
         "--repo": str(ROOT),
+        "--revision": str(paths["revision"]),
+        "--archive": str(paths["archive"]),
         "--r2-env": str(paths["env"]),
         "--binding": str(paths["workspace"] / "binding.json"),
         "--binding-sha256": "ab" * 32,
@@ -117,6 +170,7 @@ def run(paths: dict[str, Path], arguments: list[str]) -> subprocess.CompletedPro
         RUNPOD_POD_ID=POD,
         RUNPOD_API_KEY="placeholder",
         STUB_LOG=str(paths["log"]),
+        STUB_PIDS=str(paths["pids"]),
         REAL_PYTHON=sys.executable,
     )
     assert BASH is not None
@@ -153,6 +207,7 @@ def test_rehearsal_arms_the_timer_first_and_keeps_the_key_secret(tmp_path: Path)
     assert "--deadline-unix 1800044820" in lines[destruct]
     order = [
         destruct,
+        index(lines, f"- {paths['revision']} {paths['archive']}"),
         index(lines, "(key file check)"),
         index(lines, "tools.rehearsal_ops round-trip"),
         index(lines, "tools.rehearsal_binding fetch"),
@@ -179,6 +234,11 @@ def test_rehearsal_arms_the_timer_first_and_keeps_the_key_secret(tmp_path: Path)
     assert preflight.endswith("--device cuda:0 --compile-check"), preflight
     assert SECRET not in result.stdout + result.stderr + paths["log"].read_text()
     assert "R2 environment loaded for run A (names only)" in result.stdout
+    # The measured R2 rates are printed; the readiness receipt gates on the upload rate.
+    assert "R2 round trip bytes/s: upload 12000000.0 download 30000000.0" in result.stdout
+    # The Mac's revision record reaches the workspace byte for byte, after the timer.
+    assert (paths["workspace"] / "revision.json").read_bytes() == paths["revision"].read_bytes()
+    assert f"code revision {COMMIT} (archive SHA-256 verified)" in result.stdout
 
 
 NEEDS_DOCKER_OR_NETWORK = re.compile(
@@ -229,6 +289,8 @@ def test_the_macs_key_on_the_pod_is_refused(tmp_path: Path) -> None:
         {"--binding-sha256": "short"},
         {"--initialization-size": "0"},
         {"--r2-env": ""},
+        {"--revision": ""},
+        {"--archive": ""},
         {"--mode": "other"},
     ],
 )
@@ -261,6 +323,9 @@ def test_pilot_mode_is_unchanged(tmp_path: Path) -> None:
     assert "R2 environment" not in result.stdout
     refused = run(setup(tmp_path / "again"), [*arguments, "--run", "A"])
     assert refused.returncode == 2 and "need --mode rehearsal" in refused.stderr
+    again = setup(tmp_path / "revision")
+    refused = run(again, [*arguments, "--revision", str(again["revision"])])
+    assert refused.returncode == 2 and "need --mode rehearsal" in refused.stderr
 
 
 def test_script_keeps_the_live_pilot_fixes_and_never_traces_secrets() -> None:
@@ -288,7 +353,106 @@ def test_pod_receipts_named_by_the_bootstrap_are_the_ones_the_runbook_pulls() ->
         "data-verification.json",
         "initialization-fetch.json",
         "preflight-a40/report.json",
+        "revision.json",
     ):
         assert f"$WORKSPACE/{name}" in script, name
         assert name in runbook, name
     assert "{root}/environment.json" in script and "environment.json" in runbook
+
+
+def write_receipt(paths: dict[str, Path], **fields: object) -> Path:
+    receipt = paths["workspace"] / "self-destruct.json"
+    value = {"state": "armed", "pod_id": POD, "checked_at_unix": time.time(), **fields}
+    receipt.write_text(json.dumps(value))
+    return receipt
+
+
+def dead_pid() -> int:
+    process = subprocess.Popen([sys.executable, "-c", "pass"])
+    process.wait()
+    return process.pid
+
+
+def test_a_live_timer_is_kept_and_not_armed_twice(tmp_path: Path) -> None:
+    paths = setup(tmp_path)
+    write_receipt(paths, pid=os.getpid())  # A live process that rewrote its receipt just now.
+    result = run(paths, rehearsal_arguments(paths))
+    assert result.returncode == 0, result.stderr
+    assert "self-destruct already armed and alive" in result.stdout
+    assert not [line for line in calls(paths) if "pod_self_destruct.py" in line]
+    assert not list(paths["workspace"].glob("self-destruct.json.stale-*"))
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"pid": "dead"},  # replaced by a reaped child's pid below
+        {"pid": "self", "checked_at_unix": time.time() - 3600},  # alive, but silent for an hour
+        {"pid": "self", "state": "failed"},
+        {"pid": None},
+        {"pid": "self", "checked_at_unix": None},
+    ],
+)
+def test_a_receipt_without_a_live_timer_is_set_aside_and_the_timer_rearmed(
+    tmp_path: Path, fields: dict[str, object]
+) -> None:
+    paths = setup(tmp_path)
+    pid = {"dead": dead_pid(), "self": os.getpid(), None: None}[fields["pid"]]  # type: ignore[index]
+    stale = write_receipt(paths, **{**fields, "pid": pid})
+    original = stale.read_text()
+    result = run(paths, rehearsal_arguments(paths))
+    assert result.returncode == 0, result.stderr
+    lines = calls(paths)
+    assert "pod_self_destruct.py" in lines[index(lines, "pod_self_destruct.py")]
+    assert "set aside a self-destruct receipt with no live timer" in result.stdout
+    (aside,) = paths["workspace"].glob("self-destruct.json.stale-*")
+    assert aside.read_text() == original
+    receipt = json.loads(stale.read_text())
+    assert receipt["pid"] != pid and receipt["state"] == "armed"
+    started = index(lines, "pod_self_destruct.py")
+    assert started < index(lines, "tools.rehearsal_ops round-trip")
+
+
+def test_a_timer_that_dies_after_arming_stops_the_bootstrap(tmp_path: Path) -> None:
+    paths = setup(tmp_path)
+    stub = paths["stubs"] / "python3"
+    # The stub timer writes its receipt and exits at once: armed on paper, no live timer.
+    stub.write_text(stub.read_text().replace("exec sleep 60 ;;", "exit 0 ;;"))
+    result = run(paths, rehearsal_arguments(paths))
+    assert result.returncode == 3 and "failed to arm" in result.stderr
+    assert not [line for line in calls(paths) if "tools." in line]
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"archive_sha256": "0" * 64}, "differs from revision.json"),
+        ({"clean": False}, "dirty tree"),
+        ({"git_commit": "HEAD"}, "40 lowercase hex"),
+        ({"extra": 1}, "exactly git_commit"),
+    ],
+)
+def test_a_revision_that_does_not_name_the_shipped_archive_stops_the_bootstrap(
+    tmp_path: Path, change: dict[str, object], message: str
+) -> None:
+    paths = setup(tmp_path)
+    paths["revision"].write_bytes(revision_for(paths["archive"], **change))
+    result = run(paths, rehearsal_arguments(paths))
+    assert result.returncode == 6 and message in result.stderr, result.stderr
+    assert index(calls(paths), "pod_self_destruct.py") == 0  # The timer is armed first.
+    assert not [line for line in calls(paths) if "tools." in line]
+    assert not (paths["workspace"] / "revision.json").exists()
+
+
+def test_another_revision_already_in_the_workspace_is_never_replaced(tmp_path: Path) -> None:
+    paths = setup(tmp_path)
+    held = paths["workspace"] / "revision.json"
+    held.write_bytes(revision_for(paths["archive"], git_commit="6" * 40))
+    before = held.read_bytes()
+    result = run(paths, rehearsal_arguments(paths))
+    assert result.returncode == 6 and "already holds another revision" in result.stderr
+    assert held.read_bytes() == before
+    # The same record again (a re-run of the bootstrap) is accepted.
+    held.write_bytes(paths["revision"].read_bytes())
+    again = run(paths, rehearsal_arguments(paths))
+    assert again.returncode == 0, again.stderr

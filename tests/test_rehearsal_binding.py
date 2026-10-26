@@ -317,8 +317,9 @@ def built(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Built]:
         patch.setattr(
             rehearsal_build, "contamination_inputs", lambda *_: ([HELD_OUT], {"fixture": "held"})
         )
-        # The tree under test may be dirty; the fixture build records a clean commit.
+        # The tree under test may be dirty; the fixture build and binder record a clean commit.
         patch.setattr(rehearsal_build, "git_state", lambda: ("f" * 40, False))
+        patch.setattr(rehearsal_binding, "git_state", lambda: ("e" * 40, False))
         # The fixture tokenizer is small; the S model's 65,536 is tested separately.
         patch.setattr(rehearsal_binding, "VOCAB_SIZE", fixture.tokenizer.vocab_size)
         spec_path = fixture.spec()
@@ -424,12 +425,28 @@ def pod_root(built: Built, tmp_path: Path, run: str = "A") -> Path:
     return root
 
 
+def reidentify(binding: dict[str, Any]) -> None:
+    """Recompute ``tokens_identity`` after an edit, as a careful forger would."""
+    binding["build"]["tokens_identity"] = rehearsal_binding.tokens_identity(
+        binding["tokenizer"]["identity"], binding["stream_order"], binding["streams"]
+    )
+
+
 def forge(
-    built: Built, tmp_path: Path, change: Callable[[dict[str, Any]], object]
+    built: Built,
+    tmp_path: Path,
+    change: Callable[[dict[str, Any]], object],
+    *,
+    consistent: bool = True,
 ) -> tuple[Path, str]:
-    """A canonically written binding with one change, and its SHA-256."""
+    """A canonically written binding with one change, and its SHA-256.
+
+    ``consistent`` also recomputes ``tokens_identity``, so a later check must catch it.
+    """
     binding = copy.deepcopy(built.binding)
     change(binding)
+    if consistent:
+        reidentify(binding)
     path = tmp_path / "forged.json"
     path.write_bytes(rehearsal_binding._serialized(binding))
     return path, file_sha256(path)
@@ -789,6 +806,80 @@ def test_verify_rejects_tampered_binding_fields(
         verify_binding(path, root, expected_sha256=sha256)
 
 
+def test_tokens_identity_is_recomputed_from_the_bound_shards(built: Built, tmp_path: Path) -> None:
+    binding = built.binding
+    spec = rehearsal_build.load_spec(built.spec_path)
+    report = json.loads((built.build_dir / "output" / "report.json").read_text())
+    recomputed = rehearsal_binding.tokens_identity(
+        binding["tokenizer"]["identity"], binding["stream_order"], binding["streams"]
+    )
+    assert recomputed == rehearsal_build.identities(spec, report)["tokens_identity"]
+    assert recomputed == binding["build"]["tokens_identity"]
+    root = pod_root(built, tmp_path)
+    # An edited binding whose identity was only copied is refused by every reader, before
+    # any file is opened: another shard, the streams out of spec order, another identity
+    # or another tokenizer.
+    for change in (
+        lambda b: _shard(b).update(sha256="0" * 64),
+        lambda b: b["stream_order"].reverse(),
+        lambda b: b["build"].update(tokens_identity="0" * 64),
+        lambda b: b["tokenizer"].update(identity="0" * 64),
+    ):
+        path, sha256 = forge(built, tmp_path, change, consistent=False)
+        with pytest.raises(ValueError, match="tokens_identity differs"):
+            load_binding(path, expected_sha256=sha256)
+        with pytest.raises(ValueError, match="tokens_identity differs"):
+            verify_binding(path, root, expected_sha256=sha256)
+        forged = json.loads(path.read_text())
+        with pytest.raises(ValueError, match="tokens_identity differs"):
+            rehearsal_binding.check_binding(forged)
+        with pytest.raises(ValueError, match="tokens_identity differs"):
+            staging_files(forged, built.build_dir)
+
+
+@pytest.mark.parametrize(
+    ("binder", "message"),
+    [
+        ({"git_commit": "e" * 40, "dirty": True}, "clean tree"),
+        ({"git_commit": "e" * 40, "dirty": None}, "clean tree"),
+        ({"git_commit": "e" * 40, "dirty": 0}, "clean tree"),
+        ({"git_commit": None, "dirty": False}, "40-digit"),
+        ({"git_commit": "E" * 40, "dirty": False}, "40-digit"),
+        ({"git_commit": "e" * 39, "dirty": False}, "40-digit"),
+    ],
+)
+def test_a_binding_from_a_dirty_or_unknown_tree_is_refused(
+    built: Built, tmp_path: Path, binder: dict[str, Any], message: str
+) -> None:
+    assert built.binding["binder"] == {"git_commit": "e" * 40, "dirty": False}
+    root = pod_root(built, tmp_path)
+    path, sha256 = forge(built, tmp_path, lambda b: b.update(binder=binder))
+    with pytest.raises(ValueError, match=message):
+        verify_binding(path, root, expected_sha256=sha256)
+    with pytest.raises(ValueError, match=message):
+        fetch(
+            json.loads(path.read_text()),
+            root,
+            staged(built).store(),
+            run="A",
+            receipt=tmp_path / "r.json",
+        )
+    path, sha256 = forge(built, tmp_path, lambda b: b["build"].update(git_commit="unknown"))
+    with pytest.raises(ValueError, match="build's git_commit"):
+        load_binding(path, expected_sha256=sha256)
+
+
+def test_build_refuses_to_bind_from_a_dirty_or_unknown_tree(
+    built: Built, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output = tmp_path / "b.json"
+    for state in (("e" * 40, True), (None, True), ("not-a-commit", False)):
+        monkeypatch.setattr(rehearsal_binding, "git_state", lambda state=state: state)
+        with pytest.raises(ValueError, match="clean tree at a known commit"):
+            build_binding(built.build_dir, built.spec_path, output, r2_prefix=PREFIX)
+    assert not output.exists()
+
+
 def test_a_reformatted_binding_is_refused_even_with_its_own_hash(
     built: Built, tmp_path: Path
 ) -> None:
@@ -871,6 +962,58 @@ def test_staging_lists_every_pinned_file_and_the_binding_last(built: Built, tmp_
     edited["created_at"] = "2026-10-26T00:00:00+00:00"
     with pytest.raises(ValueError, match="is not this binding"):
         staging_files(edited, built.build_dir)
+
+
+def forged_report(
+    built: Built, tmp_path: Path, change: Callable[[dict[str, Any]], object]
+) -> tuple[dict[str, Any], Path]:
+    """A build whose report.json is edited, and a binding that pins the edited bytes.
+
+    Every hash check in ``staging_files`` passes, so only the comparison of the
+    report's contents with the binding can refuse it.
+    """
+    build_dir = copy_build(built, tmp_path)
+    report = build_dir / "output" / "report.json"
+    edit_json(report, change)
+    binding = copy.deepcopy(built.binding)
+    path = tmp_path / "pinned.json"
+    binding["build"]["report_sha256"] = file_sha256(report)
+    binding["written_to"] = str(path.absolute())
+    path.write_bytes(rehearsal_binding._serialized(binding))
+    return binding, build_dir
+
+
+def _report_shard(report: dict[str, Any], stream: str = "stage1-web") -> dict[str, Any]:
+    shard: dict[str, Any] = report["streams"][stream]["shards"][0]
+    return shard
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (
+            lambda r: _report_shard(r).update(documents=_report_shard(r)["documents"] + 1),
+            "shard list differs",
+        ),
+        (
+            lambda r: _report_shard(r, "stage2-web").update(manifest_sha256="0" * 64),
+            "shard list differs",
+        ),
+        (lambda r: r["streams"]["stage1-web"]["shards"].reverse(), "shard list differs"),
+        (lambda r: r["streams"]["validation-web"]["shards"].pop(), "shard list differs"),
+        (lambda r: r["streams"].pop("stage2-python"), "other streams"),
+        (lambda r: r.update(build_identity="0" * 64), "other identities"),
+        (lambda r: r["tokenizer"].update(identity="0" * 64), "another tokenizer"),
+    ],
+)
+def test_staging_refuses_a_binding_whose_shards_differ_from_the_pinned_report(
+    built: Built, tmp_path: Path, change: Callable[[dict[str, Any]], object], message: str
+) -> None:
+    binding, build_dir = forged_report(built, tmp_path / "control", lambda r: None)
+    assert staging_files(binding, build_dir)[-1][1] == Path(binding["written_to"])
+    binding, build_dir = forged_report(built, tmp_path / "edited", change)
+    with pytest.raises(ValueError, match=message):
+        staging_files(binding, build_dir)
 
 
 def test_credentials_use_the_named_key_pair_and_are_never_printed(
