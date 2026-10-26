@@ -30,6 +30,8 @@ Expected: `make check` green; the smoke completes offline on CPU; the preflight 
 
 `.env` is git-ignored. It holds `RUNPOD_API_KEY`, `R2_ENDPOINT`, `R2_BUCKET`, the Mac's own R2 key `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` (stages data, uploads the initialization, verifies results) and the Pods' separate key `R2_POD_ACCESS_KEY_ID`/`R2_POD_SECRET_ACCESS_KEY`. The Pod key must be its own Cloudflare API token with Object Read & Write on this one bucket only; it reaches the Pods only over SSH stdin (step 6), never in a create body, and it is revoked after both runs (step 13).
 
+The blocks put `#` comments after commands. An interactive zsh treats those as arguments unless comments are enabled, so run `setopt interactivecomments` once in each new terminal first (oh-my-zsh already sets it; bash and scripts need nothing).
+
 No secret value ever appears on a process command line, where another local account could read it with `ps`. The Runpod key reaches `curl` on its standard input (`--config -`, written by the shell's builtin `printf`), and the leak check in step 7 feeds the values to `grep` on its standard input. The Python tools read keys from the environment.
 
 ```sh

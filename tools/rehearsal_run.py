@@ -2064,8 +2064,9 @@ class Worker:
         The heartbeat reads ``uploading`` until this ends, whatever the training outcome,
         so the Mac side never reads a final status while a milestone is still pending or
         in flight inside the transfer window. A wall or cost stop never waits for uploads.
-        Otherwise every unverified milestone is resubmitted and the drain may use the
-        whole transfer window left (``drain_budget``). A run with a milestone still not
+        Otherwise every unverified milestone is resubmitted and the drain may run until
+        ``FINALIZE_MARGIN_SECONDS`` before the handover (``drain_budget``); the bounded
+        checks after it end by the handover (``handover_due``). A run with a milestone still not
         verified in R2 then ends ``failed`` with ``failure: r2_milestones_unverified``;
         ``finalization.json`` and ``report.json`` (``r2.unverified_milestones``) list each
         such milestone's local export, path and SHA-256 for the supervisor to pull over
