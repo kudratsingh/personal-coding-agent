@@ -164,7 +164,13 @@ class Trainer:
                     # existing computation of this update untouched.
                     masked, masked_sum, masked_count = 0, 0.0, 0
                     interrupted = False
-                    for _ in range(options.accumulation_steps):
+                    if options.loss_normalization == "update_targets":
+                        # Every microbatch takes the masked path, divided by the update's
+                        # real target count instead of its capacity.
+                        interrupted, masked_sum, masked_count = self._target_normalized(should_stop)
+                        masked = 0 if interrupted else options.accumulation_steps
+                    by_capacity = options.loss_normalization == "capacity"
+                    for _ in range(options.accumulation_steps if by_capacity else 0):
                         if should_stop is not None and should_stop():
                             interrupted = True
                             break
@@ -289,12 +295,44 @@ class Trainer:
                     self.record.save(self.run_root)
         return losses
 
-    def _masked_microbatch(self, x: Tensor, y: Tensor) -> tuple[float, int]:
+    def _target_normalized(self, should_stop: Callable[[], bool] | None) -> tuple[bool, float, int]:
+        """One update divided by its real target count; return (interrupted, sum, count).
+
+        All ``accumulation_steps`` microbatches are read first, so the count of targets
+        that are not IGNORE is known before any forward pass. Each microbatch then
+        backpropagates its summed loss over that one count, and the accumulated gradient
+        is the gradient of the mean loss over every real target of the update. A stop
+        before the last read returns at once; the caller restores the loader.
+        """
+        options = self.config.train
+        batches: list[tuple[list[list[int]], list[list[int]]]] = []
+        for _ in range(options.accumulation_steps):
+            if should_stop is not None and should_stop():
+                return True, 0.0, 0
+            inputs, targets, _ = self.loader.next_batch()
+            batches.append((inputs, targets))
+        count = sum(target != IGNORE for _, targets in batches for row in targets for target in row)
+        if count == 0:
+            raise ValueError("a masked update has no real targets")
+        summed, seen = 0.0, 0
+        for inputs, targets in batches:
+            x = torch.tensor(inputs, dtype=torch.long, device=self.device)
+            y = torch.tensor(targets, dtype=torch.long, device=self.device)
+            total, real = self._masked_microbatch(x, y, divisor=count)
+            summed, seen = summed + total, seen + real
+        if seen != count:
+            raise RuntimeError("masked loss counted different targets than the update holds")
+        return False, summed, count
+
+    def _masked_microbatch(
+        self, x: Tensor, y: Tensor, *, divisor: int | None = None
+    ) -> tuple[float, int]:
         """Backpropagate a microbatch with IGNORE targets; return its loss sum and count.
 
-        The summed loss is divided by the update's full capacity
+        By default the summed loss is divided by the update's full capacity
         (``batch_size * sequence_length * accumulation_steps``), the same per-target
-        weight that an unmasked microbatch's ``mean / accumulation_steps`` gives.
+        weight that an unmasked microbatch's ``mean / accumulation_steps`` gives. With
+        ``divisor`` (the ``update_targets`` normalization) it is divided by that count.
         """
         options = self.config.train
         if options.z_loss > 0:
@@ -311,7 +349,7 @@ class Trainer:
         ):
             logits = self.forward(x)
             total, count = cross_entropy_sum(logits, y, ignore_index=IGNORE)
-            loss = total / capacity
+            loss = total / (capacity if divisor is None else divisor)
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError("nonfinite training loss")
         loss.backward()  # type: ignore[no-untyped-call]  # PyTorch's Tensor stub.

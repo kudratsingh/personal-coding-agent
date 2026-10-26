@@ -84,6 +84,9 @@ class TrainConfig:
     compile: bool = False
     validation_interval: int = 0
     validation_documents: int = 2
+    # How microbatches with IGNORE targets are divided: by the update's full capacity
+    # (the default, as in every pretraining run) or by the update's real target count.
+    loss_normalization: str = "capacity"
 
     def __post_init__(self) -> None:
         for name in (
@@ -126,6 +129,10 @@ class TrainConfig:
             raise ValueError("decay_fraction must be in (0, 1]")
         if type(self.compile) is not bool:
             raise ValueError("compile must be a boolean")
+        if self.loss_normalization not in {"capacity", "update_targets"}:
+            raise ValueError("loss_normalization must be capacity or update_targets")
+        if self.loss_normalization == "update_targets" and self.z_loss:
+            raise ValueError("update_targets loss normalization does not support z-loss")
 
 
 @dataclass(frozen=True)

@@ -29,3 +29,7 @@ Implemented: [multiple-choice evaluation](multiple-choice.md).
 Implemented: [rehearsal data binding](rehearsal-binding.md).
 
 Implemented: [rehearsal run worker](rehearsal-run.md).
+
+Implemented: [chat-v1 conversations, loss masks and code extraction](chat-format.md).
+
+Implemented: [SFT batching, assistant-token normalization and dev loss](sft-batching.md).
