@@ -13,7 +13,8 @@ import torch
 from scratchcoder.common.records import atomic_json
 from scratchcoder.data.onepass import combine_digests
 from scratchcoder.data.shards import file_sha256
-from tools import rehearsal_binding, rehearsal_run
+from tools import pilot_readiness_receipt as receipt_tool
+from tools import rehearsal_binding, rehearsal_ops, rehearsal_run
 from tools.pilot_feasibility import (
     default_rehearsal_plans,
     planned_updates,
@@ -54,6 +55,8 @@ STREAMS = {
     "validation-python": ("python", "validation", 5_334_710, 4_848),
 }
 """The S build's stage and validation sizes, so the checked-in specifications plan them."""
+PROBE = rehearsal_ops.ROUND_TRIP_PROBE_BYTES
+REVISION = {"git_commit": "ab" * 20, "clean": True, "archive_sha256": "ef" * 32}
 CONFIGS = Path(__file__).resolve().parents[1] / "configs"
 SPECS = {"A": CONFIGS / "rehearsal-a40-s-a.json", "B": CONFIGS / "rehearsal-a40-s-b.json"}
 _A = json.loads(SPECS["A"].read_text(encoding="utf-8"))
@@ -176,6 +179,8 @@ def fixtures(tmp_path: Path, run: str = "A", **change: Any) -> dict[str, Any]:
             "data_verification",
             "round_trip",
             "initialization_fetch",
+            "connection",
+            "revision",
         )
     }
     paths["binding"].write_bytes(data)
@@ -211,8 +216,10 @@ def fixtures(tmp_path: Path, run: str = "A", **change: Any) -> dict[str, Any]:
         },
         "self_destruct_receipt": {
             "pod_id": POD,
+            "pid": 4242,
             "state": "armed",
             "armed_at_unix": CREATED + 300,
+            "checked_at_unix": CREATED + 1_795,  # The live timer rewrites it every 5 s.
             "deadline_unix": CREATED - 5 + 45_000 - 180,
         },
         "confirmations": {
@@ -251,12 +258,15 @@ def fixtures(tmp_path: Path, run: str = "A", **change: Any) -> dict[str, Any]:
             "pod_id": POD,
             "prefix": prefix,
             "key": prefix + "preflight/round-trip-0.bin",
+            "bytes": PROBE,
             "steps": {
-                "put_seconds": 0.1,
+                "put_seconds": 10.0,
                 "head_seconds": 0.1,
-                "get_seconds": 0.1,
+                "get_seconds": 5.0,
                 "delete_seconds": 0.1,
             },
+            "upload_bytes_per_second": PROBE / 10.0,  # 13.4 MB/s
+            "download_bytes_per_second": PROBE / 5.0,
         },
         "initialization_fetch": {
             "kind": "r2-pinned-object",
@@ -264,6 +274,14 @@ def fixtures(tmp_path: Path, run: str = "A", **change: Any) -> dict[str, Any]:
             "sha256": INIT,
             "method": "downloaded",
         },
+        "connection": {
+            "schema_version": 1,
+            "pod_id": POD,
+            "status": "RUNNING",
+            "cost_usd_per_hour": 0.6,
+            "created_at": CREATED_AT,
+        },
+        "revision": dict(REVISION),
     }
     for name, update in change.items():
         if update is None:
@@ -311,6 +329,86 @@ def test_receipt_binds_the_pods_evidence_and_passes_the_d35_gate(tmp_path: Path)
         check_rehearsal_readiness(receipt, now=CREATED + 1_801, run="B")
 
 
+def test_receipt_records_the_code_revision_cost_and_upload_rate(tmp_path: Path) -> None:
+    values = fixtures(tmp_path)
+    receipt = build_rehearsal_receipt(**values)
+    assert receipt["revision"] == REVISION  # The worker compares its own copy with this.
+    assert receipt["pod_cost_usd_per_hour"] == 0.6
+    for name in ("connection", "revision", "round_trip"):
+        assert receipt["evidence_sha256"][name] == file_sha256(values[name])
+    # 2 x 1.65 GB inside the 780 s drain with a factor-2 margin.
+    required = rehearsal_ops.REQUIRED_UPLOAD_BYTES_PER_SECOND
+    assert required == pytest.approx(2 * 1.65e9 / (900 - 120) * 2)
+    assert PROBE / 10.0 >= required  # The fixture's 13.4 MB/s passes.
+    # The receipt is checked again before it is written, and wherever it is read.
+    for change, message in (
+        ({"revision": {**REVISION, "clean": False}}, "dirty"),
+        ({"revision": None}, "exactly the keys"),
+        ({"pod_cost_usd_per_hour": 0.62}, "captured Pod cost"),
+        ({"pod_cost_usd_per_hour": None}, "captured Pod cost"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            check_rehearsal_readiness({**receipt, **change}, now=CREATED + 1_801, run="A")
+
+
+def test_a_rate_at_the_requirement_passes_and_the_freshness_edge_is_inclusive(
+    tmp_path: Path,
+) -> None:
+    seconds = PROBE / rehearsal_ops.REQUIRED_UPLOAD_BYTES_PER_SECOND
+    steps = {"put_seconds": seconds, "head_seconds": 0.1, "get_seconds": 5.0, "delete_seconds": 0.1}
+    values = fixtures(
+        tmp_path,
+        round_trip={"steps": steps, "upload_bytes_per_second": PROBE / seconds},
+        self_destruct_receipt={"checked_at_unix": CREATED + 1_800 - 60},
+        connection={"cost_usd_per_hour": 0.59},
+    )
+    receipt = build_rehearsal_receipt(**values)
+    assert receipt["r2_round_trip_tested"] is True and receipt["pod_cost_usd_per_hour"] == 0.59
+
+
+def test_cli_reads_the_connection_and_revision_next_to_the_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    values = fixtures(tmp_path)
+    monkeypatch.setattr(receipt_tool, "time", SimpleNamespace(time=lambda: values["now"]))
+    controller = tmp_path / "ctrl"
+    controller.mkdir()
+    identity = controller / "pod-identity.json"
+    identity.write_bytes(values["identity"].read_bytes())
+    output = tmp_path / "receipt.json"
+    argv = ["rehearsal", "--run", "A", "--output", str(output), "--identity", str(identity)]
+    for name in (
+        "specification",
+        "binding",
+        "preflight",
+        "policy",
+        "self_destruct_receipt",
+        "confirmations",
+        "data_fetch",
+        "data_verification",
+        "round_trip",
+        "initialization_fetch",
+        "binding_sha256",
+        "initialization_sha256",
+        "billing_origin_unix",
+    ):
+        argv += [f"--{name.replace('_', '-')}", str(values[name])]
+    assert main(argv) == 1 and not output.exists()  # Neither file is next to it yet.
+    assert "pod-connection.json" in capsys.readouterr().err
+    (controller / "pod-connection.json").write_bytes(values["connection"].read_bytes())
+    atomic_json(controller / "revision.json", {**REVISION, "clean": False})
+    assert main(argv) == 1 and not output.exists()
+    assert "dirty tree" in capsys.readouterr().err
+    atomic_json(controller / "revision.json", REVISION)
+    assert main(argv) == 0
+    assert json.loads(output.read_text())["revision"] == REVISION
+    # An explicit --revision wins over the default location.
+    output.unlink()
+    atomic_json(tmp_path / "dirty.json", {**REVISION, "clean": False})
+    assert main([*argv, "--revision", str(tmp_path / "dirty.json")]) == 1
+    assert not output.exists()
+
+
 def test_run_b_receipt_covers_the_mixed_stage(tmp_path: Path) -> None:
     receipt = build_rehearsal_receipt(**fixtures(tmp_path, run="B"))
     assert receipt["run"] == "B" and receipt["r2_run_prefix"] == f"rehearsal-runs/B/{POD}/"
@@ -343,6 +441,45 @@ def test_run_b_receipt_covers_the_mixed_stage(tmp_path: Path) -> None:
         ({"self_destruct_receipt": {"state": "dry_run_complete"}}, "not armed"),
         ({"self_destruct_receipt": {"deadline_unix": CREATED + 50_000}}, "lifetime"),
         ({"confirmations": {"owner_accepts_best_effort_termination": False}}, "acceptance"),
+        # A timer that died after arming leaves a receipt nobody refreshes.
+        ({"self_destruct_receipt": {"checked_at_unix": CREATED + 1_739}}, "live timer within"),
+        ({"self_destruct_receipt": {"checked_at_unix": None}}, "live timer within"),
+        ({"self_destruct_receipt": {"checked_at_unix": CREATED + 1_900}}, "inconsistent"),
+        ({"self_destruct_receipt": {"checked_at_unix": CREATED + 200}}, "live timer within"),
+        ({"self_destruct_receipt": {"pid": None}}, "pid"),
+        ({"self_destruct_receipt": {"pid": 0}}, "pid"),
+        ({"self_destruct_receipt": {"pid": True}}, "pid"),
+        # The live Pod price must not exceed the quote the deadlines plan at.
+        ({"connection": {"cost_usd_per_hour": 0.61}}, "above the quoted"),
+        ({"connection": {"cost_usd_per_hour": None}}, "no hourly cost"),
+        ({"connection": {"cost_usd_per_hour": True}}, "no hourly cost"),
+        ({"connection": {"pod_id": "another-pod"}}, "another Pod"),
+        # The round trip must measure throughput with a large probe, fast enough.
+        ({"round_trip": {"bytes": 65_536}}, "below the 134,217,728 bytes"),
+        (
+            {
+                "round_trip": {
+                    "steps": {
+                        "put_seconds": 20.0,
+                        "head_seconds": 0.1,
+                        "get_seconds": 5.0,
+                        "delete_seconds": 0.1,
+                    },
+                    "upload_bytes_per_second": PROBE / 20.0,
+                }
+            },
+            "upload rate of 6.71 MB/s is below the 8.46 MB/s",
+        ),
+        ({"round_trip": {"upload_bytes_per_second": None}}, "no upload_bytes_per_second"),
+        ({"round_trip": {"download_bytes_per_second": 0}}, "no download_bytes_per_second"),
+        ({"round_trip": {"upload_bytes_per_second": 1e9}}, "disagrees with its put_seconds"),
+        # The code revision must be clean and well formed.
+        ({"revision": {"clean": False}}, "dirty tree"),
+        ({"revision": {"git_commit": "ab" * 10}}, "40 lower-case hex"),
+        ({"revision": {"git_commit": "AB" * 20}}, "40 lower-case hex"),
+        ({"revision": {"archive_sha256": "tarball"}}, "archive_sha256"),
+        ({"revision": {"note": "extra"}}, "exactly the keys"),
+        ({"revision": None}, "exactly the keys"),
     ],
 )
 def test_receipt_is_refused_when_a_gate_or_limit_fails(
@@ -353,8 +490,9 @@ def test_receipt_is_refused_when_a_gate_or_limit_fails(
 
 
 def test_receipt_is_refused_when_too_little_lifetime_is_left(tmp_path: Path) -> None:
-    late = fixtures(tmp_path)
-    late["now"] = CREATED + 45_000 - 180 - 1_700
+    moment = CREATED + 45_000 - 180 - 1_700
+    late = fixtures(tmp_path, self_destruct_receipt={"checked_at_unix": moment - 5})
+    late["now"] = moment
     with pytest.raises(ValueError, match="cannot hold the run"):
         build_rehearsal_receipt(**late)
     (tmp_path / "fresh").mkdir()
@@ -364,9 +502,10 @@ def test_receipt_is_refused_when_too_little_lifetime_is_left(tmp_path: Path) -> 
 
 
 def test_cli_writes_nothing_when_a_gate_fails_and_the_pilot_cli_is_untouched(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     values = fixtures(tmp_path, confirmations={"r2_token_bucket_scoped": False})
+    monkeypatch.setattr(receipt_tool, "time", SimpleNamespace(time=lambda: values["now"]))
     output = tmp_path / "receipt.json"
     argv = ["rehearsal", "--run", "A", "--output", str(output)]
     for name in (
@@ -381,6 +520,8 @@ def test_cli_writes_nothing_when_a_gate_fails_and_the_pilot_cli_is_untouched(
         "data_verification",
         "round_trip",
         "initialization_fetch",
+        "connection",
+        "revision",
         "binding_sha256",
         "initialization_sha256",
         "billing_origin_unix",

@@ -12,7 +12,8 @@ The owner approved two rehearsal pretraining runs of the S model (decision D-35)
 | Launch rule | the Pod lifetime left must hold the whole planned run at the reference 56,479 tok/s (see below) |
 | Speed and fit | after 900 s of training: stop below 0.85 x 56,479 tok/s, **or** when the projected finish at the measured rates passes the armed deadline |
 | Upload window | `max_transfer_seconds` 900: an `uploading` worker may keep the idle Pod up to 900 s after its last GPU work while the Mac sees new objects reach R2 |
-| Quote | $0.59/h GPU, $0.60/h with the 40 GB container disk ([Pod body](../configs/runpod-pod-a40-s-rehearsal.json)); at most $7.50 per Pod, $15.00 for both |
+| Upload rate | the Pod's measured R2 upload rate must reach `REQUIRED_UPLOAD_BYTES_PER_SECOND`, 2 x 1.65 GB / (900 - 120) s x 2 = 8.46 MB/s: two labels in the 780 s drain with a factor-2 margin |
+| Quote | $0.59/h GPU, $0.60/h with the 40 GB container disk ([Pod body](../configs/runpod-pod-a40-s-rehearsal.json)); at most $7.50 per Pod, $15.00 for both; the captured Pod's `cost_usd_per_hour` must not exceed $0.60 |
 
 ## The two time rules
 
@@ -31,12 +32,12 @@ The earlier worker draft planned at the 85% floor instead, which left only about
 
 | Piece | Where | What it does |
 | --- | --- | --- |
-| `tools/rehearsal_ops.py` | Mac and Pod | The D-35 constants, the receipt's kind and gate names, the worker's statuses and the R2 run layout. `pod-env` writes the Pod's R2 key file to a pipe; `round-trip` tests PUT, HEAD, GET and DELETE under the run's prefix; `fetch-object` downloads one pinned object (the initialization); `verify-final` checks a finished run in R2. |
+| `tools/rehearsal_ops.py` | Mac and Pod | The D-35 constants (the required upload rate among them), the receipt's kind and gate names, the worker's statuses, the code-revision record and the R2 run layout. `pod-env` writes the Pod's R2 key file to a pipe; `round-trip` tests PUT, HEAD, GET and DELETE of a 128 MiB probe under the run's prefix and records `upload_bytes_per_second` and `download_bytes_per_second`; `fetch-object` downloads one pinned object (the initialization); `verify-final` checks a finished run in R2. |
 | `tools/pilot_pod_bootstrap.sh --mode rehearsal` | Pod | Arms the self-destruct timer first, then loads the 0600 R2 key file without printing it, records the environment, installs the project, runs the R2 round trip, fetches and re-verifies the run's pinned data and the initialization, runs the CPU tests (the worker's `tests/test_rehearsal_run.py`, the integration test and every rehearsal test except the Mac-only data build's; none needs Docker or the network), and runs the A40 preflight with `--compile-check`. The pilot path is unchanged. |
-| `tools/pilot_readiness_receipt.py rehearsal` | Mac | Builds one receipt per run from the Pod's own receipts and the owner's confirmations, in exactly the form the worker accepts. It reads the worker's specification file with the worker's parser, checks it against D-35 and the binding, requires a passed `compile_equivalence` when the specification compiles, pins the policy's billing origin and 900 s transfer window, and refuses to write if any gate is false or the launch rule fails. |
-| `tools/pilot_feasibility.py rehearsal` | Mac | Projects time, cost, container disk and R2 storage for both runs at the reference speed and at the 85% floor, with its own assumptions (Pod setup included). A projection only; the launch rule above is the gate. |
-| `tools/runpod_watchdog.py --pidfile` | Mac | One watchdog per run; each writes its own PID file so one run's watchdog can be restarted without touching the other's. Under a `rehearsal` policy it accepts the worker's `uploading` status as a transfer status. |
-| `tools/pilot_supervisor.py --mode rehearsal` | Mac | One supervisor per run. It mirrors the heartbeat, guards the Pod through the API, reads `heartbeat.json` and `report.json` over SSH with bounded sizes, never copies a checkpoint over SSH, stamps transfer progress only from new R2 objects it lists with the Mac's key, and approves teardown only after the final state is verified in R2 and archived. |
+| `tools/pilot_readiness_receipt.py rehearsal` | Mac | Builds one receipt per run from the Pod's own receipts and the owner's confirmations, in exactly the form the worker accepts. It reads the worker's specification file with the worker's parser, checks it against D-35 and the binding, requires a passed `compile_equivalence` when the specification compiles, a round trip fast enough for the upload window, a self-destruct receipt the live timer rewrote within 60 s, a captured Pod price within the quote and a clean code revision (`--revision`), pins the policy's billing origin and 900 s transfer window, and refuses to write if any gate is false or the launch rule fails. |
+| `tools/pilot_feasibility.py rehearsal` | Mac | Projects time, cost, container disk, R2 storage and the required R2 upload rate for both runs at the reference speed and at the 85% floor, with its own assumptions (Pod setup included). A projection only; the launch rule above is the gate. |
+| `tools/runpod_watchdog.py --pidfile` | Mac | One watchdog per run; each writes its own PID file so one run's watchdog can be restarted without touching the other's. Under a `rehearsal` policy it accepts the worker's `uploading` status as a transfer status, and it ignores a mirrored heartbeat that names another Pod or predates this Pod's creation. |
+| `tools/pilot_supervisor.py --mode rehearsal` | Mac | One supervisor per run. It mirrors the heartbeat, guards the Pod through the API, reads `heartbeat.json`, `report.json` and `finalization.json` over SSH with bounded sizes, stamps transfer progress only from new R2 objects it lists with the Mac's key (or bytes of its own SSH pull), and approves teardown only after the final state is verified in R2 and archived, or, for a milestone the worker could not verify in R2, after the milestone is pulled over SSH and its SHA-256 checked. |
 
 ## Readiness receipt and worker
 
@@ -49,6 +50,13 @@ The worker accepts exactly the receipt `python -m tools.pilot_readiness_receipt 
 - `watchdog_policy` says `"mode": "rehearsal"` and `max_transfer_seconds` 900, carries the create-request billing origin (the policy file's own value must agree with `--billing-origin-unix`), and is no weaker than the specification's limits;
 - `self_destruct_deadline_unix` is the armed in-Pod deadline; every worker deadline plans against `lifetime_end`, which is that deadline for the D-35 values.
 
+The receipt tool also refuses, before writing:
+
+- a round trip (`r2_round_trip_tested`) whose probe is smaller than 128 MiB, whose `upload_bytes_per_second` or `download_bytes_per_second` is missing or disagrees with its timed step, or whose upload rate is below `REQUIRED_UPLOAD_BYTES_PER_SECOND` (8.46 MB/s);
+- a self-destruct receipt that is not `armed` for this Pod, names no positive `pid`, or whose `checked_at_unix` is more than 60 s older than the receipt (the live timer rewrites it every 5 s, so copy it from the Pod just before running the tool);
+- a captured connection record (`--connection`, default `pod-connection.json` next to `--identity`) for another Pod, without `cost_usd_per_hour`, or above the specification's quoted $0.60/h total: the watchdog stops at the higher of the API cost and the quote, so a higher live price would end the Pod before the worker's deadlines;
+- a code revision (`--revision`, default `revision.json` next to `--identity`) that is not exactly `{"git_commit": <40 hex>, "clean": true, "archive_sha256": <64 hex>}`. The runbook writes it on the Mac from the commit and the shipped tarball (refusing a dirty tree) and ships it to the Pod as `/workspace/rehearsal/revision.json`. The receipt records it as `revision`, with `pod_cost_usd_per_hour` and the SHA-256 of both files; the worker refuses to start unless its copy equals the receipt's `revision`, and records it in `report.json` as `code_revision`.
+
 The worker then applies the launch rule again at its own start, so a receipt written long before the launch cannot carry a stale fit.
 
 ## R2 layout
@@ -59,7 +67,7 @@ Data sits under the binding's own prefix (see [artifact storage](storage.md)). T
 - milestone labels `<stage>-final` (run A: `stage1-final` and `stage2-final`; run B: `mixed-final`), never deleted;
 - each label holds `checkpoint.pt`, `checkpoint.pt.sha256`, `record.json`, `updates.jsonl` (cumulative) and, for a stage end, `ticket.json`;
 - `report.json`, the run summary, at most 1,000,000 bytes;
-- `preflight/round-trip-<random>.bin` exists only for the moment of the round-trip test.
+- `preflight/round-trip-<random>.bin`, the 128 MiB probe, exists only for the moment of the round-trip test.
 
 ## Credentials
 
@@ -67,9 +75,11 @@ The Pods use their own Cloudflare token, `R2_POD_ACCESS_KEY_ID` and `R2_POD_SECR
 
 ## When a Pod may be deleted
 
-The worker's heartbeat stays `running` through every stage, including run A's boundary between its two stages. When training ends, for any reason other than a wall or cost stop, it reads `uploading` while the worker drains its uploader (at most 480 s, and never later than 120 s before the end of the 900 s transfer window), checks every kept label in R2 by HEAD, and uploads and checks `report.json`. Only then does it write its final status: `awaiting_transfer` with `r2_final` (the report and checkpoint keys and their SHA-256s) for a verified completed or time-limited run, or `stopped`/`failed`.
+The worker's heartbeat stays `running` through every stage, including run A's boundary between its two stages. When training ends, for any reason other than a wall or cost stop, it reads `uploading` while any milestone is pending or in flight: the worker resubmits every unverified milestone (a failed milestone upload is retried for the rest of the run), drains its uploader for the whole remaining transfer window (900 s less the 120 s margin, measured from the start of finalization), checks every kept label in R2 by HEAD, and uploads and checks `report.json`. Only then does it write its final status: `awaiting_transfer` with `r2_final` (the report and checkpoint keys and their SHA-256s) for a verified completed or time-limited run, or `stopped`/`failed`. If a milestone still cannot be verified in R2, the run ends `failed` with `failure: r2_milestones_unverified`, and `finalization.json` lists each unverified milestone's local export and checkpoint SHA-256 (`unverified_milestones: [{"label", "path": "exports/<label>", "sha256"}]`).
 
-While the heartbeat reads `uploading` or `awaiting_transfer`, the supervisor lists the run's prefix with the Mac's key. The first listing is a baseline; any later new object stamps `transfer_progress_unix` in the mirrored heartbeat. The watchdog lets an idle GPU pass its 600 s limit only for these statuses, only while that stamp is younger than 600 s, and never more than 900 s after the last GPU work. The Pod cannot stamp it itself, so a hung worker still ends at the idle limit. The supervisor treats `uploading` exactly like `running`: no verification and no teardown.
+While the heartbeat reads `uploading` or `awaiting_transfer`, the supervisor lists the run's prefix with the Mac's key. The first listing is a baseline; any later new object stamps `transfer_progress_unix` in the mirrored heartbeat. The watchdog lets an idle GPU pass its 600 s limit only for these statuses (and the final `stopped`/`failed`), only while that stamp is younger than 600 s, and never more than 900 s after the last GPU work. The Pod cannot stamp it itself, so a hung worker still ends at the idle limit. The supervisor treats `uploading` exactly like `running`: no verification and no teardown.
+
+Every heartbeat carries the worker's `pod_id`. The watchdog and the supervisor treat a heartbeat that names another Pod as absent, never as fresh; under a rehearsal policy so is one whose `updated_at_unix` predates this Pod's `createdAt`. A controller directory reused for a new Pod still holds the previous Pod's mirrored heartbeat (often `shutdown_ready`, or an hour stale); it is ignored, the new watchdog's idle baseline applies, and the supervisor never mirrors or acts on such a heartbeat. The watchdog receipt's `detail` records the reason.
 
 On `awaiting_transfer` with `r2_final`, the supervisor, with the Mac's own key:
 
@@ -80,7 +90,14 @@ On `awaiting_transfer` with `r2_final`, the supervisor, with the Mac's own key:
 5. archives `report.json` and a small `summary.json` to `rehearsal-runs/<run>/<pod id>/final/` in the private artifacts repository, reading each back byte for byte;
 6. only then marks `shutdown_ready`, which lets the watchdog and its own guard delete the Pod.
 
-Any mismatch stops at its step and is retried each cycle; it never approves teardown, and the idle limit still ends the Pod 600 seconds after its last GPU activity (up to 900 s while new objects keep reaching R2). The worker publishes `r2_final` only when a verified stage-final milestone closes what it trained, so a stopped run A whose `stage1-final` is in R2 is verified the same way under its own status. A worker that reports `stopped` or `failed` without `r2_final` gets a 60-second grace (its own drain is already over), then its own report and a list of the labels that reached R2 are archived under `diagnostics/`, and teardown is approved. `updates.jsonl` and every checkpoint stay in R2; GitHub only holds the small records.
+Any mismatch stops at its step and is retried each cycle; it never approves teardown, and the idle limit still ends the Pod 600 seconds after its last GPU activity (up to 900 s while new objects keep reaching R2). The worker publishes `r2_final` only when a verified stage-final milestone closes what it trained, so a stopped run A whose `stage1-final` is in R2 is verified the same way under its own status.
+
+A worker that reports `stopped` or `failed` without `r2_final` is first checked for milestones at risk, those that may exist only on the Pod:
+
+- after `failure: r2_milestones_unverified` or `r2_finalization`: every milestone `finalization.json` lists, plus every stage-final milestone the report records that the Mac's own HEAD cannot find in R2 with its recorded SHA-256. `finalization.json` must be readable; until it is, the supervisor retries and never approves;
+- after any other stop or failure: the milestones `finalization.json` lists or the report flags in `r2.milestones_verified` as unverified.
+
+With none at risk, the run gets the 60-second grace (its own drain is already over); then its report and a list of the labels that reached R2 are archived under `diagnostics/`, and teardown is approved. With any at risk there is no grace timer. The supervisor pulls each one, the last stage's first, from `exports/<label>/` (`checkpoint.pt` and `record.json`) to `$CTRL/supervisor/recovered/<pod id>/<label>/` with the pilot's verified pull (`pilot_transfer.pull_artifacts`: the Pod's own manifest, then size and SHA-256 of every streamed file). Each pull must end by the end of the transfer window, 900 s after the heartbeat's last GPU work; its arriving bytes stamp `transfer_progress_unix`, so the watchdog waits that long and no longer. The supervisor then checks the pulled checkpoint against the SHA-256 the report and `finalization.json` record, archives the report and a summary (with `milestone_recovery`: each pulled file's path, SHA-256 and size, and each milestone the Mac verified in R2) under `diagnostics/`, and only then approves teardown. A failed or mismatched pull is retried while the window lasts; it writes `MILESTONES-NOT-SECURED.json` and `controller-error.json` naming each file on the Pod and its SHA-256, prints a banner, and never approves teardown. The watchdog's idle, transfer, wall and cost limits then end the Pod. `updates.jsonl` and every checkpoint that reached R2 stay there; GitHub only holds the small records.
 
 ## Projected fit
 
@@ -101,12 +118,16 @@ These projections use their own assumptions and are not the launch gate; the lau
 - a receipt built by `build_rehearsal_receipt` from fixture evidence and accepted by the worker's `check_readiness` and its `run` command line, and refused for a tampered specification, binding, preflight or initialization hash;
 - the worker's CPU smoke for both runs replayed heartbeat by heartbeat, with its `report.json` and in-memory bucket, into the real supervisor over fake SSH and GitHub: no teardown at run A's stage boundary or while uploading, `shutdown_ready` only after the R2 verification and archive, and never after a mismatched R2 SHA-256;
 - the supervisor with fake SSH, R2 and GitHub, including the R2-observed progress stamps, and the watchdog's transfer window under a rehearsal policy;
+- an unverified milestone pulled over a fake SSH pull, checked and archived before teardown, with no grace timer; a failed, tampered, late or unconfigured pull that names the files and never approves teardown while the watchdog still ends the Pod at the window; `r2_finalization` with every milestone checked in R2 by the Mac; strict parsing of `finalization.json`;
+- a reused controller directory's old mirrored heartbeat (another Pod's ID, or older than this Pod) that never deletes the new Pod and is never mirrored;
 - the bootstrap run end to end against stub programs: the timer first, the 45,000-second ceiling, the 0600 key file, the Pod key never printed, the compile check, the on-Pod test list, the pilot path unchanged;
-- receipts refused for each missing gate, weak limit, missing compile check, wrong transfer window or billing origin, and a specification that differs from D-35 or the binding; the feasibility arithmetic and the watchdog PID file.
+- receipts refused for each missing gate, weak limit, missing compile check, wrong transfer window or billing origin, a specification that differs from D-35 or the binding, a small or slow round trip, a stale self-destruct receipt or one without a pid, a captured cost above the quote, and a dirty or malformed revision; the round trip's measured rates, the feasibility arithmetic and the watchdog PID file.
 
 ## Limitations
 
 - No rehearsal run has been measured; every time and cost figure above is a projection.
 - Termination is layered best-effort (in-Pod timer, Mac watchdog, supervisor guard, worker deadlines); Runpod offers no provider-enforced Pod lifetime.
 - The Mac must stay awake and online for the whole run: a sleeping Mac stops the heartbeat mirror, and on waking the watchdog would read a stale heartbeat and delete the Pod.
-- R2 progress is seen only when an object completes: an upload of one 1.6 GB checkpoint slower than about 2.7 MB/s shows no progress for 600 s and the idle limit ends the Pod.
+- R2 progress is seen only when an object completes: an upload of one 1.6 GB checkpoint slower than about 2.7 MB/s shows no progress for 600 s and the idle limit ends the Pod. The receipt's 8.46 MB/s requirement is measured once, before training; R2 may be slower at the end.
+- If nothing reaches R2 during the final drain (an R2 outage), the Mac sees no progress and the idle limit ends the Pod 600 s after its last GPU work, before the worker's drain ends and before any SSH pull can start.
+- The SSH fallback has only what is left of the 900 s window after the worker's drain and checks, at most the 120 s margin when the drain runs to its end: a 1.62 GB milestone then needs SSH faster than about 13.5 MB/s. A slower pull fails, is reported in `MILESTONES-NOT-SECURED.json`, and the Pod is deleted with that copy.

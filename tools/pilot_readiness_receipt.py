@@ -9,11 +9,13 @@ produces a receipt. Nothing here contacts Runpod or starts any resource.
 
 ``rehearsal`` builds one receipt per rehearsal run (D-35) instead, in exactly the form
 ``tools.rehearsal_run run`` accepts. Besides the pilot's gates it requires the Pod's R2
-round-trip receipt, the fetch receipt and re-verification of exactly the run's pinned
-data, the pinned shared initialization, an A40 preflight with the compile check when the
-specification compiles, and the owner's statement that the Pod's R2 token is scoped to
-the one bucket. The specification is the worker's own file, checked against the D-35
-limits and the binding; the time left must pass the worker's launch rule
+round-trip receipt with an upload rate the transfer window can use, the fetch receipt and
+re-verification of exactly the run's pinned data, the pinned shared initialization, an A40
+preflight with the compile check when the specification compiles, a self-destruct receipt
+the live timer rewrote within the last minute, a captured Pod price no higher than the
+quote, a clean code revision (``revision.json``), and the owner's statement that the Pod's
+R2 token is scoped to the one bucket. The specification is the worker's own file, checked
+against the D-35 limits and the binding; the time left must pass the worker's launch rule
 (``rehearsal_run.launch_fit``). ``check_rehearsal_readiness`` applies the D-35 limits
 before anything is written.
 """
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -122,6 +125,59 @@ REHEARSAL_OWNER_GATES = rehearsal_ops.OWNER_GATES
 pilot's ``ssh_transfer_tested`` is replaced by the evidence gates below."""
 REHEARSAL_EVIDENCE_GATES = rehearsal_ops.EVIDENCE_GATES
 """Set only from the Pod's receipts: the R2 round trip and the fetched, re-hashed data."""
+SELF_DESTRUCT_FRESH_SECONDS = 60.0
+"""The live timer rewrites its receipt every 5 s; one older than this at receipt time may
+describe a timer that has since died, so it is refused (copy it again and retry)."""
+
+
+def _number(value: object) -> float | None:
+    """A finite number (never a bool), or None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def self_destruct_live(timer: dict[str, Any], *, pod_id: str, now: float) -> float:
+    """The armed deadline of a self-destruct receipt the live timer wrote just now.
+
+    The timer rewrites the receipt every 5 s with its own ``pid`` and ``checked_at_unix``,
+    so a receipt for this Pod in state ``armed``, naming a positive pid, checked within
+    ``SELF_DESTRUCT_FRESH_SECONDS`` of ``now`` (and not after it beyond the clock skew),
+    records that timer alive. A stale one, from a timer that died after arming, is refused.
+    """
+    if timer.get("pod_id") != pod_id or timer.get("state") != "armed":
+        raise ValueError("self-destruct receipt is not armed for this Pod")
+    pid = timer.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError("the self-destruct receipt records no live timer pid")
+    checked = _number(timer.get("checked_at_unix"))
+    if checked is None or not now - SELF_DESTRUCT_FRESH_SECONDS <= checked:
+        raise ValueError(
+            "the self-destruct receipt was not refreshed by a live timer within the last "
+            f"{SELF_DESTRUCT_FRESH_SECONDS:.0f} s; copy it from the Pod again"
+        )
+    armed = _number(timer.get("armed_at_unix"))
+    if checked > now + CLOCK_SKEW_SECONDS or (armed is not None and checked < armed):
+        raise ValueError("the self-destruct receipt's check time is inconsistent")
+    return finite_number(timer.get("deadline_unix"), "self-destruct deadline")
+
+
+def pod_cost_within_quote(connection: dict[str, Any], *, pod_id: str, quoted: float) -> float:
+    """The captured Pod's hourly price (``pod-connection.json``), refused above the quote.
+
+    The watchdog stops at ``max(API cost, quote)``; a live price above the quote would end
+    the Pod before the worker's own deadlines, which plan at the quote.
+    """
+    if connection.get("pod_id") != pod_id:
+        raise ValueError("the captured Pod connection record is for another Pod")
+    cost = _number(connection.get("cost_usd_per_hour"))
+    if cost is None or cost < 0:
+        raise ValueError("the captured Pod connection record carries no hourly cost")
+    if cost > quoted:
+        raise ValueError(
+            f"the Pod's captured cost ${cost:.4f}/h is above the quoted ${quoted:.2f}/h total"
+        )
+    return cost
 
 
 def _rehearsal_constants() -> dict[str, Any]:
@@ -225,7 +281,12 @@ def shards_staged_and_hash_checked(
 
 
 def round_trip_passed(probe: dict[str, Any], *, run: str, pod_id: str) -> bool:
-    """True when the Pod's R2 round trip passed under this run's own prefix."""
+    """True when the Pod's R2 round trip passed under this run's own prefix, fast enough.
+
+    The probe must hold at least ``ROUND_TRIP_PROBE_BYTES`` and its measured upload rate
+    (the bytes over the PUT's seconds) must reach ``REQUIRED_UPLOAD_BYTES_PER_SECOND``:
+    slower, the final drain cannot move two labels inside the transfer window.
+    """
     prefix = rehearsal_ops.run_prefix(run, pod_id)
     if (
         probe.get("kind") != "r2-round-trip"
@@ -244,6 +305,31 @@ def round_trip_passed(probe: dict[str, Any], *, run: str, pod_id: str) -> bool:
         "delete_seconds",
     }:
         raise ValueError("the R2 round trip receipt lacks a step")
+    size = probe.get("bytes")
+    if isinstance(size, bool) or not isinstance(size, int):
+        raise ValueError("the R2 round trip receipt records no probe size")
+    if size < rehearsal_ops.ROUND_TRIP_PROBE_BYTES:
+        raise ValueError(
+            f"the R2 round trip probe of {size:,} bytes is below the "
+            f"{rehearsal_ops.ROUND_TRIP_PROBE_BYTES:,} bytes that measure throughput"
+        )
+    rates = {}
+    for name, step in (
+        ("upload_bytes_per_second", "put_seconds"),
+        ("download_bytes_per_second", "get_seconds"),
+    ):
+        rate, seconds = _number(probe.get(name)), _number(steps.get(step))
+        if rate is None or seconds is None or rate <= 0 or seconds <= 0:
+            raise ValueError(f"the R2 round trip receipt records no {name}")
+        if not math.isclose(rate, size / seconds, rel_tol=1e-6):
+            raise ValueError(f"the R2 round trip's {name} disagrees with its {step}")
+        rates[name] = rate
+    required = rehearsal_ops.REQUIRED_UPLOAD_BYTES_PER_SECOND
+    if rates["upload_bytes_per_second"] < required:
+        raise ValueError(
+            f"the Pod's measured R2 upload rate of {rates['upload_bytes_per_second'] / 1e6:.2f} "
+            f"MB/s is below the {required / 1e6:.2f} MB/s the transfer window needs"
+        )
     return True
 
 
@@ -298,6 +384,10 @@ def check_rehearsal_readiness(receipt: dict[str, Any], *, now: float, run: str) 
         )
     if receipt.get("r2_run_prefix") != rehearsal_ops.run_prefix(run, identity.pod_id):
         raise ValueError("the receipt's R2 prefix is not this run's Pod prefix")
+    rehearsal_ops.check_revision(receipt.get("revision"))  # A clean, well-formed revision.
+    cost = _number(receipt.get("pod_cost_usd_per_hour"))
+    if cost is None or not 0 <= cost <= rehearsal_ops.QUOTED_TOTAL_HOURLY:
+        raise ValueError("the receipt's captured Pod cost is missing or above the D-35 quote")
     for name in ("binding_sha256", "initialization_sha256", "specification_sha256"):
         value = receipt.get(name)
         if not isinstance(value, str) or len(value) != 64:
@@ -347,13 +437,18 @@ def build_rehearsal_receipt(
     initialization_fetch: Path,
     initialization_sha256: str,
     billing_origin_unix: float,
+    connection: Path,
+    revision: Path,
     now: float | None = None,
 ) -> dict[str, Any]:
     """Assemble one run's receipt from the Pod's evidence and the owner's confirmations.
 
     The result is exactly what ``tools.rehearsal_run run`` accepts: its kind, run, gate
     names, the four SHA-256 bindings, the Pod identity the worker takes its Pod ID from,
-    the watchdog policy with the billing origin, and the armed deadline.
+    the watchdog policy with the billing origin, the armed deadline and the code
+    ``revision`` (``revision.json``, which the worker compares with its own copy).
+    ``connection`` is the captured ``pod-connection.json``: its hourly cost must not
+    exceed the specification's quoted total.
     """
     created_at = now if now is not None else time.time()
     # The worker's own file, parsed as the worker parses it and bound by its SHA-256.
@@ -367,8 +462,11 @@ def build_rehearsal_receipt(
         raise ValueError("the policy file's billing origin differs from --billing-origin-unix")
     watchdog = Policy(**{**policy_value, "billing_started_at_unix": billing_origin_unix})
     timer = _load(self_destruct_receipt)
-    if timer.get("pod_id") != pod_identity.pod_id or timer.get("state") != "armed":
-        raise ValueError("self-destruct receipt is not armed for this Pod")
+    deadline = self_destruct_live(timer, pod_id=pod_identity.pod_id, now=created_at)
+    cost = pod_cost_within_quote(
+        _load(connection), pod_id=pod_identity.pod_id, quoted=spec.limits.quoted_total_hourly
+    )
+    code = rehearsal_ops.check_revision(_load(revision))
     owner = _load(confirmations)
     guarantee = owner.get("termination_guarantee")
     if guarantee not in TERMINATION_GUARANTEES:
@@ -405,7 +503,6 @@ def build_rehearsal_receipt(
         or initialization.get("method") not in {"downloaded", "present"}
     ):
         raise ValueError("the shared initialization was not fetched with its pinned SHA-256")
-    deadline = finite_number(timer.get("deadline_unix"), "self-destruct deadline")
     origin = min(billing_origin_unix, parse_timestamp(pod_identity.created_at))
     end = d35_lifetime_end(watchdog, origin=origin, deadline=deadline)
     fit = launch_fit(spec, bound, remaining_seconds=end - created_at)
@@ -436,11 +533,15 @@ def build_rehearsal_receipt(
         "r2_shards_staged_and_hash_checked": staged,
         "initialization_sha256": initialization_sha256,
         "initialization_key": initialization.get("key"),
+        "revision": code,
+        "pod_cost_usd_per_hour": cost,
         "evidence_sha256": {
             "data_fetch": file_sha256(data_fetch),
             "data_verification": file_sha256(data_verification),
             "round_trip": file_sha256(round_trip),
             "initialization_fetch": file_sha256(initialization_fetch),
+            "connection": file_sha256(connection),
+            "revision": file_sha256(revision),
         },
         "limits": _rehearsal_constants(),
         "time_fit": {**fit, "lifetime_end_unix": end, "checked_at_unix": created_at},
@@ -475,6 +576,18 @@ def rehearsal_main(argv: list[str]) -> int:
     parser.add_argument("--binding-sha256", required=True)
     parser.add_argument("--initialization-sha256", required=True)
     parser.add_argument("--billing-origin-unix", type=float, required=True)
+    parser.add_argument(
+        "--connection",
+        type=Path,
+        help="the captured pod-connection.json (default: next to --identity); its hourly "
+        "cost must not exceed the quote",
+    )
+    parser.add_argument(
+        "--revision",
+        type=Path,
+        help="the Mac's revision.json for the shipped code (default: next to --identity); "
+        "a dirty tree is refused",
+    )
     args = parser.parse_args(argv)
     try:
         receipt = build_rehearsal_receipt(
@@ -493,6 +606,9 @@ def rehearsal_main(argv: list[str]) -> int:
             initialization_fetch=args.initialization_fetch,
             initialization_sha256=args.initialization_sha256,
             billing_origin_unix=args.billing_origin_unix,
+            # runpod_pod_identity capture writes both next to each other, as does the runbook.
+            connection=args.connection or args.identity.with_name("pod-connection.json"),
+            revision=args.revision or args.identity.with_name("revision.json"),
         )
     except (OSError, ValueError, TypeError, KeyError) as error:
         print(f"rehearsal-readiness-receipt: {type(error).__name__}: {error}", file=sys.stderr)

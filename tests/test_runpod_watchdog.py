@@ -721,3 +721,44 @@ class ModeCeilingTests(unittest.TestCase):
             ]
         )
         self.assertEqual(policy_from_args(args).mode, "rehearsal")
+
+
+class ForeignHeartbeatTests(unittest.TestCase):
+    """A heartbeat written for another Pod is never evidence about this one."""
+
+    def test_another_pods_id_or_an_older_update_reads_as_absent(self) -> None:
+        from tools.runpod_watchdog import foreign_heartbeat
+
+        beat = {"updated_at_unix": NOW + 10, "pod_id": "sample-pod-id"}
+        self.assertIsNone(foreign_heartbeat(beat, pod_id="sample-pod-id", created_at_unix=NOW))
+        self.assertEqual(
+            foreign_heartbeat(beat, pod_id="new-pod-id", created_at_unix=NOW),
+            "heartbeat_names_another_pod",
+        )
+        self.assertEqual(
+            foreign_heartbeat(beat, pod_id="sample-pod-id", created_at_unix=NOW + 11),
+            "heartbeat_predates_pod_creation",
+        )
+        # The pilot worker's heartbeat has no pod_id; without a creation time it is read.
+        self.assertIsNone(
+            foreign_heartbeat({"updated_at_unix": 1.0}, pod_id="x", created_at_unix=None)
+        )
+
+    def test_pilot_heartbeat_naming_another_pod_uses_the_creation_baseline(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "heartbeat.json"
+        heartbeat(path, activity=NOW - 900, updated=NOW - 899)
+        value = json.loads(path.read_text())
+        path.write_text(json.dumps({**value, "pod_id": "previous-pod"}))
+        transport = FakeTransport([json_response(200, pod())])
+        result = check_once(
+            RunpodClient("secret-placeholder", transport),
+            IDENTITY,
+            POLICY,
+            path,
+            now=lambda: NOW + 30,
+        )
+        # Read, this heartbeat would be stale and delete; ignored, the Pod is 30 s old.
+        self.assertEqual((result.state, result.detail), ("watching", "heartbeat_names_another_pod"))
+        self.assertEqual([call[0] for call in transport.calls], ["GET"])

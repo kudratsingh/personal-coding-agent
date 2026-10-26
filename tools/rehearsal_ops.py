@@ -8,8 +8,9 @@
 ``fetch-object`` (Pod)
     Download one object pinned to its size and SHA-256, such as the shared initialization.
 ``round-trip`` (Pod)
-    PUT, HEAD, GET and DELETE one random probe object under the run's R2 prefix with the
-    Pod's key, and write a receipt; the readiness receipt requires it.
+    PUT, HEAD, GET and DELETE one random 128 MiB probe object under the run's R2 prefix
+    with the Pod's key, and write a receipt with the measured upload and download
+    throughput; the readiness receipt requires it and the upload rate the window needs.
 ``verify-final`` (Mac)
     Check a finished run's final milestone and ``report.json`` in R2 with the Mac's own key,
     the same check the supervisor applies before it lets a Pod be deleted.
@@ -21,6 +22,7 @@ Nothing here contacts Runpod or creates any resource.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -56,8 +58,26 @@ MAX_TRANSFER_SECONDS = 900
 
 The worker's last drain to R2 leaves the GPU idle. 900 s equals the finalization reserve, the
 time every run already plans for its final save, uploads and checks; it is half of the
-watchdog's 1,800 s ceiling, costs at most $0.15 more per Pod at $0.60/h, and moves two 1.6 GB
-labels at about 4 MB/s. The watchdog grants it only while the Mac sees new objects in R2."""
+watchdog's 1,800 s ceiling and costs at most $0.15 more per Pod at $0.60/h. The worker drains
+for at most ``MAX_TRANSFER_SECONDS - TRANSFER_MARGIN_SECONDS`` (780 s) of it, so the upload
+rate it needs is ``REQUIRED_UPLOAD_BYTES_PER_SECOND``, which the readiness receipt checks
+against the Pod's measured round trip. The watchdog grants the window only while the Mac sees
+new objects in R2."""
+TRANSFER_MARGIN_SECONDS = 120
+"""The worker's drain ends this long before the transfer window does (its
+``FINALIZE_MARGIN_SECONDS``), leaving time for the HEAD checks and the report upload."""
+S_LABEL_CHECKPOINT_BYTES = 1_650_000_000
+"""One S label's checkpoint, weights and AdamW state: the measured 1,623,502,465 bytes
+(``pilot_feasibility.MEASURED_UNTRAINED_CHECKPOINT_BYTES``) rounded up to 1.65 GB."""
+REQUIRED_UPLOAD_BYTES_PER_SECOND = (
+    2 * S_LABEL_CHECKPOINT_BYTES / (MAX_TRANSFER_SECONDS - TRANSFER_MARGIN_SECONDS) * 2
+)
+"""The Pod's measured R2 upload rate must reach this, about 8.46 MB/s: two labels (a rolling
+upload still in flight and the stage-final milestone) inside the 780 s drain, with a factor-2
+safety margin. The readiness receipt's ``r2_round_trip_tested`` gate requires it."""
+ROUND_TRIP_PROBE_BYTES = 128 * 1024 * 1024
+"""The round trip's probe: large enough (128 MiB) that its PUT and GET measure throughput
+rather than request latency. The readiness receipt refuses a smaller probe."""
 SPEED_CHECK_SECONDS = 900
 REFERENCE_TOKENS_PER_SECOND = 56_479.0
 """The pilot's measured eager 35,974 tok/s times its measured 1.57x compile speedup."""
@@ -88,6 +108,11 @@ EVIDENCE_GATES = ("r2_round_trip_tested", "r2_shards_staged_and_hash_checked")
 """Set only from the Pod's receipts: the R2 round trip and the fetched, re-hashed data."""
 READINESS_GATES = (*OWNER_GATES, *EVIDENCE_GATES, "pod_self_destruct_armed")
 """Every gate the receipt sets and the worker requires to be an explicit ``true``."""
+REVISION_KEYS = frozenset({"git_commit", "clean", "archive_sha256"})
+"""``revision.json``: the Mac's commit, its clean tree and the shipped tarball's SHA-256. The
+runbook writes it next to the tarball and ships it to the Pod; the readiness receipt records it
+as ``revision`` and the worker requires its own copy to be equal."""
+_GIT_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 
 RUN_ROOT = "rehearsal-runs"
 REPORT_MAX_BYTES = 1_000_000
@@ -144,6 +169,22 @@ def _hex(value: object, name: str) -> str:
     if not isinstance(value, str) or not SHA256_HEX.fullmatch(value):
         raise ValueError(f"{name} must be 64 lower-case hex digits")
     return value
+
+
+def check_revision(value: object) -> dict[str, Any]:
+    """The code revision record: exactly a 40-hex commit, ``clean: true`` and a tarball hash.
+
+    A dirty tree or any other shape is refused: the run must name the exact code it trains.
+    """
+    if not isinstance(value, dict) or set(value) != REVISION_KEYS:
+        raise ValueError(f"the revision record must have exactly the keys {sorted(REVISION_KEYS)}")
+    commit = value["git_commit"]
+    if not isinstance(commit, str) or not _GIT_COMMIT.fullmatch(commit):
+        raise ValueError("the revision's git_commit must be 40 lower-case hex digits")
+    if value["clean"] is not True:
+        raise ValueError("the revision was taken from a dirty tree; commit or stash first")
+    _hex(value["archive_sha256"], "the revision's archive_sha256")
+    return {"git_commit": commit, "clean": True, "archive_sha256": value["archive_sha256"]}
 
 
 def check_r2_final(value: object, *, run: str, pod_id: str) -> tuple[dict[str, str], str]:
@@ -395,14 +436,19 @@ def round_trip(
     run: str,
     pod_id: str,
     receipt: Path,
-    size: int = 65_536,
+    size: int = ROUND_TRIP_PROBE_BYTES,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """PUT, HEAD, GET and DELETE one random object under the run's prefix; write a receipt.
 
-    The probe is deleted again on any failure after it was stored. The receipt says
-    ``passed`` only when every step succeeded and the object is gone afterwards.
+    The PUT and the GET are timed, and the receipt records ``upload_bytes_per_second`` and
+    ``download_bytes_per_second`` (retries included, so the rates err low). The probe is
+    deleted again on any failure after it was stored. The receipt says ``passed`` only when
+    every step succeeded and the object is gone afterwards; whether the upload rate is
+    enough for the transfer window is the readiness receipt's decision.
     """
+    if type(size) is not int or size <= 0:
+        raise ValueError("the probe size must be a positive integer")
     prefix = run_prefix(run, pod_id)
     key = f"{prefix}preflight/round-trip-{uuid.uuid4().hex}.bin"
     steps: dict[str, float] = {}
@@ -416,12 +462,20 @@ def round_trip(
         "key": key,
         "bytes": size,
         "steps": steps,
+        "required_upload_bytes_per_second": REQUIRED_UPLOAD_BYTES_PER_SECOND,
     }
     stored = False
     with tempfile.TemporaryDirectory(prefix="r2-round-trip-") as directory:
         source = Path(directory) / "probe.bin"
-        source.write_bytes(os.urandom(size))
-        digest = file_sha256(source)
+        hasher = hashlib.sha256()
+        with source.open("wb") as stream:
+            left = size
+            while left:
+                block = os.urandom(min(left, 8 * 1024 * 1024))
+                hasher.update(block)
+                stream.write(block)
+                left -= len(block)
+        digest = hasher.hexdigest()
         record["sha256"] = digest
         try:
             began = clock()
@@ -435,6 +489,10 @@ def round_trip(
             began = clock()
             store.download(key, Path(directory) / "back.bin", sha256=digest, size=size)
             steps["get_seconds"] = clock() - began
+            if steps["put_seconds"] <= 0 or steps["get_seconds"] <= 0:
+                raise ValueError("the clock did not advance over the PUT or the GET")
+            record["upload_bytes_per_second"] = size / steps["put_seconds"]
+            record["download_bytes_per_second"] = size / steps["get_seconds"]
             began = clock()
             store.delete(key)
             if store.head(key) is not None:

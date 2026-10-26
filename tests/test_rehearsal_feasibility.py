@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from tools import rehearsal_ops
 from tools.pilot_feasibility import (
+    MEASURED_UNTRAINED_CHECKPOINT_BYTES,
     REHEARSAL_DISCLAIMER,
     RehearsalOptions,
     RehearsalPlan,
@@ -66,6 +68,17 @@ def test_d35_runs_fit_at_the_reference_speed_and_the_quote_bounds_spend() -> Non
     assert report["runs"]["B"]["reference"]["full_validations"] == 1
     assert report["r2_storage"]["monthly_usd"] < 1
     assert report["disclaimer"] == REHEARSAL_DISCLAIMER
+    # The upload rate the receipt requires: two labels of at least the measured checkpoint
+    # size in the 780 s drain, with a factor-2 margin.
+    upload = report["r2_upload"]
+    assert upload["checkpoint_bytes"] >= MEASURED_UNTRAINED_CHECKPOINT_BYTES
+    assert upload["drain_seconds"] == 780
+    assert upload["required_upload_bytes_per_second"] == pytest.approx(
+        2 * upload["checkpoint_bytes"] / 780 * 2
+    )
+    assert (
+        upload["required_upload_bytes_per_second"] == rehearsal_ops.REQUIRED_UPLOAD_BYTES_PER_SECOND
+    )
 
 
 def test_a_higher_quote_breaks_the_cost_stop() -> None:
@@ -102,6 +115,7 @@ def test_cli_prints_the_report_and_writes_json(
     printed = capsys.readouterr().out
     assert printed.startswith("# Rehearsal feasibility (D-35)")
     assert REHEARSAL_DISCLAIMER in printed and "| A | 15,260 |" in printed
+    assert "2 labels of 1.65 GB in the 780 s drain with a 2x margin need 8.46 MB/s" in printed
     saved = json.loads(output.read_text())
     assert saved["kind"] == "rehearsal-feasibility" and set(saved["runs"]) == {"A", "B"}
     with pytest.raises(SystemExit):

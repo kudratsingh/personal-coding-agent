@@ -3,14 +3,17 @@
 An independent thread checks Runpod while SSH transfers run. This manages only
 an explicitly identified existing Pod and cannot guarantee API availability.
 
-``--mode rehearsal`` supervises one of the two rehearsal Pods (D-35) instead. It never
-copies a checkpoint over SSH: the worker uploads its checkpoints to R2 itself, and once
-its heartbeat says ``awaiting_transfer`` with ``r2_final``, the supervisor checks the final
-milestone and ``report.json`` in R2 with the Mac's own key, archives the small records
-privately, and only then reports ``shutdown_ready``. A ``running`` or ``uploading``
-heartbeat, including run A's boundary between its two stages, never leads to teardown.
-While the worker uploads, new objects under its R2 prefix (listed with the Mac's key) are
-the Mac-observed progress that lets the watchdog wait out the transfer window.
+``--mode rehearsal`` supervises one of the two rehearsal Pods (D-35) instead. The worker
+uploads its checkpoints to R2 itself, and once its heartbeat says ``awaiting_transfer``
+with ``r2_final``, the supervisor checks the final milestone and ``report.json`` in R2 with
+the Mac's own key, archives the small records privately, and only then reports
+``shutdown_ready``. A ``running`` or ``uploading`` heartbeat, including run A's boundary
+between its two stages, never leads to teardown. While the worker uploads, new objects
+under its R2 prefix (listed with the Mac's key) are the Mac-observed progress that lets the
+watchdog wait out the transfer window. The one checkpoint copy over SSH is the fallback for
+a stage-final milestone the worker could not verify in R2: the supervisor pulls it with the
+pilot's verified pull, checks its SHA-256, archives the records and only then approves
+teardown; if that fails it never approves, and the watchdog's limits end the Pod.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -26,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
@@ -35,7 +40,7 @@ import torch
 from scratchcoder.common.records import atomic_json
 from scratchcoder.data.shards import file_sha256
 from tools.pilot_transfer import Artifact, _ssh_command, child_environment, pull_artifacts
-from tools.r2_store import Store
+from tools.r2_store import SHA256_HEX, Store
 from tools.rehearsal_binding import RUNS, r2_credentials
 from tools.rehearsal_ops import (
     FAILURE_STATUSES,
@@ -47,10 +52,13 @@ from tools.rehearsal_ops import (
     UPLOADING_STATUS,
     ObjectStore,
     check_r2_final,
+    head_sha256,
     run_prefix,
+    run_stages,
     run_summary,
     verify_final,
 )
+from tools.rehearsal_ops import MAX_TRANSFER_SECONDS as REHEARSAL_TRANSFER_SECONDS
 from tools.runpod_watchdog import (
     API_KEY_ENV,
     Outcome,
@@ -60,14 +68,23 @@ from tools.runpod_watchdog import (
     UrllibTransport,
     atomic_receipt,
     check_once,
+    foreign_heartbeat,
     load_observed,
+    parse_timestamp,
     save_observed,
 )
+from tools.runpod_watchdog import MAX_TRANSFER_SECONDS as WATCHDOG_TRANSFER_CEILING_SECONDS
 
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _BUNDLE = re.compile(r"exports/lr-[0-9]+(?:-continued)?-step[0-9]+-[0-9]+\Z")
 _ARCHIVE_ROOT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9][A-Za-z0-9_.-]*)*\Z")
 _ARCHIVE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+STATUS_FILE_LIMITS = {
+    "heartbeat.json": 65_536,
+    "report.json": 4_194_304,
+    "finalization.json": 1_000_000,  # The rehearsal worker's drain and check record.
+}
+"""The status files the fixed-code SSH channel may stream, each with its byte bound."""
 
 
 def fetch_status(
@@ -83,9 +100,9 @@ def fetch_status_bytes(
     ssh: list[str], root: str, name: str, *, max_bytes: int | None = None
 ) -> bytes:
     """One bounded status file's exact bytes over the fixed-code SSH channel."""
-    if name not in {"heartbeat.json", "report.json"}:
+    if name not in STATUS_FILE_LIMITS:
         raise ValueError("unsupported status file")
-    limit = 65_536 if name == "heartbeat.json" else 4_194_304
+    limit = STATUS_FILE_LIMITS[name]
     if max_bytes is not None:
         if type(max_bytes) is not int or not 0 < max_bytes <= limit:
             raise ValueError("a status bound can only tighten the default")
@@ -399,6 +416,20 @@ DEFAULT_FAILURE_GRACE_SECONDS = 60.0
 """The worker writes ``stopped`` or ``failed`` only after its own drain and report upload
 (it reads ``uploading`` until then), so the grace only covers a status change in flight;
 the idle limit counts from the last GPU work, before that drain."""
+RECOVERY_FAILURES = frozenset({"r2_milestones_unverified", "r2_finalization"})
+"""Worker failures after which the Pod may hold the only copy of a stage-final milestone.
+They never lead to teardown on the grace timer: every milestone must first be verified in
+R2 with the Mac's key or pulled over SSH and checked."""
+MILESTONE_ERROR_FILE = "MILESTONES-NOT-SECURED.json"
+"""Written to the supervisor directory when an unverified milestone could not be pulled."""
+RECOVERED_ARTIFACTS = (Artifact("checkpoint", "checkpoint.pt"), Artifact("record", "record.json"))
+"""What the SSH fallback pulls from ``exports/<label>/``: the weights and the label's record."""
+EXPORT_PATH_KEYS = ("path", "export_path", "local_path", "export")
+"""Keys under which ``finalization.json`` may give an unverified milestone's export path."""
+
+Recover = Callable[[str, Path, float], Path]
+"""Pull ``exports/<label>`` (relative to the worker's root) into a destination directory
+within a timeout in seconds, verified against the Pod's own manifest; return the bundle."""
 
 
 class SupervisedStore(ObjectStore, Protocol):
@@ -406,30 +437,143 @@ class SupervisedStore(ObjectStore, Protocol):
 
 
 def _no_ssh_pull(name: str) -> Path:
-    raise RuntimeError("rehearsal mode never copies checkpoints over SSH")
+    raise RuntimeError(
+        "rehearsal mode never copies checkpoints over SSH, except an unverified milestone"
+    )
+
+
+def _milestone_stage(label: object, *, run: str) -> str:
+    """The stage whose milestone ``label`` is (``<stage>-final`` of this run), or raise."""
+    stages = [stage for stage in run_stages(run) if label == f"{stage}-final"]
+    if len(stages) != 1:
+        raise ValueError(f"{label!r} is not a stage-final milestone of run {run}")
+    return stages[0]
+
+
+def _export_label(path: object) -> str:
+    """The label of a worker export path: ``[<root>/]exports/<label>[/checkpoint.pt]``."""
+    if not isinstance(path, str):
+        raise ValueError("an export path must be a string")
+    parts = PurePosixPath(path).parts
+    if parts and parts[-1] == "checkpoint.pt":
+        parts = parts[:-1]
+    if len(parts) < 2 or parts[-2] != "exports":
+        raise ValueError(f"{path!r} is not a worker export path")
+    return parts[-1]
+
+
+def unverified_milestones(finalization: object, *, run: str) -> dict[str, str]:
+    """Each milestone ``finalization.json`` lists as unverified in R2: label to SHA-256.
+
+    The worker lists them under ``unverified_milestones``, as a list of objects or a map
+    from label to object, each with the checkpoint's ``sha256`` and its local export
+    ``path`` (and optionally its ``label``). Every identifier given must name the same
+    stage-final milestone of this run; the SSH pull always reads ``exports/<label>``.
+    """
+    if not isinstance(finalization, dict):
+        raise ValueError("finalization.json must be an object")
+    raw = finalization.get("unverified_milestones")
+    if raw is None:
+        return {}
+    rows: list[object]
+    if isinstance(raw, dict):
+        rows = [
+            {"label": label, **row} if isinstance(row, dict) else row for label, row in raw.items()
+        ]
+    elif isinstance(raw, list):
+        rows = list(raw)
+    else:
+        raise ValueError("unverified_milestones must be a list or an object")
+    found: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("each unverified milestone must be an object")
+        names = {row["label"]} if "label" in row else set()
+        names |= {_export_label(row[key]) for key in EXPORT_PATH_KEYS if key in row}
+        if len(names) != 1:
+            raise ValueError(f"an unverified milestone names no single label: {sorted(names)}")
+        (label,) = names
+        _milestone_stage(label, run=run)
+        digest = row.get("sha256")
+        if not isinstance(digest, str) or not SHA256_HEX.fullmatch(digest):
+            raise ValueError(f"unverified milestone {label} carries no checkpoint SHA-256")
+        if found.get(label, digest) != digest:
+            raise ValueError(f"unverified milestone {label} is listed with two SHA-256s")
+        found[label] = digest
+    return found
+
+
+def recorded_milestones(report: dict[str, Any], *, run: str) -> dict[str, str]:
+    """Every stage-final milestone the worker's report records: label to checkpoint SHA-256."""
+    found: dict[str, str] = {}
+    for entry in report.get("stages") or []:
+        if not isinstance(entry, dict) or entry.get("final_checkpoint_sha256") is None:
+            continue
+        label = f"{entry.get('name')}-final"
+        _milestone_stage(label, run=run)
+        digest = entry["final_checkpoint_sha256"]
+        if not isinstance(digest, str) or not SHA256_HEX.fullmatch(digest):
+            raise ValueError(f"the report's {label} SHA-256 is malformed")
+        found[label] = digest
+    return found
+
+
+def verify_recovered(bundle: Path, *, label: str, sha256: str) -> dict[str, Any]:
+    """Check a pulled milestone against the expected SHA-256 and its transfer receipt."""
+    receipt = json.loads((bundle / "transfer-receipt.json").read_text())
+    if not isinstance(receipt, dict) or receipt.get("status") != "verified":
+        raise ValueError(f"the SSH pull of {label} is unverified")
+    rows = {row.get("name"): row for row in receipt.get("artifacts", []) if isinstance(row, dict)}
+    checkpoint = bundle / "checkpoint.pt"
+    if set(rows) != {item.name for item in RECOVERED_ARTIFACTS} or checkpoint.is_symlink():
+        raise ValueError(f"the SSH pull of {label} does not hold exactly the milestone files")
+    size = checkpoint.stat().st_size
+    if rows["checkpoint.pt"].get("sha256") != sha256 or file_sha256(checkpoint) != sha256:
+        raise ValueError(f"the pulled {label} checkpoint differs from its recorded SHA-256")
+    if rows["checkpoint.pt"].get("size_bytes") != size:
+        raise ValueError(f"the pulled {label} checkpoint differs from its transfer receipt")
+    return {
+        "label": label,
+        "remote_export": f"exports/{label}",
+        "path": str(checkpoint),
+        "sha256": sha256,
+        "size_bytes": size,
+    }
 
 
 class RehearsalSupervisor(Supervisor):
-    """Supervise one rehearsal run: R2 verification instead of SSH checkpoint pulls.
+    """Supervise one rehearsal run: R2 verification, and SSH only for unverified milestones.
 
-    Teardown is approved (``shutdown_ready``) in exactly two cases:
+    Teardown is approved (``shutdown_ready``) in exactly three cases:
 
-    - the heartbeat is ``awaiting_transfer`` with ``r2_final``, the SSH copy of
-      ``report.json`` hashes to ``r2_final``'s SHA-256, ``verify_final`` passes with the
-      Mac's own R2 key, and the report and a summary are archived privately with
-      read-back; or
-    - the worker reported ``stopped`` or ``failed`` with no ``r2_final`` for the failure
-      grace period, and its diagnostics are archived.
+    - the heartbeat is ``awaiting_transfer`` (or ``stopped``/``failed`` with no milestone
+      at risk) with ``r2_final``, the SSH copy of ``report.json`` hashes to ``r2_final``'s
+      SHA-256, ``verify_final`` passes with the Mac's own R2 key, and the report and a
+      summary are archived privately with read-back;
+    - the worker reported ``stopped`` or ``failed`` with no ``r2_final``, no milestone is
+      at risk, the failure grace period passed, and its diagnostics are archived; or
+    - a milestone is at risk (the worker failed ``r2_milestones_unverified`` or
+      ``r2_finalization``, or listed or flagged a milestone it could not verify in R2),
+      and every one of them is now verified in R2 with the Mac's key or was pulled over
+      SSH with the pilot's verified pull, its SHA-256 checked, and the records archived.
 
     A ``running`` or ``uploading`` heartbeat never approves teardown, whatever stage the
-    run is in. A mismatching or missing R2 object never approves it either; the
-    watchdog's idle, transfer, wall and cost limits still bound the Pod.
+    run is in. A mismatching or missing R2 object never approves it either, and neither
+    does a failed SSH pull: that writes ``MILESTONES-NOT-SECURED.json`` and
+    ``controller-error.json`` naming the files, and the watchdog's idle, transfer, wall
+    and cost limits still bound the Pod. A pull is bounded by the transfer window: it
+    must end ``transfer_window_seconds`` after the heartbeat's last GPU work, when the
+    watchdog stops waiting.
 
     While the heartbeat reads ``uploading`` or ``awaiting_transfer``, the mirror lists
     the run's R2 prefix with the Mac's key. The first listing is a baseline; any object
     (key and size) not seen before stamps ``transfer_progress_unix``, the Mac-observed
     progress the watchdog requires before it lets an idle GPU wait out the policy's
-    ``max_transfer_seconds``. The Pod can never stamp it itself.
+    ``max_transfer_seconds``. Bytes arriving from an SSH pull stamp it too. The Pod can
+    never stamp it itself.
+
+    A heartbeat naming another Pod, or updated before this Pod's creation, is ignored
+    (``runpod_watchdog.foreign_heartbeat``): it is never mirrored and never acted on.
     """
 
     def __init__(
@@ -444,22 +588,40 @@ class RehearsalSupervisor(Supervisor):
         archive: Callable[[Path], dict[str, Any]],
         clock: Callable[[], float] = time.time,
         failure_grace_seconds: float = DEFAULT_FAILURE_GRACE_SECONDS,
+        fetch_finalization: Callable[[], bytes] | None = None,
+        recover: Recover | None = None,
+        transfer_window_seconds: float = REHEARSAL_TRANSFER_SECONDS,
+        pod_created_unix: float | None = None,
     ) -> None:
         run_prefix(run, pod_id)
         if not 0 < failure_grace_seconds <= IDLE_SECONDS:
             raise ValueError("the failure grace must be positive and within the idle limit")
+        if not 0 <= transfer_window_seconds <= WATCHDOG_TRANSFER_CEILING_SECONDS:
+            raise ValueError("the transfer window must be within the watchdog's ceiling")
         super().__init__(
             root, fetch=fetch, pull=_no_ssh_pull, archive=archive, clock=clock, reuse_output=True
         )
         self.run, self.pod_id, self.store = run, pod_id, store
         self.prefix = run_prefix(run, pod_id)
         self.fetch_report = fetch_report
+        self.fetch_finalization = fetch_finalization
+        self.recover = recover
+        self.transfer_window_seconds = transfer_window_seconds
+        self.pod_created_unix = pod_created_unix
         self.failure_grace_seconds = failure_grace_seconds
         self.r2_verified: dict[str, Any] | None = None
         self.failure_seen_unix: float | None = None
         self.summary: dict[str, Any] | None = None
         self.r2_seen: set[tuple[str, int]] | None = None
         self.progress_lock = threading.Lock()
+        # Milestones at risk: pulled over SSH and checked, or verified in R2 by the Mac.
+        # Keyed by Pod, so a reused controller directory never mixes two Pods' copies.
+        self.recovery_root = root / "recovered" / pod_id
+        self.recovered: dict[str, dict[str, Any]] = {}
+        self.r2_secured: dict[str, dict[str, Any]] = {}
+        self.recovering = False
+        self.recovery_staged = 0
+        self.milestone_error: dict[str, Any] | None = None
 
     def observe_r2_progress(self) -> None:
         """Stamp ``transfer_progress_unix`` when the run's prefix holds a new object.
@@ -481,12 +643,36 @@ class RehearsalSupervisor(Supervisor):
                 self.transfer_progress_unix = self.clock()
             self.r2_seen = listed if self.r2_seen is None else self.r2_seen | listed
 
+    def observe_recovery_progress(self) -> None:
+        """Stamp ``transfer_progress_unix`` while an SSH pull's staged bytes grow on the Mac."""
+        total = 0
+        if self.recovery_root.is_dir():
+            for staging in self.recovery_root.glob(".*.staging-*"):
+                if staging.is_dir() and not staging.is_symlink():
+                    total += sum(
+                        item.stat().st_size
+                        for item in staging.iterdir()
+                        if item.is_file() and not item.is_symlink()
+                    )
+        with self.progress_lock:
+            if total > self.recovery_staged:
+                self.transfer_progress_unix = self.clock()
+            self.recovery_staged = total
+
     def refresh_heartbeat(self) -> dict[str, Any]:
         heartbeat = self.fetch("heartbeat.json")
+        foreign = foreign_heartbeat(
+            heartbeat, pod_id=self.pod_id, created_at_unix=self.pod_created_unix
+        )
+        if foreign is not None:
+            # Another Pod's heartbeat is no evidence about this one: never mirror it.
+            raise ValueError(f"the fetched heartbeat is ignored: {foreign}")
         for key in MAC_ONLY_HEARTBEAT_KEYS:
             heartbeat.pop(key, None)  # Only the Mac's own checks may set these.
         if heartbeat.get("status") in PROGRESS_STATUSES and not self.shutdown_ready:
             self.observe_r2_progress()
+        if self.recovering:
+            self.observe_recovery_progress()
         if self.transfer_progress_unix is not None:
             heartbeat["transfer_progress_unix"] = self.transfer_progress_unix
         if self.r2_verified is not None:
@@ -516,8 +702,17 @@ class RehearsalSupervisor(Supervisor):
                 self.finish(r2_final, raw, statuses=SUCCESS_STATUSES)
             return  # Until the worker publishes r2_final there is nothing to verify.
         if status in FAILURE_STATUSES:
+            # Never on the grace timer while the Pod may hold a milestone's only copy, even
+            # when the worker published r2_final for its last verified milestone.
+            at_risk = self.milestones_at_risk(report)
+            if at_risk:
+                self.secure(raw, report, heartbeat, at_risk)
+                return
             if r2_final is not None:
                 self.finish(r2_final, raw, statuses=(str(status),))
+                return
+            if at_risk is not None:  # Every milestone verified in R2 with the Mac's key.
+                self.secure(raw, report, heartbeat, at_risk)
                 return
             now = self.clock()
             if self.failure_seen_unix is None:
@@ -564,7 +759,169 @@ class RehearsalSupervisor(Supervisor):
         self.shutdown_ready = True
         self.refresh_heartbeat()
 
-    def diagnose(self, raw: bytes, report: dict[str, Any]) -> None:
+    def read_finalization(self) -> dict[str, Any]:
+        """The worker's ``finalization.json`` over the bounded SSH channel, kept locally."""
+        if self.fetch_finalization is None:
+            raise RuntimeError("no finalization.json channel is configured")
+        value = json.loads(self.fetch_finalization())
+        if not isinstance(value, dict):
+            raise ValueError("finalization.json must be an object")
+        atomic_json(self.root / "remote-finalization.json", value)
+        return value
+
+    def milestones_at_risk(self, report: dict[str, Any]) -> dict[str, str] | None:
+        """Milestones a stopped or failed run may hold only on the Pod (label to SHA-256).
+
+        ``None`` means none is at risk and the ordinary grace applies. After
+        ``r2_milestones_unverified`` or ``r2_finalization`` the answer is never ``None``:
+        ``finalization.json`` must be readable (an error is raised and retried each cycle),
+        and every milestone the report records that the worker did not list is checked in
+        R2 with the Mac's key; any that fails is at risk too. After any other failure, the
+        milestones ``finalization.json`` lists or the report flags as unverified are.
+        """
+        recovery = report.get("failure") in RECOVERY_FAILURES
+        try:
+            finalization = self.read_finalization()
+        except Exception:
+            if recovery:
+                raise  # The unverified list is needed; never approve without it.
+            finalization = {}
+        listed = unverified_milestones(finalization, run=self.run)
+        recorded = recorded_milestones(report, run=self.run)
+        for label, digest in listed.items():
+            if recorded.get(label, digest) != digest:
+                raise ValueError(f"finalization.json and report.json give {label} two SHA-256s")
+        at_risk = dict(listed)
+        r2 = report.get("r2")
+        flags = r2.get("milestones_verified") if isinstance(r2, dict) else None
+        if isinstance(flags, dict):
+            for label, verified in flags.items():
+                if verified is True or label in at_risk:
+                    continue
+                if label not in recorded:
+                    raise ValueError(f"the report flags {label} unverified with no SHA-256")
+                at_risk[label] = recorded[label]
+        if not recovery:
+            return at_risk or None
+        for label, digest in recorded.items():
+            if label in at_risk or label in self.r2_secured:
+                continue
+            try:
+                row = head_sha256(
+                    self.store, f"{self.prefix}{label}/checkpoint.pt", expected=digest
+                )
+            except Exception:  # missing, mismatched or unreachable: secure it over SSH
+                at_risk[label] = digest
+            else:
+                self.r2_secured[label] = row
+        return at_risk
+
+    def secure(
+        self,
+        raw: bytes,
+        report: dict[str, Any],
+        heartbeat: dict[str, Any],
+        at_risk: dict[str, str],
+    ) -> None:
+        """Pull every milestone at risk over SSH, check it, archive, and only then approve.
+
+        The last stage's milestone goes first. Every pull ends with the transfer window,
+        measured from the heartbeat's last GPU work as the watchdog measures it. A failure
+        writes the prominent error, is retried next cycle while the window lasts, and
+        never approves teardown.
+        """
+        stages = run_stages(self.run)
+        order = sorted(
+            at_risk, key=lambda label: -stages.index(_milestone_stage(label, run=self.run))
+        )
+        pending = [label for label in order if label not in self.recovered]
+        activity = heartbeat.get("last_gpu_activity_unix")
+        for label in pending:
+            if self.recover is None:
+                self.fail_milestones(at_risk, "no SSH pull is configured")
+                return
+            if (
+                not isinstance(activity, (int, float))
+                or isinstance(activity, bool)
+                or not 0 < activity < math.inf
+            ):
+                self.fail_milestones(at_risk, "the heartbeat carries no last GPU activity")
+                return
+            left = float(activity) + self.transfer_window_seconds - self.clock()
+            if left <= 0:
+                self.fail_milestones(at_risk, "the watchdog's transfer window is over")
+                return
+            self.recovering = True
+            try:
+                bundle = self.recovery_root / label
+                if not bundle.exists():
+                    self.recovery_root.mkdir(parents=True, exist_ok=True)
+                    bundle = self.recover(f"exports/{label}", self.recovery_root, left)
+                try:
+                    row = verify_recovered(bundle, label=label, sha256=at_risk[label])
+                except Exception:
+                    # Kept for inspection under another name; a retry pulls a fresh copy.
+                    bundle.replace(bundle.with_name(f"{label}.rejected-{uuid.uuid4().hex[:8]}"))
+                    raise
+            except Exception as error:
+                self.fail_milestones(at_risk, f"{label}: {type(error).__name__}: {error}")
+                return
+            finally:
+                self.recovering = False
+            self.recovered[label] = row
+        self.diagnose(
+            raw,
+            report,
+            recovery={
+                "failure": report.get("failure"),
+                "pulled_over_ssh": [self.recovered[label] for label in order],
+                "verified_in_r2_by_mac": [
+                    self.r2_secured[label] for label in sorted(self.r2_secured)
+                ],
+            },
+        )
+
+    def fail_milestones(self, at_risk: dict[str, str], detail: str) -> None:
+        """Record, prominently, that milestones are not secured; never approve teardown."""
+        files = [
+            {
+                "label": label,
+                "pod_path": f"exports/{label}/checkpoint.pt",
+                "sha256": at_risk[label],
+                "pulled": label in self.recovered,
+            }
+            for label in sorted(at_risk)
+        ]
+        record = {
+            "error_type": "MilestonesNotSecured",
+            "detail": (
+                "these stage-final milestones are neither verified in R2 nor pulled to the "
+                "Mac; teardown is NOT approved and the watchdog's limits will end the Pod: "
+                + detail
+            )[:2000],
+            "files": files,
+            "local_destination": str(self.recovery_root),
+            "recorded_unix": self.clock(),
+        }
+        atomic_json(self.root / MILESTONE_ERROR_FILE, record)
+        atomic_json(self.root / "controller-error.json", record)
+        if self.milestone_error is None or self.milestone_error["detail"] != record["detail"]:
+            names = ", ".join(
+                f"exports/{label}/checkpoint.pt"
+                for label in sorted(at_risk)
+                if label not in self.recovered
+            )
+            print(
+                f"\n*** run {self.run} Pod {self.pod_id}: MILESTONES NOT SECURED: {names}\n"
+                f"*** {detail}\n*** see {self.root / MILESTONE_ERROR_FILE}\n",
+                file=sys.stderr,
+                flush=True,
+            )
+        self.milestone_error = record
+
+    def diagnose(
+        self, raw: bytes, report: dict[str, Any], *, recovery: dict[str, Any] | None = None
+    ) -> None:
         """Archive a failed run's own report and what reached R2, then approve teardown."""
         directory = self.root / "diagnostics"
         directory.mkdir(exist_ok=True)
@@ -587,10 +944,13 @@ class RehearsalSupervisor(Supervisor):
             )
         except Exception as error:  # recorded; diagnostics are archived regardless
             summary["r2_listing_error"] = type(error).__name__
+        if recovery is not None:
+            summary["milestone_recovery"] = recovery
         atomic_json(directory / "summary.json", summary)
         self.summary, self.latest = summary, directory
         self.archive_verified(directory)
         self.shutdown_ready = True
+        self.milestone_error = None
         self.refresh_heartbeat()
 
 
@@ -819,6 +1179,21 @@ def _rehearsal_main(
             message="Save rehearsal report and summary",
         )
 
+    def recover(name: str, destination: Path, timeout: float) -> Path:
+        # The pilot's verified pull: the Pod's own manifest, then a size and SHA-256 check
+        # of every streamed file before the bundle is published on the Mac.
+        return pull_artifacts(
+            host=args.host,
+            port=args.port,
+            identity_file=args.identity_file,
+            known_hosts=args.known_hosts,
+            remote_dir=f"{args.remote_root}/{name}",
+            destination=destination,
+            bundle_name=PurePosixPath(name).name,
+            artifacts=RECOVERED_ARTIFACTS,
+            timeout=min(timeout, args.transfer_timeout),
+        )
+
     supervisor = RehearsalSupervisor(
         args.output,
         run=args.run,
@@ -830,6 +1205,10 @@ def _rehearsal_main(
         store=store,
         archive=archive,
         failure_grace_seconds=args.failure_grace_seconds,
+        fetch_finalization=lambda: fetch_status_bytes(ssh, args.remote_root, "finalization.json"),
+        recover=recover,
+        transfer_window_seconds=policy.max_transfer_seconds,
+        pod_created_unix=parse_timestamp(identity.created_at),
     )
     # Mirror one heartbeat before the API guard starts: without it the guard's first check
     # would read no heartbeat and apply the policy's (long past) pre-heartbeat idle baseline.
@@ -868,10 +1247,17 @@ def _rehearsal_main(
         "shutdown_ready": supervisor.shutdown_ready,
         "shutdown_receipt": json.loads(receipt.read_text()) if receipt.exists() else None,
         "summary": supervisor.summary,
+        "milestones_not_secured": supervisor.milestone_error,
         "resource_audit": "Pod only; R2 objects, network volumes and billing need separate audit",
         "supervisor_interrupted": interrupted,
     }
     atomic_json(closing / "summary.json", record)  # Always written locally first.
+    if supervisor.milestone_error is not None:
+        print(
+            f"rehearsal supervisor: run {args.run} ended with milestones NOT secured; see "
+            f"{args.output / MILESTONE_ERROR_FILE}",
+            file=sys.stderr,
+        )
     archive_failed = False
     try:
         archive_bundle(

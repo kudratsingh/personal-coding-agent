@@ -4,14 +4,19 @@ import hashlib
 import io
 import json
 import shlex
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from tools import rehearsal_ops
+from tools.pilot_feasibility import MEASURED_UNTRAINED_CHECKPOINT_BYTES
+from tools.pilot_readiness_receipt import round_trip_passed
 from tools.rehearsal_ops import (
+    REQUIRED_UPLOAD_BYTES_PER_SECOND,
     check_r2_final,
+    check_revision,
     fetch_object,
     pod_environment,
     round_trip,
@@ -20,6 +25,7 @@ from tools.rehearsal_ops import (
     run_summary,
     verify_final,
 )
+from tools.rehearsal_run import FINALIZE_MARGIN_SECONDS
 
 POD = "podfixture01"
 ENVIRONMENT = {
@@ -321,13 +327,115 @@ def test_fetch_object_is_pinned_and_keeps_only_identical_bytes(tmp_path: Path) -
         fetch_object(bucket, key="k", sha256="bad", size=1, output=output, receipt=receipt)
 
 
+def ticking(step: float) -> Callable[[], float]:
+    """A clock that advances ``step`` seconds on every reading."""
+    now = [0.0]
+
+    def clock() -> float:
+        now[0] += step
+        return now[0]
+
+    return clock
+
+
 def test_round_trip_passes_and_leaves_nothing_behind(tmp_path: Path) -> None:
     bucket = Bucket()
-    record = round_trip(bucket, run="A", pod_id=POD, receipt=tmp_path / "trip.json", size=1024)
+    record = round_trip(
+        bucket, run="A", pod_id=POD, receipt=tmp_path / "trip.json", size=1024, clock=ticking(0.5)
+    )
     assert record["status"] == "passed" and not bucket.data
     assert record["key"].startswith(f"rehearsal-runs/A/{POD}/preflight/round-trip-")
     assert set(record["steps"]) == {"put_seconds", "head_seconds", "get_seconds", "delete_seconds"}
     assert json.loads((tmp_path / "trip.json").read_text()) == record
+    # Each timed transfer is one clock step: 1,024 bytes over 0.5 s.
+    assert record["upload_bytes_per_second"] == record["download_bytes_per_second"] == 2048
+    assert record["required_upload_bytes_per_second"] == REQUIRED_UPLOAD_BYTES_PER_SECOND
+
+
+class SizeOnlyBucket:
+    """R2 for a full-size probe: keeps each object's size and SHA-256, not its bytes."""
+
+    def __init__(self) -> None:
+        self.meta: dict[str, tuple[int, str]] = {}
+
+    def put_known(self, key: str, path: Path, sha256: str, size: int) -> int:
+        assert path.stat().st_size == size
+        self.meta[key] = (size, sha256)
+        return 1
+
+    def head(self, key: str) -> dict[str, str] | None:
+        if key not in self.meta:
+            return None
+        size, digest = self.meta[key]
+        return {"x-amz-meta-sha256": digest, "content-length": str(size)}
+
+    def download(self, key: str, destination: Path, *, sha256: str, size: int) -> dict[str, Any]:
+        assert self.meta[key] == (size, sha256)
+        return {"key": key, "bytes": size, "sha256": sha256, "attempts": 1, "seconds": 0.0}
+
+    def delete(self, key: str) -> None:
+        del self.meta[key]
+
+
+@pytest.mark.parametrize(("step", "fast_enough"), [(1.0, True), (20.0, False)])
+def test_the_default_probe_measures_throughput_the_receipt_checks(
+    tmp_path: Path, step: float, fast_enough: bool
+) -> None:
+    """The bootstrap's command uses the default 128 MiB probe; its receipt feeds the gate."""
+    bucket = SizeOnlyBucket()
+    record = round_trip(
+        bucket, run="A", pod_id=POD, receipt=tmp_path / "trip.json", clock=ticking(step)
+    )
+    assert record["bytes"] == rehearsal_ops.ROUND_TRIP_PROBE_BYTES == 128 * 1024 * 1024
+    assert record["upload_bytes_per_second"] == record["bytes"] / step
+    assert record["status"] == "passed" and not bucket.meta
+    # 134 MB/s passes; 6.7 MB/s is below the 8.46 MB/s the 780 s drain needs.
+    if fast_enough:
+        assert round_trip_passed(record, run="A", pod_id=POD)
+    else:
+        with pytest.raises(ValueError, match="upload rate"):
+            round_trip_passed(record, run="A", pod_id=POD)
+
+
+def test_round_trip_refuses_a_clock_that_never_moves_and_a_bad_size(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="clock did not advance"):
+        round_trip(
+            Bucket(), run="A", pod_id=POD, receipt=tmp_path / "t.json", size=64, clock=lambda: 5.0
+        )
+    saved = json.loads((tmp_path / "t.json").read_text())
+    assert saved["status"] == "failed" and saved["probe_deleted"] is True
+    for size in (0, -1, 1.5, True):
+        with pytest.raises(ValueError, match="positive integer"):
+            round_trip(Bucket(), run="A", pod_id=POD, receipt=tmp_path / "t.json", size=size)  # type: ignore[arg-type]
+
+
+def test_required_upload_rate_moves_two_labels_inside_the_drain_with_margin() -> None:
+    window = rehearsal_ops.MAX_TRANSFER_SECONDS - rehearsal_ops.TRANSFER_MARGIN_SECONDS
+    assert window == 780 and rehearsal_ops.TRANSFER_MARGIN_SECONDS == FINALIZE_MARGIN_SECONDS
+    assert rehearsal_ops.S_LABEL_CHECKPOINT_BYTES >= MEASURED_UNTRAINED_CHECKPOINT_BYTES
+    # Two 1.65 GB labels in 780 s need 4.23 MB/s; the factor-2 margin makes it 8.46 MB/s.
+    assert REQUIRED_UPLOAD_BYTES_PER_SECOND == pytest.approx(8_461_538.46, abs=0.01)
+    assert 2 * rehearsal_ops.S_LABEL_CHECKPOINT_BYTES / REQUIRED_UPLOAD_BYTES_PER_SECOND == (
+        pytest.approx(window / 2)
+    )
+
+
+def test_revision_must_be_clean_and_exact() -> None:
+    revision = {"git_commit": "0123456789abcdef" * 2 + "01234567", "clean": True}
+    revision["archive_sha256"] = "f" * 64
+    assert check_revision(revision) == revision
+    for change in (
+        {"clean": False},
+        {"clean": "true"},
+        {"git_commit": "0" * 39},
+        {"git_commit": "g" * 40},
+        {"archive_sha256": "F" * 64},
+        {"extra": 1},
+    ):
+        with pytest.raises(ValueError):
+            check_revision({**revision, **change})
+    with pytest.raises(ValueError, match="exactly the keys"):
+        check_revision([revision])
 
 
 @pytest.mark.parametrize("failure", ["get", "delete"])

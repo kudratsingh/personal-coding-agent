@@ -241,15 +241,48 @@ class Heartbeat:
     status: str | None
     shutdown_receipts_verified: bool = False
     transfer_progress_unix: float | None = None
+    ignored: str | None = None
+    """Why a heartbeat on disk was treated as absent (another Pod's, or older than this Pod)."""
+
+
+def foreign_heartbeat(
+    value: dict[str, Any], *, pod_id: str | None, created_at_unix: float | None
+) -> str | None:
+    """Why a heartbeat cannot be this Pod's, or None.
+
+    A heartbeat naming another ``pod_id``, or updated before this Pod was created, was
+    written for an earlier Pod (a reused controller directory). It is never evidence about
+    this Pod: the guards treat it as absent, never as fresh, never as a reason to delete.
+    A heartbeat without ``pod_id`` (the pilot worker's) is judged by its time alone.
+    """
+    if pod_id is not None and "pod_id" in value and value["pod_id"] != pod_id:
+        return "heartbeat_names_another_pod"
+    updated = value.get("updated_at_unix")
+    if (
+        created_at_unix is not None
+        and _is_number(updated)
+        and math.isfinite(updated)
+        and updated < created_at_unix
+    ):
+        return "heartbeat_predates_pod_creation"
+    return None
 
 
 def read_heartbeat(
-    path: Path, *, now: float, max_idle_seconds: float, mode: str = "pilot"
+    path: Path,
+    *,
+    now: float,
+    max_idle_seconds: float,
+    mode: str = "pilot",
+    pod_id: str | None = None,
+    created_at_unix: float | None = None,
 ) -> Heartbeat:
     """Return last GPU activity and a failure reason; absent means just-created.
 
     ``mode`` adds that mode's statuses (``MODE_STATUSES``); under a pilot policy an
-    ``uploading`` heartbeat stays malformed, exactly as before.
+    ``uploading`` heartbeat stays malformed, exactly as before. With ``pod_id`` and
+    ``created_at_unix`` (the captured identity), a heartbeat that cannot be this Pod's
+    (``foreign_heartbeat``) reads as absent, whatever else it says.
     """
     try:
         raw = path.read_bytes()
@@ -265,6 +298,9 @@ def read_heartbeat(
         return Heartbeat(0.0, "heartbeat_malformed", None)
     if not isinstance(value, dict):
         return Heartbeat(0.0, "heartbeat_malformed", None)
+    foreign = foreign_heartbeat(value, pod_id=pod_id, created_at_unix=created_at_unix)
+    if foreign is not None:
+        return Heartbeat(0.0, None, None, ignored=foreign)
     activity = value.get("last_gpu_activity_unix")
     updated = value.get("updated_at_unix")
     step = value.get("step")
@@ -416,15 +452,25 @@ def check_once(
     through the API. Until then a 404 is not evidence of termination: a wrong
     base URL, Pod ID or key scope would otherwise read as a successful
     shutdown while the Pod keeps billing.
+
+    A heartbeat naming another Pod reads as absent. Under a rehearsal policy so does one
+    updated before this Pod's ``createdAt``: a controller directory reused for a new Pod
+    still holds the old Pod's mirrored heartbeat, which must never delete the new one.
     """
     raw_now = now()
     clock_valid = _is_number(raw_now) and math.isfinite(raw_now)
     checked_at = float(raw_now) if clock_valid else 0.0
+    try:
+        created_unix = parse_timestamp(identity.created_at) if policy.mode == "rehearsal" else None
+    except ValueError:
+        created_unix = None  # The guard below fails closed on the same timestamp.
     heartbeat = read_heartbeat(
         heartbeat_path,
         now=checked_at,
         max_idle_seconds=policy.max_idle_seconds,
         mode=policy.mode,
+        pod_id=identity.pod_id,
+        created_at_unix=created_unix,
     )
     try:
         status, body = client.get_pod(identity.pod_id, policy.request_timeout_seconds)
@@ -500,15 +546,19 @@ def check_once(
         except (ValueError, OverflowError):
             trigger = "guard_calculation_error"
 
+    def settled(state: str, reason: str) -> Outcome:
+        # An ignored heartbeat is recorded so the operator sees why it was not read.
+        return _outcome(state, reason, identity, checked_at, heartbeat.ignored)
+
     if not trigger:
-        return _outcome("watching", "within_limits", identity, checked_at)
+        return settled("watching", "within_limits")
 
     try:
         delete_status, _ = client.delete_pod(identity.pod_id, policy.request_timeout_seconds)
     except ApiTransportError:
-        return _outcome("unknown", trigger + "_delete_transport_error", identity, checked_at)
+        return settled("unknown", trigger + "_delete_transport_error")
     if delete_status != 204:
-        return _outcome("unknown", trigger + f"_delete_http_{delete_status}", identity, checked_at)
+        return settled("unknown", trigger + f"_delete_http_{delete_status}")
 
     for attempt in range(policy.delete_verify_attempts):
         if attempt:
@@ -518,31 +568,17 @@ def check_once(
                 identity.pod_id, policy.request_timeout_seconds
             )
         except ApiTransportError:
-            return _outcome(
-                "unknown", trigger + "_delete_unconfirmed_transport_error", identity, checked_at
-            )
+            return settled("unknown", trigger + "_delete_unconfirmed_transport_error")
         if verify_status == 404:
-            return _outcome("terminated", trigger + "_delete_204_get_404", identity, checked_at)
+            return settled("terminated", trigger + "_delete_204_get_404")
         if verify_status != 200:
-            return _outcome(
-                "unknown",
-                trigger + f"_delete_unconfirmed_http_{verify_status}",
-                identity,
-                checked_at,
-            )
+            return settled("unknown", trigger + f"_delete_unconfirmed_http_{verify_status}")
         remaining = _decode_object(verify_body)
         if remaining is None:
-            return _outcome(
-                "unknown", trigger + "_delete_unconfirmed_malformed_json", identity, checked_at
-            )
+            return settled("unknown", trigger + "_delete_unconfirmed_malformed_json")
         if not identity.matches(remaining):
-            return _outcome(
-                "identity_mismatch",
-                trigger + "_post_delete_identity_mismatch",
-                identity,
-                checked_at,
-            )
-    return _outcome("unknown", trigger + "_delete_still_present", identity, checked_at)
+            return settled("identity_mismatch", trigger + "_post_delete_identity_mismatch")
+    return settled("unknown", trigger + "_delete_still_present")
 
 
 def _transfer_in_progress(heartbeat: Heartbeat, policy: Policy, now: float) -> bool:

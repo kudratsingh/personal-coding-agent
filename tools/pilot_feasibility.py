@@ -1131,6 +1131,15 @@ def build_rehearsal_report(
         "quoted_total_hourly": hourly,
         "runs": runs,
         "two_runs_wall_bound_usd": 2 * wall_cost,
+        "r2_upload": {
+            "checkpoint_bytes": d35.S_LABEL_CHECKPOINT_BYTES,
+            "labels_in_one_drain": 2,
+            "drain_seconds": d35.MAX_TRANSFER_SECONDS - d35.TRANSFER_MARGIN_SECONDS,
+            "safety_factor": 2,
+            "required_upload_bytes_per_second": d35.REQUIRED_UPLOAD_BYTES_PER_SECOND,
+            "gate": "the readiness receipt refuses a Pod whose measured R2 round-trip upload "
+            "rate is lower",
+        },
         "r2_storage": {
             "bytes": stored,
             "monthly_usd": monthly_storage_usd(stored),
@@ -1181,8 +1190,13 @@ def render_rehearsal_markdown(report: Mapping[str, Any]) -> str:
             f"{disk['container_disk_gb']:g} GB: {'fits' if disk['fits'] else '**does not fit**'}."
         )
     storage = report["r2_storage"]
+    upload = report["r2_upload"]
     lines += [
         f"- Both runs at their walls: ${report['two_runs_wall_bound_usd']:.2f}.",
+        f"- R2 upload: {upload['labels_in_one_drain']} labels of "
+        f"{upload['checkpoint_bytes'] / 1e9:.2f} GB in the {upload['drain_seconds']} s drain "
+        f"with a {upload['safety_factor']}x margin need "
+        f"{upload['required_upload_bytes_per_second'] / 1e6:.2f} MB/s; {upload['gate']}.",
         f"- R2 storage {storage['bytes'] / GB:,.1f} GB, ${storage['monthly_usd']:.2f}/month "
         f"({storage['assumption']}).",
         "",

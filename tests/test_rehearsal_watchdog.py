@@ -3,6 +3,7 @@
 import json
 import os
 import signal
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +129,122 @@ def test_the_pilot_policy_never_accepts_an_uploading_heartbeat(tmp_path: Path) -
     outcome = guard(tmp_path, "uploading", idle=10, progress_age=5, policy=pilot, into_run=1_000)
     assert outcome.reason.startswith("heartbeat_malformed")
     assert "uploading" not in runpod_watchdog.MODE_STATUSES["pilot"]
+
+
+def old_pod_heartbeat(path: Path, **extra: Any) -> None:
+    """What a reused controller directory still holds: the previous Pod's last mirror."""
+    beat = {
+        "schema_version": 1,
+        "updated_at_unix": CREATED - 3_600,  # An hour before this Pod was created.
+        "last_gpu_activity_unix": CREATED - 3_700,
+        "phase": "finalizing",
+        "step": 15_259,
+        "status": "shutdown_ready",
+        "mac_receipt_verified": True,
+        "github_receipt_verified": True,
+        "pod_id": "previous-pod",
+        **extra,
+    }
+    path.write_text(json.dumps(beat))
+
+
+def check(path: Path, now: float, api: API, *, policy: Policy = REHEARSAL) -> Outcome:
+    return check_once(
+        RunpodClient("authored-test-key", api),
+        PodIdentity.from_dict(IDENTITY),
+        policy,
+        path,
+        now=lambda: now,
+        sleep=lambda _: None,
+        observed=False,  # A new Pod's first polls.
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra", "reason"),
+    [
+        ({}, "heartbeat_names_another_pod"),
+        ({"pod_id": IDENTITY["id"]}, "heartbeat_predates_pod_creation"),
+        ({"pod_id": None}, "heartbeat_names_another_pod"),
+        ({"status": "running", "pod_id": IDENTITY["id"]}, "heartbeat_predates_pod_creation"),
+    ],
+)
+def test_a_reused_controller_directory_never_deletes_the_new_pod(
+    tmp_path: Path, extra: dict[str, Any], reason: str
+) -> None:
+    """The previous Pod's mirrored heartbeat reads as absent, never as stale or ready."""
+    path = tmp_path / "supervisor" / "heartbeat.json"
+    path.parent.mkdir()
+    old_pod_heartbeat(path, **extra)
+    baseline = CREATED + 120  # The new watchdog's idle baseline (runbook step 5).
+    policy = replace(REHEARSAL, idle_baseline_unix=baseline)
+    api = API()
+    outcome = check(path, CREATED + 140, api, policy=policy)
+    assert (outcome.state, outcome.reason, outcome.detail) == ("watching", "within_limits", reason)
+    assert api.calls == ["GET"]
+    # Absent, not fresh: the pre-heartbeat idle rule from the baseline still ends it.
+    late = check(path, baseline + 600, API(), policy=policy)
+    assert late.reason == "idle_gpu_limit_delete_204_get_404" and late.detail == reason
+
+
+def test_without_the_identity_rule_the_same_file_deletes_the_new_pod(tmp_path: Path) -> None:
+    """The finding's reproduction: an hour-old heartbeat reads as stale and deletes."""
+    path = tmp_path / "heartbeat.json"
+    old_pod_heartbeat(path, pod_id=IDENTITY["id"])
+    beat = runpod_watchdog.read_heartbeat(
+        path, now=CREATED + 140, max_idle_seconds=600, mode="rehearsal"
+    )
+    assert beat.error == "heartbeat_stale"
+    ignored = runpod_watchdog.read_heartbeat(
+        path,
+        now=CREATED + 140,
+        max_idle_seconds=600,
+        mode="rehearsal",
+        pod_id="podfixture01",
+        created_at_unix=CREATED,
+    )
+    assert (ignored.error, ignored.last_gpu_activity_unix, ignored.ignored) == (
+        None,
+        0.0,
+        "heartbeat_predates_pod_creation",
+    )
+
+
+def test_this_pods_own_heartbeat_is_still_read(tmp_path: Path) -> None:
+    path = tmp_path / "heartbeat.json"
+    activity = CREATED + 2_000
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "updated_at_unix": activity + 5,
+                "last_gpu_activity_unix": activity,
+                "phase": "stage1",
+                "step": 10,
+                "status": "running",
+                "pod_id": IDENTITY["id"],
+            }
+        )
+    )
+    watching = check(path, activity + 30, API())
+    assert watching.state == "watching" and watching.detail is None
+    idle = check(path, activity + 600, API())
+    assert idle.reason == "idle_gpu_limit_delete_204_get_404" and idle.detail is None
+
+
+def test_the_pilot_keeps_reading_heartbeats_without_the_creation_rule(tmp_path: Path) -> None:
+    """The pilot path is unchanged: no creation-time rule; another Pod's ID is still ignored."""
+    pilot = Policy(5_400, 3.0, 600, 0.6, billing_started_at_unix=CREATED)
+    path = tmp_path / "heartbeat.json"
+    old_pod_heartbeat(path)
+    unnamed = json.loads(path.read_text())
+    del unnamed["pod_id"]
+    path.write_text(json.dumps(unnamed))
+    stale = check(path, CREATED + 140, API(), policy=pilot)
+    assert stale.reason == "heartbeat_stale_delete_204_get_404"
+    old_pod_heartbeat(path)  # Naming another Pod: absent, then the creation-time baseline.
+    outcome = check(path, CREATED + 140, API(), policy=pilot)
+    assert outcome.state == "watching" and outcome.detail == "heartbeat_names_another_pod"
 
 
 def test_the_runbook_window_is_the_d35_one_and_within_the_ceiling() -> None:
