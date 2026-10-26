@@ -4,10 +4,13 @@ Shell variables get concrete values; no tool is executed. A command is parsed by
 its module's ``main`` with ``ArgumentParser.parse_args`` intercepted, so an unknown flag,
 a missing required flag or a bad choice fails here exactly as it would on the Mac or Pod.
 
-The runbook's own shell and Python (the step 5 Pod ID guard and wait for RUNNING, the
-per-Pod helpers, the step 7 and step 9 wait loops, the step 8 timer copy, the revision
-writer, the step 13 DELETE gate and the billing check) are extracted from this file and run
-against stubs, in bash and in zsh where the shell matters.
+The runbook's own shell and Python (the step 5 create guard, create request, Pod ID guard
+and wait for RUNNING, the per-Pod helpers, the step 7 and step 9 launches and wait loops,
+the step 8 timer copy, the revision writer, the step 13 DELETE gate and the billing check)
+are extracted from this file and run against stubs, in bash and in zsh where the shell
+matters. The step 7 and step 9 launches run as the Pod's shell would run them, to show that
+they return at once. No block may hold a comment: an interactive zsh on macOS has
+``interactivecomments`` off, so every block must also parse as one.
 """
 
 import argparse
@@ -23,6 +26,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import textwrap
 import time
 from collections import Counter
 from pathlib import Path
@@ -483,10 +487,15 @@ POD_ID_PARSER = "export POD_ID=$(python3 -c "
 
 
 def pod_id_guard() -> str:
-    """Step 5 from the Pod ID parser through the controller-directory guard's ``fi``."""
+    """Step 5 from the Pod ID parser through the controller-directory guard's ``fi``.
+
+    The guard sits inside the create branch, so it is dedented to run on its own.
+    """
     create = blocks(5)[0]
-    start = create.index(POD_ID_PARSER)
-    return create[start : create.index("\nfi\n", start) + 4]
+    start = create.rindex("\n", 0, create.index(POD_ID_PARSER)) + 1
+    indent = create[start : create.index(POD_ID_PARSER)]
+    end = create.index(f"\n{indent}fi\n", start) + len(indent) + 4
+    return textwrap.dedent(create[start:end])
 
 
 def test_pod_id_is_parsed_from_the_create_response_never_copied_by_hand() -> None:
@@ -495,14 +504,15 @@ def test_pod_id_is_parsed_from_the_create_response_never_copied_by_hand() -> Non
     assert "<id printed above>" not in text and "export POD_ID=<" not in text
     assert "tee " not in create  # The response goes to its file only; the parser reads it.
     request = create.index("curl --config -")
-    response = '> "$LAUNCH/create-response.json"\n'
+    response = '-o "$LAUNCH/create-response.json"'
     assert request < create.index(response) < create.index(POD_ID_PARSER)
-    (parser,) = [line for line in create.splitlines() if line.startswith(POD_ID_PARSER)]
+    (parser,) = [line for line in create.splitlines() if line.strip().startswith(POD_ID_PARSER)]
     assert parser.endswith(' "$LAUNCH/create-response.json")')
     # The parser accepts exactly the Pod IDs the watchdog accepts.
     assert _SAFE_POD_ID.pattern.removesuffix("\\Z") in parser and "re.fullmatch(" in parser
     # Every later use of POD_ID sits behind the guard's check that it is set.
     guard = pod_id_guard()
+    assert guard.startswith(POD_ID_PARSER) and guard.endswith("\nfi\n")
     assert guard.index('if [ -z "$POD_ID" ]; then') < guard.index('elif mkdir "$CTRL"; then')
 
 
@@ -514,6 +524,7 @@ def run_pod_id_guard(
     launch.mkdir(parents=True)
     (launch / "create-body.json").write_text('{"name": "rehearsal-a40-s-a"}\n')
     (launch / "create-response.json").write_text(response)
+    (launch / "create-http-code").write_text("201\n")
     control = root / "a" / "podfixture01"
     if existing:
         control.mkdir()
@@ -549,6 +560,7 @@ def test_step_5_takes_the_pod_id_from_the_response_and_writes_run_env(
     )
     assert sorted(path.name for path in control.iterdir()) == [
         "create-body.json",
+        "create-http-code",
         "create-response.json",
         "run.env",
     ]
@@ -575,6 +587,7 @@ def test_step_5_refusal_names_this_pod_and_leaves_the_existing_directory_alone(
     assert (control / "run.env").read_text() == "export ORIGIN=1700000000 POD_ID=podfixture01\n"
     assert sorted(path.name for path in launch.iterdir()) == [
         "create-body.json",
+        "create-http-code",
         "create-response.json",
     ]
     assert f"CTRL={launch}\n" in message
@@ -602,43 +615,314 @@ def test_step_5_refuses_a_missing_or_malformed_pod_id(
 ) -> None:
     result, launch, control = run_pod_id_guard(tmp_path, shell, response)
     assert "names no valid Pod id" in result.stdout
-    assert "never terminate a Pod by name or by guess" in result.stdout
+    # A missing ID never means that no Pod exists: the owner checks the console.
+    assert "A Pod MAY STILL EXIST" in result.stdout
+    assert "a Pod named rehearsal-a40-s-a created at or after " in result.stdout
+    assert "terminate any such Pod there, and to decide before any retry" in result.stdout
+    assert "Never delete a Pod from this terminal by name or by guess" in result.stdout
+    assert "created no Pod" not in result.stdout
     assert "terminate Pod" not in result.stdout  # No ID, so it names no Pod to delete.
     assert f"CTRL={launch}\nPOD_ID=\n" in result.stdout
     assert sorted(path.name for path in launch.parent.iterdir()) == [launch.name]
     assert not (launch / "run.env").exists()
 
 
+# Step 5: one Pod per run at a time, and a create whose reply failed ---------------------
+
+CREATE_STUBS = r"""
+curl() {
+  cat > "$STUB_DIR/curl.stdin"
+  printf '%s\n' "$@" > "$STUB_DIR/curl.args"
+  echo create >> "$STUB_DIR/curl.calls"
+  OUT=
+  while [ $# -gt 0 ]; do if [ "$1" = -o ]; then OUT=$2; fi; shift; done
+  printf '%s' "$RESPONSE" > "$OUT"
+  printf '%s\n' "$HTTP_CODE"
+  return "$CURL_EXIT"
+}
+"""
+CREATED = '{"id": "podfixture01", "name": "rehearsal-a40-s-a", "status": "PROVISIONING"}'
+
+
+def create_block() -> str:
+    (block,) = [block for block in blocks(5) if "-X POST" in block]
+    return block
+
+
+def run_create(
+    tmp_path: Path,
+    shell: str,
+    *,
+    response: str = CREATED,
+    http_code: str = "201",
+    curl_exit: int = 0,
+    pod_id: str | None = None,
+    pastes: int = 1,
+) -> tuple[str, Path, list[str]]:
+    """Paste the create block ``pastes`` times into one shell; curl is a stub."""
+    stubs = tmp_path / "stubs"
+    stubs.mkdir(exist_ok=True)
+    root = tmp_path / "runs"
+    environment = {
+        **os.environ,
+        "STUB_DIR": str(stubs),
+        "CTRL_ROOT": str(root),
+        "RUN": "A",
+        "RUN_LOWER": "a",
+        "RUNPOD_API_KEY": "rpa_fixture_key",
+        "RESPONSE": response,
+        "HTTP_CODE": http_code,
+        "CURL_EXIT": str(curl_exit),
+    }
+    for name in ("POD_ID", "CTRL", "ORIGIN", "LAUNCH", "SELF_DESTRUCT_DEADLINE", "TERMINATE"):
+        environment.pop(name, None)
+    if pod_id is not None:
+        environment.update(POD_ID=pod_id, CTRL=str(root / "a" / pod_id))
+    script = (
+        CREATE_STUBS
+        + create_block() * pastes
+        + 'printf "POD_ID=[%s]\\nCTRL=[%s]\\n" "${POD_ID:-}" "${CTRL:-}"\n'
+    )
+    # The body is read from configs/ in the checkout; everything written goes under tmp_path.
+    result = subprocess.run(
+        [shell, "-c", script], cwd=ROOT, env=environment, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    calls = stubs / "curl.calls"
+    return result.stdout, root / "a", calls.read_text().splitlines() if calls.exists() else []
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_step_5_pasted_twice_creates_one_pod_and_records_the_http_code(
+    tmp_path: Path, shell: str
+) -> None:
+    out, runs, calls = run_create(tmp_path, shell, pastes=2)
+    control = runs / "podfixture01"
+    assert calls == ["create"]  # The second paste sent nothing.
+    assert f"run A: Pod podfixture01, controller directory {control}" in out
+    assert (
+        "run A: NOT creating a Pod: this terminal already names Pod podfixture01 "
+        f"({control}), which may still bill" in out
+    )
+    assert "Confirm Pod podfixture01 gone with step 13 in this terminal." in out
+    assert out.endswith(f"POD_ID=[podfixture01]\nCTRL=[{control}]\n")
+    assert sorted(path.name for path in runs.iterdir()) == ["podfixture01"]
+    assert (control / "create-http-code").read_text() == "201\n"
+    assert json.loads((control / "create-body.json").read_text())["name"] == "rehearsal-a40-s-a"
+    origin = re.search(r"ORIGIN=(\d+) ", (control / "run.env").read_text())
+    assert origin
+    launch = runs / f"launch-{origin.group(1)}"
+    stubs = tmp_path / "stubs"
+    assert (stubs / "curl.args").read_text().splitlines() == [
+        "--config",
+        "-",
+        "-sS",
+        "--fail-with-body",
+        "-X",
+        "POST",
+        "https://api.runpod.io/v2/pods",
+        "-H",
+        "Content-Type: application/json",
+        "--data",
+        f"@{launch}/create-body.json",
+        "-o",
+        f"{launch}/create-response.json",
+        "-w",
+        "%{http_code}\\n",
+    ]
+    # The key reaches curl on its standard input only.
+    stdin = (stubs / "curl.stdin").read_text()
+    assert stdin == 'header = "Authorization: Bearer rpa_fixture_key"\n'
+    assert "rpa_fixture_key" not in (stubs / "curl.args").read_text()
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_step_5_refuses_to_create_while_this_terminal_names_a_pod(
+    tmp_path: Path, shell: str
+) -> None:
+    out, runs, calls = run_create(tmp_path, shell, pod_id="podearlier01")
+    assert calls == [] and not runs.exists()
+    assert "run A: NOT creating a Pod: this terminal already names Pod podearlier01" in out
+    assert "Confirm Pod podearlier01 gone with step 13 in this terminal." in out
+    assert "run unset POD_ID and paste this block again" in out
+    assert out.endswith(f"POD_ID=[podearlier01]\nCTRL=[{runs}/podearlier01]\n")
+
+
+OPEN_RUN_ENV = "export ORIGIN=1700000000 POD_ID=podold01 SELF_DESTRUCT_DEADLINE=1700044820\n"
+TEARDOWN_LINE = "export TEARDOWN=1700040000\n"
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize(
+    ("directories", "open_one"),
+    [
+        ({"podold01": OPEN_RUN_ENV}, "podold01"),
+        ({"podold01": OPEN_RUN_ENV + "export POD_HOST=203.0.113.9 POD_PORT=1\n"}, "podold01"),
+        ({"podold01": None}, "podold01"),
+        ({"launch-1700000000": None}, "launch-1700000000"),  # A create never confirmed.
+        ({"podold01": OPEN_RUN_ENV + TEARDOWN_LINE, "podold02": OPEN_RUN_ENV}, "podold02"),
+    ],
+)
+def test_step_5_refuses_to_create_while_another_pod_of_the_run_has_no_teardown(
+    tmp_path: Path, shell: str, directories: dict[str, str | None], open_one: str
+) -> None:
+    runs = tmp_path / "runs" / "a"
+    for name, run_env in directories.items():
+        (runs / name).mkdir(parents=True)
+        if run_env is not None:
+            (runs / name / "run.env").write_text(run_env)
+    out, runs, calls = run_create(tmp_path, shell)
+    assert calls == []
+    assert f"run A: NOT creating a Pod: no TEARDOWN is recorded in {runs}/{open_one}. " in out
+    assert "End each Pod with step 13 in its own terminal" in out
+    assert "POD_ID=[]\nCTRL=[]\n" in out
+    assert sorted(path.name for path in runs.iterdir()) == sorted(directories)  # Nothing new.
+    for name, run_env in directories.items():
+        if run_env is not None:
+            assert (runs / name / "run.env").read_text() == run_env
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("settled", ["podold01", "launch-1700000000"])
+def test_step_5_creates_once_every_earlier_pod_has_its_teardown(
+    tmp_path: Path, shell: str, settled: str
+) -> None:
+    runs = tmp_path / "runs" / "a"
+    (runs / settled).mkdir(parents=True)
+    run_env = (OPEN_RUN_ENV if settled.startswith("pod") else "") + TEARDOWN_LINE
+    (runs / settled / "run.env").write_text(run_env)
+    out, runs, calls = run_create(tmp_path, shell)
+    assert calls == ["create"] and "NOT creating" not in out
+    assert sorted(path.name for path in runs.iterdir()) == sorted([settled, "podfixture01"])
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize(
+    ("response", "code", "curl_exit"),
+    [
+        ("<html>502 Bad Gateway</html>", "502", 22),  # A gateway error after the create.
+        ("", "000", 52),  # The connection dropped: no reply at all.
+        ('{"error": "internal error"}', "500", 22),
+    ],
+)
+def test_step_5_failed_reply_warns_that_a_pod_may_exist_and_blocks_a_retry(
+    tmp_path: Path, shell: str, response: str, code: str, curl_exit: int
+) -> None:
+    out, runs, calls = run_create(
+        tmp_path, shell, response=response, http_code=code, curl_exit=curl_exit, pastes=2
+    )
+    assert calls == ["create"]  # Pasting again never retries on its own.
+    (launch,) = list(runs.iterdir())
+    assert launch.name.startswith("launch-")
+    assert (
+        f"run A: the create request ended with HTTP {code} and "
+        f"{launch}/create-response.json names no valid Pod id" in out
+    )
+    assert "A Pod MAY STILL EXIST" in out
+    assert (
+        "look in the Runpod console for a Pod named rehearsal-a40-s-a created at or after " in out
+    )
+    assert "terminate any such Pod there, and to decide before any retry" in out
+    assert f"run A: NOT creating a Pod: no TEARDOWN is recorded in {launch}. " in out
+    assert out.endswith(f"POD_ID=[]\nCTRL=[{launch}]\n")
+    assert sorted(path.name for path in launch.iterdir()) == [
+        "create-body.json",
+        "create-http-code",
+        "create-response.json",
+    ]
+    assert (launch / "create-http-code").read_text() == f"{code}\n"
+    assert (launch / "create-response.json").read_text() == response
+    # The settled launch is recorded as step 5 says, and the next paste creates again.
+    settle = 'printf \'export TEARDOWN=%s\\n\' "$(date +%s)" >> "$LAUNCH/run.env"'
+    assert f"`{settle}`" in section(5)
+    (launch / "run.env").write_text(TEARDOWN_LINE)
+    (tmp_path / "stubs" / "curl.calls").unlink()
+    out, runs, calls = run_create(tmp_path, shell)
+    assert calls == ["create"] and "run A: Pod podfixture01" in out
+
+
+def test_step_5_create_block_guards_before_it_sends_anything() -> None:
+    create = create_block()
+    first, second = create.splitlines()[:2]
+    assert first.startswith('OPEN_PODS=$(find "$CTRL_ROOT/$RUN_LOWER" -mindepth 1 -maxdepth 1')
+    assert "grep -qs '^export TEARDOWN=' \"$DIR/run.env\"" in first
+    assert "*" not in first  # No glob: zsh would stop the paste on "no matches found".
+    assert second == 'if [ -n "${POD_ID:-}" ]; then'
+    assert create.index('elif [ -n "$OPEN_PODS" ]; then') < create.index("\nelse\n")
+    assert create.index("\nelse\n") < create.index("export ORIGIN=$(date +%s)")
+    assert create.index("export ORIGIN=") < create.index("curl --config -")
+    assert create.rstrip().endswith("\n  fi\nfi")
+    # The step 13 teardown record is what lets a later create through.
+    assert 'printf \'export TEARDOWN=%s\\n\' "$TEARDOWN" >> "$CTRL/run.env"' in termination()
+
+
 # Step 5: the bounded wait for RUNNING ----------------------------------------------------
 
-RUNNING_STUBS = r"""
+WATCHDOG_STUBS = r"""
 date() { cat "$CLOCK"; }
 sleep() { echo $(( $(cat "$CLOCK") + $1 )) > "$CLOCK"; }
-watchdog() { BASE=$(cat "$CLOCK"); echo "watchdog $BASE" >> "$CALLS"; }
+watchdog() {
+  if [ -n "${WATCHDOG_FAILS:-}" ]; then
+    echo "watchdog failed $(cat "$CLOCK")" >> "$CALLS"; return 1
+  fi
+  BASE=$(cat "$CLOCK"); echo "watchdog $BASE" >> "$CALLS"; echo 4242 > "$CTRL/watchdog.pid"
+}
+ps() {
+  if [ "$2" = 4242 ]; then
+    echo "python -m tools.runpod_watchdog --mode rehearsal --identity $CTRL/pod-identity.json"
+  else
+    echo "sleep 30"
+  fi
+}
+"""
+"""The clock, this Pod's watchdog (PID 4242) and ``ps`` for every wait loop."""
+
+
+def keepalive() -> str:
+    """The ``keepalive`` helper, as written into helpers.sh."""
+    match = re.search(r"\nkeepalive\(\) \{\n.*?\n\}\n", "\n" + helpers(), re.S)
+    assert match, "the helpers define keepalive"
+    return match.group(0).lstrip("\n")
+
+
+def loop_stubs(extra: str) -> str:
+    return WATCHDOG_STUBS + keepalive() + extra
+
+
+RUNNING_STUBS = r"""
 uv() {
   echo "$*" >> "$CAPTURES"
-  if [ "$(cat "$CLOCK")" -ge "$RUNNING_AT" ]; then
-    printf '{"status": "RUNNING", "ssh_direct": %s}\n' "$DIRECT" > "$CTRL/pod-connection.json"
+  NOW=$(cat "$CLOCK")
+  if [ "$NOW" -lt "$RUNNING_AT" ]; then
+    STATUS=null DIRECT_NOW=null PROXY=true
+  elif [ "$NOW" -lt "$DIRECT_AT" ] || [ "$DIRECT" = null ]; then
+    STATUS='"RUNNING"' DIRECT_NOW=null PROXY=true
   else
-    printf '{"status": null, "ssh_direct": null}\n' > "$CTRL/pod-connection.json"
+    STATUS='"RUNNING"' DIRECT_NOW=$DIRECT PROXY=false
   fi
+  printf '{"status": %s, "ssh_direct": %s, "ssh_proxy_only": %s}\n' \
+    "$STATUS" "$DIRECT_NOW" "$PROXY" > "$CTRL/pod-connection.json"
 }
 """
 DIRECT_SSH = json.dumps({"host": VALUES["POD_HOST"], "port": int(VALUES["POD_PORT"])})
 
 
 def running_wait() -> str:
-    (block,) = [block for block in blocks(5) if "until python3 -c" in block]
+    (block,) = [block for block in blocks(5) if '"$CTRL/pod-connection.json"; STATE=$?' in block]
     return block
 
 
 def test_the_wait_for_running_is_bounded_and_rebaselines_the_watchdog() -> None:
     loop = running_wait()
-    assert loop.startswith("GIVE_UP=$(( $(date +%s) + 1200 ))\n")
-    assert "if [ $(( $(date +%s) - BASE )) -ge 300 ]; then watchdog; fi" in loop
+    assert loop.startswith("GIVE_UP=$(( $(date +%s) + 1200 )); PROXY_ONLY=0\nwhile :; do\n")
     body = loop[loop.index("; do\n") : loop.index("\ndone\n")]
     assert "tools.runpod_pod_identity capture" in body  # Captured again inside the loop.
+    assert body.rstrip().endswith("\n  keepalive")
     assert '"status") == "RUNNING"' in loop and 'd.get("host")' in loop and 'd.get("port")' in loop
+    # RUNNING with only the proxy on three captures in a row ends the wait early.
+    assert 'c.get("ssh_proxy_only") is True' in loop
+    assert '"ssh_proxy_only": direct is None' in (ROOT / "tools/runpod_pod_identity.py").read_text()
+    assert 'if [ "$PROXY_ONLY" -ge 3 ]; then' in body
     # The wait sits between the helpers (which start the watchdog) and the host-key pin.
     assert blocks(5).index(loop) == 2 and "ssh-keyscan" in blocks(5)[3]
     assert "re-run the capture until it does" not in section(5)
@@ -647,7 +931,13 @@ def test_the_wait_for_running_is_bounded_and_rebaselines_the_watchdog() -> None:
 
 
 def run_running_wait(
-    tmp_path: Path, shell: str, *, running_at: int, direct: str = DIRECT_SSH
+    tmp_path: Path,
+    shell: str,
+    *,
+    running_at: int,
+    direct: str = DIRECT_SSH,
+    direct_at: int = 0,
+    watchdog_pid: str | None = "4242",
 ) -> tuple[str, list[str], list[str]]:
     clock, calls, captures = tmp_path / "clock", tmp_path / "calls", tmp_path / "captures"
     clock.write_text("1000\n")
@@ -655,6 +945,8 @@ def run_running_wait(
     captures.write_text("")
     control = tmp_path / "ctrl"
     control.mkdir()
+    if watchdog_pid is not None:
+        (control / "watchdog.pid").write_text(f"{watchdog_pid}\n")
     # The capture before the helpers block saw a Pod that is not running yet.
     (control / "pod-connection.json").write_text('{"status": null, "ssh_direct": null}\n')
     environment = {
@@ -664,13 +956,14 @@ def run_running_wait(
         "CAPTURES": str(captures),
         "RUNNING_AT": str(running_at),
         "DIRECT": direct,
+        "DIRECT_AT": str(direct_at),
         "CTRL": str(control),
         "POD_ID": VALUES["POD_ID"],
         "RUN": "A",
         "BASE": "1000",
     }
     result = subprocess.run(
-        [shell, "-c", RUNNING_STUBS + running_wait() + "\nexit 0\n"],
+        [shell, "-c", loop_stubs(RUNNING_STUBS) + running_wait() + "\nexit 0\n"],
         env=environment,
         capture_output=True,
         text=True,
@@ -686,6 +979,7 @@ def test_the_wait_for_running_returns_once_the_pod_has_direct_ssh(
 ) -> None:
     out, calls, captures = run_running_wait(tmp_path, shell, running_at=1400)
     assert "RUNNING with direct SSH" in out and "not RUNNING" not in out
+    assert "WARNING" not in out
     assert calls == ["watchdog 1300"]  # Re-baselined after 300 s of waiting.
     control = tmp_path / "ctrl"
     assert len(captures) == 20 and set(captures) == {
@@ -695,19 +989,56 @@ def test_the_wait_for_running_returns_once_the_pod_has_direct_ssh(
 
 
 @pytest.mark.parametrize("shell", SHELLS)
-@pytest.mark.parametrize("direct", [DIRECT_SSH, "null", '{"host": null, "port": 40022}'])
+@pytest.mark.parametrize("direct", [DIRECT_SSH, '{"host": null, "port": 40022}'])
 def test_the_wait_for_running_gives_up_after_20_minutes(
     tmp_path: Path, shell: str, direct: str
 ) -> None:
-    # Never RUNNING, or RUNNING behind the proxy only: the wait ends at its deadline.
+    # Never RUNNING, or RUNNING with an incomplete direct address: the wait ends at its deadline.
     running_at = 10**9 if direct == DIRECT_SSH else 1100
     out, calls, captures = run_running_wait(tmp_path, shell, running_at=running_at, direct=direct)
     assert (
         "run A: Pod podfixture01 is not RUNNING with direct SSH after 20 minutes; "
         "terminate it (step 13, TERMINATE=yes)" in out
     )
+    assert "proxy SSH only" not in out
     assert calls == ["watchdog 1300", "watchdog 1600", "watchdog 1900", "watchdog 2200"]
     assert len(captures) == 60
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_the_wait_for_running_stops_early_for_a_pod_with_proxy_ssh_only(
+    tmp_path: Path, shell: str
+) -> None:
+    out, calls, captures = run_running_wait(tmp_path, shell, running_at=1100, direct="null")
+    assert (
+        "run A: Pod podfixture01 is RUNNING with proxy SSH only: it has no public IP, so no "
+        "file can reach it; terminate it (step 13, TERMINATE=yes)" in out
+    )
+    assert "after 20 minutes" not in out
+    # Seen RUNNING behind the proxy at 1100, 1120 and 1140: three captures in a row.
+    assert len(captures) == 7 and out.count("RUNNING with proxy SSH only\n") == 3
+    assert calls == []
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_the_wait_for_running_allows_a_direct_address_that_comes_late(
+    tmp_path: Path, shell: str
+) -> None:
+    # Two proxy-only captures, then the direct address: the wait carries on and succeeds.
+    out, calls, captures = run_running_wait(tmp_path, shell, running_at=1100, direct_at=1140)
+    assert out.count("RUNNING with proxy SSH only\n") == 2
+    assert out.rstrip().endswith("RUNNING with direct SSH")
+    assert "terminate" not in out and len(captures) == 7
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_the_wait_for_running_warns_and_restarts_a_dead_watchdog(
+    tmp_path: Path, shell: str
+) -> None:
+    # watchdog.pid names a process that is not this Pod's watchdog.
+    out, calls, _ = run_running_wait(tmp_path, shell, running_at=1400, watchdog_pid="999")
+    assert out.count("WARNING run A: NO LIVE WATCHDOG guards Pod podfixture01") == 1
+    assert calls == ["watchdog 1020", "watchdog 1320"]  # Restarted on the first pass.
 
 
 # The per-Pod helpers file ----------------------------------------------------------------
@@ -814,6 +1145,7 @@ def test_sourced_helpers_reach_only_this_pod_and_restart_only_this_watchdog(
         'podscp "$CTRL/revision.json" root@$POD_HOST:/workspace/revision.json\n'
         'watchdog && cat "$CTRL/watchdog.pid" > "$CTRL/first.pid"\n'
         'watchdog && cat "$CTRL/watchdog.pid" > "$CTRL/second.pid"\n'
+        'keepalive > "$CTRL/keepalive.out"\n'
     )
     pids: list[int] = []
     try:
@@ -861,6 +1193,9 @@ def test_sourced_helpers_reach_only_this_pod_and_restart_only_this_watchdog(
         while alive(first) and time.monotonic() < deadline:
             time.sleep(0.1)
         assert not alive(first) and alive(second)  # The restart replaced only its own.
+        # keepalive's real ps check recognises the live watchdog: no warning, no restart.
+        assert (control / "keepalive.out").read_text() == ""
+        assert int((control / "watchdog.pid").read_text()) == second
     finally:
         for pid in pids:
             stop(pid)
@@ -868,16 +1203,87 @@ def test_sourced_helpers_reach_only_this_pod_and_restart_only_this_watchdog(
         bystander.wait()
 
 
+def run_keepalive(
+    tmp_path: Path, shell: str, *, watchdog_pid: str | None, base: int, fails: bool = False
+) -> tuple[str, list[str]]:
+    """Two passes of keepalive, 10 s apart, starting at clock 2000."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    clock, calls = tmp_path / "clock", tmp_path / "calls"
+    clock.write_text("2000\n")
+    calls.write_text("")
+    control = tmp_path / "ctrl"
+    control.mkdir()
+    if watchdog_pid is not None:
+        (control / "watchdog.pid").write_text(f"{watchdog_pid}\n")
+    environment = {
+        **os.environ,
+        "CLOCK": str(clock),
+        "CALLS": str(calls),
+        "CTRL": str(control),
+        "POD_ID": VALUES["POD_ID"],
+        "RUN": "A",
+        "BASE": str(base),
+        "WATCHDOG_FAILS": "1" if fails else "",
+    }
+    script = loop_stubs("") + "keepalive\nsleep 10\nkeepalive\n"
+    result = subprocess.run(
+        [shell, "-c", script], env=environment, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0 and result.stderr == "", result.stderr
+    return result.stdout, calls.read_text().splitlines()
+
+
+NO_WATCHDOG = (
+    "WARNING run A: NO LIVE WATCHDOG guards Pod podfixture01: {ctrl}/watchdog.pid is missing "
+    "or names no live watchdog of this Pod."
+)
+RESTART_FAILED = "WARNING run A: the watchdog restart FAILED; see {ctrl}/watchdog.log."
+
+
+def test_keepalive_checks_this_pods_watchdog_as_the_helper_does() -> None:
+    body = keepalive()
+    check = (
+        'ps -p "$LIVE" -o command= 2>/dev/null | grep -qF -- "--identity $CTRL/pod-identity.json"'
+    )
+    assert check in body
+    assert body.count("BASE=0") == 2 and body.count("WARNING") == 2
+    assert "if [ $(( $(date +%s) - BASE )) -ge 300 ]; then" in body
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_keepalive_is_quiet_while_this_pods_watchdog_lives(tmp_path: Path, shell: str) -> None:
+    out, calls = run_keepalive(tmp_path, shell, watchdog_pid="4242", base=1900)
+    assert out == "" and calls == []
+    out, calls = run_keepalive(tmp_path / "old", shell, watchdog_pid="4242", base=1700)
+    assert "WARNING" not in out and calls == ["watchdog 2000"]  # 300 s since the baseline.
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("watchdog_pid", [None, "999", "not-a-pid"])
+def test_keepalive_warns_and_restarts_a_missing_or_dead_watchdog(
+    tmp_path: Path, shell: str, watchdog_pid: str | None
+) -> None:
+    out, calls = run_keepalive(tmp_path, shell, watchdog_pid=watchdog_pid, base=1990)
+    assert out.count(NO_WATCHDOG.format(ctrl=tmp_path / "ctrl")) == 1
+    assert calls == ["watchdog 2000"]  # At once, though the baseline was only 10 s old.
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_keepalive_warns_when_a_restart_fails_and_retries_on_the_next_pass(
+    tmp_path: Path, shell: str
+) -> None:
+    out, calls = run_keepalive(tmp_path, shell, watchdog_pid="4242", base=1700, fails=True)
+    assert out.count(RESTART_FAILED.format(ctrl=tmp_path / "ctrl")) == 2
+    assert calls == ["watchdog failed 2000", "watchdog failed 2010"]  # Not 5 minutes later.
+
+
 # Step 7: one bootstrap per Pod, and a wait that notices a failed launch ------------------
 
 BOOTSTRAP_STUBS = r"""
-date() { cat "$CLOCK"; }
-sleep() { echo $(( $(cat "$CLOCK") + $1 )) > "$CLOCK"; }
-watchdog() { BASE=$(cat "$CLOCK"); echo "watchdog $BASE" >> "$CALLS"; }
 podssh() {
   case "$1" in
     "test -e /workspace/rehearsal/bootstrap.log") [ -n "$LOG_EXISTS" ] ;;
-    "test ! -e /workspace/rehearsal/bootstrap.log && cd /workspace/repo && "*)
+    "test ! -e /workspace/rehearsal/bootstrap.log || exit 1; cd /workspace/repo && "*)
       echo launch >> "$CALLS" ;;
     "grep -q ^BOOTSTRAP_EXIT= /workspace/rehearsal/bootstrap.log")
       [ -e "$CLOCK.exited" ] || [ "$(cat "$CLOCK")" -ge "$EXIT_AT" ] ;;
@@ -903,16 +1309,24 @@ def test_step_7_never_launches_a_second_bootstrap_and_checks_that_one_runs() -> 
     # Refused from the Mac when bootstrap.log exists, and again on the Pod before the tar.
     assert wait.startswith("if podssh 'test -e /workspace/rehearsal/bootstrap.log'; then\n")
     assert wait.index("\nelse\n") < wait.index(launch) < wait.index("\nfi\n")
+    # Each check is its own statement, so only the bootstrap itself goes to the background.
     assert launch.strip().startswith(
-        'podssh "test ! -e /workspace/rehearsal/bootstrap.log && cd /workspace/repo && tar xzf'
+        'podssh "test ! -e /workspace/rehearsal/bootstrap.log || exit 1; cd /workspace/repo && '
+        "tar xzf /workspace/repo.tar.gz || exit 1; setsid nohup bash -c '"
     )
-    assert "> /workspace/rehearsal/bootstrap.log 2>&1 < /dev/null &" in launch
+    assert launch.strip().endswith("' > /workspace/rehearsal/bootstrap.log 2>&1 < /dev/null &\"")
     # The wait checks liveness with the bootstrap script's own name, and keeps re-baselining.
     assert f"podssh 'pgrep -f {BOOTSTRAP.name}' > /dev/null; ALIVE=$?" in wait
     assert '[ "$ALIVE" -eq 1 ]' in wait
-    assert "if [ $(( $(date +%s) - BASE )) -ge 300 ]; then watchdog; fi" in wait
+    assert "  sleep 30; keepalive\ndone\n" in wait and "then watchdog; fi" not in wait
     assert "GIVE_UP=$(( $(date +%s) + 2700 ))" in wait
     assert "move the old log aside" in section(7)
+    # A new commit also needs the workspace's old revision moved aside, or exit 6 repeats.
+    assert (
+        "podssh 'mv /workspace/rehearsal/revision.json "
+        "/workspace/rehearsal/revision.json.old-$(date +%s)'" in section(7)
+    )
+    assert "without this it exits 6 every time" in section(7)
 
 
 def run_bootstrap_wait(
@@ -924,14 +1338,21 @@ def run_bootstrap_wait(
     alive_until: int = 0,
     pgrep_none: int = 1,
     exits_during_pgrep: bool = False,
+    watchdog_pid: str | None = "4242",
 ) -> tuple[str, list[str]]:
     clock, calls = tmp_path / "clock", tmp_path / "calls"
     clock.write_text("1000\n")
     calls.write_text("")
+    control = tmp_path / "ctrl"
+    control.mkdir()
+    if watchdog_pid is not None:
+        (control / "watchdog.pid").write_text(f"{watchdog_pid}\n")
     environment = {
         **os.environ,
         "CLOCK": str(clock),
         "CALLS": str(calls),
+        "CTRL": str(control),
+        "POD_ID": VALUES["POD_ID"],
         "LOG_EXISTS": "1" if log_exists else "",
         "EXIT_AT": str(exit_at),
         "ALIVE_UNTIL": str(alive_until),
@@ -951,7 +1372,7 @@ def run_bootstrap_wait(
         },
     }
     result = subprocess.run(
-        [shell, "-c", BOOTSTRAP_STUBS + bootstrap_wait() + "\nexit 0\n"],
+        [shell, "-c", loop_stubs(BOOTSTRAP_STUBS) + bootstrap_wait() + "\nexit 0\n"],
         env=environment,
         capture_output=True,
         text=True,
@@ -971,6 +1392,18 @@ def test_step_7_launches_once_and_waits_for_the_bootstrap_to_exit(
     out, calls = run_bootstrap_wait(tmp_path, shell, exit_at=1400, alive_until=1400)
     assert calls == ["launch", "watchdog 1300"]
     assert "already exists" not in out and NO_BOOTSTRAP not in out and "45 minutes" not in out
+    assert "WARNING" not in out
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_step_7_wait_warns_and_restarts_when_watchdog_pid_is_missing(
+    tmp_path: Path, shell: str
+) -> None:
+    out, calls = run_bootstrap_wait(
+        tmp_path, shell, exit_at=1400, alive_until=1400, watchdog_pid=None
+    )
+    assert out.count(NO_WATCHDOG.format(ctrl=tmp_path / "ctrl")) == 1
+    assert calls == ["launch", "watchdog 1030", "watchdog 1330"]  # Restarted on the first pass.
 
 
 @pytest.mark.parametrize("shell", SHELLS)
@@ -1022,6 +1455,205 @@ def test_step_7_gives_up_after_45_minutes(tmp_path: Path, shell: str) -> None:
     assert calls == ["launch", *(f"watchdog {1000 + 300 * n}" for n in range(1, 10))]
 
 
+# Steps 7 and 9: each launch returns at once, as the Pod's shell runs it -----------------
+
+LAUNCH_VALUES = (
+    "RUN",
+    "SELF_DESTRUCT_DEADLINE",
+    "BINDING_SHA256",
+    "INIT_KEY",
+    "INIT_SHA256",
+    "INIT_SIZE",
+    "SPEC",
+)
+FAKE_BOOTSTRAP = 'printf "%s\\n" "$@" > "$STUB_DIR/bootstrap.args"\nsleep 5\n'
+FAKE_WORKER = """#!/bin/sh
+printf '%s\\n' "$@" > "$STUB_DIR/worker.args"
+printf '%s\\n' "${R2_FIXTURE_NAME:-unset}" > "$STUB_DIR/worker.env"
+sleep 5
+"""
+POD_STUBS = {
+    "setsid": '#!/bin/sh\nexec "$@"\n',
+    "tar": '#!/bin/sh\nprintf "%s\\n" "$@" > "$STUB_DIR/tar.args"\nexit "${TAR_EXIT:-0}"\n',
+    "python3": FAKE_WORKER,
+}
+FAST_RETURN_SECONDS = 2.0
+"""The fake bootstrap and worker run 5 s; a launch that waits for them takes at least that."""
+
+
+def launch_branch(block: str) -> str:
+    """The ``else`` branch of a block's first ``if``: the launch on the Pod."""
+    start = block.index("\nelse\n") + len("\nelse\n")
+    return block[start : block.index("\nfi\n", start) + 1]
+
+
+def remote_launch(block: str) -> str:
+    """The command the Pod's shell receives from a launch, as each Mac shell expands it."""
+    expanded = set()
+    for shell in SHELLS:
+        result = subprocess.run(
+            [shell, "-c", 'podssh() { printf "%s" "$1"; }\n' + launch_branch(block)],
+            env={**os.environ, **{name: VALUES[name] for name in LAUNCH_VALUES}},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0 and result.stderr == "", result.stderr
+        expanded.add(result.stdout)
+    (command,) = expanded  # Every Mac shell sends the same text.
+    return command
+
+
+def pod_workspace(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    """A stand-in for the Pod's /workspace, with setsid, tar and python3 stubs on PATH."""
+    assert re.fullmatch(r"[\w/.-]+", str(tmp_path)), tmp_path  # Unquoted, as /workspace is.
+    workspace = tmp_path / "workspace"
+    (workspace / "rehearsal").mkdir(parents=True)
+    (workspace / "repo" / "tools").mkdir(parents=True)
+    stubs = tmp_path / "pod-bin"
+    stubs.mkdir()
+    for name, text in POD_STUBS.items():
+        (stubs / name).write_text(text)
+        (stubs / name).chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}",
+        "STUB_DIR": str(stubs),
+    }
+    return workspace, environment
+
+
+def run_on_pod(command: str, environment: dict[str, str]) -> tuple[float, int]:
+    """Run a launch as sshd does, with its output on a pipe like the SSH channel.
+
+    ``cat`` returns only once every process holding the pipe has closed it, so the elapsed
+    time is how long ``podssh`` would block on the Mac.
+    """
+    start = time.monotonic()
+    result = subprocess.run(
+        ["bash", "-c", 'bash -c "$POD_COMMAND" 2>&1 | cat; exit "${PIPESTATUS[0]}"'],
+        env={**environment, "POD_COMMAND": command},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return time.monotonic() - start, result.returncode
+
+
+def wait_for_line(path: Path, prefix: str, seconds: float = 30) -> str:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if path.exists():
+            for line in path.read_text().splitlines():
+                if line.startswith(prefix):
+                    return line
+        time.sleep(0.1)
+    raise AssertionError(f"no {prefix} line in {path}")
+
+
+def bootstrap_launch() -> str:
+    command = remote_launch(blocks(7)[1])
+    assert command.startswith(
+        "test ! -e /workspace/rehearsal/bootstrap.log || exit 1; cd /workspace/repo && "
+        "tar xzf /workspace/repo.tar.gz || exit 1; setsid nohup bash -c 'bash "
+        "tools/pilot_pod_bootstrap.sh --mode rehearsal --run A "
+    )
+    assert command.endswith(
+        "; echo BOOTSTRAP_EXIT=$?' > /workspace/rehearsal/bootstrap.log 2>&1 < /dev/null &"
+    )
+    return command
+
+
+def test_step_7_launch_returns_at_once_and_the_bootstrap_runs_detached(tmp_path: Path) -> None:
+    command = bootstrap_launch()
+    workspace, environment = pod_workspace(tmp_path)
+    (workspace / "repo.tar.gz").write_bytes(b"")
+    (workspace / "repo" / "tools" / BOOTSTRAP.name).write_text(FAKE_BOOTSTRAP)
+    elapsed, status = run_on_pod(command.replace("/workspace", str(workspace)), environment)
+    assert status == 0
+    assert elapsed < FAST_RETURN_SECONDS, f"the launch held the SSH channel for {elapsed:.1f} s"
+    log = workspace / "rehearsal" / "bootstrap.log"
+    assert wait_for_line(log, "BOOTSTRAP_EXIT=") == "BOOTSTRAP_EXIT=0"
+    stubs = Path(environment["STUB_DIR"])
+    assert (stubs / "tar.args").read_text().splitlines() == ["xzf", f"{workspace}/repo.tar.gz"]
+    argv = (stubs / "bootstrap.args").read_text().splitlines()
+    assert argv[:4] == ["--mode", "rehearsal", "--run", "A"]
+    assert argv[argv.index("--workspace") + 1] == f"{workspace}/rehearsal"
+
+
+@pytest.mark.parametrize("case", ["log_exists", "tar_fails"])
+def test_step_7_launch_refuses_on_the_pod_without_starting_a_bootstrap(
+    tmp_path: Path, case: str
+) -> None:
+    command = bootstrap_launch()
+    workspace, environment = pod_workspace(tmp_path)
+    (workspace / "repo" / "tools" / BOOTSTRAP.name).write_text(FAKE_BOOTSTRAP)
+    log = workspace / "rehearsal" / "bootstrap.log"
+    if case == "log_exists":
+        log.write_text("BOOTSTRAP_EXIT=0\n")  # An earlier bootstrap's log.
+    else:
+        environment["TAR_EXIT"] = "2"
+    elapsed, status = run_on_pod(command.replace("/workspace", str(workspace)), environment)
+    assert status == 1 and elapsed < FAST_RETURN_SECONDS
+    time.sleep(0.5)  # A wrongly started bootstrap would have written its arguments by now.
+    stubs = Path(environment["STUB_DIR"])
+    assert not (stubs / "bootstrap.args").exists()
+    if case == "log_exists":
+        assert log.read_text() == "BOOTSTRAP_EXIT=0\n" and not (stubs / "tar.args").exists()
+    else:
+        assert not log.exists()
+
+
+def worker_launch() -> str:
+    command = remote_launch(blocks(9)[0])
+    assert command.startswith(
+        "test ! -e /workspace/rehearsal/run.log || exit 1; setsid nohup bash -c 'set -a; "
+        ". /workspace/rehearsal/r2-pod.env; set +a; cd /workspace/repo && "
+        "python3 -m tools.rehearsal_run run "
+    )
+    assert command.endswith(
+        "; echo WORKER_EXIT=$?'     > /workspace/rehearsal/run.log 2>&1 < /dev/null &"
+    )
+    return command
+
+
+def test_step_9_launch_returns_at_once_and_the_worker_runs_detached(tmp_path: Path) -> None:
+    command = worker_launch()
+    workspace, environment = pod_workspace(tmp_path)
+    (workspace / "rehearsal" / "r2-pod.env").write_text("R2_FIXTURE_NAME=loaded\n")
+    elapsed, status = run_on_pod(command.replace("/workspace", str(workspace)), environment)
+    assert status == 0
+    assert elapsed < FAST_RETURN_SECONDS, f"the launch held the SSH channel for {elapsed:.1f} s"
+    log = workspace / "rehearsal" / "run.log"
+    assert wait_for_line(log, "WORKER_EXIT=") == "WORKER_EXIT=0"
+    stubs = Path(environment["STUB_DIR"])
+    argv = (stubs / "worker.args").read_text().splitlines()
+    assert argv[:3] == ["-m", "tools.rehearsal_run", "run"]
+    assert argv[argv.index("--output") + 1] == f"{workspace}/rehearsal-run"
+    # The worker saw the key file's variables, loaded on the Pod, never on a command line.
+    assert (stubs / "worker.env").read_text() == "loaded\n"
+
+
+def test_step_9_launch_refuses_a_second_worker_on_the_pod(tmp_path: Path) -> None:
+    command = worker_launch()
+    workspace, environment = pod_workspace(tmp_path)
+    (workspace / "rehearsal" / "r2-pod.env").write_text("R2_FIXTURE_NAME=loaded\n")
+    log = workspace / "rehearsal" / "run.log"
+    log.write_text("an earlier worker's log\n")
+    elapsed, status = run_on_pod(command.replace("/workspace", str(workspace)), environment)
+    assert status == 1 and elapsed < FAST_RETURN_SECONDS
+    time.sleep(0.5)  # A wrongly started worker would have written its arguments by now.
+    assert not (Path(environment["STUB_DIR"]) / "worker.args").exists()
+    assert log.read_text() == "an earlier worker's log\n"
+
+
+def test_no_other_block_sends_a_background_job_over_ssh() -> None:
+    # Only the two launches end a podssh command with "&"; both are checked above.
+    launches = [line for line in _code() if line.startswith("podssh ") and line.endswith('&"')]
+    assert len(launches) == 2
+    assert all(" && setsid" not in line and "|| exit 1; " in line for line in launches)
+
+
 # Step 8: a fresh timer receipt right before the readiness receipt ----------------------
 
 FRESH_TIMER_COPY = (
@@ -1070,11 +1702,11 @@ def test_step_8_copy_reaches_this_pods_live_receipt(tmp_path: Path, shell: str) 
 # Step 9: the wait for the worker's first heartbeat --------------------------------------
 
 LOOP_STUBS = r"""
-date() { cat "$CLOCK"; }
-sleep() { echo $(( $(cat "$CLOCK") + $1 )) > "$CLOCK"; }
-watchdog() { BASE=$(cat "$CLOCK"); echo "watchdog $BASE" >> "$CALLS"; }
 podssh() {
   case "$1" in
+    "test -e /workspace/rehearsal/run.log") [ -n "$LOG_EXISTS" ] ;;
+    "test ! -e /workspace/rehearsal/run.log || exit 1; setsid nohup bash -c "*)
+      echo launch >> "$CALLS" ;;
     "test -s /workspace/rehearsal-run/heartbeat.json") [ "$(cat "$CLOCK")" -ge "$HEARTBEAT_AT" ] ;;
     "grep -q ^WORKER_EXIT= /workspace/rehearsal/run.log") [ "$(cat "$CLOCK")" -ge "$EXIT_AT" ] ;;
     "tail -n 40 /workspace/rehearsal/run.log") echo "TAIL OF RUN LOG" ;;
@@ -1090,24 +1722,40 @@ def wait_loop() -> str:
 
 
 def run_wait(
-    tmp_path: Path, shell: str, *, heartbeat_at: int, exit_at: int
+    tmp_path: Path,
+    shell: str,
+    *,
+    heartbeat_at: int,
+    exit_at: int,
+    whole_block: bool = False,
+    log_exists: bool = False,
+    watchdog_fails: bool = False,
 ) -> tuple[str, list[str]]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     clock, calls = tmp_path / "clock", tmp_path / "calls"
     clock.write_text("1000\n")
     calls.write_text("")
+    control = tmp_path / "ctrl"
+    control.mkdir()
+    (control / "watchdog.pid").write_text("4242\n")
     environment = {
         **os.environ,
         "CLOCK": str(clock),
         "CALLS": str(calls),
+        "CTRL": str(control),
+        "POD_ID": VALUES["POD_ID"],
         "HEARTBEAT_AT": str(heartbeat_at),
         "EXIT_AT": str(exit_at),
-        "RUN": "A",
+        "LOG_EXISTS": "1" if log_exists else "",
+        "WATCHDOG_FAILS": "1" if watchdog_fails else "",
         "BASE": "1000",
+        **{name: VALUES[name] for name in LAUNCH_VALUES},
     }
+    code = blocks(9)[0] if whole_block else wait_loop()
     # The block's last line fails when no heartbeat exists; "exit 0" is reached only if every
     # line of the block parsed and ran.
     result = subprocess.run(
-        [shell, "-c", LOOP_STUBS + wait_loop() + "\nexit 0\n"],
+        [shell, "-c", loop_stubs(LOOP_STUBS) + code + "\nexit 0\n"],
         env=environment,
         capture_output=True,
         text=True,
@@ -1120,8 +1768,12 @@ def run_wait(
 def test_step_9_waits_with_a_deadline_and_rebaselines_like_step_7() -> None:
     loop = wait_loop()
     assert "GIVE_UP=$(( $(date +%s) + 1200 ))" in loop
-    assert "if [ $(( $(date +%s) - BASE )) -ge 300 ]; then watchdog; fi" in loop
+    assert "  sleep 10; keepalive\ndone\n" in loop and "then watchdog; fi" not in loop
     assert "^WORKER_EXIT=" in loop and "tail -n 40 /workspace/rehearsal/run.log" in loop
+    # Refused from the Mac when run.log exists, and again on the Pod before the launch.
+    block = blocks(9)[0]
+    assert block.startswith("if podssh 'test -e /workspace/rehearsal/run.log'; then\n")
+    assert block.index("\nelse\n") < block.index("setsid nohup") < block.index("\nfi\n")
     # Only a heartbeat that exists earns the last re-baseline before step 10.
     assert loop.rstrip().endswith(
         "done\npodssh 'test -s /workspace/rehearsal-run/heartbeat.json' && watchdog"
@@ -1155,6 +1807,34 @@ def test_step_9_gives_up_after_its_deadline(tmp_path: Path, shell: str) -> None:
     assert calls == ["watchdog 1300", "watchdog 1600", "watchdog 1900", "watchdog 2200"]
 
 
+@pytest.mark.parametrize("shell", SHELLS)
+def test_step_9_launches_once_then_follows_the_first_worker(tmp_path: Path, shell: str) -> None:
+    out, calls = run_wait(tmp_path, shell, heartbeat_at=1400, exit_at=10**9, whole_block=True)
+    assert calls[0] == "launch" and calls.count("launch") == 1
+    out, calls = run_wait(
+        tmp_path / "again",
+        shell,
+        heartbeat_at=1400,
+        exit_at=10**9,
+        whole_block=True,
+        log_exists=True,
+    )
+    assert "launch" not in calls  # Pasted again: no second worker.
+    assert (
+        "run A: /workspace/rehearsal/run.log already exists, so a worker was launched on this "
+        "Pod before; not launching a second one. The wait below follows that one." in out
+    )
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_step_9_wait_warns_on_a_failed_restart_and_retries_on_the_next_pass(
+    tmp_path: Path, shell: str
+) -> None:
+    out, calls = run_wait(tmp_path, shell, heartbeat_at=1400, exit_at=10**9, watchdog_fails=True)
+    assert calls[:2] == ["watchdog failed 1300", "watchdog failed 1310"]
+    assert out.count(RESTART_FAILED.format(ctrl=tmp_path / "ctrl")) == len(range(1300, 1401, 10))
+
+
 # Step 13: confirm by reading; DELETE only on shutdown_ready or TERMINATE=yes --------------
 
 TERMINATE_STUBS = r"""
@@ -1173,8 +1853,10 @@ uv() {
   echo '{"pod_id": "podfixture01", "status": "RUNNING"}'
 }
 kill() { echo "$*" >> "$STUB_DIR/kill.calls"; }
+ps() { [ "$2" = 4242 ] && printf '%s\n' "$WATCHDOG_COMMAND"; }
 """
 DELETE_URL = "https://api.runpod.io/v2/pods/$POD_ID"
+DECISION_LINE = "DECISION=${TERMINATE:-}; unset TERMINATE"
 
 
 def termination() -> str:
@@ -1200,14 +1882,28 @@ def test_step_13_confirm_only_reads_and_the_delete_is_gated() -> None:
     assert '"$CTRL/supervisor/heartbeat.json" "$POD_ID"' in terminate
     assert 'h.get("status") == "shutdown_ready" and h.get("pod_id") == sys.argv[2]' in terminate
     assert 'status="shutdown_ready"' in (ROOT / "tools" / "pilot_supervisor.py").read_text()
-    assert '[ "${TERMINATE:-}" = yes ] && APPROVAL=TERMINATE=yes' in terminate
-    assert terminate.rstrip().endswith("\nunset TERMINATE")
+    # A shutdown_ready approves the DELETE only with both receipts verified, as the watchdog
+    # requires before it deletes on that status.
+    receipts = ("mac_receipt_verified", "github_receipt_verified")
+    assert all(f'h.get("{name}") is True' in terminate for name in receipts)
+    watchdog_source = (ROOT / "tools" / "runpod_watchdog.py").read_text()
+    assert all(f'value.get("{name}") is True' in watchdog_source for name in receipts)
+    # The decision is read and cleared on the first line, then only DECISION is consulted.
+    first, rest = terminate.split("\n", 1)
+    assert first == DECISION_LINE and "TERMINATE:-" not in rest and "unset TERMINATE" not in rest
+    assert '[ "$DECISION" = yes ] && APPROVAL=TERMINATE=yes' in rest
     # Teardown is recorded only after the status tool's own 404 message.
     identity = (ROOT / "tools" / "runpod_pod_identity.py").read_text()
     assert 'LookupError("resource not found (HTTP 404)")' in identity
     after = terminate[terminate.index("grep -qF 'resource not found (HTTP 404)'") :]
-    assert after.index("export TEARDOWN=") < after.index('kill "$(cat "$CTRL/watchdog.pid")"')
-    assert after.index('kill "$(cat') < after.index("\nelse\n")
+    # Only this Pod's watchdog is stopped, after the same command-line check the helper makes.
+    check = (
+        'if [ -n "$WATCHDOG_PID" ] && ps -p "$WATCHDOG_PID" -o command= 2>/dev/null | '
+        'grep -qF -- "--identity $CTRL/pod-identity.json"; then kill "$WATCHDOG_PID"; fi'
+    )
+    assert check in after and terminate.count("kill ") == 1
+    assert 'grep -qF -- "--identity $CTRL/pod-identity.json"' in helpers()
+    assert after.index("export TEARDOWN=") < after.index(check) < after.index("\nelse\n")
     # Each named TERMINATE=yes case is in the text.
     for case in ("Before the supervisor ran.", "no milestone at risk.", "After step 14's rescue."):
         assert case in section(13)
@@ -1221,6 +1917,7 @@ def run_termination(
     terminate: str | None = None,
     gone: str = "after_delete",
     pod_id: str = "podfixture01",
+    watchdog_command: str | None = None,
 ) -> tuple[str, Path, bool]:
     stubs = tmp_path / "stubs"
     stubs.mkdir()
@@ -1230,6 +1927,12 @@ def run_termination(
         (control / "supervisor" / "heartbeat.json").write_text(heartbeat)
     (control / "run.env").write_text("export ORIGIN=1800000000 POD_ID=podfixture01\n")
     (control / "watchdog.pid").write_text("4242\n")  # This Pod's watchdog.
+    if watchdog_command is None:
+        watchdog_command = (
+            "/repo/.venv/bin/python3 -m tools.runpod_watchdog --mode rehearsal "
+            f"--identity {control}/pod-identity.json "
+            f"--heartbeat {control}/supervisor/heartbeat.json"
+        )
     environment = {
         **os.environ,
         "STUB_DIR": str(stubs),
@@ -1238,6 +1941,7 @@ def run_termination(
         "RUN": "A",
         "GONE": gone,
         "RUNPOD_API_KEY": "rpa_fixture_key",
+        "WATCHDOG_COMMAND": watchdog_command,
     }
     environment.pop("TERMINATE", None)
     typed = "" if terminate is None else f"TERMINATE={terminate}\n"  # What the owner types.
@@ -1255,8 +1959,17 @@ def run_termination(
     return result.stdout, stubs, stopped
 
 
-def shutdown_ready(pod_id: str = "podfixture01") -> str:
-    return json.dumps({"status": "shutdown_ready", "pod_id": pod_id, "phase": "done"})
+def shutdown_ready(pod_id: str = "podfixture01", **fields: object) -> str:
+    """The supervisor's mirrored shutdown_ready heartbeat, with both receipts verified."""
+    value = {
+        "status": "shutdown_ready",
+        "pod_id": pod_id,
+        "phase": "done",
+        "mac_receipt_verified": True,
+        "github_receipt_verified": True,
+        **fields,
+    }
+    return json.dumps({name: item for name, item in value.items() if item is not None})
 
 
 def assert_deleted(stubs: Path, out: str) -> None:
@@ -1305,6 +2018,12 @@ def test_step_13_deletes_on_the_owners_terminate_decision(tmp_path: Path, shell:
         (json.dumps({"status": "uploading", "pod_id": "podfixture01"}), None, "podfixture01"),
         (json.dumps({"status": "failed", "pod_id": "podfixture01"}), None, "podfixture01"),
         (shutdown_ready("otherpod"), None, "podfixture01"),  # Another Pod's old heartbeat.
+        # shutdown_ready without both verified receipts, which the watchdog also refuses.
+        (shutdown_ready(mac_receipt_verified=None), None, "podfixture01"),
+        (shutdown_ready(github_receipt_verified=None), None, "podfixture01"),
+        (shutdown_ready(github_receipt_verified=False), None, "podfixture01"),
+        (shutdown_ready(mac_receipt_verified="true"), None, "podfixture01"),
+        (shutdown_ready(mac_receipt_verified=1, github_receipt_verified=1), None, "podfixture01"),
         (None, None, "podfixture01"),
         ("not json", None, "podfixture01"),
         ('["shutdown_ready"]', None, "podfixture01"),
@@ -1340,6 +2059,57 @@ def test_step_13_records_a_pod_the_guards_already_deleted(tmp_path: Path, shell:
     out, stubs, stopped = run_termination(tmp_path, shell, heartbeat=failed, gone="already")
     assert not (stubs / "curl.args").exists() and "no DELETE sent" in out
     assert "TEARDOWN=" in (tmp_path / "ctrl" / "run.env").read_text() and stopped
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sleep 30",  # The PID now belongs to some other process.
+        "python3 -m tools.runpod_watchdog --mode rehearsal --identity runs/other/pod-identity.json",
+        "",  # No such process.
+    ],
+)
+def test_step_13_never_kills_a_process_that_is_not_this_pods_watchdog(
+    tmp_path: Path, shell: str, command: str
+) -> None:
+    out, stubs, stopped = run_termination(
+        tmp_path, shell, heartbeat=shutdown_ready(), watchdog_command=command
+    )
+    assert_deleted(stubs, out)
+    assert "TEARDOWN=" in (tmp_path / "ctrl" / "run.env").read_text()
+    assert not stopped
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_step_13_clears_terminate_even_when_the_block_stops_partway(
+    tmp_path: Path, shell: str
+) -> None:
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    control = tmp_path / "ctrl"
+    control.mkdir()
+    report = 'printf "TERMINATE=[%s] DECISION=[%s]\\n" "${TERMINATE:-}" "${DECISION:-}"'
+    # The owner typed TERMINATE=yes; the block then stops at its gate (a crash, a Ctrl-C).
+    script = (
+        TERMINATE_STUBS
+        + f"TERMINATE=yes\ntrap '{report}' EXIT\npython3() {{ exit 3; }}\n"
+        + termination()
+    )
+    environment = {
+        **os.environ,
+        "STUB_DIR": str(stubs),
+        "CTRL": str(control),
+        "POD_ID": VALUES["POD_ID"],
+        "RUN": "A",
+        "RUNPOD_API_KEY": "rpa_fixture_key",
+    }
+    result = subprocess.run(
+        [shell, "-c", script], env=environment, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 3
+    assert result.stdout == "TERMINATE=[] DECISION=[yes]\n"
+    assert not (stubs / "curl.args").exists()
 
 
 # Secrets never reach a command line -------------------------------------------------------
@@ -1682,3 +2452,115 @@ def test_step_15_refuses_records_that_do_not_cover_the_pod(
     result = check_billing(tmp_path, records, **settings)
     assert result.returncode == 1 and message in result.stderr, result.stderr
     assert "billing does NOT cover this Pod's lifetime" in result.stderr
+
+
+# Every block pastes safely into an interactive zsh with interactivecomments off -----------
+
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+OPERATORS = ";&|()<>"
+
+
+def comment_lines(block: str) -> list[str]:
+    """The lines of one shell block that hold a comment.
+
+    A ``#`` counts when it starts a word outside quotes, as in a script; ``$#``, ``${#name}``
+    and a ``#`` inside a word or quotes do not. In a heredoc body every ``#`` counts: there
+    it is a comment of the language the heredoc holds. Quotes may span lines.
+    """
+    found: list[str] = []
+    single = double = False
+    heredoc: str | None = None
+    for line in block.splitlines():
+        if heredoc is not None:
+            if line == heredoc:
+                heredoc = None
+            elif "#" in line:
+                found.append(line)
+            continue
+        pending: str | None = None
+        escaped = False
+        previous = "\n"
+        index = 0
+        while index < len(line):
+            character = line[index]
+            if escaped:
+                escaped = False
+            elif single:
+                single = character != "'"
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                double = not double
+            elif double:
+                pass
+            elif character == "'":
+                single = True
+            elif character == "#" and (previous.isspace() or previous in OPERATORS):
+                found.append(line)
+                break
+            elif line.startswith("<<", index) and (match := HEREDOC.match(line, index)):
+                pending = match.group(2)
+                index = match.end()
+                previous = line[index - 1]
+                continue
+            previous = character
+            index += 1
+        if pending is not None:
+            heredoc = pending
+    return found
+
+
+def all_blocks() -> list[str]:
+    return re.findall(r"```sh\n(.*?)```", RUNBOOK.read_text(encoding="utf-8"), re.S)
+
+
+def test_the_comment_finder_finds_what_an_interactive_zsh_would_misread() -> None:
+    misread = [
+        "echo a  # expect 204",
+        "# a whole-line note",
+        "echo a;# after an operator",
+        "cat <<'PY'\nx = 1  # a Python comment\nPY",
+        "echo 'one\ntwo' # after a quote that spans lines",
+    ]
+    for text in misread:
+        assert comment_lines(text), text
+    harmless = [
+        'echo "a # b"',
+        "echo 'a # b'",
+        "echo $# ${#name}",
+        "echo a#b",
+        "echo \\# escaped",
+        "cat <<'PY'\nx = 1\nPY\necho done",
+        "printf '%s\\n' \"$RUN\" | grep -c '^#'",
+    ]
+    for text in harmless:
+        assert comment_lines(text) == [], text
+
+
+def test_no_block_holds_a_comment() -> None:
+    found = {line for block in all_blocks() for line in comment_lines(block)}
+    assert not found, sorted(found)
+    # The prose says so, and keeps the note for the owner's own lines.
+    assert "The blocks hold no `#` comments" in section(2)
+    assert "run `setopt interactivecomments` in that terminal" in section(2)
+
+
+def test_every_block_parses_in_an_interactive_zsh_without_comments(tmp_path: Path) -> None:
+    if shutil.which("zsh") is None:
+        pytest.skip("zsh is not installed")
+    for block in all_blocks():
+        # The operator pastes the reviewed hash over the step 2 placeholder.
+        pasted = block.replace("<reviewed binding sha256>", BINDING_SHA256)
+        # -i reads the paste as a terminal session would: interactivecomments is off by
+        # default, history expansion is on; -n parses without running anything.
+        result = subprocess.run(
+            ["zsh", "-f", "-i", "-n"],
+            input=pasted,
+            env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "PS1": ""},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (block.splitlines()[0], result.stderr)
+        for error in ("unmatched", "parse error", "event not found", "bad pattern"):
+            assert error not in result.stderr, (block.splitlines()[0], result.stderr)

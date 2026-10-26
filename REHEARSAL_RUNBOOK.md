@@ -24,40 +24,44 @@ uv run --locked python -m tools.pilot_preflight --output runs/rehearsal-prefligh
 uv run --locked pytest tests/test_rehearsal_run.py tests/test_rehearsal_integration.py tests/test_rehearsal_runbook.py tests/test_rehearsal_supervisor.py tests/test_rehearsal_ops.py tests/test_rehearsal_bootstrap.py tests/test_rehearsal_readiness.py tests/test_rehearsal_feasibility.py tests/test_rehearsal_watchdog.py tests/test_runpod_watchdog.py tests/test_pod_self_destruct.py -q
 ```
 
-Expected: `make check` green; the smoke completes offline on CPU; the preflight report shows `"status": "completed"` on `cpu`; every listed test passes. The runbook test parses every tool command in this file against the real parsers, and runs this file's own code against stubs: the step 5 Pod ID and directory guard, the helpers file, the step 5 wait for RUNNING, the step 7 and step 9 wait loops, the step 6 revision writer, the step 7 leak check, the step 13 DELETE gate and the step 15 billing check. The integration test builds a receipt with the receipt tool and has the worker accept it, and feeds the smoke's heartbeats, reports and in-memory bucket to the supervisor.
+Expected: `make check` green; the smoke completes offline on CPU; the preflight report shows `"status": "completed"` on `cpu`; every listed test passes. The runbook test parses every tool command in this file against the real parsers, and runs this file's own code against stubs: the step 5 create guard (one Pod per run at a time), create request, Pod ID and directory guard, the helpers file, the step 5 wait for RUNNING, the step 7 and step 9 launches (each must return at once) and wait loops, the step 6 revision writer, the step 7 leak check, the step 13 DELETE gate and the step 15 billing check. It also checks that no block holds a `#` comment and that every block parses in an interactive zsh. The integration test builds a receipt with the receipt tool and has the worker accept it, and feeds the smoke's heartbeats, reports and in-memory bucket to the supervisor.
 
 ## 2. Credentials and per-run environment (Mac, free, each terminal)
 
 `.env` is git-ignored. It holds `RUNPOD_API_KEY`, `R2_ENDPOINT`, `R2_BUCKET`, the Mac's own R2 key `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY` (stages data, uploads the initialization, verifies results) and the Pods' separate key `R2_POD_ACCESS_KEY_ID`/`R2_POD_SECRET_ACCESS_KEY`. The Pod key must be its own Cloudflare API token with Object Read & Write on this one bucket only; it reaches the Pods only over SSH stdin (step 6), never in a create body, and it is revoked after both runs (step 13).
 
-The blocks put `#` comments after commands. An interactive zsh treats those as arguments unless comments are enabled, so run `setopt interactivecomments` once in each new terminal first (oh-my-zsh already sets it; bash and scripts need nothing).
+The blocks hold no `#` comments; every explanation sits in the text around them. An interactive zsh on macOS has `interactivecomments` off, so there a `#` starts an argument, not a comment: a trailing note becomes extra arguments, and an apostrophe in one opens a quote that swallows the rest of the block. With bracketed paste zsh parses a whole pasted block before it runs any of it, so a `setopt` line inside a block would come too late. The setting matters only for lines of your own: before you paste one that carries a comment, run `setopt interactivecomments` in that terminal (oh-my-zsh already sets it; bash and scripts need nothing).
 
 No secret value ever appears on a process command line, where another local account could read it with `ps`. The Runpod key reaches `curl` on its standard input (`--config -`, written by the shell's builtin `printf`), and the leak check in step 7 feeds the values to `grep` on its standard input. The Python tools read keys from the environment.
+
+Set `RUN=A` in terminal 1 and `RUN=B` in terminal 2:
 
 ```sh
 set -a; source .env; set +a
 for name in RUNPOD_API_KEY R2_ENDPOINT R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_POD_ACCESS_KEY_ID R2_POD_SECRET_ACCESS_KEY; do
-  if [ -n "$(printenv "$name")" ]; then echo "$name is set"; else echo "MISSING $name"; fi   # names only, never values
+  if [ -n "$(printenv "$name")" ]; then echo "$name is set"; else echo "MISSING $name"; fi
 done
-gh auth status                                   # the private archive of reports and summaries
-caffeinate -dimsu -w $$ &                        # keep the Mac awake while this terminal lives; stay on AC power
-export RUN=A                                     # terminal 1: A; terminal 2: B
+gh auth status
+caffeinate -dimsu -w $$ &
+export RUN=A
 export RUN_LOWER=$(printf %s "$RUN" | tr AB ab)
-export CTRL_ROOT=runs/rehearsal-controller       # each Pod gets its own controller directory $CTRL_ROOT/<run>/<pod id> (step 5)
-export KNOWN_HOSTS=~/.ssh/rehearsal_${RUN_LOWER}_known_hosts   # one per Pod; no whitespace: ssh splits the option on spaces
+export CTRL_ROOT=runs/rehearsal-controller
+export KNOWN_HOSTS=~/.ssh/rehearsal_${RUN_LOWER}_known_hosts
 export SPEC=configs/rehearsal-a40-s-$RUN_LOWER.json
 export SHARED=runs/rehearsal-shared && mkdir -p "$SHARED"
 export POD_SSH_KEY=~/.ssh/runpod_ed25519
-export PRIVATE_REPO=kudratsingh/personal-coding-agent-artifacts   # must be private; the supervisor verifies this
-export BUILD_DIR=runs/rehearsal-s-20261025                        # the admitted S build
-export BINDING=runs/rehearsal-binding/binding.json                # the reviewed binding; never rebuilt here
-export BINDING_SHA256=<reviewed binding sha256>                   # pinned at review; never recomputed from the file
-printf '%s  %s\n' "$BINDING_SHA256" "$BINDING" | shasum -a 256 -c -   # expect "...binding.json: OK"
+export PRIVATE_REPO=kudratsingh/personal-coding-agent-artifacts
+export BUILD_DIR=runs/rehearsal-s-20261025
+export BINDING=runs/rehearsal-binding/binding.json
+export BINDING_SHA256=<reviewed binding sha256>
+printf '%s  %s\n' "$BINDING_SHA256" "$BINDING" | shasum -a 256 -c -
 ```
 
-`BINDING_SHA256` is the `sha256` that `tools.rehearsal_binding build` printed when the binding was written, as recorded in the owner's review of that binding. Paste it; never derive it from the file, or every later `--expected-sha256` check would only compare the file with itself. If `shasum` prints anything but `OK`, the file is not the reviewed binding: stop and ask the owner.
+The loop prints each variable's name and whether it is set, never a value. `gh auth status` checks the GitHub login the supervisor uses to archive reports and summaries in the private repository; `PRIVATE_REPO` must be private, and the supervisor verifies that. Each Pod gets its own controller directory `$CTRL_ROOT/<run>/<pod id>` (step 5). `KNOWN_HOSTS` is this run's own known-hosts file, written again for each new Pod in step 5; its path must hold no whitespace, because ssh splits the option on spaces. `BUILD_DIR` is the admitted S build and `BINDING` the reviewed binding, which is never rebuilt here.
 
-A sleeping Mac stops the mirror: when it wakes, the watchdog would read a stale heartbeat and delete the Pod. Keep both terminals open on AC power for the whole run. The working directory must not sit under a symlinked path (macOS `/tmp` is one).
+`BINDING_SHA256` is the `sha256` that `tools.rehearsal_binding build` printed when the binding was written, as recorded in the owner's review of that binding. Paste it in place of the placeholder; never derive it from the file, or every later `--expected-sha256` check would only compare the file with itself. The last line should print `runs/rehearsal-binding/binding.json: OK`. If `shasum` prints anything but `OK`, the file is not the reviewed binding: stop and ask the owner.
+
+`caffeinate` keeps the Mac awake while this terminal lives. A sleeping Mac stops the mirror: when it wakes, the watchdog would read a stale heartbeat and delete the Pod. Keep both terminals open on AC power for the whole run. The working directory must not sit under a symlinked path (macOS `/tmp` is one).
 
 ## 3. Final quote check for both Pods (Mac, free, once)
 
@@ -92,33 +96,48 @@ printf 'export INIT_SHA256=%s INIT_SIZE=%s INIT_KEY=%s\n' "$INIT_SHA256" "$INIT_
 
 ## 5. Pod creation, identity and the watchdog (Mac, BILLABLE, each terminal)
 
-Only after explicit launch authorization. Capture the billing origin before the create request so every deadline is conservative. The body is `configs/runpod-pod-a40-s-rehearsal.json` (A40, Secure Cloud, template `runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404`, 40 GB container disk, TCP 22, no volume, no environment variables) with the run's letter appended to the name. The create request runs from a fresh launch directory; once the Pod ID is known, that directory becomes this Pod's own controller directory `$CTRL`:
+Only after explicit launch authorization. Capture the billing origin before the create request so every deadline is conservative. The body is `configs/runpod-pod-a40-s-rehearsal.json` (A40, Secure Cloud, template `runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404`, 40 GB container disk, TCP 22, no volume, no environment variables) with the run's letter appended to the name. The create request runs from a fresh launch directory; once the Pod ID is known, that directory becomes this Pod's own controller directory `$CTRL`.
+
+The block creates at most one Pod per run at a time. It refuses to send the create request, and says why, when this terminal already names a Pod (`POD_ID` is set), or when any directory under `$CTRL_ROOT/$RUN_LOWER` has no `TEARDOWN` line in its `run.env`: a Pod directory is named by its Pod ID, and a `launch-<time>` directory is a create whose Pod was never confirmed. Without that check, pasting the block twice would create a second Pod, and the first would bill with no watchdog. `SELF_DESTRUCT_DEADLINE` is 3 minutes inside the 45,000-second wall:
 
 ```sh
-export ORIGIN=$(date +%s)
-export LAUNCH=$CTRL_ROOT/$RUN_LOWER/launch-$ORIGIN && mkdir -p "$LAUNCH"
-python3 -c 'import json,sys; b=json.load(open("configs/runpod-pod-a40-s-rehearsal.json")); b["name"]+="-"+sys.argv[1]; print(json.dumps(b))' "$RUN_LOWER" > "$LAUNCH/create-body.json"
-printf 'header = "Authorization: Bearer %s"\n' "$RUNPOD_API_KEY" | curl --config - -sS -X POST https://api.runpod.io/v2/pods \
-  -H "Content-Type: application/json" --data @"$LAUNCH/create-body.json" > "$LAUNCH/create-response.json"
-export POD_ID=$(python3 -c 'import json,re,sys; v=json.load(open(sys.argv[1])); i=v.get("id") if isinstance(v, dict) else None; ok=isinstance(i, str) and re.fullmatch("[A-Za-z0-9][A-Za-z0-9_-]{0,127}", i); print(i) if ok else sys.exit("no valid Pod id in " + sys.argv[1])' "$LAUNCH/create-response.json")
-export SELF_DESTRUCT_DEADLINE=$((ORIGIN + 45000 - 180))      # 3 minutes inside the 45,000-second wall
-export CTRL=$CTRL_ROOT/$RUN_LOWER/$POD_ID
-if [ -z "$POD_ID" ]; then
-  echo "run $RUN: $LAUNCH/create-response.json names no valid Pod id, so this terminal cannot name a Pod to terminate. Read that file: an error there means the request created no Pod. Stop here and ask the owner; never terminate a Pod by name or by guess."
-  export CTRL=$LAUNCH
-elif mkdir "$CTRL"; then
-  mv "$LAUNCH/create-body.json" "$LAUNCH/create-response.json" "$CTRL/" && rmdir "$LAUNCH"
-  printf 'export ORIGIN=%s POD_ID=%s SELF_DESTRUCT_DEADLINE=%s\n' "$ORIGIN" "$POD_ID" "$SELF_DESTRUCT_DEADLINE" > "$CTRL/run.env"
-  echo "run $RUN: Pod $POD_ID, controller directory $CTRL"
+OPEN_PODS=$(find "$CTRL_ROOT/$RUN_LOWER" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read -r DIR; do grep -qs '^export TEARDOWN=' "$DIR/run.env" || printf '%s ' "$DIR"; done)
+if [ -n "${POD_ID:-}" ]; then
+  echo "run $RUN: NOT creating a Pod: this terminal already names Pod $POD_ID (${CTRL:-no controller directory}), which may still bill, and a second Pod would leave one of them without a watchdog. Confirm Pod $POD_ID gone with step 13 in this terminal. Only after step 13 has recorded its TEARDOWN and the owner has approved a new Pod, run unset POD_ID and paste this block again."
+elif [ -n "$OPEN_PODS" ]; then
+  echo "run $RUN: NOT creating a Pod: no TEARDOWN is recorded in ${OPEN_PODS% }. Each names a Pod of run $RUN that may still bill (the directory name is its Pod ID), or a launch-<time> create whose Pod was never confirmed. End each Pod with step 13 in its own terminal, settle each launch directory as step 5 says, and ask the owner before creating another."
 else
-  echo "run $RUN: $CTRL already exists, so it is NOT this Pod's: this launch did not create it, and a controller directory is never reused. Leave it untouched. Stop here and terminate Pod $POD_ID, the one $LAUNCH/create-response.json names, with step 13 in this terminal (TERMINATE=yes); never delete any other Pod."
-  export CTRL=$LAUNCH
+  export ORIGIN=$(date +%s)
+  export LAUNCH=$CTRL_ROOT/$RUN_LOWER/launch-$ORIGIN && mkdir -p "$LAUNCH"
+  python3 -c 'import json,sys; b=json.load(open("configs/runpod-pod-a40-s-rehearsal.json")); b["name"]+="-"+sys.argv[1]; print(json.dumps(b))' "$RUN_LOWER" > "$LAUNCH/create-body.json"
+  printf 'header = "Authorization: Bearer %s"\n' "$RUNPOD_API_KEY" | curl --config - -sS --fail-with-body -X POST https://api.runpod.io/v2/pods \
+    -H "Content-Type: application/json" --data @"$LAUNCH/create-body.json" -o "$LAUNCH/create-response.json" -w '%{http_code}\n' > "$LAUNCH/create-http-code"
+  export POD_ID=$(python3 -c 'import json,re,sys; v=json.load(open(sys.argv[1])); i=v.get("id") if isinstance(v, dict) else None; ok=isinstance(i, str) and re.fullmatch("[A-Za-z0-9][A-Za-z0-9_-]{0,127}", i); print(i) if ok else sys.exit("no valid Pod id in " + sys.argv[1])' "$LAUNCH/create-response.json")
+  export SELF_DESTRUCT_DEADLINE=$((ORIGIN + 45000 - 180))
+  export CTRL=$CTRL_ROOT/$RUN_LOWER/$POD_ID
+  if [ -z "$POD_ID" ]; then
+    POD_NAME=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$LAUNCH/create-body.json")
+    SINCE=$(python3 -c 'import sys,time; print(time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(int(sys.argv[1]))))' "$ORIGIN")
+    echo "run $RUN: the create request ended with HTTP $(cat "$LAUNCH/create-http-code") and $LAUNCH/create-response.json names no valid Pod id. A Pod MAY STILL EXIST: a gateway error or a dropped connection can follow a create the server carried out. Stop here and ask the owner to look in the Runpod console for a Pod named $POD_NAME created at or after $SINCE, to terminate any such Pod there, and to decide before any retry. Never delete a Pod from this terminal by name or by guess."
+    export CTRL=$LAUNCH
+  elif mkdir "$CTRL"; then
+    mv "$LAUNCH/create-body.json" "$LAUNCH/create-response.json" "$LAUNCH/create-http-code" "$CTRL/" && rmdir "$LAUNCH"
+    printf 'export ORIGIN=%s POD_ID=%s SELF_DESTRUCT_DEADLINE=%s\n' "$ORIGIN" "$POD_ID" "$SELF_DESTRUCT_DEADLINE" > "$CTRL/run.env"
+    echo "run $RUN: Pod $POD_ID, controller directory $CTRL"
+  else
+    echo "run $RUN: $CTRL already exists, so it is NOT this Pod's: this launch did not create it, and a controller directory is never reused. Leave it untouched. Stop here and terminate Pod $POD_ID, the one $LAUNCH/create-response.json names, with step 13 in this terminal (TERMINATE=yes); never delete any other Pod."
+    export CTRL=$LAUNCH
+  fi
 fi
 ```
 
-`POD_ID` comes from the create response itself, never from a hand copy: the parser prints the response's `id` only when it has the shape the watchdog accepts, and otherwise prints nothing and refuses. `mkdir` without `-p` refuses an existing directory, so nothing below ever starts in a controller directory that another Pod, or an earlier run of this step, left behind: no stale `run.env`, policy or mirrored heartbeat can reach this Pod's watchdog. If it printed `names no valid Pod id` or `already exists`, do not continue. Both refusals point `CTRL` at the launch directory, which holds only this request's body and response, so nothing later in this terminal touches the existing directory or another Pod's watchdog. After `already exists`, terminate the Pod the response names at once with step 13 (`TERMINATE=yes`): it bills, and no timer or watchdog guards it. A new Pod for the same run (step 14) always gets a new directory.
+If it printed `NOT creating a Pod`, nothing was sent and nothing changed: do not continue with this step.
 
-Capture the identity the guards enforce, write the policy, write this run's helpers (the `watchdog` function and the `podssh`/`podscp` commands) once into `$CTRL/helpers.sh`, and start the watchdog at once:
+`POD_ID` comes from the create response itself, never from a hand copy: the parser prints the response's `id` only when it has the shape the watchdog accepts, and otherwise prints nothing and refuses. The Runpod key still reaches `curl` on its standard input only. `--fail-with-body` makes `curl` exit nonzero on an HTTP error and still keep the reply in `create-response.json`, and `-w` records the HTTP code in `create-http-code` (`000` when no reply arrived at all). `mkdir` without `-p` refuses an existing directory, so nothing below ever starts in a controller directory that another Pod, or an earlier run of this step, left behind: no stale `run.env`, policy or mirrored heartbeat can reach this Pod's watchdog. If it printed `names no valid Pod id` or `already exists`, do not continue. Both refusals point `CTRL` at the launch directory, which holds only this request's body, response and HTTP code, so nothing later in this terminal touches the existing directory or another Pod's watchdog.
+
+After `names no valid Pod id`, no Pod ID is known, but the request may still have created a Pod that bills with no timer or watchdog: a gateway 5xx, a timeout or a dropped connection can come after the server acted. Read `create-response.json` and `create-http-code`, and ask the owner to check the Runpod console for a Pod with the printed name created at or after the printed time (`ORIGIN`), and to terminate any such Pod there. Retry only when the owner says so: record the settled launch first, `printf 'export TEARDOWN=%s\n' "$(date +%s)" >> "$LAUNCH/run.env"`, which lets this block create again; the launch directory stays as the record. (In another terminal `LAUNCH` is unset: use the `launch-<time>` directory the refusal names.) After `already exists`, terminate the Pod the response names at once with step 13 (`TERMINATE=yes`): it bills, and no timer or watchdog guards it. Step 13 records its `TEARDOWN` in the launch directory. A new Pod for the same run (step 14) always gets a new directory, and this terminal creates it only after step 13 has recorded the old Pod's `TEARDOWN` and `unset POD_ID` has cleared its ID.
+
+Capture the identity the guards enforce, write the policy, write this run's helpers once into `$CTRL/helpers.sh`, and start the watchdog at once. The helpers read `CTRL`, `RUN`, `ORIGIN`, `POD_ID`, `POD_HOST`, `POD_PORT`, `POD_SSH_KEY` and `KNOWN_HOSTS` from the shell at the moment of each call, so source the file after step 2 and `run.env`. `watchdog` (re)starts this run's watchdog with a fresh idle baseline and leaves the other run's untouched. `keepalive` is what every wait loop below calls on each pass (see after the block). `podssh` and `podscp` reach this Pod only, pinned to this run's known-hosts file:
 
 ```sh
 uv run --locked python -m tools.runpod_pod_identity capture --pod-id "$POD_ID" \
@@ -129,9 +148,7 @@ cat > "$CTRL/policy.json" <<EOF
  "idle_baseline_unix": $(date +%s)}
 EOF
 [ -e "$CTRL/helpers.sh" ] || cat > "$CTRL/helpers.sh" <<'EOF'
-# This run's helpers. Source after step 2 and run.env; every call reads CTRL, RUN, ORIGIN,
-# POD_HOST, POD_PORT, POD_SSH_KEY and KNOWN_HOSTS from the shell at that moment.
-watchdog() {   # (re)start THIS run's watchdog with a fresh idle baseline; the other run's is untouched
+watchdog() {
   OLD=$(cat "$CTRL/watchdog.pid" 2>/dev/null || true)
   BASE=$(date +%s)
   nohup uv run --locked python -m tools.runpod_watchdog --mode rehearsal --identity "$CTRL/pod-identity.json" \
@@ -151,7 +168,17 @@ watchdog() {   # (re)start THIS run's watchdog with a fresh idle baseline; the o
   if [ -n "$OLD" ] && ps -p "$OLD" -o command= | grep -qF -- "--identity $CTRL/pod-identity.json"; then kill "$OLD"; fi
   echo "run $RUN watchdog pid $NEW, idle baseline $BASE"
 }
-podssh() {   # this Pod only, pinned to this run's known-hosts file
+keepalive() {
+  LIVE=$(cat "$CTRL/watchdog.pid" 2>/dev/null || true)
+  if [ -z "$LIVE" ] || ! ps -p "$LIVE" -o command= 2>/dev/null | grep -qF -- "--identity $CTRL/pod-identity.json"; then
+    echo "WARNING run $RUN: NO LIVE WATCHDOG guards Pod $POD_ID: $CTRL/watchdog.pid is missing or names no live watchdog of this Pod. Read $CTRL/watchdog.log and $CTRL/watchdog-receipt.json. Restarting it now."
+    BASE=0
+  fi
+  if [ $(( $(date +%s) - BASE )) -ge 300 ]; then
+    watchdog || { echo "WARNING run $RUN: the watchdog restart FAILED; see $CTRL/watchdog.log. Trying again on the next pass."; BASE=0; }
+  fi
+}
+podssh() {
   ssh -F /dev/null -p "$POD_PORT" -i "$POD_SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
     -o "UserKnownHostsFile=$KNOWN_HOSTS" -o BatchMode=yes "root@$POD_HOST" "$@"
 }
@@ -166,28 +193,34 @@ watchdog
 
 **A reopened terminal** (or the second window of step 10) repeats step 2 for its run, then sets this Pod's directory and sources its files, and never re-runs a block that creates a Pod or writes `run.env`, the policy or the known-hosts file: `export CTRL=$CTRL_ROOT/$RUN_LOWER/<pod id>; source "$SHARED/init.env"; source "$CTRL/run.env"; source "$CTRL/helpers.sh"`. `ls "$CTRL_ROOT/$RUN_LOWER"` lists the run's Pod directories.
 
-Each watchdog writes its own PID to `$CTRL/watchdog.pid` and removes it when it exits. The helper starts the replacement first, then stops only the process whose PID the file held and whose command line names this Pod's identity file; there is no global `pkill`, so restarting run A's watchdog never touches run B's. The watchdog reads the heartbeat the supervisor mirrors to `$CTRL/supervisor/heartbeat.json`, which exists only once the supervisor runs (step 10); a mirrored heartbeat whose `pod_id` is not this Pod's, or whose update predates the Pod's creation, counts as absent, never as fresh. Until then the idle clock runs from the last baseline: every waiting command below runs `watchdog` again at least every 5 minutes, and the steps call it at each setup milestone. Wall and cost limits never pause, and 600 seconds without a restart still deletes the Pod.
+Each watchdog writes its own PID to `$CTRL/watchdog.pid` and removes it when it exits. The helper starts the replacement first, then stops only the process whose PID the file held and whose command line names this Pod's identity file; there is no global `pkill`, so restarting run A's watchdog never touches run B's. The watchdog reads the heartbeat the supervisor mirrors to `$CTRL/supervisor/heartbeat.json`, which exists only once the supervisor runs (step 10); a mirrored heartbeat whose `pod_id` is not this Pod's, or whose update predates the Pod's creation, counts as absent, never as fresh. Until then the idle clock runs from the last baseline: every wait loop below calls `keepalive` on each pass, which runs `watchdog` again once 5 minutes have passed since the last baseline, and the steps call `watchdog` at each setup milestone. Wall and cost limits never pause, and 600 seconds without a restart still deletes the Pod.
 
-Then wait, for at most 20 minutes, until `pod-connection.json` shows `"status": "RUNNING"` with a direct SSH host and port. The loop captures the Pod again every 20 s and re-baselines this run's watchdog every 5 minutes: before the first heartbeat the idle clock runs from the last baseline, so without it a start that takes more than 600 s would have the watchdog delete the Pod. Twenty minutes is a fifth of run A's 100-minute setup allowance (**The two time rules**), which still leaves the bootstrap its 45 minutes, and costs at most $0.20 at $0.60/h:
+`keepalive` never fails silently. When `watchdog.pid` is missing, or names a process that is not this Pod's watchdog (the same command-line check `watchdog` makes before it stops one), it prints a `WARNING ... NO LIVE WATCHDOG` line and restarts the watchdog on that pass. When a restart fails, it prints a `WARNING ... restart FAILED` line and tries again on the next pass, instead of waiting another 5 minutes. A watchdog that deleted the Pod also exits, so read its receipt before anything else.
+
+Then wait, for at most 20 minutes, until `pod-connection.json` shows `"status": "RUNNING"` with a direct SSH host and port. The loop captures the Pod again every 20 s and calls `keepalive`: before the first heartbeat the idle clock runs from the last baseline, so without the re-baseline a start that takes more than 600 s would have the watchdog delete the Pod. Twenty minutes is a fifth of run A's 100-minute setup allowance (**The two time rules**), which still leaves the bootstrap its 45 minutes, and costs at most $0.20 at $0.60/h. A Pod that is `RUNNING` with `ssh_proxy_only` true on three captures in a row (40 s) has no public IP, and no file can move to or from it, so the wait stops early for it; one or two such captures are allowed, in case the direct address appears a moment after the status:
 
 ```sh
-GIVE_UP=$(( $(date +%s) + 1200 ))
-until python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); d=c.get("ssh_direct") or {}; ok=c.get("status") == "RUNNING" and bool(d.get("host")) and bool(d.get("port")); print(c.get("status"), "with direct SSH" if ok else "without direct SSH"); sys.exit(0 if ok else 1)' "$CTRL/pod-connection.json"; do
+GIVE_UP=$(( $(date +%s) + 1200 )); PROXY_ONLY=0
+while :; do
+  python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); d=c.get("ssh_direct") or {}; running=c.get("status") == "RUNNING"; ok=running and bool(d.get("host")) and bool(d.get("port")); proxy=running and not ok and c.get("ssh_proxy_only") is True; print(c.get("status"), "with direct SSH" if ok else "with proxy SSH only" if proxy else "without direct SSH"); sys.exit(0 if ok else 2 if proxy else 1)' "$CTRL/pod-connection.json"; STATE=$?
+  if [ "$STATE" -eq 0 ]; then break; fi
+  if [ "$STATE" -eq 2 ]; then PROXY_ONLY=$((PROXY_ONLY + 1)); else PROXY_ONLY=0; fi
+  if [ "$PROXY_ONLY" -ge 3 ]; then echo "run $RUN: Pod $POD_ID is RUNNING with proxy SSH only: it has no public IP, so no file can reach it; terminate it (step 13, TERMINATE=yes)"; break; fi
   if [ "$(date +%s)" -ge "$GIVE_UP" ]; then echo "run $RUN: Pod $POD_ID is not RUNNING with direct SSH after 20 minutes; terminate it (step 13, TERMINATE=yes)"; break; fi
   sleep 20
   uv run --locked python -m tools.runpod_pod_identity capture --pod-id "$POD_ID" --identity "$CTRL/pod-identity.json" --connection "$CTRL/pod-connection.json" > /dev/null
-  if [ $(( $(date +%s) - BASE )) -ge 300 ]; then watchdog; fi
+  keepalive
 done
 ```
 
-If it printed `not RUNNING`, do not continue: terminate the Pod (step 13, `TERMINATE=yes`) and report. The watchdog is no longer re-baselined, so its idle rule also deletes the Pod within 600 s. If `pod-connection.json` shows `"status": "RUNNING"` with `ssh_proxy_only` true, the Pod has no public IP: terminate it the same way and create it again. Pin this Pod's host key in this run's own known-hosts file:
+If it printed `proxy SSH only` or `not RUNNING`, do not continue: terminate the Pod (step 13, `TERMINATE=yes`) and report. The watchdog is no longer re-baselined, so its idle rule also deletes the Pod within 600 s. A Pod without a public IP may be created again with the owner's approval: step 5 again, after step 13 has recorded its `TEARDOWN` and `unset POD_ID` has cleared its ID. Otherwise pin this Pod's host key in this run's own known-hosts file, and compare the fingerprint `ssh-keygen` prints with the one shown in this Pod's web terminal:
 
 ```sh
 export POD_HOST=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_direct"]["host"])' "$CTRL/pod-connection.json")
 export POD_PORT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_direct"]["port"])' "$CTRL/pod-connection.json")
 printf 'export POD_HOST=%s POD_PORT=%s\n' "$POD_HOST" "$POD_PORT" >> "$CTRL/run.env"
 ssh-keyscan -p "$POD_PORT" "$POD_HOST" > "$KNOWN_HOSTS" 2>/dev/null
-ssh-keygen -lf "$KNOWN_HOSTS"      # compare with the fingerprint shown in this Pod's web terminal
+ssh-keygen -lf "$KNOWN_HOSTS"
 watchdog
 ```
 
@@ -226,11 +259,11 @@ podscp "$CTRL/repo.tar.gz" root@$POD_HOST:/workspace/repo.tar.gz
 podscp "$CTRL/revision.json" root@$POD_HOST:/workspace/revision.json
 podscp "$BINDING" root@$POD_HOST:/workspace/rehearsal/binding.json
 uv run --locked python -m tools.rehearsal_ops pod-env | podssh 'umask 077 && cat > /workspace/rehearsal/r2-pod.env && chmod 600 /workspace/rehearsal/r2-pod.env'
-podssh 'stat -c "%a %U %s" /workspace/rehearsal/r2-pod.env'     # expect 600 root and a nonzero size
+podssh 'stat -c "%a %U %s" /workspace/rehearsal/r2-pod.env'
 watchdog
 ```
 
-If the writer says the tree is dirty, nothing was archived and both `podscp` lines of the code fail: commit or stash, then run this block again.
+The `stat` line should print `600 root` and a nonzero size. If the writer says the tree is dirty, nothing was archived and both `podscp` lines of the code fail: commit or stash, then run this block again.
 
 ## 7. Bootstrap (Pod, billable, each terminal)
 
@@ -241,20 +274,24 @@ python3 tools/pod_self_destruct.py --pod-id "$RUNPOD_POD_ID" --deadline-unix "$S
   --receipt /workspace/rehearsal/self-destruct.json --stop-file /workspace/rehearsal/TERMINATE_NOW --max-lifetime-seconds 45000
 ```
 
-An existing `self-destruct.json` counts as armed only while its timer lives: its `pid` answers `kill -0` and its `checked_at_unix` (rewritten every 5 s) is at most 30 s old. Any other receipt is set aside as `self-destruct.json.stale-<time>` and the timer is armed again, so a re-run bootstrap never trusts a dead timer. The bootstrap then checks the shipped archive against `/workspace/revision.json` (the SHA-256 must match, the commit be 40 hex digits and the tree clean) and copies that record byte for byte to `/workspace/rehearsal/revision.json`, loads the R2 key file (a regular 0600 file, names printed, values never), refuses to continue if the Mac's key variables are set on the Pod, records the environment, installs the project against the image's CUDA torch, measures an R2 round trip under `rehearsal-runs/<run>/<pod id>/` (upload and download throughput with a probe of at least 128 MiB), fetches this run's pinned shards, manifests and tokenizer with `tools.rehearsal_binding fetch --key-prefix R2_POD_` and re-verifies them, fetches the initialization pinned to `INIT_SHA256` and `INIT_SIZE`, runs the CPU tests (the pilot's list plus the one-pass loader, validation, R2, the worker's own `tests/test_rehearsal_run.py`, the integration test and the Mac-side rehearsal tools' tests; none needs Docker or the network, and the data build's tests stay on the Mac), and runs the A40 precision, fused-attention, compile-equivalence (`tools.pilot_preflight --compile-check`) and exact-resume preflight. Launch it detached so an SSH drop cannot kill it, and keep re-baselining this run's watchdog while it runs, for at most 45 minutes. The launch refuses to run when `/workspace/rehearsal/bootstrap.log` already exists (checked from the Mac, and again on the Pod in the launch command itself), so pasting this block again never starts a second bootstrap: the wait follows the first one instead. The wait stops early when the Pod answers that no bootstrap process runs and the log has no `BOOTSTRAP_EXIT` line: the launch itself failed, and no timer may be armed. Only `pgrep`'s own "none found" (exit 1) counts; an SSH failure (255) or a Pod without `pgrep` never stops the wait early:
+An existing `self-destruct.json` counts as armed only while its timer lives: its `pid` answers `kill -0` and its `checked_at_unix` (rewritten every 5 s) is at most 30 s old. Any other receipt is set aside as `self-destruct.json.stale-<time>` and the timer is armed again, so a re-run bootstrap never trusts a dead timer. The bootstrap then checks the shipped archive against `/workspace/revision.json` (the SHA-256 must match, the commit be 40 hex digits and the tree clean) and copies that record byte for byte to `/workspace/rehearsal/revision.json`, loads the R2 key file (a regular 0600 file, names printed, values never), refuses to continue if the Mac's key variables are set on the Pod, records the environment, installs the project against the image's CUDA torch, measures an R2 round trip under `rehearsal-runs/<run>/<pod id>/` (upload and download throughput with a probe of at least 128 MiB), fetches this run's pinned shards, manifests and tokenizer with `tools.rehearsal_binding fetch --key-prefix R2_POD_` and re-verifies them, fetches the initialization pinned to `INIT_SHA256` and `INIT_SIZE`, runs the CPU tests (the pilot's list plus the one-pass loader, validation, R2, the worker's own `tests/test_rehearsal_run.py`, the integration test and the Mac-side rehearsal tools' tests; none needs Docker or the network, and the data build's tests stay on the Mac), and runs the A40 precision, fused-attention, compile-equivalence (`tools.pilot_preflight --compile-check`) and exact-resume preflight. Launch it detached so an SSH drop cannot kill it, and keep re-baselining this run's watchdog while it runs, for at most 45 minutes. The launch refuses to run when `/workspace/rehearsal/bootstrap.log` already exists (checked from the Mac, and again on the Pod in the launch command itself), so pasting this block again never starts a second bootstrap: the wait follows the first one instead.
+
+The launch returns at once. On the Pod each check is its own statement ending in `|| exit 1;`, so the command sent to the background is the bootstrap alone, with its output going to the log. Joining the checks to it with `&&` would send the whole list to the background as one subshell, which keeps the SSH session's output open: `podssh` would not return until the bootstrap ended, 15 to 45 minutes later, the wait below would never re-baseline the watchdog, and the watchdog's idle rule would delete the Pod after 600 s.
+
+The wait stops early when the Pod answers that no bootstrap process runs and the log has no `BOOTSTRAP_EXIT` line: the launch itself failed, and no timer may be armed. Only `pgrep`'s own "none found" (exit 1) counts; an SSH failure (255) or a Pod without `pgrep` never stops the wait early:
 
 ```sh
 if podssh 'test -e /workspace/rehearsal/bootstrap.log'; then
   echo "run $RUN: /workspace/rehearsal/bootstrap.log already exists, so a bootstrap was launched on this Pod before; not launching a second one. The wait below follows that one."
 else
-  podssh "test ! -e /workspace/rehearsal/bootstrap.log && cd /workspace/repo && tar xzf /workspace/repo.tar.gz && setsid nohup bash -c 'bash tools/pilot_pod_bootstrap.sh --mode rehearsal --run $RUN --deadline-unix $SELF_DESTRUCT_DEADLINE --workspace /workspace/rehearsal --repo /workspace/repo --revision /workspace/revision.json --archive /workspace/repo.tar.gz --r2-env /workspace/rehearsal/r2-pod.env --binding /workspace/rehearsal/binding.json --binding-sha256 $BINDING_SHA256 --data-root /workspace/rehearsal-data --initialization-key $INIT_KEY --initialization-sha256 $INIT_SHA256 --initialization-size $INIT_SIZE; echo BOOTSTRAP_EXIT=\$?' > /workspace/rehearsal/bootstrap.log 2>&1 < /dev/null &"
+  podssh "test ! -e /workspace/rehearsal/bootstrap.log || exit 1; cd /workspace/repo && tar xzf /workspace/repo.tar.gz || exit 1; setsid nohup bash -c 'bash tools/pilot_pod_bootstrap.sh --mode rehearsal --run $RUN --deadline-unix $SELF_DESTRUCT_DEADLINE --workspace /workspace/rehearsal --repo /workspace/repo --revision /workspace/revision.json --archive /workspace/repo.tar.gz --r2-env /workspace/rehearsal/r2-pod.env --binding /workspace/rehearsal/binding.json --binding-sha256 $BINDING_SHA256 --data-root /workspace/rehearsal-data --initialization-key $INIT_KEY --initialization-sha256 $INIT_SHA256 --initialization-size $INIT_SIZE; echo BOOTSTRAP_EXIT=\$?' > /workspace/rehearsal/bootstrap.log 2>&1 < /dev/null &"
 fi
 GIVE_UP=$(( $(date +%s) + 2700 ))
 until podssh 'grep -q ^BOOTSTRAP_EXIT= /workspace/rehearsal/bootstrap.log'; do
   if [ "$(date +%s)" -ge "$GIVE_UP" ]; then echo "run $RUN: bootstrap exceeded 45 minutes; terminate the Pod (step 13, TERMINATE=yes)"; break; fi
   podssh 'pgrep -f pilot_pod_bootstrap.sh' > /dev/null; ALIVE=$?
   if [ "$ALIVE" -eq 1 ] && ! podssh 'grep -q ^BOOTSTRAP_EXIT= /workspace/rehearsal/bootstrap.log'; then echo "run $RUN: no bootstrap runs on the Pod and bootstrap.log has no BOOTSTRAP_EXIT line: the launch failed. Read the lines below, then terminate the Pod (step 13, TERMINATE=yes)"; break; fi
-  sleep 30; if [ $(( $(date +%s) - BASE )) -ge 300 ]; then watchdog; fi
+  sleep 30; keepalive
 done
 for name in bootstrap.log self-destruct.json environment.json r2-round-trip.json data-fetch.json data-verification.json initialization-fetch.json; do
   podscp root@$POD_HOST:/workspace/rehearsal/$name "$CTRL/$name"
@@ -262,11 +299,11 @@ done
 podscp root@$POD_HOST:/workspace/rehearsal/preflight-a40/report.json "$CTRL/preflight-a40-report.json"
 podscp root@$POD_HOST:/workspace/rehearsal/revision.json "$CTRL/pod-revision.json"
 cmp "$CTRL/revision.json" "$CTRL/pod-revision.json" && echo "the Pod holds this revision"
-for name in R2_POD_SECRET_ACCESS_KEY R2_SECRET_ACCESS_KEY RUNPOD_API_KEY; do printenv "$name"; done | grep -cFf - "$CTRL/bootstrap.log"   # expect 0
+for name in R2_POD_SECRET_ACCESS_KEY R2_SECRET_ACCESS_KEY RUNPOD_API_KEY; do printenv "$name"; done | grep -cFf - "$CTRL/bootstrap.log"
 grep BOOTSTRAP_EXIT "$CTRL/bootstrap.log"; watchdog
 ```
 
-Expected: `BOOTSTRAP_EXIT=0`; `self-destruct.json` shows `"state": "armed"` and `deadline_unix` equal to `SELF_DESTRUCT_DEADLINE`; `the Pod holds this revision`; `r2-round-trip.json` shows `"status": "passed"` and an `upload_bytes_per_second` of at least about 9.17 million (the receipt refuses less; see **Upload rate** above); `preflight-a40-report.json` shows `"status": "completed"`, `"hardware_precision_and_resume_checked": true`, a passed `fused_attention` and a passed `compile_equivalence` (the receipt tool refuses a compiling specification without it). The leak check prints `0`: `bootstrap.log` holds none of the three secret values. `printenv` takes only the variables' names on its command line, and `grep` reads the values as patterns from its standard input (`-f -`), so no value reaches a process list. Any other exit code: read `bootstrap.log`, then terminate the Pod (step 13) unless the fix is obvious and cheap. Exit 6 means the shipped archive does not match `/workspace/revision.json`, or the workspace already holds another revision; the message says which. To run the bootstrap again after such a fix, first check that `podssh 'pgrep -f pilot_pod_bootstrap.sh'` prints nothing, then move the old log aside with `podssh 'mv /workspace/rehearsal/bootstrap.log /workspace/rehearsal/bootstrap.log.failed-$(date +%s)'` and paste this block again.
+Expected: `BOOTSTRAP_EXIT=0`; `self-destruct.json` shows `"state": "armed"` and `deadline_unix` equal to `SELF_DESTRUCT_DEADLINE`; `the Pod holds this revision`; `r2-round-trip.json` shows `"status": "passed"` and an `upload_bytes_per_second` of at least about 9.17 million (the receipt refuses less; see **Upload rate** above); `preflight-a40-report.json` shows `"status": "completed"`, `"hardware_precision_and_resume_checked": true`, a passed `fused_attention` and a passed `compile_equivalence` (the receipt tool refuses a compiling specification without it). The leak check prints `0`: `bootstrap.log` holds none of the three secret values. `printenv` takes only the variables' names on its command line, and `grep` reads the values as patterns from its standard input (`-f -`), so no value reaches a process list. Any other exit code: read `bootstrap.log`, then terminate the Pod (step 13) unless the fix is obvious and cheap. Exit 6 means the shipped archive does not match `/workspace/revision.json`, or the workspace already holds another revision; the message says which. To run the bootstrap again after such a fix, first check that `podssh 'pgrep -f pilot_pod_bootstrap.sh'` prints nothing, then move the old log aside with `podssh 'mv /workspace/rehearsal/bootstrap.log /workspace/rehearsal/bootstrap.log.failed-$(date +%s)'` and paste this block again. If the fix is a new commit (step 6 run again, which ships a new archive and `revision.json`), also move the workspace's copy of the old revision aside before pasting, with `podssh 'mv /workspace/rehearsal/revision.json /workspace/rehearsal/revision.json.old-$(date +%s)'`: the bootstrap never replaces a `revision.json` it finds there, so without this it exits 6 every time.
 
 ## 8. Readiness receipt (Mac, billable, each terminal)
 
@@ -301,21 +338,24 @@ The four Runpod steps are: funded balance verified for both runs, SSH public key
 
 ## 9. Worker launch (Pod, billable, each terminal)
 
-Start the worker detached from the SSH session, with the R2 key loaded from the 0600 file and nothing secret on the command line. Its exit status lands in `run.log` as `WORKER_EXIT=<code>`. Then wait for its first heartbeat, for at most 20 minutes, re-baselining the watchdog every 5 minutes; the wait stops early, and prints the end of `run.log`, if the worker exits first:
+Start the worker detached from the SSH session, with the R2 key loaded from the 0600 file and nothing secret on the command line. Its exit status lands in `run.log` as `WORKER_EXIT=<code>`. As in step 7, the launch returns at once: the guard is its own statement ending in `|| exit 1;`, and the command sent to the background is one `bash -c` with every redirect outside it, so it holds nothing of the SSH session open. The launch refuses to run when `/workspace/rehearsal/run.log` already exists (checked from the Mac, and again on the Pod in the launch command itself), so pasting this block again never starts a second worker: the wait follows the first one instead. Then wait for its first heartbeat, for at most 20 minutes, calling `keepalive` on each pass; the wait stops early, and prints the end of `run.log`, if the worker exits first:
 
 ```sh
-podssh "setsid nohup bash -c 'set -a; . /workspace/rehearsal/r2-pod.env; set +a; cd /workspace/repo && python3 -m tools.rehearsal_run run \
-  --specification $SPEC --binding /workspace/rehearsal/binding.json --binding-sha256 $BINDING_SHA256 \
-  --root /workspace/rehearsal-data --initialization /workspace/rehearsal/initialization.pt \
-  --initialization-sha256 $INIT_SHA256 --readiness /workspace/rehearsal/readiness-receipt.json \
-  --preflight /workspace/rehearsal/preflight-a40/report.json --output /workspace/rehearsal-run; echo WORKER_EXIT=\$?' \
-  > /workspace/rehearsal/run.log 2>&1 < /dev/null &"
-# Wrapping in bash -c with the redirect outside keeps no SSH channel open.
+if podssh 'test -e /workspace/rehearsal/run.log'; then
+  echo "run $RUN: /workspace/rehearsal/run.log already exists, so a worker was launched on this Pod before; not launching a second one. The wait below follows that one."
+else
+  podssh "test ! -e /workspace/rehearsal/run.log || exit 1; setsid nohup bash -c 'set -a; . /workspace/rehearsal/r2-pod.env; set +a; cd /workspace/repo && python3 -m tools.rehearsal_run run \
+    --specification $SPEC --binding /workspace/rehearsal/binding.json --binding-sha256 $BINDING_SHA256 \
+    --root /workspace/rehearsal-data --initialization /workspace/rehearsal/initialization.pt \
+    --initialization-sha256 $INIT_SHA256 --readiness /workspace/rehearsal/readiness-receipt.json \
+    --preflight /workspace/rehearsal/preflight-a40/report.json --output /workspace/rehearsal-run; echo WORKER_EXIT=\$?' \
+    > /workspace/rehearsal/run.log 2>&1 < /dev/null &"
+fi
 GIVE_UP=$(( $(date +%s) + 1200 ))
 until podssh 'test -s /workspace/rehearsal-run/heartbeat.json'; do
   if podssh 'grep -q ^WORKER_EXIT= /workspace/rehearsal/run.log'; then echo "run $RUN: the worker exited before its first heartbeat:"; podssh 'tail -n 40 /workspace/rehearsal/run.log'; break; fi
   if [ "$(date +%s)" -ge "$GIVE_UP" ]; then echo "run $RUN: no heartbeat after 20 minutes:"; podssh 'tail -n 40 /workspace/rehearsal/run.log'; break; fi
-  sleep 10; if [ $(( $(date +%s) - BASE )) -ge 300 ]; then watchdog; fi
+  sleep 10; keepalive
 done
 podssh 'test -s /workspace/rehearsal-run/heartbeat.json' && watchdog
 ```
@@ -363,39 +403,40 @@ For a run A that closed at `stage1-final` (time-limited between its stages, or s
 
 ## 13. Pod termination (Mac, each terminal)
 
-The guards delete the Pod after `shutdown_ready`; the in-Pod timer deletes it at `SELF_DESTRUCT_DEADLINE` regardless. To confirm, read the Pod's status and its mirrored heartbeat. This block only reads; it never deletes anything:
+The guards delete the Pod after `shutdown_ready`; the in-Pod timer deletes it at `SELF_DESTRUCT_DEADLINE` regardless. To confirm, read the Pod's status and its mirrored heartbeat. This block only reads; it never deletes anything. The status command prints `resource not found (HTTP 404)` once the Pod is gone:
 
 ```sh
-uv run --locked python -m tools.runpod_pod_identity status --pod-id "$POD_ID"    # "resource not found (HTTP 404)" once the Pod is gone
+uv run --locked python -m tools.runpod_pod_identity status --pod-id "$POD_ID"
 python3 -c 'import json,sys; h=json.load(open(sys.argv[1])); print(h.get("status"), h.get("phase"), h.get("pod_id"))' "$CTRL/supervisor/heartbeat.json"
 ```
 
-To terminate by hand, use the block below. It sends the DELETE only when the mirrored heartbeat the watchdog reads, `$CTRL/supervisor/heartbeat.json`, says `shutdown_ready` for this Pod, or when the owner has decided to end the Pod and you typed `TERMINATE=yes` in this terminal first. That decision covers these cases only:
+To terminate by hand, use the block below. It sends the DELETE only when the mirrored heartbeat the watchdog reads, `$CTRL/supervisor/heartbeat.json`, says `shutdown_ready` for this Pod with `mac_receipt_verified` and `github_receipt_verified` both true (exactly what the watchdog requires before it deletes on that status), or when the owner has decided to end the Pod and you typed `TERMINATE=yes` in this terminal first. That decision covers these cases only:
 
 - **Before the supervisor ran.** A step from 5 to 9 told you to terminate this Pod: a refused controller directory, no RUNNING within 20 minutes, no public IP, a changed host key, a failed or stuck bootstrap, a refused receipt, or no worker heartbeat. No worker has trained on the Pod, so no milestone is at risk.
 - **A stuck or failed run with no milestone at risk.** `$CTRL/supervisor/MILESTONES-NOT-SECURED.json` does not exist, and the owner has checked with `verify-final` or `tools.r2_store status` (steps 12 and 14) that every stage-final milestone the run reached is in R2.
 - **After step 14's rescue.** Every file that `MILESTONES-NOT-SECURED.json` names is on the Mac with its SHA-256 checked.
 
-The Runpod key again reaches `curl` on its standard input. The block records when this Pod was confirmed gone, and stops this Pod's watchdog, only once the status shows HTTP 404. It clears `TERMINATE` at its end, so the decision never carries over to a later paste:
+The Runpod key again reaches `curl` on its standard input; the DELETE prints its HTTP code, which should be `204`. The block's first line reads the decision into `DECISION` and clears `TERMINATE` at once, so the decision never carries over to a later paste, even when the block stops partway. It records when this Pod was confirmed gone, in `run.env` as `TEARDOWN`, only once the status shows HTTP 404. Then it stops this Pod's watchdog, if one still runs: only the process `watchdog.pid` names, and only when its command line names this Pod's identity file, the same check the `watchdog` helper makes; a PID file left by another process never gets that process killed:
 
 ```sh
+DECISION=${TERMINATE:-}; unset TERMINATE
 APPROVAL=none
-python3 -c 'import json,sys; h=json.load(open(sys.argv[1])); sys.exit(0 if h.get("status") == "shutdown_ready" and h.get("pod_id") == sys.argv[2] else 1)' "$CTRL/supervisor/heartbeat.json" "$POD_ID" 2>/dev/null && APPROVAL=shutdown_ready
-[ "${TERMINATE:-}" = yes ] && APPROVAL=TERMINATE=yes
+python3 -c 'import json,sys; h=json.load(open(sys.argv[1])); sys.exit(0 if h.get("status") == "shutdown_ready" and h.get("pod_id") == sys.argv[2] and h.get("mac_receipt_verified") is True and h.get("github_receipt_verified") is True else 1)' "$CTRL/supervisor/heartbeat.json" "$POD_ID" 2>/dev/null && APPROVAL=shutdown_ready
+[ "$DECISION" = yes ] && APPROVAL=TERMINATE=yes
 if [ -n "$POD_ID" ] && [ "$APPROVAL" != none ]; then
   echo "run $RUN: deleting Pod $POD_ID ($APPROVAL)"
-  printf 'header = "Authorization: Bearer %s"\n' "$RUNPOD_API_KEY" | curl --config - -sS -o /dev/null -w '%{http_code}\n' -X DELETE "https://api.runpod.io/v2/pods/$POD_ID"   # expect 204
+  printf 'header = "Authorization: Bearer %s"\n' "$RUNPOD_API_KEY" | curl --config - -sS -o /dev/null -w '%{http_code}\n' -X DELETE "https://api.runpod.io/v2/pods/$POD_ID"
 else
-  echo "run $RUN: no DELETE sent: the mirrored heartbeat is not shutdown_ready for Pod $POD_ID, and TERMINATE is not yes"
+  echo "run $RUN: no DELETE sent: the mirrored heartbeat is not a verified shutdown_ready for Pod $POD_ID, and TERMINATE was not yes"
 fi
 POD_STATUS=$(uv run --locked python -m tools.runpod_pod_identity status --pod-id "$POD_ID" 2>&1); printf '%s\n' "$POD_STATUS"
 if printf '%s\n' "$POD_STATUS" | grep -qF 'resource not found (HTTP 404)'; then
-  export TEARDOWN=$(date +%s) && printf 'export TEARDOWN=%s\n' "$TEARDOWN" >> "$CTRL/run.env"   # only once the 404 above is shown
-  kill "$(cat "$CTRL/watchdog.pid")" 2>/dev/null || true                         # this Pod's watchdog only, if still running
+  export TEARDOWN=$(date +%s) && printf 'export TEARDOWN=%s\n' "$TEARDOWN" >> "$CTRL/run.env"
+  WATCHDOG_PID=$(cat "$CTRL/watchdog.pid" 2>/dev/null || true)
+  if [ -n "$WATCHDOG_PID" ] && ps -p "$WATCHDOG_PID" -o command= 2>/dev/null | grep -qF -- "--identity $CTRL/pod-identity.json"; then kill "$WATCHDOG_PID"; fi
 else
   echo "run $RUN: Pod $POD_ID is not confirmed gone; TEARDOWN is not recorded and its watchdog keeps running"
 fi
-unset TERMINATE
 ```
 
 A Pod the guards already deleted shows the 404 without a DELETE, and the block records its teardown all the same.
@@ -406,7 +447,7 @@ After both Pods are gone, revoke the Pods' R2 token in the Cloudflare dashboard 
 
 The runs are independent: never stop, restart or re-baseline the other run's watchdog or supervisor because one failed, and never reuse a Pod or a controller directory for another Pod.
 
-- **Bootstrap or receipt fails.** Read `$CTRL/bootstrap.log` or the receipt tool's message, terminate that Pod (step 13) and report. A new Pod for the same run is a new launch: ask the owner first. It starts again at step 5 with a new controller directory. The initialization and binding are unchanged and can be reused.
+- **Bootstrap or receipt fails.** Read `$CTRL/bootstrap.log` or the receipt tool's message, terminate that Pod (step 13) and report. A new Pod for the same run is a new launch: ask the owner first. It starts again at step 5 with a new controller directory, once step 13 has recorded the old Pod's `TEARDOWN` and `unset POD_ID` has cleared its ID; step 5 refuses to create while either is missing. The initialization and binding are unchanged and can be reused.
 - **The worker stops or fails** (speed-and-fit check, rising loss, nonfinite loss, cost, a crash). After its own drain (heartbeat `uploading`) the heartbeat shows `stopped` or `failed`. The worker publishes `r2_final` only when a verified stage-final milestone closes what it trained (for example `stage1-final` of a run A stopped in stage 2); then the supervisor verifies it as in step 12 and archives it. Otherwise it waits 60 seconds (`--failure-grace-seconds`), then archives the worker's own `report.json` and a summary listing the labels present in R2 to `.../diagnostics/`, and approves teardown. The last verified rolling checkpoint and the report stay in R2.
 - **A milestone never reached R2** (heartbeat `failed`, failure `r2_milestones_unverified`). The worker writes `finalization.json` with the local export path and SHA-256 of every milestone R2 never verified. The supervisor does not approve teardown on its grace timer: it pulls those exports over SSH with the pilot's verified pull path in the 420 s reserve (from the worker's final heartbeat, by 480 s after its last GPU work, to the end of the 900 s window; see **Upload window**), checks each SHA-256, archives the records, and only then sets `shutdown_ready`. While the pulled bytes grow it stamps transfer progress every 5 s, so the watchdog keeps the Pod past the 600 s idle limit. If the pull fails too, it writes a prominent `controller-error.json` and `MILESTONES-NOT-SECURED.json` naming the files and never sets `shutdown_ready`; the watchdog's wall, cost and transfer limits remain the backstop, so act within them. To rescue a milestone by hand, copy each `pod_path` the file names from under the worker's root, for example `podscp root@$POD_HOST:/workspace/rehearsal-run/exports/<label>/checkpoint.pt "$CTRL/rescued-<label>.pt"`, and check that `shasum -a 256` prints the `sha256` it records; only then may step 13 end the Pod with `TERMINATE=yes`.
 - **The supervisor reports an R2 mismatch.** It never approves teardown. Inspect with `verify-final` and `uv run --locked python -m tools.r2_store status`; the idle limit deletes the Pod 600 seconds after its last GPU activity.
@@ -415,10 +456,10 @@ The runs are independent: never stop, restart or re-baseline the other run's wat
 
 ## 15. Final billing verification (Mac, each terminal)
 
-Fetch every hourly bucket from the hour of `ORIGIN` to now, and check that the provider's records cover the Pod's whole lifetime:
+Fetch every hourly bucket from the hour of `ORIGIN` to now, and check that the provider's records cover the Pod's whole lifetime. `BUCKETS` counts enough hourly buckets to reach back to the hour of `ORIGIN`:
 
 ```sh
-export BUCKETS=$(( ($(date +%s) - ORIGIN) / 3600 + 2 ))   # enough hourly buckets to reach back to ORIGIN's hour
+export BUCKETS=$(( ($(date +%s) - ORIGIN) / 3600 + 2 ))
 uv run --locked python -m tools.runpod_pod_identity billing --pod-id "$POD_ID" --last-buckets "$BUCKETS" --output "$CTRL/billing.json"
 python3 - "$CTRL/billing.json" "$POD_ID" "$ORIGIN" "${TEARDOWN:-}" "$BUCKETS" "$CTRL/supervisor/heartbeat.json" <<'PY'
 import calendar, json, sys, time
@@ -442,7 +483,7 @@ def stamp(moment):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))
 
 
-alive = origin  # The Pod certainly billed until its last mirrored heartbeat.
+alive = origin
 try:
     alive = max(alive, float(json.load(open(heartbeat))["updated_at_unix"]))
 except (OSError, ValueError, KeyError, TypeError):
@@ -465,7 +506,6 @@ for record in records:
     starts.append(start)
 if len(set(starts)) != len(starts):
     problems.append("an hour is billed twice")
-# Billing starts with the create request; one created in the next hour skips ORIGIN's hour.
 missing = [h for h in range(hour(origin + 300), hour(alive) + 1, 3600) if h not in starts]
 if missing:
     problems.append("no record for the hours from " + ", ".join(stamp(h) for h in missing))
@@ -483,7 +523,7 @@ print(f"billing covers this Pod from {stamp(origin)} to its last heartbeat; unde
 PY
 ```
 
-The check fails unless the request reached back to the hour of `ORIGIN`, every record is this Pod's and lies within its lifetime (from `ORIGIN` to `TEARDOWN`, recorded in step 13), every hour from `ORIGIN` to the last mirrored heartbeat has a record, the records sum to the provider totals, and the total is below the $10 cap. Runpod bills every five minutes and records may lag: a check that fails right after teardown only for the last hour is re-run an hour later (the same block, which recomputes `BUCKETS`); a failure that persists means the records do not cover this Pod, so report it. Compare the total with the report's `cost` for each run, and note the R2 storage held by `uv run --locked python -m tools.r2_store status`.
+The check fails unless the request reached back to the hour of `ORIGIN`, every record is this Pod's and lies within its lifetime (from `ORIGIN` to `TEARDOWN`, recorded in step 13), every hour from `ORIGIN` to the last mirrored heartbeat has a record (the Pod certainly billed until that heartbeat; billing starts with the create request, and a Pod created in the hour after `ORIGIN`'s skips that hour, so the first hour required is the one that holds `ORIGIN` + 300 s), the records sum to the provider totals, and the total is below the $10 cap. Runpod bills every five minutes and records may lag: a check that fails right after teardown only for the last hour is re-run an hour later (the same block, which recomputes `BUCKETS`); a failure that persists means the records do not cover this Pod, so report it. Compare the total with the report's `cost` for each run, and note the R2 storage held by `uv run --locked python -m tools.r2_store status`.
 
 ## 16. Results
 
