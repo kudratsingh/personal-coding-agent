@@ -568,6 +568,8 @@ class Recovery:
     ) -> None:
         self.holder, self.disk, self.fail = holder, disk, fail
         self.calls: list[tuple[str, float]] = []
+        self.seconds = 1.0
+        """How long the pull runs on the fake clock before it lands or drops."""
         self.progress: list[object] = []
 
     def __call__(self, name: str, destination: Path, timeout: float) -> Path:
@@ -580,7 +582,7 @@ class Recovery:
         staging.mkdir(parents=True)
         data = self.disk[label]
         (staging / "checkpoint.pt").write_bytes(data[: len(data) // 2])
-        unit.now[0] += 1  # type: ignore[attr-defined]
+        unit.now[0] += self.seconds  # type: ignore[attr-defined]
         # The mirror thread runs meanwhile: bytes arriving on the Mac are transfer progress.
         self.progress.append(unit.refresh_heartbeat().get("transfer_progress_unix"))
         if self.fail is not None:
@@ -1576,11 +1578,12 @@ class FlakyOnce(FakeR2):
         return super().head(key)
 
 
-def test_r2_stays_a_fallback_after_a_transient_check_failure(tmp_path: Path) -> None:
+def test_an_unreachable_r2_is_checked_again_only_after_the_window(tmp_path: Path) -> None:
     """The worker ran out of time to confirm stage2-final, though every file reached R2.
-    The Mac's first HEAD times out and every SSH pull fails. Within R2_RECHECK_SECONDS the
-    retries go straight to the pull; after it R2 is checked again, finds the milestone
-    whole, and teardown is approved without any pull succeeding."""
+    The Mac's first HEAD times out and every SSH pull fails. While a pull can run, no
+    recheck spends the reserve: each retry goes straight to the pull. Once the transfer
+    window has closed, R2 is checked once more, finds the milestone whole, and the record
+    and teardown follow what R2 holds."""
     flaky = FlakyOnce()
     report, disk = unverified_run(flaky)
     put_export(flaky, "stage2-final", disk["stage2-final"])
@@ -1598,21 +1601,68 @@ def test_r2_stays_a_fallback_after_a_transient_check_failure(tmp_path: Path) -> 
     )
     holder.append(unit)
     checkpoint = f"{run_prefix('A', POD)}stage2-final/checkpoint.pt"
-    unit.now[0] = 1980.0  # type: ignore[attr-defined]  # The handover.
-    unit.cycle()  # The HEAD times out: at risk, and the pull fails.
-    unit.now[0] = 1990.0  # type: ignore[attr-defined]
-    unit.cycle()  # Inside the recheck delay: no HEAD, straight to the pull, which fails.
+    for moment in (1980.0, 2100.0, 2300.0):  # Inside the window: pulls only.
+        unit.now[0] = moment  # type: ignore[attr-defined]
+        unit.cycle()
     assert [call for call in flaky.calls if call == ("HEAD", checkpoint)] == [("HEAD", checkpoint)]
-    assert len(recovery.calls) == 2 and not unit.shutdown_ready
+    assert len(recovery.calls) == 3 and not unit.shutdown_ready
     assert (unit.root / "MILESTONES-NOT-SECURED.json").exists()
-    unit.now[0] = 1980.0 + pilot_supervisor.R2_RECHECK_SECONDS + 1  # type: ignore[attr-defined]
-    unit.cycle()  # R2 is checked again and holds every file: secured without a pull.
-    assert len(recovery.calls) == 2
+    unit.now[0] = 1500.0 + 900 + 1  # type: ignore[attr-defined]
+    unit.cycle()  # The window is over: no pull starts, and none is attempted.
+    assert len(recovery.calls) == 3 and unit.window_closed and not unit.shutdown_ready
+    unit.now[0] += 5  # type: ignore[attr-defined]
+    unit.cycle()  # R2 is checked once more and holds every file.
     assert unit.shutdown_ready and archive.bundles == [unit.root / "diagnostics"]
     summary = json.loads((unit.root / "diagnostics" / "summary.json").read_text())
     secured = summary["milestone_recovery"]["verified_in_r2_by_mac"]
     assert sorted(row["key"].split("/")[-2] for row in secured) == ["stage1-final", "stage2-final"]
     assert summary["milestone_recovery"]["pulled_over_ssh"] == []
+
+
+class SlowDropping(Dropping):
+    """A dropped pull that ran 70 s before the connection reset, as a real 1.65 GB pull can."""
+
+    def __call__(self, name: str, destination: Path, timeout: float) -> Path:
+        self.seconds = 1.0 if any(started == name for started, _ in self.starts) else 70.0
+        return super().__call__(name, destination, timeout)
+
+
+def test_a_slow_dropped_pull_is_retried_in_the_next_cycle_with_no_recheck(
+    tmp_path: Path,
+) -> None:
+    """R2 never answers the Mac and the first pull of each milestone drops after 70 s,
+    longer than any recheck delay. Each retry still starts one 5 s cycle after the drop,
+    and neither milestone is HEADed again while a pull can run."""
+    stalled = Stalled()
+    report, disk = unverified_run(stalled, in_r2=())
+    rows = listing(disk, "stage1-final", "stage2-final")
+    pod = Pod(heartbeat("failed", last_gpu_activity_unix=1500), report, rows)
+    holder: list[RehearsalSupervisor] = []
+    recovery = SlowDropping(holder, disk)
+    unit, archive = supervisor(
+        tmp_path,
+        pod,
+        stalled,
+        fetch_finalization=pod.fetch_finalization,
+        recover=recovery,
+        transfer_window_seconds=900,
+    )
+    holder.append(unit)
+    stalled.now = unit.now  # type: ignore[attr-defined]
+    handover = 1500.0 + 480
+    unit.now[0] = handover  # type: ignore[attr-defined]
+    for _ in range(3):
+        unit.cycle()
+        unit.now[0] += 5  # type: ignore[attr-defined]  # The wait between two cycles.
+    assert len([call for call in stalled.calls if call[0] == "HEAD"]) == 2  # Once each.
+    first = handover + 2 * STALL_SECONDS
+    assert recovery.starts == [
+        ("exports/stage2-final", first),  # Dropped after 70 s.
+        ("exports/stage2-final", first + 70 + 5),
+        ("exports/stage1-final", first + 70 + 5 + 1),  # Dropped after 70 s.
+        ("exports/stage1-final", first + 70 + 5 + 1 + 70 + 5),
+    ]
+    assert unit.shutdown_ready and archive.bundles == [unit.root / "diagnostics"]
 
 
 def test_a_recorded_milestone_r2_lacks_is_never_checked_again_on_a_pull_retry(

@@ -280,7 +280,7 @@ def fixtures(tmp_path: Path, run: str = "A", **change: Any) -> dict[str, Any]:
             "schema_version": 1,
             "pod_id": POD,
             "status": "RUNNING",
-            "cost_usd_per_hour": 0.6,
+            "cost_usd_per_hour": 0.59,  # The API's cost is the GPU price alone.
             "created_at": CREATED_AT,
         },
         "revision": dict(REVISION),
@@ -335,7 +335,7 @@ def test_receipt_records_the_code_revision_cost_and_upload_rate(tmp_path: Path) 
     values = fixtures(tmp_path)
     receipt = build_rehearsal_receipt(**values)
     assert receipt["revision"] == REVISION  # The worker compares its own copy with this.
-    assert receipt["pod_cost_usd_per_hour"] == 0.6
+    assert receipt["pod_cost_usd_per_hour"] == 0.59
     for name in ("connection", "revision", "round_trip"):
         assert receipt["evidence_sha256"][name] == file_sha256(values[name])
     # 1.65 GB inside the 360 s drain with a factor-2 margin.
@@ -346,7 +346,7 @@ def test_receipt_records_the_code_revision_cost_and_upload_rate(tmp_path: Path) 
     for change, message in (
         ({"revision": {**REVISION, "clean": False}}, "dirty"),
         ({"revision": None}, "exactly the keys"),
-        ({"pod_cost_usd_per_hour": 0.62}, "captured Pod cost"),
+        ({"pod_cost_usd_per_hour": 0.6}, "captured Pod cost"),  # Above the $0.59 GPU quote.
         ({"pod_cost_usd_per_hour": None}, "captured Pod cost"),
     ):
         with pytest.raises(ValueError, match=message):
@@ -452,7 +452,8 @@ def test_run_b_receipt_covers_the_mixed_stage(tmp_path: Path) -> None:
         ({"self_destruct_receipt": {"pid": 0}}, "pid"),
         ({"self_destruct_receipt": {"pid": True}}, "pid"),
         # The live Pod price must not exceed the quote the deadlines plan at.
-        ({"connection": {"cost_usd_per_hour": 0.61}}, "above the quoted"),
+        # One cent above the GPU quote: with the 40 GB disk it would pass $10 at the wall.
+        ({"connection": {"cost_usd_per_hour": 0.6}}, "above the quoted"),
         ({"connection": {"cost_usd_per_hour": None}}, "no hourly cost"),
         ({"connection": {"cost_usd_per_hour": True}}, "no hourly cost"),
         ({"connection": {"pod_id": "another-pod"}}, "another Pod"),

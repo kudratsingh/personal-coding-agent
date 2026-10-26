@@ -429,16 +429,14 @@ EXPORT_PATH_KEYS = ("path", "export_path", "local_path", "export")
 """Keys under which ``finalization.json`` may give an unverified milestone's export path."""
 LISTED_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 """A file name the worker lists for an unverified milestone: one plain path component."""
-R2_RECHECK_SECONDS = 60.0
-"""A milestone whose R2 check timed out or could not connect is checked again after this long."""
 MAC_CHECK_TIMEOUT_SECONDS = 5.0
 """The socket timeout of the Mac's own R2 listings and HEAD checks (``quick_store``). A HEAD
 is one request, but urllib tries every address the endpoint resolves to with the whole
 timeout, and name resolution has no timeout at all. The worker hands over 480 s after its
 last GPU work and the pull must stamp progress before the 600 s idle limit, so an
 unreachable R2 delays the pull by up to addresses x 5 s for each milestone checked (each
-check stops at its first failure and is never repeated): about 40 s for run A's two
-milestones with four addresses, plus name resolution."""
+check stops at its first failure and is not repeated while a pull can run): about 40 s for
+run A's two milestones with four addresses, plus name resolution."""
 CHECKPOINT_DIGEST_KEYS = ("checkpoint_sha256", "sha256")
 """Keys under which an unverified milestone gives its checkpoint's SHA-256: the worker's
 ``checkpoint_sha256`` (``rehearsal_run.Worker.export_listing``), else an older row's ``sha256``."""
@@ -643,9 +641,10 @@ class RehearsalSupervisor(Supervisor):
     retried. An R2 endpoint that stalls then holds the mirror or the start of a pull for up
     to 5 s per address it resolves to on each request, instead of 300 s, plus name
     resolution, which no socket timeout bounds; its error is recorded and stamps nothing.
-    A milestone is checked at most once: one already pulled, or one whose check failed
-    (``r2_unconfirmed``), goes straight to the pull on a retry. ``verify_final`` and its
-    downloads use ``store``.
+    While a pull can run, a milestone is checked at most once: one already pulled, or one
+    whose check failed, goes straight to the pull on a retry. One whose check timed out or
+    could not connect is checked once more after the transfer window has closed, only so
+    the record says what R2 holds. ``verify_final`` and its downloads use ``store``.
 
     A heartbeat naming another Pod, or updated before this Pod's creation, is ignored
     (``runpod_watchdog.foreign_heartbeat``): it is never mirrored and never acted on.
@@ -696,10 +695,14 @@ class RehearsalSupervisor(Supervisor):
         self.recovery_root = root / "recovered" / pod_id
         self.recovered: dict[str, dict[str, Any]] = {}
         self.r2_secured: dict[str, dict[str, Any]] = {}
-        # Milestones whose R2 check by the Mac failed (missing, different or unreachable):
-        # never checked again, so a retried pull starts at once instead of after the HEADs.
+        # Milestones whose R2 check by the Mac failed: R2 answered missing or different
+        # (never checked again), or did not answer (checked once more after the window), so
+        # a retried pull starts at once instead of after the HEADs.
         self.r2_unconfirmed: set[str] = set()
-        self.r2_recheck_after: dict[str, float] = {}
+        self.r2_unreachable: set[str] = set()
+        self.r2_rechecked: set[str] = set()
+        self.window_closed = False
+        """Set once no SSH pull can start: the watchdog's transfer window is over."""
         self.recovering = False
         self.recovery_staged = 0
         self.milestone_error: dict[str, Any] | None = None
@@ -869,11 +872,13 @@ class RehearsalSupervisor(Supervisor):
         report records that the worker did not list is checked in R2 the same way, by its
         checkpoint; any that fails or times out is at risk too. After any other failure,
         the listed milestones the Mac could not find and those the report flags as
-        unverified are. A milestone already pulled, or one R2 answered as missing or
-        different (``r2_unconfirmed``), stays at risk with no new HEAD, so a pull retried
-        after a dropped one starts within a cycle. One whose check timed out or could not
-        connect is checked again only ``R2_RECHECK_SECONDS`` later (``r2_recheck_after``),
-        so R2 stays a fallback when the SSH pull is the broken path.
+        unverified are. A milestone already pulled, or one whose R2 check failed, stays at
+        risk with no new HEAD while a pull can still run, so a pull retried after a dropped
+        one starts within a cycle and no recheck spends the SSH reserve. A check that timed
+        out or could not connect (``r2_unreachable``, unlike R2's own answer that the object
+        is missing or different, ``r2_unconfirmed``) is made once more after the transfer
+        window has closed (``window_closed``), only to keep the record accurate: a milestone
+        R2 holds whole is then secured, and teardown approved.
         """
         recovery = report.get("failure") in RECOVERY_FAILURES
         try:
@@ -888,9 +893,13 @@ class RehearsalSupervisor(Supervisor):
             if recorded.get(label, digest) != digest:
                 raise ValueError(f"finalization.json and report.json give {label} two SHA-256s")
         files = listed_files(finalization, run=self.run)
-        now = self.clock()
         settled = self.recovered.keys() | self.r2_unconfirmed  # Never checked in R2 again.
-        settled |= {label for label, after in self.r2_recheck_after.items() if now < after}
+        if not self.window_closed:
+            settled |= self.r2_unreachable  # While a pull can run, it gets the whole reserve.
+        else:
+            self.r2_unreachable -= self.r2_rechecked  # Each is checked once more, at most.
+            settled |= self.r2_rechecked
+            self.r2_rechecked |= self.r2_unreachable
         at_risk: dict[str, str] = {}
         for label, digest in listed.items():
             if label in self.r2_secured:
@@ -927,12 +936,13 @@ class RehearsalSupervisor(Supervisor):
 
     def r2_check_failed(self, label: str, error: Exception) -> None:
         """Record a failed R2 check of ``label``: for good when R2 answered (``head_sha256``
-        raises ``ValueError`` for a missing object, other bytes or no SHA-256), else until
-        ``R2_RECHECK_SECONDS`` from now (a timeout, a refused connection, an HTTP error)."""
+        raises ``ValueError`` for a missing object, other bytes or no SHA-256), else as
+        unreachable (a timeout, a refused connection, an HTTP error), checked once more
+        after the transfer window has closed."""
         if isinstance(error, ValueError):
             self.r2_unconfirmed.add(label)
         else:
-            self.r2_recheck_after[label] = self.clock() + R2_RECHECK_SECONDS
+            self.r2_unreachable.add(label)
 
     def secured_in_r2(self, label: str, files: Sequence[tuple[str, str]]) -> bool:
         """True, and recorded in ``r2_secured``, when every listed file of ``label`` is in R2
@@ -984,6 +994,9 @@ class RehearsalSupervisor(Supervisor):
                 return
             left = float(activity) + self.transfer_window_seconds - self.clock()
             if left <= 0:
+                # No pull can start now: the next cycle checks unreachable milestones in R2
+                # once more, so the record says what R2 holds.
+                self.window_closed = True
                 self.fail_milestones(at_risk, "the watchdog's transfer window is over")
                 return
             self.recovering = True

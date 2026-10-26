@@ -163,10 +163,12 @@ def self_destruct_live(timer: dict[str, Any], *, pod_id: str, now: float) -> flo
 
 
 def pod_cost_within_quote(connection: dict[str, Any], *, pod_id: str, quoted: float) -> float:
-    """The captured Pod's hourly price (``pod-connection.json``), refused above the quote.
+    """The captured Pod's hourly price (``pod-connection.json``), refused above ``quoted``.
 
-    The watchdog stops at ``max(API cost, quote)``; a live price above the quote would end
-    the Pod before the worker's own deadlines, which plan at the quote.
+    The Pod API's ``cost`` is the GPU price alone (the pilot's A40 read $0.59 while its disk
+    billed separately), so ``quoted`` is the GPU quote: a GPU one cent above it, plus the
+    40 GB disk, would carry a Pod past the $10 cap at its 60,000 s wall. The watchdog stops
+    at ``max(API cost, total quote)``, and the worker's deadlines plan at the total quote.
     """
     if connection.get("pod_id") != pod_id:
         raise ValueError("the captured Pod connection record is for another Pod")
@@ -175,7 +177,7 @@ def pod_cost_within_quote(connection: dict[str, Any], *, pod_id: str, quoted: fl
         raise ValueError("the captured Pod connection record carries no hourly cost")
     if cost > quoted:
         raise ValueError(
-            f"the Pod's captured cost ${cost:.4f}/h is above the quoted ${quoted:.2f}/h total"
+            f"the Pod's captured GPU cost ${cost:.4f}/h is above the quoted ${quoted:.2f}/h"
         )
     return cost
 
@@ -386,8 +388,8 @@ def check_rehearsal_readiness(receipt: dict[str, Any], *, now: float, run: str) 
         raise ValueError("the receipt's R2 prefix is not this run's Pod prefix")
     rehearsal_ops.check_revision(receipt.get("revision"))  # A clean, well-formed revision.
     cost = _number(receipt.get("pod_cost_usd_per_hour"))
-    if cost is None or not 0 <= cost <= rehearsal_ops.QUOTED_TOTAL_HOURLY:
-        raise ValueError("the receipt's captured Pod cost is missing or above the D-35 quote")
+    if cost is None or not 0 <= cost <= rehearsal_ops.QUOTED_GPU_HOURLY:
+        raise ValueError("the receipt's captured Pod cost is missing or above the D-35 GPU quote")
     for name in ("binding_sha256", "initialization_sha256", "specification_sha256"):
         value = receipt.get(name)
         if not isinstance(value, str) or len(value) != 64:
@@ -464,7 +466,7 @@ def build_rehearsal_receipt(
     timer = _load(self_destruct_receipt)
     deadline = self_destruct_live(timer, pod_id=pod_identity.pod_id, now=created_at)
     cost = pod_cost_within_quote(
-        _load(connection), pod_id=pod_identity.pod_id, quoted=spec.limits.quoted_total_hourly
+        _load(connection), pod_id=pod_identity.pod_id, quoted=spec.quoted_gpu_hourly
     )
     code = rehearsal_ops.check_revision(_load(revision))
     owner = _load(confirmations)
