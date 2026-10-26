@@ -208,8 +208,8 @@ def fixtures(tmp_path: Path, run: str = "A", **change: Any) -> dict[str, Any]:
         },
         "policy": {
             "mode": "rehearsal",
-            "max_wall_seconds": 45_000,
-            "max_cost_usd": 7.54,
+            "max_wall_seconds": 60_000,
+            "max_cost_usd": 9.99,
             "max_idle_seconds": 600,
             "quoted_total_hourly": 0.6,
             "max_transfer_seconds": 900,
@@ -222,7 +222,7 @@ def fixtures(tmp_path: Path, run: str = "A", **change: Any) -> dict[str, Any]:
             "state": "armed",
             "armed_at_unix": CREATED + 300,
             "checked_at_unix": CREATED + 1_795,  # The live timer rewrites it every 5 s.
-            "deadline_unix": CREATED - 5 + 45_000 - 180,
+            "deadline_unix": CREATED - 5 + 60_000 - 180,
         },
         "confirmations": {
             "owner_confirms_four_runpod_steps": True,
@@ -315,14 +315,14 @@ def test_receipt_binds_the_pods_evidence_and_passes_the_d35_gate(tmp_path: Path)
     assert receipt["limits"]["max_transfer_seconds"] == 900
     assert receipt["watchdog_policy"]["max_transfer_seconds"] == 900
     fit = receipt["time_fit"]
-    assert fit["remaining_seconds"] == pytest.approx(45_000 - 180 - 5 - 1_800)
+    assert fit["remaining_seconds"] == pytest.approx(60_000 - 180 - 5 - 1_800)
     # The worker's launch rule, at the reference speed, from the worker's own plan.
     spec = Specification.load(SPECS["A"])
     targets, full = binding_targets(spec, synthetic_binding())
     plan = planned_seconds(spec, stage_targets=targets, full_validation_targets=full)
     assert fit["reference_seconds_needed"] == pytest.approx(plan["total_seconds"])
     assert fit["rule"] == LAUNCH_RULE and fit["fits_at_reference"]
-    # 43,015 s left holds the run at 56,479 tok/s (38,843 s) and at the 90% floor (42,808 s).
+    # 58,015 s left holds the run at 56,479 tok/s (38,843 s) and at the 90% floor (42,808 s).
     assert fit["fits_at_floor"] is True
     assert fit["floor_seconds_needed"] == pytest.approx(42_808, abs=1)
     assert "ssh_transfer_tested" not in receipt
@@ -441,7 +441,7 @@ def test_run_b_receipt_covers_the_mixed_stage(tmp_path: Path) -> None:
         ({"specification": {"r2": {**A_R2, "max_transfer_seconds": 1_000}}}, "D-35"),
         ({"specification": {"stages": [{**A_STAGES[0], "updates": 7_631}, A_STAGES[1]]}}, "spec's"),
         ({"self_destruct_receipt": {"state": "dry_run_complete"}}, "not armed"),
-        ({"self_destruct_receipt": {"deadline_unix": CREATED + 50_000}}, "lifetime"),
+        ({"self_destruct_receipt": {"deadline_unix": CREATED + 61_000}}, "lifetime"),
         ({"confirmations": {"owner_accepts_best_effort_termination": False}}, "acceptance"),
         # A timer that died after arming leaves a receipt nobody refreshes.
         ({"self_destruct_receipt": {"checked_at_unix": CREATED + 1_739}}, "live timer within"),
@@ -492,7 +492,7 @@ def test_receipt_is_refused_when_a_gate_or_limit_fails(
 
 
 def test_receipt_is_refused_when_too_little_lifetime_is_left(tmp_path: Path) -> None:
-    moment = CREATED + 45_000 - 180 - 1_700
+    moment = CREATED + 60_000 - 180 - 1_700
     late = fixtures(tmp_path, self_destruct_receipt={"checked_at_unix": moment - 5})
     late["now"] = moment
     with pytest.raises(ValueError, match="cannot hold the run"):
@@ -500,7 +500,7 @@ def test_receipt_is_refused_when_too_little_lifetime_is_left(tmp_path: Path) -> 
     (tmp_path / "fresh").mkdir()
     receipt = build_rehearsal_receipt(**fixtures(tmp_path / "fresh"))
     with pytest.raises(ValueError, match="cannot hold the run"):
-        check_rehearsal_readiness(receipt, now=CREATED + 45_000 - 180 - 1_700, run="A")
+        check_rehearsal_readiness(receipt, now=CREATED + 60_000 - 180 - 1_700, run="A")
 
 
 def test_cli_writes_nothing_when_a_gate_fails_and_the_pilot_cli_is_untouched(

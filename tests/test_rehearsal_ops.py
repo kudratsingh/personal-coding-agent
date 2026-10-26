@@ -117,7 +117,9 @@ def test_run_layout_and_limits_follow_d35() -> None:
     assert rehearsal_ops.MINIMUM_SPEED_FRACTION == 0.9
     assert rehearsal_ops.WATCHDOG_COST_STOP_USD < rehearsal_ops.COST_STOP_USD
     assert rehearsal_ops.TOKENS_PER_UPDATE == 131_072
-    assert rehearsal_ops.POD_LIFETIME_SECONDS * rehearsal_ops.QUOTED_TOTAL_HOURLY / 3600 == 7.5
+    # The 60,000 s wall falls at the $10 cap at the quoted rate: the cap is the binding limit.
+    assert rehearsal_ops.POD_LIFETIME_SECONDS == 60_000
+    assert rehearsal_ops.POD_LIFETIME_SECONDS * rehearsal_ops.QUOTED_TOTAL_HOURLY / 3600 == 10.0
 
 
 @pytest.mark.parametrize(

@@ -28,8 +28,9 @@ API_BASE = "https://api.runpod.io/v2"
 API_KEY_ENV = "RUNPOD_API_KEY"
 MAX_RESPONSE_BYTES = 1_048_576
 MAX_POD_WALL_SECONDS = 5_400
-# The owner-approved rehearsal runs (D-35) have a 12.5-hour Pod limit; the pilot keeps 5,400.
-MODE_WALL_SECONDS = {"pilot": MAX_POD_WALL_SECONDS, "rehearsal": 45_000}
+# The owner-approved rehearsal runs (D-35) have a 60,000-second (16.7-hour) Pod limit, so the
+# $10 cap at $0.60/h is the binding limit; the pilot keeps 5,400.
+MODE_WALL_SECONDS = {"pilot": MAX_POD_WALL_SECONDS, "rehearsal": 60_000}
 MAX_GPU_IDLE_SECONDS = 600
 MAX_TRANSFER_SECONDS = 1_800
 CLOCK_SKEW_SECONDS = 60.0  # Tolerated difference between Pod, provider and Mac clocks.
@@ -619,7 +620,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=sorted(MODE_WALL_SECONDS),
         default="pilot",
-        help="wall ceiling: pilot 5400 s, rehearsal 45000 s",
+        help="wall ceiling: pilot 5400 s, rehearsal 60000 s",
     )
     parser.add_argument("--max-cost-usd", type=float, required=True)
     parser.add_argument("--max-idle-seconds", type=float, default=600)

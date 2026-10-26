@@ -203,7 +203,7 @@ def test_rehearsal_arms_the_timer_first_and_keeps_the_key_secret(tmp_path: Path)
     lines = calls(paths)
     destruct = index(lines, "pod_self_destruct.py")
     assert destruct == 0, "the self-destruct timer is the first program the bootstrap starts"
-    assert "--max-lifetime-seconds 45000" in lines[destruct]
+    assert "--max-lifetime-seconds 60000" in lines[destruct]
     assert "--deadline-unix 1800044820" in lines[destruct]
     order = [
         destruct,

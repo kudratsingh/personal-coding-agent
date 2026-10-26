@@ -42,9 +42,11 @@ from tools.rehearsal_binding import RUNS, r2_credentials
 
 # The owner-approved run parameters (D-35). The worker's specification carries its own
 # copy; these are the ceilings the Mac-side tools check every artifact against.
-POD_LIFETIME_SECONDS = 45_000
+POD_LIFETIME_SECONDS = 60_000
+"""The Pod wall: 60,000 s, $10.00 at the quoted $0.60/h, so the $10 cap is the binding limit
+(owner, 2026-10-25; it was 45,000 s)."""
 SELF_DESTRUCT_MARGIN_SECONDS = 180
-"""The runbook arms the in-Pod timer this long before the 45,000-second wall."""
+"""The runbook arms the in-Pod timer this long before the 60,000-second wall."""
 APPROVED_COST_CAP_USD = 10.0
 ESTIMATED_TOTAL_COST_USD = 6.2917
 COST_MULTIPLIER = 1.6
@@ -53,7 +55,8 @@ COST_STOP_USD = min(APPROVED_COST_CAP_USD, ESTIMATED_TOTAL_COST_USD * COST_MULTI
 the approved cap, not 120% of the estimate (2026-10-25). The pilot's ``Limits`` stops at
 ``min(cap, estimate x multiplier)``; any multiplier at or above cap / estimate (1.589) makes
 the cap bind, and 1.6 is the round value: min($10, $10.07) = $10.00. At the quoted $0.60/h
-the 45,000 s wall ends a Pod at $7.50, before either cost stop."""
+the 60,000 s wall also falls at $10.00; the watchdog's $9.99 stop (59,940 s) and the in-Pod
+timer armed 180 s inside the wall (59,820 s, $9.97) end a Pod just before it."""
 WATCHDOG_COST_STOP_USD = 9.99
 """The Mac watchdog's cost stop, one cent inside the worker's so it is never the weaker."""
 IDLE_SECONDS = 600

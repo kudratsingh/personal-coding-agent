@@ -6,25 +6,25 @@ The owner approved two rehearsal pretraining runs of the S model (decision D-35)
 
 | Limit | Value |
 | --- | --- |
-| Pod wall | 45,000 s (12.5 h): watchdog `--mode rehearsal`, self-destruct `--max-lifetime-seconds 45000`, armed 180 s inside the wall |
-| Cost | cap $10, also the hard stop for runs A and B (owner, 2026-10-25): worker stop $10.00 (estimate $6.2917 x 1.6 = $10.07, capped); Mac watchdog stop $9.99. At $0.60/h the 45,000 s wall ends a Pod at $7.50, before either stop |
+| Pod wall | 60,000 s (16.7 h; owner, 2026-10-25, so the $10 cap is the binding limit): watchdog `--mode rehearsal`, self-destruct `--max-lifetime-seconds 60000`, armed 180 s inside the wall |
+| Cost | cap $10, also the hard stop for runs A and B (owner, 2026-10-25): worker stop $10.00 (estimate $6.2917 x 1.6 = $10.07, capped); Mac watchdog stop $9.99. At $0.60/h the 60,000 s wall falls at $10.00; the watchdog's $9.99 stop (59,940 s) and the in-Pod timer (59,820 s, about $9.97) end a Pod just before it |
 | Idle | 600 s without GPU activity |
 | Launch rule | the Pod lifetime left must hold the whole planned run at the reference 56,479 tok/s (see below) |
 | Speed and fit | after 900 s of training: stop below 0.9 x 56,479 tok/s (50,831; owner, 2026-10-25), **or** when the projected finish at the measured rates passes the armed deadline |
 | Upload window | `max_transfer_seconds` 900: the idle Pod may stay up to 900 s after its last GPU work while the Mac stamps progress (new R2 objects, or SSH-pull bytes). The worker's drain ends by 360 s, its bounded checks and final heartbeat by 480 s, and the last 420 s are the Mac's SSH-pull reserve |
 | Upload rate | the Pod's measured R2 upload rate must reach `REQUIRED_UPLOAD_BYTES_PER_SECOND`, 1 x 1.65 GB x 2 / 360 s = 9.17 MB/s: one label in the 360 s drain with a factor-2 margin |
-| Quote | $0.59/h GPU, $0.60/h with the 40 GB container disk ([Pod body](../configs/runpod-pod-a40-s-rehearsal.json)); at most $7.50 per Pod, $15.00 for both; the captured Pod's `cost_usd_per_hour` must not exceed $0.60 |
+| Quote | $0.59/h GPU, $0.60/h with the 40 GB container disk ([Pod body](../configs/runpod-pod-a40-s-rehearsal.json)); at most $10.00 per Pod, $20.00 for both; the captured Pod's `cost_usd_per_hour` must not exceed $0.60 |
 
 ## The two time rules
 
-**At launch.** The receipt tool and the worker apply one rule, written once in `tools/rehearsal_run.py` (`launch_fit` and `require_fit`) and called by both. The lifetime left is measured to the first moment any guard ends the Pod: the 45,000 s wall, the armed in-Pod deadline (180 s earlier), the watchdog's wall, or the worker's or the watchdog's cost stop at its quoted rate (`lifetime_end`). It must hold the whole planned run at the **reference speed**: every update at 56,479 tok/s, every interval validation and every full validation (both full streams at each quarter and end of every stage: 8 passes for A, 4 for B) at the planning 100,000 tok/s, 300 s of startup per stage (model build, parent check and compilation), a 15 s checkpoint save every 1,800 s of training and validation and at each stage end, and the 900 s finalization reserve.
+**At launch.** The receipt tool and the worker apply one rule, written once in `tools/rehearsal_run.py` (`launch_fit` and `require_fit`) and called by both. The lifetime left is measured to the first moment any guard ends the Pod: the 60,000 s wall, the armed in-Pod deadline (180 s earlier), the watchdog's wall, or the worker's or the watchdog's cost stop at its quoted rate (`lifetime_end`). It must hold the whole planned run at the **reference speed**: every update at 56,479 tok/s, every interval validation and every full validation (both full streams at each quarter and end of every stage: 8 passes for A, 4 for B) at the planning 100,000 tok/s, 300 s of startup per stage (model build, parent check and compilation), a 15 s checkpoint save every 1,800 s of training and validation and at each stage end, and the 900 s finalization reserve.
 
 | Run | Training | Validation | Startup | Saves | Reserve | Needed | Setup allowance to the armed deadline |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| A | 35,411 s | 1,598 s | 600 s | 22 x 15 s | 900 s | 38,839 s | 5,981 s (100 min) |
-| B | 35,411 s | 1,109 s | 300 s | 21 x 15 s | 900 s | 38,035 s | 6,785 s (113 min) |
+| A | 35,411 s | 1,598 s | 600 s | 22 x 15 s | 900 s | 38,839 s | 20,981 s (350 min) |
+| B | 35,411 s | 1,109 s | 300 s | 21 x 15 s | 900 s | 38,035 s | 21,785 s (363 min) |
 
-An earlier worker draft planned at the speed floor instead, which left only about 18 to 21 minutes for Pod setup. At the 90% floor the same plan now needs 42,804 s (A) and 42,000 s (B), which fit before the 44,820 s armed deadline when Pod setup takes at most 2,016 s (A) or 2,820 s (B). These figures come from the reviewed binding: full passes of 12,220,020 validation targets, about 122 s each. The receipt records both plans (`time_fit.reference` and `time_fit.floor`) and reports `fits_at_floor` for information only.
+An earlier worker draft planned at the speed floor instead, which left only about 18 to 21 minutes for Pod setup. At the 90% floor the same plan now needs 42,804 s (A) and 42,000 s (B), which fit before the 59,820 s armed deadline when Pod setup takes at most 17,016 s (A) or 17,820 s (B). These figures come from the reviewed binding: full passes of 12,220,020 validation targets, about 122 s each. The receipt records both plans (`time_fit.reference` and `time_fit.floor`) and reports `fits_at_floor` for information only.
 
 **At 900 s of training.** The worker measures its post-compile throughput, leaving out each stage's first two updates. It stops `throughput_below_limit` below 90% of the reference (50,831 tok/s). It also projects its finish at the measured rates: the remaining updates, every remaining validation, a recompilation per later stage, the remaining checkpoint saves (the planned 15 s each until one save is measured) and the reserve. A projection past the end of the Pod lifetime stops it `projected_finish_after_deadline`. This second rule binds even when the speed passes, so a run that cannot finish stops early, after about $0.15 of training, instead of ending time-limited near the wall. Both rules are recorded in the worker's `report.json` (`launch_fit.rule`, `speed_check.rule`) and in the receipt (`time_fit.rule`).
 
@@ -107,10 +107,10 @@ With none at risk, the run gets the 60-second grace (its own drain is already ov
 
 | Run | Updates | Reference 56,479 tok/s | Floor 50,831 tok/s |
 | --- | ---: | --- | --- |
-| A (stage1, stage2) | 15,260 | 11.0 h total; fits with 89 min to spare | 12.1 h total; fits with 20 min to spare (startup up to 40.2 min) |
-| B (mixed) | 15,259 | 10.8 h total; fits with 98 min to spare | 11.9 h total; fits with 31 min to spare (startup up to 50.6 min) |
+| A (stage1, stage2) | 15,260 | 11.0 h total; fits with 339 min to spare | 12.1 h total; fits with 270 min to spare (startup up to 290.2 min) |
+| B (mixed) | 15,259 | 10.8 h total; fits with 348 min to spare | 11.9 h total; fits with 281 min to spare (startup up to 300.6 min) |
 
-These projections use their own assumptions and are not the launch gate; the launch rule above is. At the quoted $0.60/h each Pod costs at most $7.50 at its wall, inside the $10.00 stop; only a total rate above $0.80/h would put the wall above it, and the receipt refuses any Pod costing more than the $0.60/h quote. Each Pod needs 16 to 18 GB of its 40 GB container disk with headroom, and the bucket holds about 16 GB ($0.09 a month). These are projections from one measured pilot, not rehearsal measurements: a run near the floor speed whose setup took long will be stopped by the 900-second projected-finish rule.
+These projections use their own assumptions and are not the launch gate; the launch rule above is. At the quoted $0.60/h the 60,000 s wall falls at the $10.00 stop, so the cap is the binding limit; at a higher rate the cost stop ends the Pod first, and the receipt refuses any Pod costing more than the $0.60/h quote. Each Pod needs 16 to 18 GB of its 40 GB container disk with headroom, and the bucket holds about 16 GB ($0.09 a month). These are projections from one measured pilot, not rehearsal measurements: a run near the floor speed whose setup took long will be stopped by the 900-second projected-finish rule.
 
 ## Verification
 
@@ -123,7 +123,7 @@ These projections use their own assumptions and are not the launch gate; the lau
 - the supervisor with fake SSH, R2 and GitHub, including the R2-observed progress stamps, and the watchdog's transfer window under a rehearsal policy;
 - an unverified milestone pulled over a fake SSH pull, checked and archived before teardown, with no grace timer; a failed, tampered, late or unconfigured pull that names the files and never approves teardown while the watchdog still ends the Pod at the window; an R2 that never answers the Mac, each HEAD taking the socket timeout on four addresses, with the first pull's bytes still arriving before the idle limit and a dropped pull retried in the next cycle without checking R2 again; `r2_finalization` with every milestone checked in R2 by the Mac; strict parsing of `finalization.json`;
 - a reused controller directory's old mirrored heartbeat (another Pod's ID, or older than this Pod) that never deletes the new Pod and is never mirrored;
-- the bootstrap run end to end against stub programs: the timer first, the 45,000-second ceiling, the 0600 key file, the Pod key never printed, the compile check, the on-Pod test list, the pilot path unchanged;
+- the bootstrap run end to end against stub programs: the timer first, the 60,000-second ceiling, the 0600 key file, the Pod key never printed, the compile check, the on-Pod test list, the pilot path unchanged;
 - receipts refused for each missing gate, weak limit, missing compile check, wrong transfer window or billing origin, a specification that differs from D-35 or the binding, a small or slow round trip, a stale self-destruct receipt or one without a pid, a captured cost above the quote, and a dirty or malformed revision; the round trip's measured rates, the feasibility arithmetic and the watchdog PID file.
 
 ## Limitations

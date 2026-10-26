@@ -73,7 +73,7 @@ VALUES = {
     "ORIGIN": str(ORIGIN),
     "POD_ID": "podfixture01",
     "RUNPOD_POD_ID": "podfixture01",
-    "SELF_DESTRUCT_DEADLINE": str(ORIGIN + 45_000 - 180),
+    "SELF_DESTRUCT_DEADLINE": str(ORIGIN + 60_000 - 180),
     "POD_HOST": "203.0.113.7",
     "POD_PORT": "40022",
     "BASE": str(NOW),
@@ -325,7 +325,7 @@ def test_watchdog_runs_in_rehearsal_mode_with_the_d35_limits() -> None:
     args = _watchdog()
     policy = policy_from_args(args)
     assert policy.mode == "rehearsal"
-    assert (policy.max_wall_seconds, policy.max_idle_seconds) == (45_000, 600)
+    assert (policy.max_wall_seconds, policy.max_idle_seconds) == (60_000, 600)
     assert policy.max_cost_usd == rehearsal_ops.WATCHDOG_COST_STOP_USD == 9.99
     assert policy.max_cost_usd < rehearsal_ops.COST_STOP_USD
     assert policy.quoted_total_hourly == 0.60
@@ -391,11 +391,11 @@ def test_self_destruct_command_parses_and_matches_the_bootstrap(
 ) -> None:
     monkeypatch.setenv("RUNPOD_API_KEY", "placeholder")
     args = parse("tools.pod_self_destruct", _self_destruct(), monkeypatch)
-    assert args.max_lifetime_seconds == 45_000
-    assert args.deadline_unix == ORIGIN + 45_000 - 180
-    assert "SELF_DESTRUCT_DEADLINE=$((ORIGIN + 45000 - 180))" in "\n".join(_code())
+    assert args.max_lifetime_seconds == 60_000
+    assert args.deadline_unix == ORIGIN + 60_000 - 180
+    assert "SELF_DESTRUCT_DEADLINE=$((ORIGIN + 60000 - 180))" in "\n".join(_code())
     script = BOOTSTRAP.read_text(encoding="utf-8")
-    assert "LIFETIME_ARGS=(--max-lifetime-seconds 45000)" in script
+    assert "LIFETIME_ARGS=(--max-lifetime-seconds 60000)" in script
     for flag in ("--pod-id", "--deadline-unix", "--receipt", "--stop-file"):
         assert flag in script
     assert args.receipt == "/workspace/rehearsal/self-destruct.json"
@@ -565,7 +565,7 @@ def test_step_5_takes_the_pod_id_from_the_response_and_writes_run_env(
     result, launch, control = run_pod_id_guard(tmp_path, shell, response)
     assert not launch.exists()
     assert (control / "run.env").read_text() == (
-        "export ORIGIN=1800000000 POD_ID=podfixture01 SELF_DESTRUCT_DEADLINE=1800044820\n"
+        "export ORIGIN=1800000000 POD_ID=podfixture01 SELF_DESTRUCT_DEADLINE=1800059820\n"
     )
     assert sorted(path.name for path in control.iterdir()) == [
         "create-body.json",
@@ -757,7 +757,7 @@ def test_step_5_refuses_to_create_while_this_terminal_names_a_pod(
     assert out.endswith(f"POD_ID=[podearlier01]\nCTRL=[{runs}/podearlier01]\n")
 
 
-OPEN_RUN_ENV = "export ORIGIN=1700000000 POD_ID=podold01 SELF_DESTRUCT_DEADLINE=1700044820\n"
+OPEN_RUN_ENV = "export ORIGIN=1700000000 POD_ID=podold01 SELF_DESTRUCT_DEADLINE=1700059820\n"
 TEARDOWN_LINE = "export TEARDOWN=1700040000\n"
 
 
@@ -2833,7 +2833,7 @@ def test_step_15_fetches_every_bucket_back_to_the_origin(monkeypatch: pytest.Mon
     )
     # The formula always reaches the hour of ORIGIN, wherever in their hours both fall.
     for origin in (ORIGIN, ORIGIN + 1, ORIGIN + HOUR - 1):
-        for elapsed in (0, 1, HOUR - 1, HOUR, 45_000, 45_000 + 7 * HOUR - 1):
+        for elapsed in (0, 1, HOUR - 1, HOUR, 60_000, 60_000 + 7 * HOUR - 1):
             now = origin + elapsed
             buckets = elapsed // HOUR + 2
             assert now // HOUR * HOUR - (buckets - 1) * HOUR <= origin // HOUR * HOUR

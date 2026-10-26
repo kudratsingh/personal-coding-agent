@@ -55,7 +55,7 @@
   "speed_check_warmup_updates": 2,
   "quoted_gpu_hourly": 0.59,
   "limits": {
-    "pod_seconds": 45000,
+    "pod_seconds": 60000,
     "startup_seconds": 300,
     "finalization_reserve_seconds": 900,
     "quoted_total_hourly": 0.6,

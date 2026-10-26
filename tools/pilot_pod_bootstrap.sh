@@ -10,7 +10,7 @@
 #        --workspace /workspace/pilot [--repo /workspace/repo] [--skip-tests]
 #
 # Rehearsal mode (D-35; one Pod per run, see REHEARSAL_RUNBOOK.md) arms the timer
-# with the 45,000-second lifetime ceiling first, then checks the shipped code archive
+# with the 60,000-second lifetime ceiling first, then checks the shipped code archive
 # against the Mac's revision.json and copies that record into the workspace (the worker
 # refuses to start without it), loads the Pod's R2 key from a 0600 file the operator
 # delivered over SSH stdin (never echoed), measures an R2 round trip (its upload rate is
@@ -113,7 +113,7 @@ cd "$REPO"
 RECEIPT="$WORKSPACE/self-destruct.json"
 LIFETIME_ARGS=()
 if [[ "$MODE" == "rehearsal" ]]; then
-  LIFETIME_ARGS=(--max-lifetime-seconds 45000)  # The D-35 ceiling; the pilot keeps 5400.
+  LIFETIME_ARGS=(--max-lifetime-seconds 60000)  # The D-35 ceiling; the pilot keeps 5400.
 fi
 FRESH_SECONDS=30
 # Succeeds only for a receipt whose timer still runs: a live state, a pid that answers

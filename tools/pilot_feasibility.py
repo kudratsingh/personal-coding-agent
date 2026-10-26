@@ -1189,7 +1189,8 @@ def render_rehearsal_markdown(report: Mapping[str, Any]) -> str:
         disk = row["container_disk"]
         lines.append(
             f"- Run {run}: ${cost['planned_at_floor_usd']:.2f} planned at the floor, "
-            f"${cost['wall_bound_usd']:.2f} at the 45,000-second wall, against the "
+            f"${cost['wall_bound_usd']:.2f} at the {options['lifetime_seconds']:,.0f}-second wall, "
+            "against the "
             f"${cost['cost_stop_usd']:.2f} stop: {'fits' if cost['fits'] else '**does not fit**'}"
             f"; container disk {disk['with_headroom_bytes'] / GB:,.1f} GB with headroom of "
             f"{disk['container_disk_gb']:g} GB: {'fits' if disk['fits'] else '**does not fit**'}."

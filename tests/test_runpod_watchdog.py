@@ -694,12 +694,12 @@ class IdleBaselineTests(unittest.TestCase):
 
 
 class ModeCeilingTests(unittest.TestCase):
-    def test_pilot_keeps_5400_and_rehearsal_allows_45000_seconds(self) -> None:
+    def test_pilot_keeps_5400_and_rehearsal_allows_60000_seconds(self) -> None:
         with self.assertRaises(ValueError):
             Policy(5401, 1.0, 600, 0.6)
-        self.assertEqual(Policy(45_000, 7.55, 600, 0.6, mode="rehearsal").max_wall_seconds, 45_000)
+        self.assertEqual(Policy(60_000, 9.99, 600, 0.6, mode="rehearsal").max_wall_seconds, 60_000)
         with self.assertRaises(ValueError):
-            Policy(45_001, 7.55, 600, 0.6, mode="rehearsal")
+            Policy(60_001, 9.99, 600, 0.6, mode="rehearsal")
         with self.assertRaises(ValueError):
             Policy(600, 1.0, 600, 0.6, mode="other")
         args = build_parser().parse_args(
@@ -711,9 +711,9 @@ class ModeCeilingTests(unittest.TestCase):
                 "--receipt",
                 "r.json",
                 "--max-wall-seconds",
-                "45000",
+                "60000",
                 "--max-cost-usd",
-                "7.55",
+                "9.99",
                 "--quoted-total-hourly",
                 "0.6",
                 "--mode",

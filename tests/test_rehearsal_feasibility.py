@@ -56,14 +56,14 @@ def test_d35_runs_fit_at_the_reference_speed_and_the_quote_bounds_spend() -> Non
     report = build_rehearsal_report(default_rehearsal_plans(), RehearsalOptions(), source="S")
     assert report["quoted_total_hourly"] == 0.60
     assert report["floor_tokens_per_second"] == pytest.approx(0.9 * 56_479)
-    assert report["two_runs_wall_bound_usd"] == pytest.approx(15.0)
+    assert report["two_runs_wall_bound_usd"] == pytest.approx(20.0)
     for run, updates in (("A", 15_260), ("B", 15_259)):
         row = report["runs"][run]
         assert row["updates"] == updates and row["tokens_per_update"] == 131_072
         assert row["reference"]["fits"]
         assert row["floor"]["margin_seconds"] < row["reference"]["margin_seconds"]
         assert row["time_fit_at_floor"] is row["floor"]["fits"]
-        assert row["cost"]["wall_bound_usd"] == pytest.approx(7.5)
+        assert row["cost"]["wall_bound_usd"] == pytest.approx(10.0)
         assert row["cost"]["fits"] and row["cost"]["wall_within_cost_stop"]
         assert row["container_disk"]["fits"]
         assert row["floor"]["fits"]  # At 90% of the reference both runs fit their lifetime.
@@ -88,24 +88,19 @@ def test_d35_runs_fit_at_the_reference_speed_and_the_quote_bounds_spend() -> Non
 def test_a_higher_quote_breaks_the_cost_stop() -> None:
     assert rehearsal_total_hourly(0.59, 40) == 0.60
     assert rehearsal_total_hourly(0.61, 40) == 0.62
-    # The wall bounds spend inside the $10 stop up to $0.80/h in all.
-    within = build_rehearsal_report(
-        default_rehearsal_plans(), RehearsalOptions(quoted_gpu_hourly=0.79), source="S"
-    )
-    for row in within["runs"].values():
-        assert row["cost"]["wall_bound_usd"] == pytest.approx(10.0)
-        assert row["cost"]["wall_within_cost_stop"]
+    # At a higher rate the $10 stop ends a Pod before its 60,000 s wall, as intended: the cap
+    # binds, and a run planned at the floor still fits under it.
     above = build_rehearsal_report(
-        default_rehearsal_plans(), RehearsalOptions(quoted_gpu_hourly=0.80), source="S"
+        default_rehearsal_plans(), RehearsalOptions(quoted_gpu_hourly=0.61), source="S"
     )
     for row in above["runs"].values():
-        assert row["cost"]["wall_bound_usd"] == pytest.approx(10.125)
-        assert not row["cost"]["wall_within_cost_stop"]
+        assert row["cost"]["wall_bound_usd"] == pytest.approx(0.62 * 60_000 / 3600)
+        assert not row["cost"]["wall_within_cost_stop"] and row["cost"]["fits"]
     report = build_rehearsal_report(
         default_rehearsal_plans(), RehearsalOptions(quoted_gpu_hourly=0.86), source="S"
     )
     for row in report["runs"].values():
-        assert row["cost"]["wall_bound_usd"] == pytest.approx(10.875)
+        assert row["cost"]["wall_bound_usd"] == pytest.approx(0.87 * 60_000 / 3600)
         assert not row["cost"]["fits"] and not row["cost"]["wall_within_cost_stop"]
 
 
@@ -115,7 +110,7 @@ def test_a_higher_quote_breaks_the_cost_stop() -> None:
         {"minimum_speed_fraction": 1.5},
         {"reference_tokens_per_second": 0},
         {"startup_seconds": -1},
-        {"self_destruct_margin_seconds": 45_000},
+        {"self_destruct_margin_seconds": 60_000},
         {"validation_interval_updates": 0},
     ],
 )

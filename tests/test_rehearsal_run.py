@@ -230,7 +230,7 @@ def test_specifications_encode_the_approved_runs() -> None:
         )
         assert spec.quoted_gpu_hourly == 0.59 and spec.limits.quoted_total_hourly == 0.6
         limits = spec.limits
-        assert limits.pod_seconds == 45_000 == MODE_WALL_SECONDS["rehearsal"]
+        assert limits.pod_seconds == 60_000 == MODE_WALL_SECONDS["rehearsal"]
         assert limits.pod_seconds == ABSOLUTE_DEADLINE_SECONDS
         assert limits.finalization_reserve_seconds == 900
         assert (limits.approved_cost_cap, limits.estimated_total_cost) == (10.0, 6.2917)
@@ -238,8 +238,9 @@ def test_specifications_encode_the_approved_runs() -> None:
         assert limits.cost_multiplier == 1.6 and limits.cost_stop == 10.0
         assert (limits.minimum_speed_fraction, limits.speed_check_seconds) == (0.9, 900)
         assert limits.idle_seconds == 600 and limits.rising_steps == 25  # As in the pilot.
-        # 45,000 s at the quoted rate stays under the cost stop, so the wall binds first.
-        assert limits.pod_seconds / 3600 * limits.quoted_total_hourly < limits.cost_stop
+        # The 60,000 s wall at the quoted rate falls at the $10 cap: the cap is the binding
+        # limit (owner, 2026-10-25), with the watchdog's $9.99 stop and the timer just inside.
+        assert limits.pod_seconds / 3600 * limits.quoted_total_hourly == limits.cost_stop
     stage1, stage2 = a.stages
     assert ((stage1.name, stage1.streams), (stage2.name, stage2.streams)) == RUNS["A"]
     assert (stage1.learning_rate, stage2.learning_rate) == (0.0006, 0.0003)
@@ -298,8 +299,8 @@ def test_launch_plan_is_the_whole_run_at_the_reference_speed() -> None:
     assert plans["B"]["total_seconds"] == pytest.approx(38_037, abs=1)
     # Pod setup before the worker starts may take up to this long before the armed
     # deadline 180 s inside the wall: about 100 and 113 minutes.
-    assert 44_820 - plans["A"]["total_seconds"] == pytest.approx(5_977, abs=1)
-    assert 44_820 - plans["B"]["total_seconds"] == pytest.approx(6_783, abs=1)
+    assert 59_820 - plans["A"]["total_seconds"] == pytest.approx(20_977, abs=1)
+    assert 59_820 - plans["B"]["total_seconds"] == pytest.approx(21_783, abs=1)
     # At the 90% floor the same run needs about 3,970 s more, and both still fit.
     floors = {
         run: planned_seconds(
@@ -313,7 +314,7 @@ def test_launch_plan_is_the_whole_run_at_the_reference_speed() -> None:
     assert floors["A"]["training_seconds"] == pytest.approx(39_346, abs=1)
     assert floors["A"]["total_seconds"] == pytest.approx(42_808, abs=1)
     assert floors["B"]["total_seconds"] == pytest.approx(42_002, abs=1)
-    assert floors["B"]["total_seconds"] < floors["A"]["total_seconds"] < 44_820
+    assert floors["B"]["total_seconds"] < floors["A"]["total_seconds"] < 59_820
 
 
 def test_quarter_updates_are_rounded_quarters_strictly_inside_the_stage() -> None:
@@ -444,15 +445,15 @@ def receipt(run: str = "A", **changes: Any) -> dict[str, Any]:
         },
         "pod_created_at_unix": 1000,
         "watchdog_policy": {
-            "max_wall_seconds": 45_000,
-            "max_cost_usd": 7.54,
+            "max_wall_seconds": 60_000,
+            "max_cost_usd": 9.99,
             "max_idle_seconds": 600,
             "quoted_total_hourly": 0.6,
             "max_transfer_seconds": 900,
             "billing_started_at_unix": 1000,
             "mode": "rehearsal",
         },
-        "self_destruct_deadline_unix": 1000 + 45_000 - 180,
+        "self_destruct_deadline_unix": 1000 + 60_000 - 180,
         "r2_run_prefix": f"rehearsal-runs/{run}/pod123/",
     }
     value.update(changes)
@@ -469,9 +470,9 @@ def test_readiness_requires_every_rehearsal_gate_and_the_whole_run_to_fit() -> N
         spec, stage_targets=[10**9, 10**9], full_validation_targets=FULL_VALIDATION_TARGETS
     )["total_seconds"]
     launch = ready(receipt(), now=1001, spec=spec)
-    assert (launch.origin, launch.pod_id, launch.end) == (1000, "pod123", 1000 + 44_820)
+    assert (launch.origin, launch.pod_id, launch.end) == (1000, "pod123", 1000 + 59_820)
     # Every deadline plans against the armed in-Pod deadline, 180 s inside the wall.
-    assert launch.spec.limits.pod_seconds == 44_820
+    assert launch.spec.limits.pod_seconds == 59_820
     assert launch.fit["reference_seconds_needed"] == pytest.approx(need)
     assert launch.fit["fits_at_reference"] and launch.fit["rule"] == LAUNCH_RULE
     assert "ssh_transfer_tested" not in REHEARSAL_GATES  # R2 replaces the SSH transfer path.
@@ -485,7 +486,7 @@ def test_readiness_requires_every_rehearsal_gate_and_the_whole_run_to_fit() -> N
         with pytest.raises(ValueError, match=gate):
             ready(unresolved, now=1001, spec=spec)
     # The launch rule: the lifetime left must hold the whole run at the reference speed.
-    latest = 1000 + 44_820 - need
+    latest = 1000 + 59_820 - need
     assert ready(receipt(), now=latest, spec=spec).fit["remaining_seconds"] == pytest.approx(need)
     with pytest.raises(ValueError, match="cannot hold the run at the reference speed"):
         ready(receipt(), now=latest + 1, spec=spec)
@@ -525,11 +526,11 @@ def test_readiness_binds_kind_run_and_every_hash() -> None:
 def test_lifetime_ends_at_the_first_guard() -> None:
     spec = Specification.load(SPECS["A"])
     policy = receipt()["watchdog_policy"]
-    # A shorter watchdog wall, or a higher watchdog rate whose $7.54 stop comes first,
+    # A shorter watchdog wall, or a higher watchdog rate whose $9.99 stop comes first,
     # ends the Pod before the armed deadline; the worker plans against that moment.
     for change, end in (
         ({"max_wall_seconds": 44_000}, 1000 + 44_000),
-        ({"quoted_total_hourly": 0.61}, 1000 + 7.54 / 0.61 * 3600),
+        ({"quoted_total_hourly": 0.61}, 1000 + 9.99 / 0.61 * 3600),
     ):
         launch = ready(receipt(watchdog_policy={**policy, **change}), now=1001, spec=spec)
         assert launch.end == pytest.approx(end)
@@ -547,7 +548,7 @@ def test_the_binding_must_plan_the_specifications_stages() -> None:
 
 
 @pytest.mark.parametrize(
-    "changes", [{"pod_seconds": 45_001}, {"idle_seconds": 601}, {"approved_cost_cap": 10.5}]
+    "changes", [{"pod_seconds": 60_001}, {"idle_seconds": 601}, {"approved_cost_cap": 10.5}]
 )
 def test_readiness_refuses_a_specification_above_the_rehearsal_ceilings(
     changes: dict[str, float],
@@ -1972,7 +1973,7 @@ def test_run_command_requires_the_receipts_code_revision_and_records_it(
         "initialization_sha256": "b" * 64,
     }
     spec = Specification.load(SPECS["A"])
-    launch = Launch(1000.0, 1000.0 + 44_820, "pod123", spec, {"rule": LAUNCH_RULE})
+    launch = Launch(1000.0, 1000.0 + 59_820, "pod123", spec, {"rule": LAUNCH_RULE})
     started: dict[str, Any] = {}
 
     class Started:
