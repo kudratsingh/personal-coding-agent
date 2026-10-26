@@ -293,21 +293,26 @@ def test_uploading_is_treated_like_running_and_r2_growth_is_the_only_progress(
     prefix = run_prefix("A", POD)
     pod = Pod(heartbeat("uploading", phase="finalizing", last_gpu_activity_unix=1500), report)
     unit, archive = supervisor(tmp_path, pod, r2)
-    unit.cycle()  # The first listing is only a baseline.
+    unit.refresh_heartbeat()  # The mirror thread lists R2; the first listing is a baseline.
+    unit.cycle()
     assert not unit.shutdown_ready and not archive.bundles
     local = mirrored(unit)
     assert local["status"] == "uploading" and "transfer_progress_unix" not in local
     assert not [call for call in r2.calls if call[0] in {"HEAD", "GET"}]  # No verification yet.
     unit.now[0] = 1600.0  # type: ignore[attr-defined]
     r2.put(f"rehearsal-runs/B/{POD}/stage1-final/checkpoint.pt", b"another run's object")
+    unit.refresh_heartbeat()
     unit.cycle()
     assert "transfer_progress_unix" not in mirrored(unit)  # Another prefix is not progress.
     unit.now[0] = 1700.0  # type: ignore[attr-defined]
     r2.put(prefix + "stage2-final/checkpoint.pt", b"a new label arrives")
-    unit.cycle()
+    unit.cycle()  # The cycle alone never lists R2, so it stamps nothing.
+    assert "transfer_progress_unix" not in mirrored(unit)
+    unit.refresh_heartbeat()
     assert mirrored(unit)["transfer_progress_unix"] == 1700.0 and not unit.shutdown_ready
     unit.now[0] = 1800.0  # type: ignore[attr-defined]
-    unit.cycle()  # Nothing new: the stamp stays where the Mac last saw progress.
+    unit.refresh_heartbeat()  # Nothing new: the stamp stays where the Mac last saw progress.
+    unit.cycle()
     assert mirrored(unit)["transfer_progress_unix"] == 1700.0
     # The watchdog reads the mirror: 700 s after the last GPU work the idle limit has
     # passed, but the Mac saw progress 100 s ago, so it waits.
@@ -327,7 +332,8 @@ def test_uploading_is_treated_like_running_and_r2_growth_is_the_only_progress(
 
     r2.objects = broken  # type: ignore[method-assign]
     unit.now[0] = 1900.0  # type: ignore[attr-defined]
-    unit.cycle()  # A failed listing stamps nothing and is recorded.
+    unit.refresh_heartbeat()  # A failed listing stamps nothing and is recorded.
+    unit.cycle()
     assert mirrored(unit)["transfer_progress_unix"] == 1700.0
     assert json.loads((unit.root / "r2-progress-error.json").read_text()) == {
         "error_type": "RuntimeError"
@@ -1183,22 +1189,27 @@ def test_the_ssh_pull_holds_the_pod_only_while_its_bytes_reach_the_mac(
     )
     holder.append(unit)
     pod.now = quick.now = unit.now  # type: ignore[attr-defined]
-    for after in range(5, 480, 5):  # The final drain: the supervisor cycles every 5 s.
+    for after in range(5, 480, 5):  # The final drain: both supervisor threads every 5 s.
         unit.now[0] = T0 + after  # type: ignore[attr-defined]
-        unit.cycle()
+        unit.refresh_heartbeat()  # The mirror thread: its stalled listing costs 20 s...
+        unit.now[0] = T0 + after  # type: ignore[attr-defined]
+        unit.cycle()  # ...of its own time only: the cycle never lists R2.
         if after == 300:
             assert watchdog(after)[0] == "watching"
     local = mirrored(unit)
     assert local["status"] == "uploading" and "transfer_progress_unix" not in local
     assert quick.listings == 95  # One per mirror refresh, each a timeout.
-    unit.now[0] = HANDOVER  # type: ignore[attr-defined]
+    # The cycle reads the final heartbeat at most one 5 s cycle after the handover.
+    unit.now[0] = HANDOVER + 5  # type: ignore[attr-defined]
     unit.cycle()  # Reads the final heartbeat, checks R2 and pulls stage2-final over SSH.
+    # Reading the final heartbeat listed nothing; only the diagnostics after a pull do.
+    assert quick.listings == (96 if pulled else 95)
     assert quick.calls == [
         ("HEAD", f"{run_prefix('A', POD)}stage2-final/checkpoint.pt"),
         ("HEAD", f"{run_prefix('A', POD)}stage1-final/checkpoint.pt"),
     ]
-    # Two stalled HEADs delay the pull by 40 s; it still has 380 s of the window.
-    assert starts["stage2-final"] == 480 + 2 * STALL_SECONDS
+    # Two stalled HEADs delay the pull by 40 s; it still has 375 s of the window.
+    assert starts["stage2-final"] == 480 + 5 + 2 * STALL_SECONDS
     assert 900 - starts["stage2-final"] >= 360
     assert not store.calls and store.listings == 0
     if pulled:
@@ -1548,3 +1559,97 @@ def test_listed_files_are_plain_names_with_the_checkpoint_among_them() -> None:
     twice = {**row, "files": [*row["files"], row["files"][1]]}
     with pytest.raises(ValueError, match="malformed"):
         pilot_supervisor.listed_files({"unverified_milestones": [twice]}, run="A")
+
+
+class FlakyOnce(FakeR2):
+    """An R2 whose first HEAD times out, as a dropped connection does; then it answers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.timed_out = False
+
+    def head(self, key: str) -> dict[str, str] | None:
+        if not self.timed_out:
+            self.timed_out = True
+            self.calls.append(("HEAD", key))
+            raise TimeoutError("The read operation timed out")
+        return super().head(key)
+
+
+def test_r2_stays_a_fallback_after_a_transient_check_failure(tmp_path: Path) -> None:
+    """The worker ran out of time to confirm stage2-final, though every file reached R2.
+    The Mac's first HEAD times out and every SSH pull fails. Within R2_RECHECK_SECONDS the
+    retries go straight to the pull; after it R2 is checked again, finds the milestone
+    whole, and teardown is approved without any pull succeeding."""
+    flaky = FlakyOnce()
+    report, disk = unverified_run(flaky)
+    put_export(flaky, "stage2-final", disk["stage2-final"])
+    rows = listing(disk, "stage2-final")
+    pod = Pod(heartbeat("failed", last_gpu_activity_unix=1500), report, rows)
+    holder: list[RehearsalSupervisor] = []
+    recovery = Recovery(holder, disk, fail="SSH artifact stream failed: connection reset")
+    unit, archive = supervisor(
+        tmp_path,
+        pod,
+        flaky,
+        fetch_finalization=pod.fetch_finalization,
+        recover=recovery,
+        transfer_window_seconds=900,
+    )
+    holder.append(unit)
+    checkpoint = f"{run_prefix('A', POD)}stage2-final/checkpoint.pt"
+    unit.now[0] = 1980.0  # type: ignore[attr-defined]  # The handover.
+    unit.cycle()  # The HEAD times out: at risk, and the pull fails.
+    unit.now[0] = 1990.0  # type: ignore[attr-defined]
+    unit.cycle()  # Inside the recheck delay: no HEAD, straight to the pull, which fails.
+    assert [call for call in flaky.calls if call == ("HEAD", checkpoint)] == [("HEAD", checkpoint)]
+    assert len(recovery.calls) == 2 and not unit.shutdown_ready
+    assert (unit.root / "MILESTONES-NOT-SECURED.json").exists()
+    unit.now[0] = 1980.0 + pilot_supervisor.R2_RECHECK_SECONDS + 1  # type: ignore[attr-defined]
+    unit.cycle()  # R2 is checked again and holds every file: secured without a pull.
+    assert len(recovery.calls) == 2
+    assert unit.shutdown_ready and archive.bundles == [unit.root / "diagnostics"]
+    summary = json.loads((unit.root / "diagnostics" / "summary.json").read_text())
+    secured = summary["milestone_recovery"]["verified_in_r2_by_mac"]
+    assert sorted(row["key"].split("/")[-2] for row in secured) == ["stage1-final", "stage2-final"]
+    assert summary["milestone_recovery"]["pulled_over_ssh"] == []
+
+
+def test_a_recorded_milestone_r2_lacks_is_never_checked_again_on_a_pull_retry(
+    tmp_path: Path,
+) -> None:
+    """r2_finalization: the worker verified both milestones and lists none, but the Mac's
+    R2 answers that both checkpoints are missing. That answer is final: each is HEADed
+    once, and each dropped pull is retried in the next 5 s cycle with no new HEAD."""
+    r2 = FakeR2()
+    report, disk = unverified_run(r2, failure="r2_finalization", in_r2=(), flags=False)
+    rows = listing(disk)
+    pod = Pod(heartbeat("failed", last_gpu_activity_unix=1500), report, rows)
+    holder: list[RehearsalSupervisor] = []
+    recovery = Dropping(holder, disk)
+    unit, archive = supervisor(
+        tmp_path,
+        pod,
+        r2,
+        fetch_finalization=pod.fetch_finalization,
+        recover=recovery,
+        transfer_window_seconds=900,
+    )
+    holder.append(unit)
+    handover = 1500.0 + 480
+    unit.now[0] = handover  # type: ignore[attr-defined]
+    for _ in range(3):
+        unit.cycle()
+        unit.now[0] += 5  # type: ignore[attr-defined]  # The wait between two cycles.
+    prefix = run_prefix("A", POD)
+    assert [call for call in r2.calls if call[0] == "HEAD"] == [
+        ("HEAD", f"{prefix}stage1-final/checkpoint.pt"),
+        ("HEAD", f"{prefix}stage2-final/checkpoint.pt"),
+    ]
+    assert recovery.starts == [
+        ("exports/stage2-final", handover),  # Dropped.
+        ("exports/stage2-final", handover + 1 + 5),
+        ("exports/stage1-final", handover + 1 + 5 + 1),  # Dropped.
+        ("exports/stage1-final", handover + 1 + 5 + 1 + 1 + 5),
+    ]
+    assert unit.shutdown_ready and archive.bundles == [unit.root / "diagnostics"]

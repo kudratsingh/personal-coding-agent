@@ -1259,8 +1259,9 @@ def test_rolling_labels_are_recorded_when_the_report_upload_fails(
     ]
     last_put = max(index for index, call in enumerate(calls) if call[0] == "PUT")
     if stalls:
-        # The fifth PUT ended after the last call: no rolling HEAD could start.
-        assert record["error"].startswith("HandoverDue") and "report.json" in record["error"]
+        # The PUTs used the time up: the run records their real error, not "no time", and
+        # no rolling HEAD could start.
+        assert record["error"] == "TimeoutError: no answer"
         assert record["labels_unchecked"] == kept and not rolling_heads
         assert not set(kept) & set(verified)
         assert all(record["verification_errors"][label].startswith("HandoverDue") for label in kept)

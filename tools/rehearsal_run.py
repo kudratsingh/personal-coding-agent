@@ -1978,7 +1978,8 @@ class Worker:
 
         It starts only until ``LAST_CALL_SECONDS`` before the handover (``late``: until
         ``FINAL_WRITE_SECONDS`` before it, for the HEAD that verifies a PUT that
-        succeeded); one that cannot start raises ``HandoverDue``. Each attempt's socket
+        succeeded); one that cannot start raises ``HandoverDue``, and one that runs out of
+        time after a failed attempt raises that attempt's own error. Each attempt's socket
         timeout is at most ``CHECK_TIMEOUT_SECONDS`` and a quarter of the time left until
         ``FINAL_WRITE_SECONDS`` before the handover, so an endpoint that resolves to up to
         four addresses still answers or fails in time; name resolution is not bounded.
@@ -1986,9 +1987,12 @@ class Worker:
         assert self.handover is not None, "R2 checks after the drain need a handover time"
         end = self.handover - FINAL_WRITE_SECONDS
         start_by = end if late else self.handover - LAST_CALL_SECONDS
+        failed: Exception | None = None
         for attempt in range(1, CHECK_ATTEMPTS + 1):
             now = self.clock()
             if now >= start_by:
+                if failed is not None:
+                    raise failed  # R2 did answer, or failed to: keep that, not "no time".
                 raise HandoverDue(f"no time left before the handover to {what}")
             store = self.check_store_for(min(CHECK_TIMEOUT_SECONDS, (end - now) / 4))
             try:
@@ -1996,6 +2000,7 @@ class Worker:
             except Exception as error:
                 if attempt == CHECK_ATTEMPTS or not transient_error(error):
                     raise
+                failed = error
             self.sleep(min(2.0**attempt, max(0.0, start_by - self.clock()) / 4))
         raise RuntimeError("unreachable")
 

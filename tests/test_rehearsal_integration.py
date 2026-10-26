@@ -163,6 +163,7 @@ def replay(unit: RehearsalSupervisor, pod: Pod, bucket: MemoryBucket, moment: Mo
     pod.moment = moment
     bucket.objects, bucket.digests = dict(moment.objects), dict(moment.digests)
     unit.now[0] += 5  # type: ignore[attr-defined]  # One mirror cycle.
+    unit.refresh_heartbeat()  # The mirror thread: it alone lists R2 for progress.
     unit.cycle()
 
 
