@@ -1087,9 +1087,9 @@ def test_final_drain_ends_before_the_handover_that_leaves_the_ssh_pull_reserve(
 class TimedStore:
     """A check store whose calls take time on the fake clock and may fail.
 
-    ``seconds`` maps the attempt's socket timeout to how long the call takes; ``fails``
-    says whether a call on that key raises a timeout. Every call is recorded with its key,
-    start and timeout.
+    ``seconds`` maps the attempt's socket timeout to how long the call takes, and
+    ``put_seconds`` does for a PUT; ``fails`` says whether a call on that key raises a
+    timeout. Every call is recorded with its key, start and timeout.
     """
 
     def __init__(
@@ -1100,13 +1100,14 @@ class TimedStore:
         timeout: float,
         seconds: Callable[[float], float],
         fails: Callable[[str, str], bool],
+        put_seconds: Callable[[float], float],
     ) -> None:
         self.inner, self.clock, self.calls, self.timeout = inner, clock, calls, timeout
-        self.seconds, self.fails = seconds, fails
+        self.seconds, self.fails, self.put_seconds = seconds, fails, put_seconds
 
     def _call(self, method: str, key: str) -> None:
         self.calls.append((method, key, self.clock.now, self.timeout))
-        self.clock.now += self.seconds(self.timeout)
+        self.clock.now += (self.put_seconds if method == "PUT" else self.seconds)(self.timeout)
         if self.fails(method, key):
             raise TimeoutError("no answer")
 
@@ -1125,8 +1126,13 @@ def timed_finalization(
     start: float,
     seconds: Callable[[float], float],
     fails: Callable[[str, str], bool] = lambda method, key: False,
+    put_seconds: Callable[[float], float] | None = None,
 ) -> tuple[Worker, dict[str, Any], list[tuple[str, str, float, float]], dict[str, Any]]:
-    """Run A with the real 900 s window, finalization starting ``start`` s after GPU work."""
+    """Run A with the real 900 s window, finalization starting ``start`` s after GPU work.
+
+    Closing the uploader takes its whole timeout on the fake clock, as when an upload in
+    flight keeps its thread busy, so the final heartbeat's time includes that wait.
+    """
     clock = Clock()
     bucket = MemoryBucket()
     worker = make_worker(data, "A", clock=clock, bucket=bucket)
@@ -1134,9 +1140,17 @@ def timed_finalization(
     calls: list[tuple[str, str, float, float]] = []
     inner = bucket.store(CREDENTIALS)  # The uploader keeps its own store.
     worker.check_store_for = lambda timeout: TimedStore(  # type: ignore[assignment]
-        inner, clock, calls, timeout, seconds, fails
+        inner, clock, calls, timeout, seconds, fails, put_seconds or seconds
     )
     worker.sleep = lambda pause: setattr(clock, "now", clock.now + pause)
+    close = worker.uploader.close
+
+    def slow_close(timeout: float | None = None) -> bool:
+        assert timeout is not None  # Finalization never waits for the uploader unbounded.
+        clock.now += timeout
+        return close(timeout)
+
+    worker.uploader.close = slow_close  # type: ignore[method-assign]
     stepping(worker, clock)
     original = worker.finalize
 
@@ -1170,10 +1184,14 @@ def test_checks_after_the_drain_end_in_time_even_at_the_worst_start(data: Author
         "stage1-final",
         "stage2-final",
     }
-    assert record["error"].startswith("TimeoutError") and "report.json" in record["error"]
-    # The final heartbeat lands by the handover, before the watchdog's 600 s idle limit.
+    assert record["error"].startswith("HandoverDue") and "report.json" in record["error"]
+    # The final heartbeat lands by the handover, before the watchdog's 600 s idle limit,
+    # even after uploader.close(timeout=5) waited its whole timeout on the fake clock.
     final = heartbeat(worker)
-    assert final["status"] == "failed" and final["updated_at_unix"] <= handover
+    last_check_end = max(start + 4 * timeout for _, _, start, timeout in calls)
+    assert record["uploader_closed"] is True
+    assert last_check_end + 5 <= final["updated_at_unix"] <= handover
+    assert final["status"] == "failed"
     assert handover - worker.last_activity < MAX_IDLE_SECONDS
 
 
@@ -1209,6 +1227,52 @@ def test_transient_failures_after_the_drain_are_retried_while_time_lasts(data: A
     puts = [call for call in calls if call[0] == "PUT"]
     assert len(puts) == 4  # Three timeouts, then the upload; more than one bounded store's 2.
     assert record["report_sha256"] == heartbeat(worker)["r2_final"]["report_sha256"]
+
+
+@pytest.mark.parametrize("stalls", [False, True])
+def test_rolling_labels_are_recorded_when_the_report_upload_fails(
+    data: Authored, stalls: bool
+) -> None:
+    """Every milestone verifies, then every report.json PUT times out: the run fails
+    ``r2_finalization``. The rolling labels are still checked by HEAD while time lasts;
+    when PUTs that stall on four addresses use the time up, they are named unchecked."""
+    worker, result, calls, record = timed_finalization(
+        data,
+        start=0.0,
+        seconds=lambda _: 1.0,
+        fails=lambda method, key: method == "PUT",
+        put_seconds=(lambda timeout: 4 * timeout) if stalls else None,
+    )
+    assert result["status"] == "failed" and result["failure"] == "r2_finalization"
+    assert record["unverified_milestones"] == [] and "report_sha256" not in record
+    rolling = [label for label in worker.label_files if label not in worker.milestones]
+    kept = [label for label in rolling if label in worker.kept_labels()]
+    assert kept and len(kept) < len(rolling)  # The uploader deleted the older ones.
+    verified = record["labels_verified"]
+    assert verified["stage1-final"] is True and verified["stage2-final"] is True
+    assert {label: verified[label] for label in rolling if label not in kept} == {
+        label: False for label in rolling if label not in kept
+    }
+    rolling_heads = [
+        index for index, (method, key, _, _) in enumerate(calls) if "-step" in key.split("/")[3]
+    ]
+    last_put = max(index for index, call in enumerate(calls) if call[0] == "PUT")
+    if stalls:
+        # The fifth PUT ended after the last call: no rolling HEAD could start.
+        assert record["error"].startswith("HandoverDue") and "report.json" in record["error"]
+        assert record["labels_unchecked"] == kept and not rolling_heads
+        assert not set(kept) & set(verified)
+        assert all(record["verification_errors"][label].startswith("HandoverDue") for label in kept)
+    else:
+        # Every attempt failed with time to spare.
+        assert record["error"] == "TimeoutError: no answer"
+        assert sum(call[0] == "PUT" for call in calls) == rehearsal_run.CHECK_ATTEMPTS
+        assert record["labels_unchecked"] == []
+        assert all(verified[label] is True for label in kept)
+        assert rolling_heads and min(rolling_heads) > last_put  # Checked after the failure.
+    assert record["last_verified_label"] == "stage2-final"
+    final = heartbeat(worker)
+    assert final["status"] == "failed" and final["updated_at_unix"] <= record["handover_due_unix"]
 
 
 def test_speed_check_stops_a_run_projected_to_pass_the_deadline(data: Authored) -> None:

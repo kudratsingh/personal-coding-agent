@@ -9,7 +9,7 @@ with ``r2_final``, the supervisor checks the final milestone and ``report.json``
 the Mac's own key, archives the small records privately, and only then reports
 ``shutdown_ready``. A ``running`` or ``uploading`` heartbeat, including run A's boundary
 between its two stages, never leads to teardown. While the worker uploads, new objects
-under its R2 prefix (listed with the Mac's key, through a store bounded to 20 s per socket
+under its R2 prefix (listed with the Mac's key, through a store bounded to 5 s per socket
 operation) are the Mac-observed progress that lets the watchdog wait out the transfer
 window. The one checkpoint copy over SSH is the fallback for a stage-final milestone the
 worker could not verify in R2: the supervisor pulls it with the pilot's verified pull,
@@ -430,9 +430,13 @@ EXPORT_PATH_KEYS = ("path", "export_path", "local_path", "export")
 LISTED_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 """A file name the worker lists for an unverified milestone: one plain path component."""
 MAC_CHECK_TIMEOUT_SECONDS = 5.0
-"""The socket timeout of the Mac's own R2 listings and HEAD checks (``quick_store``). The
-worker hands over 480 s after its last GPU work and the pull must stamp progress before the
-600 s idle limit, so a dead endpoint may cost the Mac seconds per check, not minutes."""
+"""The socket timeout of the Mac's own R2 listings and HEAD checks (``quick_store``). A HEAD
+is one request, but urllib tries every address the endpoint resolves to with the whole
+timeout, and name resolution has no timeout at all. The worker hands over 480 s after its
+last GPU work and the pull must stamp progress before the 600 s idle limit, so an
+unreachable R2 delays the pull by up to addresses x 5 s for each milestone checked (each
+check stops at its first failure and is never repeated): about 40 s for run A's two
+milestones with four addresses, plus name resolution."""
 CHECKPOINT_DIGEST_KEYS = ("checkpoint_sha256", "sha256")
 """Keys under which an unverified milestone gives its checkpoint's SHA-256: the worker's
 ``checkpoint_sha256`` (``rehearsal_run.Worker.export_listing``), else an older row's ``sha256``."""
@@ -630,12 +634,16 @@ class RehearsalSupervisor(Supervisor):
     ``max_transfer_seconds``. Bytes arriving from an SSH pull stamp it too. The Pod can
     never stamp it itself.
 
-    Every R2 call a deadline depends on goes through ``quick_store`` (``main`` builds it
-    with ``r2_store.bounded_store``: 20 s per socket operation, 2 attempts): the mirror's
-    listing, the at-risk HEAD checks and the diagnostics listing. An R2 endpoint that
-    stalls then holds the mirror or the start of a pull for a 20 s socket timeout per
-    request instead of 300 s, and its error is recorded and stamps nothing.
-    ``verify_final`` and its downloads use ``store``.
+    Every R2 call a deadline depends on goes through ``quick_store`` (``_rehearsal_main``
+    builds it with ``r2_store.bounded_store``: ``MAC_CHECK_TIMEOUT_SECONDS``, 5 s, per
+    socket operation): the mirror's listing, the at-risk HEAD checks and the diagnostics
+    listing. A HEAD, like each page of a listing, is a single request that is never
+    retried. An R2 endpoint that stalls then holds the mirror or the start of a pull for up
+    to 5 s per address it resolves to on each request, instead of 300 s, plus name
+    resolution, which no socket timeout bounds; its error is recorded and stamps nothing.
+    A milestone is checked at most once: one already pulled, or one whose check failed
+    (``r2_unconfirmed``), goes straight to the pull on a retry. ``verify_final`` and its
+    downloads use ``store``.
 
     A heartbeat naming another Pod, or updated before this Pod's creation, is ignored
     (``runpod_watchdog.foreign_heartbeat``): it is never mirrored and never acted on.
@@ -686,6 +694,9 @@ class RehearsalSupervisor(Supervisor):
         self.recovery_root = root / "recovered" / pod_id
         self.recovered: dict[str, dict[str, Any]] = {}
         self.r2_secured: dict[str, dict[str, Any]] = {}
+        # Milestones whose R2 check by the Mac failed (missing, different or unreachable):
+        # never checked again, so a retried pull starts at once instead of after the HEADs.
+        self.r2_unconfirmed: set[str] = set()
         self.recovering = False
         self.recovery_staged = 0
         self.milestone_error: dict[str, Any] | None = None
@@ -850,7 +861,9 @@ class RehearsalSupervisor(Supervisor):
         report records that the worker did not list is checked in R2 the same way, by its
         checkpoint; any that fails or times out is at risk too. After any other failure,
         the listed milestones the Mac could not find and those the report flags as
-        unverified are.
+        unverified are. Each milestone is checked at most once: one already pulled, or one
+        whose check failed in an earlier cycle (``r2_unconfirmed``), stays at risk with no
+        new HEAD, so a pull retried after a dropped one starts within a cycle.
         """
         recovery = report.get("failure") in RECOVERY_FAILURES
         try:
@@ -865,9 +878,12 @@ class RehearsalSupervisor(Supervisor):
             if recorded.get(label, digest) != digest:
                 raise ValueError(f"finalization.json and report.json give {label} two SHA-256s")
         files = listed_files(finalization, run=self.run)
+        settled = self.recovered.keys() | self.r2_unconfirmed  # Never checked in R2 again.
         at_risk: dict[str, str] = {}
         for label, digest in listed.items():
-            if label not in self.r2_secured and not self.secured_in_r2(label, files[label]):
+            if label in self.r2_secured:
+                continue
+            if label in settled or not self.secured_in_r2(label, files[label]):
                 at_risk[label] = digest
         r2 = report.get("r2")
         flags = r2.get("milestones_verified") if isinstance(r2, dict) else None
@@ -883,11 +899,15 @@ class RehearsalSupervisor(Supervisor):
         for label, digest in recorded.items():
             if label in at_risk or label in self.r2_secured:
                 continue
+            if label in settled:
+                at_risk[label] = digest
+                continue
             try:
                 row = head_sha256(
                     self.quick_store, f"{self.prefix}{label}/checkpoint.pt", expected=digest
                 )
             except Exception:  # missing, mismatched or unreachable: secure it over SSH
+                self.r2_unconfirmed.add(label)
                 at_risk[label] = digest
             else:
                 self.r2_secured[label] = row
@@ -896,7 +916,7 @@ class RehearsalSupervisor(Supervisor):
     def secured_in_r2(self, label: str, files: Sequence[tuple[str, str]]) -> bool:
         """True, and recorded in ``r2_secured``, when every listed file of ``label`` is in R2
         with its SHA-256; checked by HEAD with the bounded store, stopping at the first
-        that is missing, differs or cannot be reached."""
+        that is missing, differs or cannot be reached (recorded in ``r2_unconfirmed``)."""
         rows = []
         for name, digest in files:
             try:
@@ -904,6 +924,7 @@ class RehearsalSupervisor(Supervisor):
                     head_sha256(self.quick_store, f"{self.prefix}{label}/{name}", expected=digest)
                 )
             except Exception:  # missing, mismatched or unreachable: secure it over SSH
+                self.r2_unconfirmed.add(label)
                 return False
         checkpoint = rows[[name for name, _ in files].index("checkpoint.pt")]
         self.r2_secured[label] = {**checkpoint, "files": rows}

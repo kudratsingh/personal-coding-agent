@@ -1036,6 +1036,13 @@ def environment_secrets(environ: Mapping[str, str] = os.environ) -> list[str]:
     return [environ[name] for name in SECRET_VARIABLES if environ.get(name)]
 
 
+class HandoverDue(TimeoutError):
+    """An R2 check after the drain that could not start before the handover's limits.
+
+    Unlike a socket timeout, it says nothing about R2: the label was simply not checked.
+    """
+
+
 @dataclass
 class _Active:
     """The stage being trained: its data, global offset and per-update timing."""
@@ -1971,7 +1978,7 @@ class Worker:
 
         It starts only until ``LAST_CALL_SECONDS`` before the handover (``late``: until
         ``FINAL_WRITE_SECONDS`` before it, for the HEAD that verifies a PUT that
-        succeeded); one that cannot start raises ``TimeoutError``. Each attempt's socket
+        succeeded); one that cannot start raises ``HandoverDue``. Each attempt's socket
         timeout is at most ``CHECK_TIMEOUT_SECONDS`` and a quarter of the time left until
         ``FINAL_WRITE_SECONDS`` before the handover, so an endpoint that resolves to up to
         four addresses still answers or fails in time; name resolution is not bounded.
@@ -1982,7 +1989,7 @@ class Worker:
         for attempt in range(1, CHECK_ATTEMPTS + 1):
             now = self.clock()
             if now >= start_by:
-                raise TimeoutError(f"no time left before the handover to {what}")
+                raise HandoverDue(f"no time left before the handover to {what}")
             store = self.check_store_for(min(CHECK_TIMEOUT_SECONDS, (end - now) / 4))
             try:
                 return action(store)
@@ -2005,12 +2012,16 @@ class Worker:
         """The milestones with exports, the newest first: the order they are checked in."""
         return [*reversed([label for label in self.milestones if label in self.label_files])]
 
-    def verified_labels(self, labels: Iterable[str]) -> dict[str, bool]:
+    def verified_labels(
+        self, labels: Iterable[str], *, unchecked: list[str] | None = None
+    ) -> dict[str, bool]:
         """Each of ``labels``, in order: verified and kept by the uploader, and every file
         checked again by HEAD.
 
         A HEAD that still fails after its retries, or one there is no time left for, counts
-        as unverified; its error is kept in ``verification_errors``.
+        as unverified; its error is kept in ``verification_errors``. Given ``unchecked``, a
+        label whose HEADs could not all start in time (``HandoverDue``) is appended there
+        instead of being counted either way.
         """
         kept = self.kept_labels()
         result: dict[str, bool] = {}
@@ -2022,9 +2033,29 @@ class Worker:
                     for name, _, digest in files
                 )
             except Exception as error:  # recorded; the label is not verified
-                result[label] = False
                 self.verification_errors[label] = f"{type(error).__name__}: {error}"
+                if unchecked is not None and isinstance(error, HandoverDue):
+                    unchecked.append(label)
+                else:
+                    result[label] = False
         return result
+
+    def record_rolling(self, labels: dict[str, bool], receipt: dict[str, Any]) -> None:
+        """Check the rolling labels by HEAD while ``_checked`` allows, for the record only:
+        no ending depends on them.
+
+        Each joins ``labels`` (the receipt's ``labels_verified``), except one whose checks
+        could not all start before the handover: ``labels_unchecked`` names it, since it
+        may still be whole in R2 for the owner to resume from. A run without ``r2_final``
+        also records its newest verified label (``last_verified_label``).
+        """
+        unchecked: list[str] = []
+        rolling = [label for label in self.label_files if label not in self.milestones]
+        labels.update(self.verified_labels(rolling, unchecked=unchecked))
+        receipt.update(labels_verified=labels, labels_unchecked=unchecked)
+        if self.r2_final is None:
+            last = [label for label in self.labels if labels.get(label)]
+            receipt["last_verified_label"] = last[-1] if last else None
 
     def export_listing(self, label: str) -> dict[str, Any]:
         """A label's local export: its directory, and each file's path, SHA-256 and size."""
@@ -2106,7 +2137,10 @@ class Worker:
         SSH. A completed or time-limited run whose report cannot be verified in R2 ends
         ``failed`` (``r2_finalization``). ``r2_final`` is published only when a verified
         stage-final milestone closes the run and every milestone is verified; a stopped
-        run without one gets none, and the supervisor archives diagnostics.
+        run without one gets none, and the supervisor archives diagnostics. The rolling
+        labels are checked last, for the record, after a failed ``report.json`` upload too;
+        ``finalization.json`` names any that could not be checked in time
+        (``labels_unchecked``).
         """
         self.phase = "finalizing"
         trained = self.report["status"]
@@ -2120,6 +2154,7 @@ class Worker:
         }
         report_key = self.prefix + "report.json"
         unverified: list[dict[str, Any]] | None = None
+        labels: dict[str, bool] = {}
         self.uploading = not hurry
         try:
             self.heartbeat()
@@ -2172,11 +2207,7 @@ class Worker:
                     "checkpoint_sha256": files["checkpoint.pt"],
                 }
             # Rolling labels last, for the record only: no ending depends on them.
-            rolling = [label for label in self.label_files if label not in self.milestones]
-            labels.update(self.verified_labels(rolling))
-            if not durable:
-                last = [label for label in self.labels if labels.get(label)]
-                receipt["last_verified_label"] = last[-1] if last else None
+            self.record_rolling(labels, receipt)
         except Exception as error:
             receipt["error"] = f"{type(error).__name__}: {error}"
             if unverified is None:
@@ -2198,6 +2229,11 @@ class Worker:
                     status="failed", failure="r2_finalization", training_status=trained
                 )
             self.publish()
+            if not hurry and "labels_unchecked" not in receipt:
+                # The report upload (or a step before it) failed, not the rolling labels:
+                # check them while time lasts, or name them unchecked, so the owner can
+                # still find one to resume from. The checks end before the final writes.
+                self.record_rolling(labels, receipt)
         finally:
             receipt["unverified_milestones"] = unverified or []
             receipt["verification_errors"] = dict(self.verification_errors)

@@ -14,6 +14,7 @@ import pytest
 from scratchcoder.common.records import atomic_json
 from tools import pilot_supervisor, r2_store
 from tools.pilot_supervisor import (
+    MAC_CHECK_TIMEOUT_SECONDS,
     RehearsalSupervisor,
     archive_bundle,
     fetch_status_bytes,
@@ -63,16 +64,34 @@ class FakeR2:
         return [{"key": key, "bytes": len(data)} for key, (data, _) in self.objects_by_key.items()]
 
 
+ADDRESSES = 4
+"""The addresses an R2 endpoint is assumed to resolve to. urllib tries each one with the
+whole socket timeout, so a request to an unreachable endpoint fails only after all four."""
+STALL_SECONDS = ADDRESSES * MAC_CHECK_TIMEOUT_SECONDS
+"""How long one request of the Mac's bounded store takes to fail against such an endpoint."""
+
+
 class Stalled(FakeR2):
-    """A bounded store against an R2 endpoint that accepts connections but never answers:
-    every listing and HEAD ends in the socket timeout ``bounded_store`` sets."""
+    """A bounded store against an R2 endpoint that never answers: every listing and HEAD
+    ends in the socket timeout ``bounded_store`` sets. Given ``now``, a supervisor's fake
+    clock, each request first takes ``STALL_SECONDS`` on it."""
+
+    def __init__(self, now: list[float] | None = None) -> None:
+        super().__init__()
+        self.now = now
+
+    def stall(self) -> None:
+        if self.now is not None:
+            self.now[0] += STALL_SECONDS
 
     def head(self, key: str) -> dict[str, str] | None:
         self.calls.append(("HEAD", key))
+        self.stall()
         raise TimeoutError("The read operation timed out")
 
     def objects(self) -> list[dict[str, Any]]:
         self.listings += 1
+        self.stall()
         raise TimeoutError("The read operation timed out")
 
 
@@ -921,9 +940,10 @@ def test_finalization_and_report_must_agree_on_a_milestones_sha256(tmp_path: Pat
 
 
 def test_the_mirror_and_the_at_risk_checks_use_the_bounded_store(tmp_path: Path) -> None:
-    """R2 accepts connections and never answers. The mirror's listing and the at-risk
-    HEAD time out in the bounded store, are recorded and stamp nothing; the milestone R2
-    could not confirm is pulled too. The default store is never asked."""
+    """R2 never answers the Mac. The mirror's listing and the at-risk HEADs time out in the
+    bounded store, each after the socket timeout on four addresses of the fake clock, are
+    recorded and stamp nothing; the milestone R2 could not confirm is pulled too, and the
+    pull still starts in time. The default store is never asked."""
     r2 = FakeR2()  # The default store: it holds stage1-final, for verification only.
     report, disk = unverified_run(r2)
     stalled = Stalled()
@@ -941,6 +961,7 @@ def test_the_mirror_and_the_at_risk_checks_use_the_bounded_store(tmp_path: Path)
         transfer_window_seconds=900,
     )
     holder.append(unit)
+    stalled.now = unit.now  # type: ignore[attr-defined]
     assert supervisor(tmp_path / "default", pod, r2)[0].quick_store is r2  # The default.
     unit.now[0] = 1800.0  # type: ignore[attr-defined]
     for _ in range(2):
@@ -951,10 +972,14 @@ def test_the_mirror_and_the_at_risk_checks_use_the_bounded_store(tmp_path: Path)
     }
     assert "transfer_progress_unix" not in mirrored(unit) and unit.r2_seen is None
     pod.heartbeat = heartbeat("failed", failure="r2_milestones_unverified", **beat)
-    unit.now[0] = 1900.0  # type: ignore[attr-defined]
+    unit.now[0] = 1500.0 + 480  # type: ignore[attr-defined]  # The worker's handover.
     unit.cycle()
     # The last stage first, then stage1-final, which the Mac's HEAD could not confirm.
     assert [name for name, _ in recovery.calls] == ["exports/stage2-final", "exports/stage1-final"]
+    # Two stalled HEADs delay the first pull by 40 s: its first bytes still reach the Mac
+    # (and stamp progress) before the 600 s idle limit, with 380 s of the window left.
+    assert recovery.calls[0][1] == 900 - 480 - 2 * STALL_SECONDS >= 360
+    assert recovery.progress[0] == 1500 + 480 + 2 * STALL_SECONDS + 1 < 1500 + 600
     # The listed stage2-final is checked first and times out at its first file; then the
     # recorded stage1-final. Both are pulled.
     assert stalled.calls == [
@@ -967,6 +992,75 @@ def test_the_mirror_and_the_at_risk_checks_use_the_bounded_store(tmp_path: Path)
     summary = json.loads((unit.root / "diagnostics" / "summary.json").read_text())
     assert summary["r2_listing_error"] == "TimeoutError"
     assert summary["milestone_recovery"]["verified_in_r2_by_mac"] == []
+
+
+class Dropping(Recovery):
+    """Drops the first pull of each milestone, as a reset SSH connection does, and records
+    when each pull starts on the supervisor's fake clock."""
+
+    def __init__(self, holder: list[RehearsalSupervisor], disk: dict[str, bytes]) -> None:
+        super().__init__(holder, disk)
+        self.starts: list[tuple[str, float]] = []
+
+    def __call__(self, name: str, destination: Path, timeout: float) -> Path:
+        retry = any(started == name for started, _ in self.starts)
+        self.starts.append((name, self.holder[0].now[0]))  # type: ignore[attr-defined]
+        self.fail = None if retry else "SSH artifact stream failed: connection reset"
+        return super().__call__(name, destination, timeout)
+
+
+def test_a_retried_pull_starts_within_a_cycle_and_no_milestone_is_checked_twice(
+    tmp_path: Path,
+) -> None:
+    """R2 never answers the Mac, the worker lists both of run A's milestones, and each
+    stalled HEAD takes the socket timeout on four addresses. The first pull of each one
+    drops. Each retry starts in the next 5 s cycle: neither a milestone already pulled nor
+    one whose R2 check already failed is checked again."""
+    stalled = Stalled()
+    report, disk = unverified_run(stalled, in_r2=())
+    rows = listing(disk, "stage1-final", "stage2-final")
+    pod = Pod(heartbeat("failed", last_gpu_activity_unix=1500), report, rows)
+    holder: list[RehearsalSupervisor] = []
+    recovery = Dropping(holder, disk)
+    unit, archive = supervisor(
+        tmp_path,
+        pod,
+        stalled,
+        fetch_finalization=pod.fetch_finalization,
+        recover=recovery,
+        transfer_window_seconds=900,
+    )
+    holder.append(unit)
+    stalled.now = unit.now  # type: ignore[attr-defined]
+    handover = 1500.0 + 480
+    unit.now[0] = handover  # type: ignore[attr-defined]
+    for _ in range(3):
+        unit.cycle()
+        unit.now[0] += 5  # type: ignore[attr-defined]  # The wait between two cycles.
+    prefix = run_prefix("A", POD)
+    assert stalled.calls == [  # Once each, at the first cycle.
+        ("HEAD", f"{prefix}stage1-final/checkpoint.pt"),
+        ("HEAD", f"{prefix}stage2-final/checkpoint.pt"),
+    ]
+    # Each fake pull takes 1 s; a retry starts one 5 s wait after the dropped pull ended.
+    first = handover + 2 * STALL_SECONDS
+    assert recovery.starts == [
+        ("exports/stage2-final", first),  # Dropped.
+        ("exports/stage2-final", first + 1 + 5),
+        ("exports/stage1-final", first + 1 + 5 + 1),  # Dropped.
+        ("exports/stage1-final", first + 1 + 5 + 1 + 1 + 5),
+    ]
+    # The first pull's bytes reach the Mac before the 600 s idle limit, with 380 s left.
+    assert recovery.calls[0] == ("exports/stage2-final", 1500 + 900 - first)
+    assert 1500 + 900 - first >= 360 and recovery.progress[0] == first + 1 < 1500 + 600
+    assert unit.shutdown_ready and archive.bundles == [unit.root / "diagnostics"]
+    summary = json.loads((unit.root / "diagnostics" / "summary.json").read_text())
+    recovered = summary["milestone_recovery"]
+    assert [row["label"] for row in recovered["pulled_over_ssh"]] == [
+        "stage2-final",
+        "stage1-final",
+    ]
+    assert recovered["verified_in_r2_by_mac"] == []
 
 
 # The SSH pull inside the watchdog's transfer window, on one fake clock -------------------
@@ -1000,10 +1094,13 @@ class FinalDrain(Pod):
 def test_the_ssh_pull_holds_the_pod_only_while_its_bytes_reach_the_mac(
     tmp_path: Path, pulled: bool
 ) -> None:
-    """R2 never shows a new object. The worker hands over at T0 + 480 s; the pull's staged
-    bytes grow from T0 + 490 s to T0 + 800 s and it publishes at T0 + 855 s. The real
-    mirror (``refresh_heartbeat``) and watchdog (``check_once``) share one fake clock."""
-    quick = FakeR2()  # The Mac's bounded store: stage1-final, and never anything new.
+    """R2 never answers the Mac. The worker hands over at T0 + 480 s; the Mac's HEADs of
+    stage2-final and stage1-final each stall for the socket timeout on four addresses, so
+    the pull of stage2-final starts at T0 + 520 s. Its staged bytes grow from T0 + 530 s
+    to T0 + 800 s and it publishes at T0 + 855 s; stage1-final, small here, follows. The
+    real mirror (``refresh_heartbeat``) and watchdog (``check_once``) share one fake
+    clock."""
+    quick = Stalled()  # The Mac's bounded store: stage1-final is in R2, but unreachable.
     report, disk = unverified_run(quick, size=64 * 1024)
     store = FakeR2()  # The default store: verification and downloads only.
     pod = FinalDrain(report, listing(disk, "stage2-final"))
@@ -1011,6 +1108,8 @@ def test_the_ssh_pull_holds_the_pod_only_while_its_bytes_reach_the_mac(
     api = Runpod()
     seen: dict[float, tuple[str, str]] = {}
     checks = (599, 610, 700, 850) if pulled else (599, 600)
+    starts: dict[str, float] = {}
+    stamps: list[object] = []
 
     def watchdog(after: float) -> tuple[str, str]:
         outcome = check_once(
@@ -1025,28 +1124,8 @@ def test_the_ssh_pull_holds_the_pod_only_while_its_bytes_reach_the_mac(
         seen[after] = (outcome.state, outcome.reason)
         return seen[after]
 
-    def pull(name: str, destination: Path, timeout: float) -> Path:
-        unit = holder[0]
-        assert (name, destination, timeout) == ("exports/stage2-final", unit.recovery_root, 420)
-        data = disk["stage2-final"]
-        staging = destination / ".stage2-final.staging-timeline"
-        for after in sorted({*range(485, 860, 5), *checks}):
-            if "DELETE" in api.calls:
-                raise RuntimeError("SSH artifact stream failed: Connection closed by remote host")
-            unit.now[0] = T0 + after  # type: ignore[attr-defined]
-            if after % 5 == 0:  # The mirror thread's tick.
-                if pulled and 490 <= after <= 800:
-                    staging.mkdir(exist_ok=True)
-                    arrived = len(data) * (after - 485) // 315  # All of it by T0 + 800.
-                    (staging / "checkpoint.pt").write_bytes(data[:arrived])
-                    if after == 800:
-                        (staging / "record.json").write_bytes(b"{}")
-                unit.refresh_heartbeat()
-            if after in checks:
-                watchdog(after)
-            assert not unit.shutdown_ready and mirrored(unit)["status"] == "failed"
-        if not pulled:
-            raise TimeoutError("artifact transfer exceeded its total timeout")
+    def publish(label: str, staging: Path) -> Path:
+        data = disk[label]
         rows: list[dict[str, Any]] = [
             {"kind": "checkpoint", "name": "checkpoint.pt", "sha256": sha(data)},
             {"kind": "record", "name": "record.json", "sha256": sha(b"{}")},
@@ -1055,8 +1134,43 @@ def test_the_ssh_pull_holds_the_pod_only_while_its_bytes_reach_the_mac(
         (staging / "transfer-receipt.json").write_text(
             json.dumps({"status": "verified", "artifacts": rows})
         )
-        staging.replace(destination / "stage2-final")  # Verified and published at T0 + 855.
-        return destination / "stage2-final"
+        staging.replace(staging.parent / label)  # Verified and published.
+        return staging.parent / label
+
+    def pull(name: str, destination: Path, timeout: float) -> Path:
+        unit = holder[0]
+        label = PurePosixPath(name).name
+        start = starts[label] = unit.now[0] - T0  # type: ignore[attr-defined]
+        # Every pull must end with the transfer window, 900 s after the last GPU work.
+        assert (name, destination, timeout) == (f"exports/{label}", unit.recovery_root, 900 - start)
+        data = disk[label]
+        staging = destination / f".{label}.staging-timeline"
+        if label == "stage1-final":
+            # R2 did not confirm it for the Mac either; the fixture's copy lands at once.
+            staging.mkdir()
+            (staging / "checkpoint.pt").write_bytes(data)
+            (staging / "record.json").write_bytes(b"{}")
+            unit.now[0] += 1  # type: ignore[attr-defined]
+            return publish(label, staging)
+        begin = 5 * (int(start) // 5 + 1)  # The mirror's first tick: no bytes yet.
+        for after in sorted({*range(begin, 860, 5), *checks}):
+            if "DELETE" in api.calls:
+                raise RuntimeError("SSH artifact stream failed: Connection closed by remote host")
+            unit.now[0] = T0 + after  # type: ignore[attr-defined]
+            if after % 5 == 0:  # The mirror thread's tick.
+                if pulled and begin < after <= 800:
+                    staging.mkdir(exist_ok=True)
+                    arrived = len(data) * (after - begin) // (800 - begin)  # All by T0 + 800.
+                    (staging / "checkpoint.pt").write_bytes(data[:arrived])
+                    if after == 800:
+                        (staging / "record.json").write_bytes(b"{}")
+                stamps.append(unit.refresh_heartbeat().get("transfer_progress_unix"))
+            if after in checks:
+                watchdog(after)
+            assert not unit.shutdown_ready and mirrored(unit)["status"] == "failed"
+        if not pulled:
+            raise TimeoutError("artifact transfer exceeded its total timeout")
+        return publish(label, staging)  # At T0 + 855.
 
     unit, archive = supervisor(
         tmp_path,
@@ -1068,7 +1182,7 @@ def test_the_ssh_pull_holds_the_pod_only_while_its_bytes_reach_the_mac(
         transfer_window_seconds=900,
     )
     holder.append(unit)
-    pod.now = unit.now  # type: ignore[attr-defined]
+    pod.now = quick.now = unit.now  # type: ignore[attr-defined]
     for after in range(5, 480, 5):  # The final drain: the supervisor cycles every 5 s.
         unit.now[0] = T0 + after  # type: ignore[attr-defined]
         unit.cycle()
@@ -1076,25 +1190,32 @@ def test_the_ssh_pull_holds_the_pod_only_while_its_bytes_reach_the_mac(
             assert watchdog(after)[0] == "watching"
     local = mirrored(unit)
     assert local["status"] == "uploading" and "transfer_progress_unix" not in local
-    assert quick.listings == 95  # One per mirror refresh, none of them new.
+    assert quick.listings == 95  # One per mirror refresh, each a timeout.
     unit.now[0] = HANDOVER  # type: ignore[attr-defined]
-    unit.cycle()  # Reads the final heartbeat and pulls stage2-final over SSH.
+    unit.cycle()  # Reads the final heartbeat, checks R2 and pulls stage2-final over SSH.
     assert quick.calls == [
         ("HEAD", f"{run_prefix('A', POD)}stage2-final/checkpoint.pt"),
         ("HEAD", f"{run_prefix('A', POD)}stage1-final/checkpoint.pt"),
     ]
+    # Two stalled HEADs delay the pull by 40 s; it still has 380 s of the window.
+    assert starts["stage2-final"] == 480 + 2 * STALL_SECONDS
+    assert 900 - starts["stage2-final"] >= 360
     assert not store.calls and store.listings == 0
     if pulled:
+        # The first bytes reach the Mac, and stamp progress, before the 600 s idle limit.
+        assert min(stamp for stamp in stamps if isinstance(stamp, float)) < T0 + 600
         assert seen == {
             300: ("watching", "within_limits"),
             **{after: ("watching", "within_limits") for after in checks},
         }
         assert "DELETE" not in api.calls
-        # Teardown is approved once the pull is verified, and the watchdog acts on it.
+        # Teardown is approved once the pulls are verified, and the watchdog acts on it.
         assert unit.shutdown_ready and archive.bundles == [unit.root / "diagnostics"]
         summary = json.loads((unit.root / "diagnostics" / "summary.json").read_text())
-        (row,) = summary["milestone_recovery"]["pulled_over_ssh"]
-        assert (row["label"], row["sha256"]) == ("stage2-final", sha(disk["stage2-final"]))
+        assert [
+            (row["label"], row["sha256"])
+            for row in summary["milestone_recovery"]["pulled_over_ssh"]
+        ] == [(label, sha(disk[label])) for label in ("stage2-final", "stage1-final")]
         local = mirrored(unit)
         assert local["status"] == "shutdown_ready" and local["transfer_progress_unix"] == T0 + 800
         ending = watchdog(860)
@@ -1103,8 +1224,8 @@ def test_the_ssh_pull_holds_the_pod_only_while_its_bytes_reach_the_mac(
         # No byte reached the Mac: nothing stamps progress, and the idle limit ends the Pod.
         assert seen[599] == ("watching", "within_limits")
         assert seen[600] == ("terminated", "idle_gpu_limit_delete_204_get_404")
-        assert "transfer_progress_unix" not in mirrored(unit)
-        assert not unit.shutdown_ready and not archive.bundles
+        assert "transfer_progress_unix" not in mirrored(unit) and not any(stamps)
+        assert not unit.shutdown_ready and not archive.bundles and list(starts) == ["stage2-final"]
         assert (unit.root / "MILESTONES-NOT-SECURED.json").exists()
 
 
