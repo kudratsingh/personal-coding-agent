@@ -19,6 +19,7 @@ Start with the [project README](../README.md), [current status](status.md), and 
 | [Real samples](real-samples.md) | Inspect actual sizes, hashes, per-filter counts and exclusion coverage. |
 | [Frozen tokenizer](tokenizer-freeze.md) | Identify the immutable table and held-out compression measurements. |
 | [S rehearsal data build](rehearsal-data.md) | How the S pretraining shards were built, verified and credited, with the 2026-10-25 results. |
+| [Rehearsal task pool](task-pool.md) | How the capped SFT/RL pool and its dev/test holdouts were built and verified, with the 2026-10-25 counts. |
 | [Full-build plan status](full-build-plan.md) | Understand the estimate's scope, source-capacity limits and outstanding owner decision; no build authorization. |
 | [Rehearsal run operations](rehearsal-runs.md) | Supervise the two concurrent D-35 rehearsal Pods: limits, R2 layout, credentials, the teardown rule and the projected fit; commands are in the [rehearsal runbook](../REHEARSAL_RUNBOOK.md). |
 | [Rehearsal work-order outline](rehearsal-plan.md) | Review the plan-only Phase 4 sequence and unresolved execution prerequisites. |
