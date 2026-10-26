@@ -1459,7 +1459,12 @@ def _rehearsal_main(
         cycle_seconds=args.cycle_seconds,
     )
     # The Pod may be gone: milestones whose R2 check only timed out are checked once more.
-    after_close = supervisor.final_r2_check()
+    # Only the record depends on it, so it can never keep the closing record from being written.
+    after_close: dict[str, Any]
+    try:
+        after_close = dict(supervisor.final_r2_check())
+    except Exception as error:
+        after_close = {"error_type": type(error).__name__, "detail": str(error)[:500]}
     closing = args.output / "closing"
     closing.mkdir(exist_ok=True)
     receipt = args.output / "watchdog-receipt.json"
