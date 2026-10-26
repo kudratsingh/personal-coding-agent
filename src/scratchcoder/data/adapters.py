@@ -10,6 +10,24 @@ from typing import Any
 from scratchcoder.data.manifest import ManifestEntry
 from scratchcoder.eval.tasks import Task
 
+# Where TACO removed a figure from a problem statement it left one of these markers.
+IMAGE_PLACEHOLDER = re.compile(r"\[image\]|<image>|<img\b|!\[", re.IGNORECASE)
+# With picture_num unrecorded, statements that still point at a figure are excluded.
+FIGURE_REFERENCE = re.compile(
+    r"\b(?:figure|picture|image|diagram|illustration)s?\s+(?:below|above)\b"
+    r"|\bshown\s+in\s+the\s+(?:following\s+)?(?:figure|picture|image|diagram)",
+    re.IGNORECASE,
+)
+# Exact output comparison cannot grade problems with several valid answers or a tolerance.
+ANY_ANSWER = re.compile(
+    r"\b(?:print|output)\s+any\b|\bany\s+of\s+them\b"
+    r"|\b(?:multiple|several|many)\s+(?:possible\s+|valid\s+|correct\s+)?(?:answers|solutions)\b"
+    r"|\b(?:absolute|relative)\s+(?:or\s+(?:absolute|relative)\s+)?error\b",
+    re.IGNORECASE,
+)
+IO_CASE_LIMIT = 100
+"""The sandbox runs at most this many I/O cases in one call."""
+
 
 def adapt_taco_io_row(
     row: Mapping[str, Any],
@@ -18,8 +36,14 @@ def adapt_taco_io_row(
     upstream_split: str,
     split: str,
     public_count: int = 1,
+    truncate_cases: bool = False,
 ) -> Task:
-    """Conservative EASY stdin/stdout subset; no execution or metadata eval."""
+    """Conservative EASY stdin/stdout subset; no execution or metadata eval.
+
+    A figure-free statement has ``picture_num`` "0" or unrecorded (null) and no image
+    placeholder. Rows with more than ``IO_CASE_LIMIT`` cases are rejected unless
+    ``truncate_cases`` keeps the first ``IO_CASE_LIMIT`` distinct inputs, in upstream order.
+    """
     provenance.validate()
     if provenance.source != "BAAI/TACO" or upstream_split not in {"train", "test"}:
         raise ValueError("TACO provenance and explicit original split are required")
@@ -27,12 +51,18 @@ def adapt_taco_io_row(
         raise ValueError("evaluation-only provenance cannot become training data")
     if upstream_split == "test" and split == "train":
         raise ValueError("upstream TACO test tasks cannot become training data")
+    question = row["question"]
     if (
         row["difficulty"] != "EASY"
         or row["starter_code"]
-        or str(row.get("picture_num", "0")) != "0"
+        or row.get("picture_num") not in (None, "0")
+        or not isinstance(question, str)
+        or IMAGE_PLACEHOLDER.search(question)
+        or (row.get("picture_num") is None and FIGURE_REFERENCE.search(question))
     ):
         raise ValueError("only EASY standalone text I/O tasks are supported")
+    if ANY_ANSWER.search(question):
+        raise ValueError("TACO tasks with several valid answers need a checker, not exact match")
     cases = json.loads(row["input_output"])
     solutions = json.loads(row["solutions"])
     if (
@@ -42,7 +72,8 @@ def adapt_taco_io_row(
         or not isinstance(cases.get("inputs"), list)
         or not isinstance(cases.get("outputs"), list)
         or len(cases["inputs"]) != len(cases["outputs"])
-        or not 2 <= len(cases["inputs"]) <= 100
+        or len(cases["inputs"]) < 2
+        or (len(cases["inputs"]) > IO_CASE_LIMIT and not truncate_cases)
         or not all(isinstance(value, str) for value in [*cases["inputs"], *cases["outputs"]])
     ):
         raise ValueError("unsupported TACO I/O tests")
@@ -58,10 +89,10 @@ def adapt_taco_io_row(
             raise ValueError("conflicting outputs for identical TACO input")
         unique[given] = expected
     items = [{"input": given, "output": expected} for given, expected in unique.items()]
+    items = items[:IO_CASE_LIMIT]
     if type(public_count) is not int or not 1 <= public_count < len(items):
         raise ValueError("distinct public and hidden I/O cases required")
-    question = row["question"]
-    if not isinstance(question, str) or not isinstance(row["url"], str):
+    if not isinstance(row["url"], str):
         raise ValueError("TACO question and stable source URL must be strings")
     identity = hashlib.sha256((row["url"] + "\n" + question).encode()).hexdigest()
     return Task(

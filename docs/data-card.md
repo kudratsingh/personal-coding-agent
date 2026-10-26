@@ -74,7 +74,7 @@ The owner-approved [S rehearsal build](rehearsal-data.md) is the first build fro
 
 Every Python file was joined to The Stack dedup v1.2 repository licenses, and all 1,090,395 matched. The build kept **83.22674%** of Python bytes under the same header-first, D-05-allowlist rule as the samples. Each shard document's source row, repository/path and license IDs are recorded locally for attribution; per-stream credits by license ID are in the build report. Credit Hugging Face and Lozhkov et al. (2024) for FineWeb-Edu, and BigCode, The Stack and the original repository authors for the Python files.
 
-The data is not redistributed. Training admission still waits for the final task-pool holdout exclusion.
+The data is not redistributed. After the task-pool holdout exclusion removed 2,940 documents, the shards were admitted for rehearsal training on 2026-10-25 ([details](rehearsal-data.md#holdout-exclusion-and-admission-2026-10-25)). The [task pool](task-pool.md) credits OpenCodeInstruct (NVIDIA, CC BY 4.0), AceCode-87K (TIGER-Lab, MIT), TACO (BAAI, Apache 2.0 with MIT and CC BY 4.0 components; HackerRank problems excluded) and MBPP (Google Research, CC BY 4.0).
 
 ## Evaluation-only source actually used
 

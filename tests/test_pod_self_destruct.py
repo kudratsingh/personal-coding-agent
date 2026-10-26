@@ -186,3 +186,20 @@ def test_main_refuses_missing_key_and_out_of_ceiling_deadline(
         main(["--deadline-unix", str(time.time() + 6000), "--receipt", receipt])
     assert info.value.code == 2
     assert not os.path.exists(receipt)
+
+
+def test_lifetime_ceiling_is_60000_seconds_at_most(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    from tools.pod_self_destruct import ABSOLUTE_DEADLINE_SECONDS
+
+    assert ABSOLUTE_DEADLINE_SECONDS == 60_000  # The rehearsal wall (D-35, amended).
+    monkeypatch.setenv("RUNPOD_API_KEY", "placeholder")
+    monkeypatch.setenv("RUNPOD_POD_ID", "podabc123")
+    receipt = str(tmp_path / "r.json")
+    deadline = str(time.time() + 60_001)
+    with pytest.raises(SystemExit) as info:
+        main(["--deadline-unix", deadline, "--receipt", receipt, "--max-lifetime-seconds", "60001"])
+    assert info.value.code == 2 and not os.path.exists(receipt)

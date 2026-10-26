@@ -32,7 +32,8 @@ API_BASE = "https://api.runpod.io/v2"
 API_KEY_ENV = "RUNPOD_API_KEY"
 POD_ID_ENV = "RUNPOD_POD_ID"
 MAX_RESPONSE_BYTES = 1_048_576
-MAX_DEADLINE_SECONDS = 5_400  # The pilot's absolute Pod lifetime ceiling.
+MAX_DEADLINE_SECONDS = 5_400  # The pilot's default Pod lifetime ceiling.
+ABSOLUTE_DEADLINE_SECONDS = 60_000  # The rehearsal runs' 16.7-hour limit (D-35); never more.
 _SAFE_POD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _BACKOFF = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 
@@ -294,6 +295,8 @@ def main(argv: list[str] | None = None) -> int:
     if not token and not args.dry_run:
         parser.error(f"{API_KEY_ENV} is not set in the environment")
     now = time.time()
+    if not 0 < args.max_lifetime_seconds <= ABSOLUTE_DEADLINE_SECONDS:
+        parser.error(f"--max-lifetime-seconds must be at most {ABSOLUTE_DEADLINE_SECONDS}")
     if not now < args.deadline_unix <= now + args.max_lifetime_seconds:
         parser.error("deadline must be in the future and within the lifetime ceiling")
     try:

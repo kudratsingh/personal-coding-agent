@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "name": "task-pool-rehearsal",
+  "tokenizer": {
+    "path": "runs/tokenizer-freeze-65536-20261020/tokenizer.json",
+    "identity": "509ab5b810dee7ae93205721bd921728fe83dac8a857bf087296206f9de655e6",
+    "file_sha256": "13e2eb08dc4930f645d5582b23f2b39a58c3735dbc264720b8c78fef1c21c23e",
+    "vocab_size": 65536
+  },
+  "context_tokens": 960,
+  "context_basis": "S context of 1,024 tokens minus 64 reserved for conversation tokens; counts the public prompt plus the reference solution",
+  "sources": [
+    {
+      "kind": "opencode",
+      "dataset": "nvidia/OpenCodeInstruct",
+      "revision": "8f3ba5bafe4d6e8db46082cf7ae6741bc370604d",
+      "files": [
+        "data/train-00000-of-00050.parquet"
+      ],
+      "rows": 20000,
+      "license": "CC-BY-4.0",
+      "attribution": "NVIDIA; Ahmad et al. (2025), OpenCodeInstruct",
+      "terms": "CC BY 4.0 governing terms on the dataset card",
+      "terms_reviewed_on": "2026-10-25",
+      "obligations": "Credit NVIDIA and state the adaptations: tests split into public and hidden, Markdown fences removed from solutions"
+    },
+    {
+      "kind": "acecode",
+      "dataset": "TIGER-Lab/AceCode-87K",
+      "revision": "13216309a9f6cb40b60cb1a9750071efeac414ad",
+      "files": [
+        "data/train-00000-of-00011.parquet",
+        "data/train-00001-of-00011.parquet"
+      ],
+      "rows": 10000,
+      "license": "MIT",
+      "attribution": "TIGER-Lab; Zeng et al. (2025), AceCoder",
+      "terms": "MIT license declared on the dataset card",
+      "terms_reviewed_on": "2026-10-25",
+      "obligations": "Keep the MIT notice and credit TIGER-Lab; the solution is a recorded model attempt that passed every test in our sandbox"
+    },
+    {
+      "kind": "taco",
+      "dataset": "BAAI/TACO",
+      "revision": "d593ed0a2becbbc952230bb89be09189bf1056dc",
+      "files": [
+        "ALL/train-00000-of-00009.parquet",
+        "ALL/train-00001-of-00009.parquet",
+        "ALL/train-00002-of-00009.parquet",
+        "ALL/train-00003-of-00009.parquet",
+        "ALL/train-00004-of-00009.parquet",
+        "ALL/train-00005-of-00009.parquet",
+        "ALL/train-00006-of-00009.parquet",
+        "ALL/train-00007-of-00009.parquet",
+        "ALL/train-00008-of-00009.parquet",
+        "ALL/test-00000-of-00001.parquet"
+      ],
+      "rows": null,
+      "difficulty": "EASY",
+      "excluded_sources": [
+        "hackerrank"
+      ],
+      "license": "Apache-2.0",
+      "attribution": "BAAI, Shandong Normal University and Peking University; Li et al. (2023), TACO",
+      "terms": "Apache 2.0, with MIT and CC BY 4.0 components, per the dataset card; the card states HackerRank rights are unknown",
+      "terms_reviewed_on": "2026-10-25",
+      "obligations": "Keep the Apache 2.0 notice and the card's component credits (APPS, CodeContests, Description2Code); HackerRank-sourced problems are excluded pending an owner decision; rows with more than 100 test cases keep their first 100 distinct cases",
+      "truncate_cases": true
+    },
+    {
+      "kind": "mbpp",
+      "dataset": "google-research-datasets/mbpp",
+      "revision": "f82046ba5aabbbb427dbfd38a254d26bff08b533",
+      "files": [],
+      "rows": null,
+      "url": "https://raw.githubusercontent.com/google-research/google-research/f82046ba5aabbbb427dbfd38a254d26bff08b533/mbpp/mbpp.jsonl",
+      "sha256": "ccf64ceae9c5403bf50a044cb6d505bfd2a2963ee58338ba268fd65beab92a9f",
+      "size_bytes": 563743,
+      "license": "CC-BY-4.0",
+      "attribution": "Google Research; Austin et al. (2021), Program Synthesis with Large Language Models",
+      "terms": "CC BY 4.0",
+      "terms_reviewed_on": "2026-10-25",
+      "obligations": "Credit Google Research; MBPP+ task IDs are removed and never trained on"
+    }
+  ],
+  "protection": {
+    "humaneval": "runs/real-samples-20261019/HumanEval.jsonl.gz",
+    "evalplus_directory": "runs/evalplus-review",
+    "arc_directory": "runs/arc-review",
+    "min_alpha_tokens": 3
+  },
+  "splits": {
+    "dev": 2000,
+    "test": 2000,
+    "human_holdout_minimum": 300,
+    "model_holdout_sources": [
+      "opencode"
+    ],
+    "rl_prompt_tokens": 480
+  },
+  "verification": {
+    "timeout_seconds": 2.0,
+    "io_seconds_per_case": 0.25,
+    "memory_mb": 128,
+    "workers": 8
+  },
+  "local_copies": {
+    "nvidia/OpenCodeInstruct:data/train-00000-of-00050.parquet": "runs/opencode-review/train-00000-of-00050.parquet",
+    "google-research-datasets/mbpp:mbpp.jsonl": "runs/mbpp-review/mbpp.jsonl"
+  },
+  "max_download_bytes": 2737428363
+}

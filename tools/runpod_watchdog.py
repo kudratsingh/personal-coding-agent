@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -27,12 +28,18 @@ API_BASE = "https://api.runpod.io/v2"
 API_KEY_ENV = "RUNPOD_API_KEY"
 MAX_RESPONSE_BYTES = 1_048_576
 MAX_POD_WALL_SECONDS = 5_400
+# The owner-approved rehearsal runs (D-35) have a 60,000-second (16.7-hour) Pod limit, so the
+# $10 cap at $0.60/h is the binding limit; the pilot keeps 5,400.
+MODE_WALL_SECONDS = {"pilot": MAX_POD_WALL_SECONDS, "rehearsal": 60_000}
 MAX_GPU_IDLE_SECONDS = 600
 MAX_TRANSFER_SECONDS = 1_800
 CLOCK_SKEW_SECONDS = 60.0  # Tolerated difference between Pod, provider and Mac clocks.
 TRANSFER_STATUSES = frozenset(
-    {"awaiting_transfer", "completed", "time_limited", "stopped", "failed"}
+    {"awaiting_transfer", "completed", "time_limited", "stopped", "failed", "uploading"}
 )
+MODE_STATUSES = {"pilot": frozenset(), "rehearsal": frozenset({"uploading"})}
+"""Worker statuses beyond the pilot's that a mode's heartbeat may carry. A rehearsal worker
+reads ``uploading`` while it drains its last checkpoints to R2 with the GPU idle."""
 _SAFE_POD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 
@@ -146,6 +153,7 @@ class Policy:
     # at this later moment (the watchdog's own start), so image pull and bootstrap
     # are not read as an idle GPU. Wall and cost limits are unaffected.
     idle_baseline_unix: float | None = None
+    mode: str = "pilot"
 
     def __post_init__(self) -> None:
         for key in (
@@ -158,8 +166,13 @@ class Policy:
             value = getattr(self, key)
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{key} must be a finite positive number")
-        if self.max_wall_seconds > MAX_POD_WALL_SECONDS:
-            raise ValueError("max_wall_seconds cannot exceed the 5400-second pilot ceiling")
+        if self.mode not in MODE_WALL_SECONDS:
+            raise ValueError("mode must be pilot or rehearsal")
+        if self.max_wall_seconds > MODE_WALL_SECONDS[self.mode]:
+            raise ValueError(
+                f"max_wall_seconds cannot exceed the {self.mode} ceiling "
+                f"of {MODE_WALL_SECONDS[self.mode]} seconds"
+            )
         if (
             not _is_number(self.starting_cost_usd)
             or not math.isfinite(self.starting_cost_usd)
@@ -229,10 +242,49 @@ class Heartbeat:
     status: str | None
     shutdown_receipts_verified: bool = False
     transfer_progress_unix: float | None = None
+    ignored: str | None = None
+    """Why a heartbeat on disk was treated as absent (another Pod's, or older than this Pod)."""
 
 
-def read_heartbeat(path: Path, *, now: float, max_idle_seconds: float) -> Heartbeat:
-    """Return last GPU activity and a failure reason; absent means just-created."""
+def foreign_heartbeat(
+    value: dict[str, Any], *, pod_id: str | None, created_at_unix: float | None
+) -> str | None:
+    """Why a heartbeat cannot be this Pod's, or None.
+
+    A heartbeat naming another ``pod_id``, or updated before this Pod was created, was
+    written for an earlier Pod (a reused controller directory). It is never evidence about
+    this Pod: the guards treat it as absent, never as fresh, never as a reason to delete.
+    A heartbeat without ``pod_id`` (the pilot worker's) is judged by its time alone.
+    """
+    if pod_id is not None and "pod_id" in value and value["pod_id"] != pod_id:
+        return "heartbeat_names_another_pod"
+    updated = value.get("updated_at_unix")
+    if (
+        created_at_unix is not None
+        and _is_number(updated)
+        and math.isfinite(updated)
+        and updated < created_at_unix
+    ):
+        return "heartbeat_predates_pod_creation"
+    return None
+
+
+def read_heartbeat(
+    path: Path,
+    *,
+    now: float,
+    max_idle_seconds: float,
+    mode: str = "pilot",
+    pod_id: str | None = None,
+    created_at_unix: float | None = None,
+) -> Heartbeat:
+    """Return last GPU activity and a failure reason; absent means just-created.
+
+    ``mode`` adds that mode's statuses (``MODE_STATUSES``); under a pilot policy an
+    ``uploading`` heartbeat stays malformed, exactly as before. With ``pod_id`` and
+    ``created_at_unix`` (the captured identity), a heartbeat that cannot be this Pod's
+    (``foreign_heartbeat``) reads as absent, whatever else it says.
+    """
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
@@ -247,6 +299,9 @@ def read_heartbeat(path: Path, *, now: float, max_idle_seconds: float) -> Heartb
         return Heartbeat(0.0, "heartbeat_malformed", None)
     if not isinstance(value, dict):
         return Heartbeat(0.0, "heartbeat_malformed", None)
+    foreign = foreign_heartbeat(value, pod_id=pod_id, created_at_unix=created_at_unix)
+    if foreign is not None:
+        return Heartbeat(0.0, None, None, ignored=foreign)
     activity = value.get("last_gpu_activity_unix")
     updated = value.get("updated_at_unix")
     step = value.get("step")
@@ -259,6 +314,7 @@ def read_heartbeat(path: Path, *, now: float, max_idle_seconds: float) -> Heartb
         "shutdown_ready",
         "stopped",
         "failed",
+        *MODE_STATUSES.get(mode, frozenset()),
     }
     if (
         type(value.get("schema_version")) is not int
@@ -397,12 +453,25 @@ def check_once(
     through the API. Until then a 404 is not evidence of termination: a wrong
     base URL, Pod ID or key scope would otherwise read as a successful
     shutdown while the Pod keeps billing.
+
+    A heartbeat naming another Pod reads as absent. Under a rehearsal policy so does one
+    updated before this Pod's ``createdAt``: a controller directory reused for a new Pod
+    still holds the old Pod's mirrored heartbeat, which must never delete the new one.
     """
     raw_now = now()
     clock_valid = _is_number(raw_now) and math.isfinite(raw_now)
     checked_at = float(raw_now) if clock_valid else 0.0
+    try:
+        created_unix = parse_timestamp(identity.created_at) if policy.mode == "rehearsal" else None
+    except ValueError:
+        created_unix = None  # The guard below fails closed on the same timestamp.
     heartbeat = read_heartbeat(
-        heartbeat_path, now=checked_at, max_idle_seconds=policy.max_idle_seconds
+        heartbeat_path,
+        now=checked_at,
+        max_idle_seconds=policy.max_idle_seconds,
+        mode=policy.mode,
+        pod_id=identity.pod_id,
+        created_at_unix=created_unix,
     )
     try:
         status, body = client.get_pod(identity.pod_id, policy.request_timeout_seconds)
@@ -478,15 +547,19 @@ def check_once(
         except (ValueError, OverflowError):
             trigger = "guard_calculation_error"
 
+    def settled(state: str, reason: str) -> Outcome:
+        # An ignored heartbeat is recorded so the operator sees why it was not read.
+        return _outcome(state, reason, identity, checked_at, heartbeat.ignored)
+
     if not trigger:
-        return _outcome("watching", "within_limits", identity, checked_at)
+        return settled("watching", "within_limits")
 
     try:
         delete_status, _ = client.delete_pod(identity.pod_id, policy.request_timeout_seconds)
     except ApiTransportError:
-        return _outcome("unknown", trigger + "_delete_transport_error", identity, checked_at)
+        return settled("unknown", trigger + "_delete_transport_error")
     if delete_status != 204:
-        return _outcome("unknown", trigger + f"_delete_http_{delete_status}", identity, checked_at)
+        return settled("unknown", trigger + f"_delete_http_{delete_status}")
 
     for attempt in range(policy.delete_verify_attempts):
         if attempt:
@@ -496,39 +569,26 @@ def check_once(
                 identity.pod_id, policy.request_timeout_seconds
             )
         except ApiTransportError:
-            return _outcome(
-                "unknown", trigger + "_delete_unconfirmed_transport_error", identity, checked_at
-            )
+            return settled("unknown", trigger + "_delete_unconfirmed_transport_error")
         if verify_status == 404:
-            return _outcome("terminated", trigger + "_delete_204_get_404", identity, checked_at)
+            return settled("terminated", trigger + "_delete_204_get_404")
         if verify_status != 200:
-            return _outcome(
-                "unknown",
-                trigger + f"_delete_unconfirmed_http_{verify_status}",
-                identity,
-                checked_at,
-            )
+            return settled("unknown", trigger + f"_delete_unconfirmed_http_{verify_status}")
         remaining = _decode_object(verify_body)
         if remaining is None:
-            return _outcome(
-                "unknown", trigger + "_delete_unconfirmed_malformed_json", identity, checked_at
-            )
+            return settled("unknown", trigger + "_delete_unconfirmed_malformed_json")
         if not identity.matches(remaining):
-            return _outcome(
-                "identity_mismatch",
-                trigger + "_post_delete_identity_mismatch",
-                identity,
-                checked_at,
-            )
-    return _outcome("unknown", trigger + "_delete_still_present", identity, checked_at)
+            return settled("identity_mismatch", trigger + "_post_delete_identity_mismatch")
+    return settled("unknown", trigger + "_delete_still_present")
 
 
 def _transfer_in_progress(heartbeat: Heartbeat, policy: Policy, now: float) -> bool:
     """Allow a bounded transfer window after GPU work when the Mac shows live progress.
 
-    Progress stamps come from the Mac-side supervisor (staged bytes growing),
-    never from the worker, so a hung Pod cannot extend its own lease. The wall
-    and cost limits still apply unchanged.
+    Progress stamps come from the Mac-side supervisor (staged bytes growing; in
+    rehearsal mode, new objects under the run's R2 prefix seen with the Mac's own
+    key), never from the worker, so a hung Pod cannot extend its own lease. The
+    wall and cost limits still apply unchanged.
     """
     return (
         policy.max_transfer_seconds > 0
@@ -556,6 +616,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--receipt", type=Path, required=True, help="atomic local watchdog receipt path"
     )
     parser.add_argument("--max-wall-seconds", type=float, required=True)
+    parser.add_argument(
+        "--mode",
+        choices=sorted(MODE_WALL_SECONDS),
+        default="pilot",
+        help="wall ceiling: pilot 5400 s, rehearsal 60000 s",
+    )
     parser.add_argument("--max-cost-usd", type=float, required=True)
     parser.add_argument("--max-idle-seconds", type=float, default=600)
     parser.add_argument("--quoted-total-hourly", type=float, required=True)
@@ -576,6 +642,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=900.0,
         help="exit with status 3 if the captured identity is never seen alive within this time",
     )
+    parser.add_argument(
+        "--pidfile",
+        type=Path,
+        help="write this process's PID here, so one Pod's watchdog can be restarted alone",
+    )
     return parser
 
 
@@ -591,6 +662,7 @@ def policy_from_args(args: argparse.Namespace) -> Policy:
         starting_cost_usd=args.starting_cost_usd,
         max_transfer_seconds=args.max_transfer_seconds,
         idle_baseline_unix=args.idle_baseline_unix,
+        mode=args.mode,
     )
 
 
@@ -608,6 +680,43 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         parser.error(str(error))
     client = RunpodClient(token, UrllibTransport())
+    if args.pidfile is None:
+        return _watch(client, identity, policy, args)
+    write_pidfile(args.pidfile)
+    # A SIGTERM from the runbook's per-run restart unwinds through ``finally`` below.
+    previous = signal.signal(signal.SIGTERM, _exit_on_signal)
+    try:
+        return _watch(client, identity, policy, args)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        release_pidfile(args.pidfile)
+
+
+def _exit_on_signal(signum: int, frame: object) -> None:
+    raise SystemExit(128 + signum)
+
+
+def write_pidfile(path: Path) -> None:
+    """Atomically record this process's PID; a restart reads it to stop only this one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(f"{os.getpid()}\n")
+    os.replace(temp_name, path)
+
+
+def release_pidfile(path: Path) -> None:
+    """Remove the PID file only while it still names this process."""
+    try:
+        if path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _watch(
+    client: RunpodClient, identity: PodIdentity, policy: Policy, args: argparse.Namespace
+) -> int:
     state_path = args.receipt.with_name(args.receipt.name + ".observed.json")
     observed = load_observed(state_path, identity)
     started = time.time()

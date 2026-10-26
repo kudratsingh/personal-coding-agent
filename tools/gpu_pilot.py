@@ -403,6 +403,24 @@ def check_readiness(receipt: dict[str, Any], *, now: float, spec: Specification)
     )
     if any(receipt.get(name) is not True for name in required):
         raise ValueError("launch readiness gates are unresolved")
+    check_termination_guarantee(receipt)
+    if spec.limits.pod_seconds > 5400 or spec.limits.idle_seconds > 600:
+        raise ValueError("specification exceeds the pilot wall or idle ceiling")
+    origin, termination = termination_window(receipt, now=now, limits=spec.limits)
+    # The worker plans against the earlier of the wall and the armed in-pod deadline.
+    remaining = min(origin + spec.limits.pod_seconds, termination) - now
+    needed = (
+        spec.limits.probe_seconds
+        + spec.compile_probe_seconds
+        + spec.limits.finalization_reserve_seconds
+    )
+    if remaining <= needed:
+        raise ValueError("pod lifetime left is too short for probes and finalization")
+    return origin
+
+
+def check_termination_guarantee(receipt: dict[str, Any]) -> None:
+    """Require an honest termination guarantee, and owner acceptance of a best-effort one."""
     guarantee = receipt.get("termination_guarantee")
     if guarantee not in TERMINATION_GUARANTEES:
         raise ValueError("termination_guarantee must be provider_enforced or redundant_best_effort")
@@ -411,16 +429,25 @@ def check_readiness(receipt: dict[str, Any], *, now: float, spec: Specification)
         and receipt.get("owner_accepts_best_effort_termination") is not True
     ):
         raise ValueError("best-effort termination requires explicit owner acceptance")
-    if spec.limits.pod_seconds > 5400 or spec.limits.idle_seconds > 600:
-        raise ValueError("specification exceeds the pilot wall or idle ceiling")
+
+
+def termination_window(
+    receipt: dict[str, Any], *, now: float, limits: Limits
+) -> tuple[float, float]:
+    """Check the receipt's Pod identity, watchdog policy and armed self-destruct deadline.
+
+    Returns the conservative billing origin and the armed in-pod deadline. The policy
+    must be at least as strict as ``limits`` and the deadline inside the approved Pod
+    lifetime; a Pod that already exceeds a limit is refused.
+    """
     identity = PodIdentity.from_dict(receipt.get("pod_identity"))
     policy = Policy(**receipt.get("watchdog_policy", {}))
     if (
-        policy.max_wall_seconds > spec.limits.pod_seconds
-        or policy.max_idle_seconds > spec.limits.idle_seconds
-        or policy.max_cost_usd > spec.limits.cost_stop
-        or policy.quoted_total_hourly < spec.limits.quoted_total_hourly
-        or policy.starting_cost_usd < spec.limits.starting_cost_usd
+        policy.max_wall_seconds > limits.pod_seconds
+        or policy.max_idle_seconds > limits.idle_seconds
+        or policy.max_cost_usd > limits.cost_stop
+        or policy.quoted_total_hourly < limits.quoted_total_hourly
+        or policy.starting_cost_usd < limits.starting_cost_usd
     ):
         raise ValueError("watchdog policy is weaker than the bound specification")
     if (
@@ -438,22 +465,13 @@ def check_readiness(receipt: dict[str, Any], *, now: float, spec: Specification)
     termination = finite_number(
         receipt.get("self_destruct_deadline_unix"), "self-destruct deadline"
     )
-    if not now < termination <= origin + spec.limits.pod_seconds:
+    if not now < termination <= origin + limits.pod_seconds:
         raise ValueError("self-destruct deadline is outside the approved pod lifetime")
     if created <= 0 or created > now:
         raise ValueError("pod creation timestamp is invalid")
-    if spec.limits.stop_reason(pod_elapsed=now - origin):
+    if limits.stop_reason(pod_elapsed=now - origin):
         raise ValueError("pod already exceeds an operating limit")
-    # The worker plans against the earlier of the wall and the armed in-pod deadline.
-    remaining = min(origin + spec.limits.pod_seconds, termination) - now
-    needed = (
-        spec.limits.probe_seconds
-        + spec.compile_probe_seconds
-        + spec.limits.finalization_reserve_seconds
-    )
-    if remaining <= needed:
-        raise ValueError("pod lifetime left is too short for probes and finalization")
-    return origin
+    return origin, termination
 
 
 def check_preflight(

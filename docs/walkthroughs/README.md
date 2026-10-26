@@ -16,8 +16,16 @@ Implemented: [loss and optimization](optimizer.md).
 
 Implemented: [training and resume](training-loop.md).
 
+Implemented: [one-pass loader and masked final update](one-pass-loader.md).
+
+Implemented: [whole-document validation windows and batched validation](validation-windows.md).
+
 Implemented: [cached generation](kv-cache.md).
 
 Implemented: [evaluation metrics](metrics.md).
 
 Implemented: [multiple-choice evaluation](multiple-choice.md).
+
+Implemented: [rehearsal data binding](rehearsal-binding.md).
+
+Implemented: [rehearsal run worker](rehearsal-run.md).

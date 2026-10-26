@@ -616,3 +616,62 @@ def test_verify_rejects_a_listed_document_that_breaks_the_admission_rule(
     (output / "report.json").write_text(json.dumps(report))
     with pytest.raises(ValueError, match="allowlist"):
         verify(spec, fixture.build)
+
+
+def test_holdout_matches_are_dropped_from_intermediates_and_admission_is_recorded(
+    fixture: Fixture,
+) -> None:
+    from scratchcoder.eval.tasks import Task, save_tasks
+
+    quotas = {
+        "stage1-web": fixture.length(fixture.s1[0]) + 3,
+        "stage2-web": fixture.length(fixture.s2[0]),
+        "stage2-python": fixture.length(fixture.mit) + 5,
+    }
+    spec = prepare(fixture, fixture.spec(quotas))
+    with pytest.raises(ValueError, match="needs the task-pool holdout"):
+        build(spec, fixture.build, workers=1, admitted_on="2026-10-25", progress=quiet)
+    holdout = fixture.root / "holdout.jsonl"
+    save_tasks(
+        holdout,
+        [
+            Task(
+                id="pool/held-1",
+                prompt=fixture.s1[1],
+                public_tests="assert True",
+                hidden_tests="assert True",
+                source="fixture",
+                license="MIT",
+                written_by="model",
+                split="dev",
+                solution="x = 1",
+            )
+        ],
+    )
+    report = build(
+        spec,
+        fixture.build,
+        workers=1,
+        holdout=holdout,
+        admitted_on="2026-10-25",
+        progress=quiet,
+    )
+    held = report["holdout"]
+    assert held["matched_documents"] == 1 and held["indexed_fields"] == {"prompt": 1}
+    assert held["skipped_short_fields"] == {
+        "solution": 1,
+        "public_tests": 1,
+        "hidden_tests": 1,
+    }
+    web = report["domains"]["web"]["primary_decisions"]
+    assert web["holdout_contamination"]["files"] == 1
+    assert report["final_training_admission"] is True
+    assert report["admission"]["holdout_sha256"] == held["sha256"]
+    assert report["streams"]["stage1-web"]["documents"] == 2
+    assert report["verification"]["final_training_admission"] is True
+    output = fixture.build / "output"
+    rows = [json.loads(x) for x in (output / "exclusions.jsonl").read_text().splitlines()]
+    assert [r["sha256"] for r in rows if r["reason"] == "holdout_contamination"] == [
+        content_hash(fixture.s1[1])
+    ]
+    verify(spec, fixture.build)
