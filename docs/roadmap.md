@@ -16,6 +16,6 @@ The roadmap describes direction, not a promise of schedule or performance. Detai
 
 ## Phase gates
 
-Phase 4 now has a [plan-only work-order outline](rehearsal-plan.md) covering small-model two-stage pretraining, the identical-token mixed comparison, post-training controls, evaluation and a local demo. The operational work orders remain owner-only. Nothing in this outline authorizes implementation, builds, training or paid resources.
+Phase 4 has a [work-order outline](rehearsal-plan.md) covering small-model two-stage pretraining, the identical-token mixed comparison, post-training controls, evaluation and a local demo. Its pretraining comparison ran on 2026-10-26 ([results](rehearsal-runs.md#measured-results-2026-10-26)); the main model will pretrain on one mixed stage. The operational work orders remain owner-only. Nothing in this outline authorizes implementation, builds, training or paid resources.
 
 Each phase must have passing relevant tests, an updated public status, and a documented review before the next phase begins. Work that needs paid compute, private data, or a license decision is approved separately by the owner.

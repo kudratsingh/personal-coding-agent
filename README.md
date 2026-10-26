@@ -6,7 +6,7 @@ This repository contains a tested from-scratch Python implementation and a repro
 
 ## Current status
 
-Data/tokenizer tooling, a compact transformer, optimizer, resumable two-stage training with domain validation, cached generation, isolated code evaluation, and multiple-choice scoring are implemented. Real-corpus training and full evaluation-suite acceptance remain pending.
+Data/tokenizer tooling, a compact transformer, optimizer, resumable two-stage training with domain validation, cached generation, isolated code evaluation, and multiple-choice scoring are implemented. Real-corpus pretraining has run at rehearsal scale: two 2B-token runs of the 135M-parameter S model on A40 GPUs, comparing two-stage and mixed pretraining ([results](docs/rehearsal-runs.md#measured-results-2026-10-26)). Post-training and full evaluation-suite acceptance remain pending.
 
 The reference benchmark gate G3 is closed with owner acceptance: the pinned external model passed 14/164 HumanEval tasks (8.54%) using the project's stripped-prompt protocol, with zero empty completions. All 164 canonical solutions passed the same isolated harness. This is not evidence of our own model's coding capability. See [reference evaluation](docs/reference-evaluation.md) for the protocol and limitations.
 
