@@ -24,7 +24,7 @@ uv run --locked python -m tools.pilot_preflight --output runs/rehearsal-prefligh
 uv run --locked pytest tests/test_rehearsal_run.py tests/test_rehearsal_integration.py tests/test_rehearsal_runbook.py tests/test_rehearsal_supervisor.py tests/test_rehearsal_ops.py tests/test_rehearsal_bootstrap.py tests/test_rehearsal_readiness.py tests/test_rehearsal_feasibility.py tests/test_rehearsal_watchdog.py tests/test_runpod_watchdog.py tests/test_pod_self_destruct.py -q
 ```
 
-Expected: `make check` green; the smoke completes offline on CPU; the preflight report shows `"status": "completed"` on `cpu`; every listed test passes. The runbook test parses every tool command in this file against the real parsers, and runs this file's own code against stubs: the step 5 create guard (one Pod per run at a time), create request, Pod ID and directory guard, the helpers file, the step 5 wait for RUNNING, the step 7 and step 9 launches (each must return at once) and wait loops, the step 6 revision writer, the step 7 leak check, the step 13 DELETE gate and the step 15 billing check. It also checks that no block holds a `#` comment and that every block parses in an interactive zsh. The integration test builds a receipt with the receipt tool and has the worker accept it, and feeds the smoke's heartbeats, reports and in-memory bucket to the supervisor.
+Expected: `make check` green; the smoke completes offline on CPU; the preflight report shows `"status": "completed"` on `cpu`; every listed test passes. The runbook test parses every tool command in this file against the real parsers, and runs this file's own code against stubs: the step 5 create guard (one Pod per run at a time), create request, Pod ID and directory guard, the helpers file (with a pasted block whose `podssh` line must leave the next line to the shell), the step 5 wait for RUNNING, the step 7 and step 9 launches (each must return at once) and wait loops, the step 6 revision writer, the step 7 leak check, the step 13 DELETE gate and the step 15 billing check. It also checks that no block holds a `#` comment and that every block parses in an interactive zsh. The integration test builds a receipt with the receipt tool and has the worker accept it, and feeds the smoke's heartbeats, reports and in-memory bucket to the supervisor.
 
 ## 2. Credentials and per-run environment (Mac, free, each terminal)
 
@@ -137,7 +137,7 @@ If it printed `NOT creating a Pod`, nothing was sent and nothing changed: do not
 
 After `names no valid Pod id`, no Pod ID is known, but the request may still have created a Pod that bills with no timer or watchdog: a gateway 5xx, a timeout or a dropped connection can come after the server acted. Read `create-response.json` and `create-http-code`, and ask the owner to check the Runpod console for a Pod with the printed name created at or after the printed time (`ORIGIN`), and to terminate any such Pod there. Retry only when the owner says so: record the settled launch first, `printf 'export TEARDOWN=%s\n' "$(date +%s)" >> "$LAUNCH/run.env"`, which lets this block create again; the launch directory stays as the record. (In another terminal `LAUNCH` is unset: use the `launch-<time>` directory the refusal names.) After `already exists`, terminate the Pod the response names at once with step 13 (`TERMINATE=yes`): it bills, and no timer or watchdog guards it. Step 13 records its `TEARDOWN` in the launch directory. A new Pod for the same run (step 14) always gets a new directory, and this terminal creates it only after step 13 has recorded the old Pod's `TEARDOWN` and `unset POD_ID` has cleared its ID.
 
-Capture the identity the guards enforce, write the policy, write this run's helpers once into `$CTRL/helpers.sh`, and start the watchdog at once. The helpers read `CTRL`, `RUN`, `ORIGIN`, `POD_ID`, `POD_HOST`, `POD_PORT`, `POD_SSH_KEY` and `KNOWN_HOSTS` from the shell at the moment of each call, so source the file after step 2 and `run.env`. `watchdog` (re)starts this run's watchdog with a fresh idle baseline and leaves the other run's untouched. `keepalive` is what every wait loop below calls on each pass (see after the block). `podssh` and `podscp` reach this Pod only, pinned to this run's known-hosts file:
+Capture the identity the guards enforce, write the policy, write this run's helpers once into `$CTRL/helpers.sh`, and start the watchdog at once. The helpers read `CTRL`, `RUN`, `ORIGIN`, `POD_ID`, `POD_HOST`, `POD_PORT`, `POD_SSH_KEY` and `KNOWN_HOSTS` from the shell at the moment of each call, so source the file after step 2 and `run.env`. `watchdog` (re)starts this run's watchdog with a fresh idle baseline and leaves the other run's untouched. `keepalive` is what every wait loop below calls on each pass (see after the block). `podssh` and `podscp` reach this Pod only, pinned to this run's known-hosts file. `podssh` never reads this terminal: its `ssh` takes its standard input from `/dev/null`, so in a shell without bracketed paste (macOS `/bin/bash` 3.2) it cannot swallow the rest of a pasted block. `podssh_stdin` is the same command with its standard input kept; only step 6 uses it, once, to pipe the Pod's R2 key:
 
 ```sh
 uv run --locked python -m tools.runpod_pod_identity capture --pod-id "$POD_ID" \
@@ -151,6 +151,7 @@ EOF
 watchdog() {
   OLD=$(cat "$CTRL/watchdog.pid" 2>/dev/null || true)
   BASE=$(date +%s)
+  if [ -e "$CTRL/watchdog-receipt.json" ]; then cp "$CTRL/watchdog-receipt.json" "$CTRL/watchdog-receipt.json.prev-$BASE"; fi
   nohup uv run --locked python -m tools.runpod_watchdog --mode rehearsal --identity "$CTRL/pod-identity.json" \
     --heartbeat "$CTRL/supervisor/heartbeat.json" --receipt "$CTRL/watchdog-receipt.json" \
     --pidfile "$CTRL/watchdog.pid" --max-wall-seconds 45000 --max-idle-seconds 600 \
@@ -158,27 +159,46 @@ watchdog() {
     --max-cost-usd 9.99 --quoted-total-hourly 0.60 --billing-started-at-unix "$ORIGIN" \
     --idle-baseline-unix "$BASE" --poll-seconds 20 \
     >> "$CTRL/watchdog.log" 2>&1 < /dev/null &
+  JOB=$!
   NEW=""
   for attempt in $(seq 1 60); do
     NEW=$(cat "$CTRL/watchdog.pid" 2>/dev/null || true)
     if [ -n "$NEW" ] && [ "$NEW" != "$OLD" ]; then break; fi
     sleep 1
   done
-  if [ -z "$NEW" ] || [ "$NEW" = "$OLD" ]; then echo "run $RUN: the new watchdog did not start; see $CTRL/watchdog.log"; return 1; fi
+  if [ -z "$NEW" ] || [ "$NEW" = "$OLD" ]; then
+    if ps -p "$JOB" -o command= 2>/dev/null | grep -qF -- "--identity $CTRL/pod-identity.json"; then kill "$JOB"; fi
+    echo "run $RUN: the new watchdog did not start within 60 s and was stopped; see $CTRL/watchdog.log"; return 1
+  fi
   if [ -n "$OLD" ] && ps -p "$OLD" -o command= | grep -qF -- "--identity $CTRL/pod-identity.json"; then kill "$OLD"; fi
   echo "run $RUN watchdog pid $NEW, idle baseline $BASE"
 }
 keepalive() {
   LIVE=$(cat "$CTRL/watchdog.pid" 2>/dev/null || true)
+  PROCS=$(ps -A -o pid= -o command= 2>/dev/null)
+  PARENT=$(ps -p "$LIVE" -o ppid= 2>/dev/null | tr -d ' ')
+  STRAY=$(printf '%s\n' "$PROCS" | awk -v live="$LIVE" -v parent="$PARENT" -v id="--identity $CTRL/pod-identity.json" 'index($0, "tools.runpod_watchdog") && index($0, id) && $1 != live && $1 != parent { printf "%s ", $1 }')
+  if [ -n "$STRAY" ]; then
+    echo "WARNING run $RUN: a watchdog of Pod $POD_ID that $CTRL/watchdog.pid does not name still runs, with an old idle baseline: PID ${STRAY% }. Check each with ps -p <pid> -o command= and stop it with kill <pid>."
+  fi
   if [ -z "$LIVE" ] || ! ps -p "$LIVE" -o command= 2>/dev/null | grep -qF -- "--identity $CTRL/pod-identity.json"; then
+    GONE=$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); gone=isinstance(r, dict) and r.get("pod_id") == sys.argv[2] and r.get("state") in ("terminated", "absent", "identity_mismatch"); print("state %s, reason %s, detail %s" % (r.get("state"), r.get("reason"), r.get("detail"))) if gone else None' "$CTRL/watchdog-receipt.json" "$POD_ID" 2>/dev/null)
+    if [ -n "$GONE" ]; then
+      echo "STOP run $RUN: POD GONE: the watchdog of Pod $POD_ID ended for good with $GONE ($CTRL/watchdog-receipt.json). It is NOT restarted. Follow step 14."
+      return 3
+    fi
     echo "WARNING run $RUN: NO LIVE WATCHDOG guards Pod $POD_ID: $CTRL/watchdog.pid is missing or names no live watchdog of this Pod. Read $CTRL/watchdog.log and $CTRL/watchdog-receipt.json. Restarting it now."
     BASE=0
   fi
   if [ $(( $(date +%s) - BASE )) -ge 300 ]; then
     watchdog || { echo "WARNING run $RUN: the watchdog restart FAILED; see $CTRL/watchdog.log. Trying again on the next pass."; BASE=0; }
   fi
+  return 0
 }
 podssh() {
+  podssh_stdin "$@" < /dev/null
+}
+podssh_stdin() {
   ssh -F /dev/null -p "$POD_PORT" -i "$POD_SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
     -o "UserKnownHostsFile=$KNOWN_HOSTS" -o BatchMode=yes "root@$POD_HOST" "$@"
 }
@@ -193,27 +213,27 @@ watchdog
 
 **A reopened terminal** (or the second window of step 10) repeats step 2 for its run, then sets this Pod's directory and sources its files, and never re-runs a block that creates a Pod or writes `run.env`, the policy or the known-hosts file: `export CTRL=$CTRL_ROOT/$RUN_LOWER/<pod id>; source "$SHARED/init.env"; source "$CTRL/run.env"; source "$CTRL/helpers.sh"`. `ls "$CTRL_ROOT/$RUN_LOWER"` lists the run's Pod directories.
 
-Each watchdog writes its own PID to `$CTRL/watchdog.pid` and removes it when it exits. The helper starts the replacement first, then stops only the process whose PID the file held and whose command line names this Pod's identity file; there is no global `pkill`, so restarting run A's watchdog never touches run B's. The watchdog reads the heartbeat the supervisor mirrors to `$CTRL/supervisor/heartbeat.json`, which exists only once the supervisor runs (step 10); a mirrored heartbeat whose `pod_id` is not this Pod's, or whose update predates the Pod's creation, counts as absent, never as fresh. Until then the idle clock runs from the last baseline: every wait loop below calls `keepalive` on each pass, which runs `watchdog` again once 5 minutes have passed since the last baseline, and the steps call `watchdog` at each setup milestone. Wall and cost limits never pause, and 600 seconds without a restart still deletes the Pod.
+Each watchdog writes its own PID to `$CTRL/watchdog.pid` and removes it when it exits. The helper starts the replacement first, then stops only the process whose PID the file held and whose command line names this Pod's identity file; there is no global `pkill`, so restarting run A's watchdog never touches run B's. Before it starts one, it copies the current receipt aside as `watchdog-receipt.json.prev-<time>`, so a restart never overwrites what the last watchdog recorded. If the new watchdog has not written its PID within 60 s, the helper stops the process it just started (after the same command-line check) and returns 1, so a failed restart never leaves a stray watchdog with an old idle baseline. The watchdog reads the heartbeat the supervisor mirrors to `$CTRL/supervisor/heartbeat.json`, which exists only once the supervisor runs (step 10); a mirrored heartbeat whose `pod_id` is not this Pod's, or whose update predates the Pod's creation, counts as absent, never as fresh. Until then the idle clock runs from the last baseline: every wait loop below calls `keepalive` on each pass, which runs `watchdog` again once 5 minutes have passed since the last baseline, and the steps call `watchdog` at each setup milestone. Wall and cost limits never pause, and 600 seconds without a restart still deletes the Pod.
 
-`keepalive` never fails silently. When `watchdog.pid` is missing, or names a process that is not this Pod's watchdog (the same command-line check `watchdog` makes before it stops one), it prints a `WARNING ... NO LIVE WATCHDOG` line and restarts the watchdog on that pass. When a restart fails, it prints a `WARNING ... restart FAILED` line and tries again on the next pass, instead of waiting another 5 minutes. A watchdog that deleted the Pod also exits, so read its receipt before anything else.
+`keepalive` never fails silently. When `watchdog.pid` is missing, or names a process that is not this Pod's watchdog (the same command-line check `watchdog` makes before it stops one), it first reads `watchdog-receipt.json`. A watchdog that deleted the Pod, or found it gone or replaced, writes a final receipt (state `terminated`, `absent` or `identity_mismatch`), removes its PID file and exits. For such a receipt of this Pod, `keepalive` prints a `STOP ... POD GONE` line with the receipt's state, reason (which names the trigger) and detail, never restarts the watchdog (a new one would overwrite that receipt with `absent`), and returns 3; every wait loop below stops on 3 with `stop waiting: the Pod is gone` (step 14). Otherwise it prints a `WARNING ... NO LIVE WATCHDOG` line and restarts the watchdog on that pass. When a restart fails, it prints a `WARNING ... restart FAILED` line and tries again on the next pass, instead of waiting another 5 minutes. On every pass it also warns about any watchdog of this Pod that `watchdog.pid` does not name, apart from the `uv` process that runs the named one: such a process keeps an old idle baseline and could delete the Pod early, so stop it by hand.
 
-Then wait, for at most 20 minutes, until `pod-connection.json` shows `"status": "RUNNING"` with a direct SSH host and port. The loop captures the Pod again every 20 s and calls `keepalive`: before the first heartbeat the idle clock runs from the last baseline, so without the re-baseline a start that takes more than 600 s would have the watchdog delete the Pod. Twenty minutes is a fifth of run A's 100-minute setup allowance (**The two time rules**), which still leaves the bootstrap its 45 minutes, and costs at most $0.20 at $0.60/h. A Pod that is `RUNNING` with `ssh_proxy_only` true on three captures in a row (40 s) has no public IP, and no file can move to or from it, so the wait stops early for it; one or two such captures are allowed, in case the direct address appears a moment after the status:
+Then wait, for at most 20 minutes, until `pod-connection.json` shows `"status": "RUNNING"` with a direct SSH host and port. The loop captures the Pod again every 20 s and calls `keepalive`: before the first heartbeat the idle clock runs from the last baseline, so without the re-baseline a start that takes more than 600 s would have the watchdog delete the Pod. Twenty minutes is a fifth of run A's 100-minute setup allowance (**The two time rules**), which still leaves the bootstrap its 45 minutes, and costs at most $0.20 at $0.60/h. Runpod reports `RUNNING` from the create reply on, before the container is up: that reply has no runtime and no direct SSH, so its capture shows `runtime_ports` null and `ssh_proxy_only` true, and a Pod still pulling its image looks the same. The status alone therefore proves nothing, and a capture counts as proxy-only only once the container is up: `runtime_ports` is a non-empty list, none of its entries maps private port 22 to a public TCP port, and there is no direct SSH host or port. A Pod seen so on three captures in a row (40 s) has no public IP, and no file can move to or from it, so the wait stops early for it; one or two such captures are allowed, in case the port 22 mapping and the direct address appear a moment after the container. A capture whose container is not up yet, or whose port 22 is mapped before the direct address appears, keeps the wait going within its 20 minutes:
 
 ```sh
 GIVE_UP=$(( $(date +%s) + 1200 )); PROXY_ONLY=0
 while :; do
-  python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); d=c.get("ssh_direct") or {}; running=c.get("status") == "RUNNING"; ok=running and bool(d.get("host")) and bool(d.get("port")); proxy=running and not ok and c.get("ssh_proxy_only") is True; print(c.get("status"), "with direct SSH" if ok else "with proxy SSH only" if proxy else "without direct SSH"); sys.exit(0 if ok else 2 if proxy else 1)' "$CTRL/pod-connection.json"; STATE=$?
+  python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); d=c.get("ssh_direct") or {}; p=c.get("runtime_ports"); up=isinstance(p, list) and len(p) > 0; ssh22=up and any(isinstance(e, dict) and e.get("type") == "tcp" and e.get("private") == 22 and bool(e.get("public")) for e in p); running=c.get("status") == "RUNNING"; ok=running and bool(d.get("host")) and bool(d.get("port")); proxy=running and up and not ssh22 and not d.get("host") and not d.get("port") and c.get("ssh_proxy_only") is True; print(c.get("status"), "with direct SSH" if ok else "with proxy SSH only" if proxy else "without direct SSH" if up else "without direct SSH: container not up yet"); sys.exit(0 if ok else 2 if proxy else 1)' "$CTRL/pod-connection.json"; STATE=$?
   if [ "$STATE" -eq 0 ]; then break; fi
   if [ "$STATE" -eq 2 ]; then PROXY_ONLY=$((PROXY_ONLY + 1)); else PROXY_ONLY=0; fi
   if [ "$PROXY_ONLY" -ge 3 ]; then echo "run $RUN: Pod $POD_ID is RUNNING with proxy SSH only: it has no public IP, so no file can reach it; terminate it (step 13, TERMINATE=yes)"; break; fi
   if [ "$(date +%s)" -ge "$GIVE_UP" ]; then echo "run $RUN: Pod $POD_ID is not RUNNING with direct SSH after 20 minutes; terminate it (step 13, TERMINATE=yes)"; break; fi
   sleep 20
   uv run --locked python -m tools.runpod_pod_identity capture --pod-id "$POD_ID" --identity "$CTRL/pod-identity.json" --connection "$CTRL/pod-connection.json" > /dev/null
-  keepalive
+  keepalive; if [ $? -eq 3 ]; then echo "run $RUN: stop waiting: the Pod is gone (watchdog receipt above); follow step 14"; break; fi
 done
 ```
 
-If it printed `proxy SSH only` or `not RUNNING`, do not continue: terminate the Pod (step 13, `TERMINATE=yes`) and report. The watchdog is no longer re-baselined, so its idle rule also deletes the Pod within 600 s. A Pod without a public IP may be created again with the owner's approval: step 5 again, after step 13 has recorded its `TEARDOWN` and `unset POD_ID` has cleared its ID. Otherwise pin this Pod's host key in this run's own known-hosts file, and compare the fingerprint `ssh-keygen` prints with the one shown in this Pod's web terminal:
+If it printed `proxy SSH only` or `not RUNNING`, do not continue: terminate the Pod (step 13, `TERMINATE=yes`) and report. If it printed `the Pod is gone`, do not continue either: follow step 14. The watchdog is no longer re-baselined, so its idle rule also deletes the Pod within 600 s. A Pod without a public IP may be created again with the owner's approval: step 5 again, after step 13 has recorded its `TEARDOWN` and `unset POD_ID` has cleared its ID. Otherwise pin this Pod's host key in this run's own known-hosts file, and compare the fingerprint `ssh-keygen` prints with the one shown in this Pod's web terminal:
 
 ```sh
 export POD_HOST=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ssh_direct"]["host"])' "$CTRL/pod-connection.json")
@@ -228,7 +248,7 @@ A host key that changes later means another machine answers at that address: sto
 
 ## 6. Code, binding and the Pod's R2 key (Mac to Pod, billable, each terminal)
 
-Record exactly which code the Pod will run, then stage it with the binding. The writer below refuses a dirty working tree and writes nothing then; from a clean tree it archives `HEAD` to `$CTRL/repo.tar.gz` and writes `$CTRL/revision.json` with the 40-hex commit, `"clean": true` and the archive's SHA-256. The readiness receipt records that object as `revision`, and the worker refuses to start unless the Pod's copy, `/workspace/rehearsal/revision.json`, equals it (it then records it in `report.json` as `code_revision`). Then deliver the Pod's R2 key over SSH stdin into a 0600 file. `pod-env` refuses to write to a terminal and refuses the Mac's own key, so the values never appear on screen, in a process list or in a create body:
+Record exactly which code the Pod will run, then stage it with the binding. The writer below refuses a dirty working tree and writes nothing then; from a clean tree it archives `HEAD` to `$CTRL/repo.tar.gz` and writes `$CTRL/revision.json` with the 40-hex commit, `"clean": true` and the archive's SHA-256. The readiness receipt records that object as `revision`, and the worker refuses to start unless the Pod's copy, `/workspace/rehearsal/revision.json`, equals it (it then records it in `report.json` as `code_revision`). Then deliver the Pod's R2 key over SSH stdin into a 0600 file, with `podssh_stdin`: this is the one call that keeps its standard input, since the key travels on it. `pod-env` refuses to write to a terminal and refuses the Mac's own key, so the values never appear on screen, in a process list or in a create body:
 
 ```sh
 python3 - "$CTRL" <<'PY'
@@ -258,7 +278,7 @@ podssh 'mkdir -p /workspace/repo /workspace/rehearsal /workspace/rehearsal-data'
 podscp "$CTRL/repo.tar.gz" root@$POD_HOST:/workspace/repo.tar.gz
 podscp "$CTRL/revision.json" root@$POD_HOST:/workspace/revision.json
 podscp "$BINDING" root@$POD_HOST:/workspace/rehearsal/binding.json
-uv run --locked python -m tools.rehearsal_ops pod-env | podssh 'umask 077 && cat > /workspace/rehearsal/r2-pod.env && chmod 600 /workspace/rehearsal/r2-pod.env'
+uv run --locked python -m tools.rehearsal_ops pod-env | podssh_stdin 'umask 077 && cat > /workspace/rehearsal/r2-pod.env && chmod 600 /workspace/rehearsal/r2-pod.env'
 podssh 'stat -c "%a %U %s" /workspace/rehearsal/r2-pod.env'
 watchdog
 ```
@@ -291,7 +311,7 @@ until podssh 'grep -q ^BOOTSTRAP_EXIT= /workspace/rehearsal/bootstrap.log'; do
   if [ "$(date +%s)" -ge "$GIVE_UP" ]; then echo "run $RUN: bootstrap exceeded 45 minutes; terminate the Pod (step 13, TERMINATE=yes)"; break; fi
   podssh 'pgrep -f pilot_pod_bootstrap.sh' > /dev/null; ALIVE=$?
   if [ "$ALIVE" -eq 1 ] && ! podssh 'grep -q ^BOOTSTRAP_EXIT= /workspace/rehearsal/bootstrap.log'; then echo "run $RUN: no bootstrap runs on the Pod and bootstrap.log has no BOOTSTRAP_EXIT line: the launch failed. Read the lines below, then terminate the Pod (step 13, TERMINATE=yes)"; break; fi
-  sleep 30; keepalive
+  sleep 30; keepalive; if [ $? -eq 3 ]; then echo "run $RUN: stop waiting: the Pod is gone (watchdog receipt above); follow step 14"; break; fi
 done
 for name in bootstrap.log self-destruct.json environment.json r2-round-trip.json data-fetch.json data-verification.json initialization-fetch.json; do
   podscp root@$POD_HOST:/workspace/rehearsal/$name "$CTRL/$name"
@@ -303,7 +323,7 @@ for name in R2_POD_SECRET_ACCESS_KEY R2_SECRET_ACCESS_KEY RUNPOD_API_KEY; do pri
 grep BOOTSTRAP_EXIT "$CTRL/bootstrap.log"; watchdog
 ```
 
-Expected: `BOOTSTRAP_EXIT=0`; `self-destruct.json` shows `"state": "armed"` and `deadline_unix` equal to `SELF_DESTRUCT_DEADLINE`; `the Pod holds this revision`; `r2-round-trip.json` shows `"status": "passed"` and an `upload_bytes_per_second` of at least about 9.17 million (the receipt refuses less; see **Upload rate** above); `preflight-a40-report.json` shows `"status": "completed"`, `"hardware_precision_and_resume_checked": true`, a passed `fused_attention` and a passed `compile_equivalence` (the receipt tool refuses a compiling specification without it). The leak check prints `0`: `bootstrap.log` holds none of the three secret values. `printenv` takes only the variables' names on its command line, and `grep` reads the values as patterns from its standard input (`-f -`), so no value reaches a process list. Any other exit code: read `bootstrap.log`, then terminate the Pod (step 13) unless the fix is obvious and cheap. Exit 6 means the shipped archive does not match `/workspace/revision.json`, or the workspace already holds another revision; the message says which. To run the bootstrap again after such a fix, first check that `podssh 'pgrep -f pilot_pod_bootstrap.sh'` prints nothing, then move the old log aside with `podssh 'mv /workspace/rehearsal/bootstrap.log /workspace/rehearsal/bootstrap.log.failed-$(date +%s)'` and paste this block again. If the fix is a new commit (step 6 run again, which ships a new archive and `revision.json`), also move the workspace's copy of the old revision aside before pasting, with `podssh 'mv /workspace/rehearsal/revision.json /workspace/rehearsal/revision.json.old-$(date +%s)'`: the bootstrap never replaces a `revision.json` it finds there, so without this it exits 6 every time.
+Expected: `BOOTSTRAP_EXIT=0`; `self-destruct.json` shows `"state": "armed"` and `deadline_unix` equal to `SELF_DESTRUCT_DEADLINE`; `the Pod holds this revision`; `r2-round-trip.json` shows `"status": "passed"` and an `upload_bytes_per_second` of at least about 9.17 million (the receipt refuses less; see **Upload rate** above); `preflight-a40-report.json` shows `"status": "completed"`, `"hardware_precision_and_resume_checked": true`, a passed `fused_attention` and a passed `compile_equivalence` (the receipt tool refuses a compiling specification without it). The leak check prints `0`: `bootstrap.log` holds none of the three secret values. `printenv` takes only the variables' names on its command line, and `grep` reads the values as patterns from its standard input (`-f -`), so no value reaches a process list. If the wait printed `the Pod is gone`, the watchdog has ended this Pod: follow step 14. Any other exit code: read `bootstrap.log`, then terminate the Pod (step 13) unless the fix is obvious and cheap. Exit 6 means the shipped archive does not match `/workspace/revision.json`, or the workspace already holds another revision; the message says which. To run the bootstrap again after such a fix, first check that `podssh 'pgrep -f pilot_pod_bootstrap.sh'` prints nothing, then move the old log aside with `podssh 'mv /workspace/rehearsal/bootstrap.log /workspace/rehearsal/bootstrap.log.failed-$(date +%s)'` and paste this block again. If the fix is a new commit (step 6 run again, which ships a new archive and `revision.json`), also move the workspace's copy of the old revision aside before pasting, with `podssh 'mv /workspace/rehearsal/revision.json /workspace/rehearsal/revision.json.old-$(date +%s)'`: the bootstrap never replaces a `revision.json` it finds there, so without this it exits 6 every time.
 
 ## 8. Readiness receipt (Mac, billable, each terminal)
 
@@ -355,12 +375,12 @@ GIVE_UP=$(( $(date +%s) + 1200 ))
 until podssh 'test -s /workspace/rehearsal-run/heartbeat.json'; do
   if podssh 'grep -q ^WORKER_EXIT= /workspace/rehearsal/run.log'; then echo "run $RUN: the worker exited before its first heartbeat:"; podssh 'tail -n 40 /workspace/rehearsal/run.log'; break; fi
   if [ "$(date +%s)" -ge "$GIVE_UP" ]; then echo "run $RUN: no heartbeat after 20 minutes:"; podssh 'tail -n 40 /workspace/rehearsal/run.log'; break; fi
-  sleep 10; keepalive
+  sleep 10; keepalive; if [ $? -eq 3 ]; then echo "run $RUN: stop waiting: the Pod is gone (watchdog receipt above); follow step 14"; break; fi
 done
 podssh 'test -s /workspace/rehearsal-run/heartbeat.json' && watchdog
 ```
 
-If the wait printed `exited` or `no heartbeat`, copy the log (`podscp root@$POD_HOST:/workspace/rehearsal/run.log "$CTRL/run.log"`), terminate the Pod (step 13) and report; do not start the supervisor. Once the heartbeat exists, the last line re-baselines the watchdog, which gives step 10 a full 600 s to start the mirror; after a failed wait it does not, so the idle limit keeps running.
+If the wait printed `exited` or `no heartbeat`, copy the log (`podscp root@$POD_HOST:/workspace/rehearsal/run.log "$CTRL/run.log"`), terminate the Pod (step 13) and report; do not start the supervisor. If it printed `the Pod is gone`, do not start the supervisor either: follow step 14. Once the heartbeat exists, the last line re-baselines the watchdog, which gives step 10 a full 600 s to start the mirror; after a failed wait it does not, so the idle limit keeps running.
 
 This launch does not source `/etc/rp_environment`, so `RUNPOD_POD_ID` is usually unset: the worker takes the Pod ID from the receipt's captured identity (and checks it against `RUNPOD_POD_ID` only when that is set), and writes under the receipt's `r2_run_prefix`. Before anything else it checks the receipt against the files it was given, requires `/workspace/rehearsal/revision.json` to equal the receipt's `revision`, and applies the launch rule; any mismatch ends it with no output directory (`run.log` says why).
 
@@ -451,7 +471,7 @@ The runs are independent: never stop, restart or re-baseline the other run's wat
 - **The worker stops or fails** (speed-and-fit check, rising loss, nonfinite loss, cost, a crash). After its own drain (heartbeat `uploading`) the heartbeat shows `stopped` or `failed`. The worker publishes `r2_final` only when a verified stage-final milestone closes what it trained (for example `stage1-final` of a run A stopped in stage 2); then the supervisor verifies it as in step 12 and archives it. Otherwise it waits 60 seconds (`--failure-grace-seconds`), then archives the worker's own `report.json` and a summary listing the labels present in R2 to `.../diagnostics/`, and approves teardown. The last verified rolling checkpoint and the report stay in R2.
 - **A milestone never reached R2** (heartbeat `failed`, failure `r2_milestones_unverified`). The worker writes `finalization.json` with the local export path and SHA-256 of every milestone R2 never verified. The supervisor does not approve teardown on its grace timer: it pulls those exports over SSH with the pilot's verified pull path in the 420 s reserve (from the worker's final heartbeat, by 480 s after its last GPU work, to the end of the 900 s window; see **Upload window**), checks each SHA-256, archives the records, and only then sets `shutdown_ready`. While the pulled bytes grow it stamps transfer progress every 5 s, so the watchdog keeps the Pod past the 600 s idle limit. If the pull fails too, it writes a prominent `controller-error.json` and `MILESTONES-NOT-SECURED.json` naming the files and never sets `shutdown_ready`; the watchdog's wall, cost and transfer limits remain the backstop, so act within them. To rescue a milestone by hand, copy each `pod_path` the file names from under the worker's root, for example `podscp root@$POD_HOST:/workspace/rehearsal-run/exports/<label>/checkpoint.pt "$CTRL/rescued-<label>.pt"`, and check that `shasum -a 256` prints the `sha256` it records; only then may step 13 end the Pod with `TERMINATE=yes`.
 - **The supervisor reports an R2 mismatch.** It never approves teardown. Inspect with `verify-final` and `uv run --locked python -m tools.r2_store status`; the idle limit deletes the Pod 600 seconds after its last GPU activity.
-- **A Pod disappears or a watchdog exits.** Read `$CTRL/watchdog-receipt.json` and `$CTRL/supervisor/watchdog-receipt.json`, then confirm with the `status` command in step 13. Restart only that run's watchdog with `watchdog` (in a reopened terminal, after the reopened-terminal line of step 5).
+- **A Pod disappears or a watchdog exits** (also when a wait loop printed `the Pod is gone`). Read `$CTRL/watchdog-receipt.json`, the `$CTRL/watchdog-receipt.json.prev-<time>` copies (each `watchdog` restart keeps the receipt it replaces, so the reason a watchdog gave for deleting the Pod survives any later restart) and `$CTRL/supervisor/watchdog-receipt.json`, then confirm with the `status` command in step 13. A Pod that answers HTTP 404 is gone: run step 13's terminate block, which records its `TEARDOWN`. An `identity_mismatch` means the Pod ID no longer answers with the captured identity: ask the owner. Restart only that run's watchdog with `watchdog` (in a reopened terminal, after the reopened-terminal line of step 5), and only while its Pod still exists: `keepalive` never restarts a watchdog whose receipt reads `terminated`, `absent` or `identity_mismatch`.
 - **Spend.** Each run's limits are its own; a failed run's spend counts toward its own $10 cap. Do not relaunch a failed run without the owner's approval.
 
 ## 15. Final billing verification (Mac, each terminal)

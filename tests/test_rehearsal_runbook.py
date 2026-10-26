@@ -36,7 +36,15 @@ import pytest
 
 from tools import rehearsal_ops
 from tools.pilot_readiness_receipt import SELF_DESTRUCT_FRESH_SECONDS
-from tools.runpod_watchdog import _SAFE_POD_ID, Policy, build_parser, policy_from_args
+from tools.runpod_pod_identity import connection_from_pod
+from tools.runpod_watchdog import (
+    _SAFE_POD_ID,
+    Outcome,
+    Policy,
+    atomic_receipt,
+    build_parser,
+    policy_from_args,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "REHEARSAL_RUNBOOK.md"
@@ -415,7 +423,8 @@ def test_bootstrap_command_uses_only_flags_the_script_accepts() -> None:
 def test_r2_pod_key_travels_only_over_ssh_stdin() -> None:
     code = "\n".join(_code())
     (delivery,) = [line for line in _code() if "rehearsal_ops pod-env" in line]
-    assert delivery.index("pod-env") < delivery.index("| podssh") < delivery.index("umask 077")
+    pipe = "| podssh_stdin '"  # The one SSH call that keeps its standard input.
+    assert delivery.index("pod-env") < delivery.index(pipe) < delivery.index("umask 077")
     assert "R2_POD_SECRET_ACCESS_KEY=" not in code and "R2_SECRET_ACCESS_KEY=" not in code
     body = json.loads(POD_BODY.read_text(encoding="utf-8"))
     assert "env" not in body and "R2" not in json.dumps(body)
@@ -868,14 +877,30 @@ watchdog() {
   BASE=$(cat "$CLOCK"); echo "watchdog $BASE" >> "$CALLS"; echo 4242 > "$CTRL/watchdog.pid"
 }
 ps() {
-  if [ "$2" = 4242 ]; then
+  if [ "$1" = -A ]; then
+    echo "1 /sbin/launchd"
+    if [ -n "${PROCESSES:-}" ]; then printf '%s\n' "$PROCESSES"; fi
+  elif [ "$2" = 4242 ] && [ "$4" = ppid= ]; then
+    echo 4241
+  elif [ "$2" = 4242 ]; then
     echo "python -m tools.runpod_watchdog --mode rehearsal --identity $CTRL/pod-identity.json"
   else
     echo "sleep 30"
   fi
 }
 """
-"""The clock, this Pod's watchdog (PID 4242) and ``ps`` for every wait loop."""
+"""The clock, this Pod's watchdog (PID 4242, started by ``uv`` as PID 4241) and ``ps`` for
+every wait loop. ``ps -A`` lists the processes in ``$PROCESSES`` besides launchd."""
+
+KEEPALIVE_GONE = (
+    'keepalive; if [ $? -eq 3 ]; then echo "run $RUN: stop waiting: the Pod is gone '
+    '(watchdog receipt above); follow step 14"; break; fi'
+)
+"""How every wait loop calls keepalive: status 3 means the watchdog has ended this Pod."""
+GONE_LINE = "run A: stop waiting: the Pod is gone (watchdog receipt above); follow step 14"
+POD_GONE = "STOP run A: POD GONE: the watchdog of Pod podfixture01 ended for good with "
+TERMINATED = Outcome("terminated", "idle_gpu_limit_delete_204_get_404", "podfixture01", 990.0)
+"""The final receipt of a watchdog that deleted this Pod, as the watchdog writes it."""
 
 
 def keepalive() -> str:
@@ -889,22 +914,76 @@ def loop_stubs(extra: str) -> str:
     return WATCHDOG_STUBS + keepalive() + extra
 
 
+def write_receipt(control: Path, receipt: Outcome | str | None) -> str | None:
+    """Leave a watchdog receipt in ``control``; returns its text to compare afterwards."""
+    if receipt is None:
+        return None
+    path = control / "watchdog-receipt.json"
+    if isinstance(receipt, Outcome):
+        atomic_receipt(path, receipt)  # Exactly what tools.runpod_watchdog writes.
+    else:
+        path.write_text(receipt)
+    return path.read_text()
+
+
 RUNNING_STUBS = r"""
 uv() {
   echo "$*" >> "$CAPTURES"
   NOW=$(cat "$CLOCK")
-  if [ "$NOW" -lt "$RUNNING_AT" ]; then
-    STATUS=null DIRECT_NOW=null PROXY=true
-  elif [ "$NOW" -lt "$DIRECT_AT" ] || [ "$DIRECT" = null ]; then
-    STATUS='"RUNNING"' DIRECT_NOW=null PROXY=true
+  if [ "$NOW" -lt "$STARTED_AT" ]; then
+    printf '%s\n' "$CREATED_CAPTURE" > "$CTRL/pod-connection.json"
+  elif [ "$NOW" -lt "$LATER_AT" ]; then
+    printf '%s\n' "$STARTED_CAPTURE" > "$CTRL/pod-connection.json"
   else
-    STATUS='"RUNNING"' DIRECT_NOW=$DIRECT PROXY=false
+    printf '%s\n' "$LATER_CAPTURE" > "$CTRL/pod-connection.json"
   fi
-  printf '{"status": %s, "ssh_direct": %s, "ssh_proxy_only": %s}\n' \
-    "$STATUS" "$DIRECT_NOW" "$PROXY" > "$CTRL/pod-connection.json"
 }
 """
-DIRECT_SSH = json.dumps({"host": VALUES["POD_HOST"], "port": int(VALUES["POD_PORT"])})
+"""The capture tool: the create reply's shape until ``STARTED_AT``, then the started
+container's, then (from ``LATER_AT``) a later shape."""
+CREATE_REPLY: dict[str, Any] = {
+    "id": "podfixture01",
+    "name": "rehearsal-a40-s-a",
+    "status": "RUNNING",
+    "actions": ["stop", "restart", "terminate"],
+    "cost": 0.59,
+    "createdAt": "2027-01-15T08:00:00.704Z",
+    "startedAt": "2027-01-15T08:00:00.7Z",
+    "image": "runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404",
+    "disk": 40,
+    "ports": ["22/tcp"],
+    "mounts": {},
+    "runtime": None,
+    "ssh": {
+        "direct": None,
+        "proxy": {"host": "ssh.runpod.io", "port": 22, "username": "podfixture01-64411b02"},
+    },
+}
+"""The shape of the pilot's real create reply: ``RUNNING`` before the container is up, with
+no runtime and no direct SSH."""
+HTTP_PORT = {"ip": "100.65.27.2", "private": 19123, "public": 60084, "type": "http"}
+SSH_PORT = {
+    "ip": VALUES["POD_HOST"],
+    "private": 22,
+    "public": int(VALUES["POD_PORT"]),
+    "type": "tcp",
+}
+DIRECT = {"host": VALUES["POD_HOST"], "port": int(VALUES["POD_PORT"]), "username": "root"}
+
+
+def captured(ports: list[dict[str, Any]] | None, direct: dict[str, Any] | None) -> str:
+    """``pod-connection.json`` as ``tools.runpod_pod_identity`` writes it for one reply."""
+    reply = {**CREATE_REPLY, "ssh": {**CREATE_REPLY["ssh"], "direct": direct}}
+    if ports is not None:
+        reply["runtime"] = {"uptime": 30, "ports": ports}
+    return json.dumps(connection_from_pod(reply, captured_at=float(NOW)))
+
+
+CREATED = captured(None, None)
+STARTED = captured([HTTP_PORT, SSH_PORT], DIRECT)  # As the pilot's started Pod was captured.
+PROXY_ONLY = captured([HTTP_PORT], None)  # Up, with no public TCP port 22 and no direct SSH.
+PORT_FIRST = captured([HTTP_PORT, SSH_PORT], None)  # Port 22 mapped, direct address not yet.
+INCOMPLETE = captured([HTTP_PORT, SSH_PORT], {"host": None, "port": 40022})
 
 
 def running_wait() -> str:
@@ -917,27 +996,47 @@ def test_the_wait_for_running_is_bounded_and_rebaselines_the_watchdog() -> None:
     assert loop.startswith("GIVE_UP=$(( $(date +%s) + 1200 )); PROXY_ONLY=0\nwhile :; do\n")
     body = loop[loop.index("; do\n") : loop.index("\ndone\n")]
     assert "tools.runpod_pod_identity capture" in body  # Captured again inside the loop.
-    assert body.rstrip().endswith("\n  keepalive")
+    assert body.rstrip().endswith("\n  " + KEEPALIVE_GONE)
     assert '"status") == "RUNNING"' in loop and 'd.get("host")' in loop and 'd.get("port")' in loop
-    # RUNNING with only the proxy on three captures in a row ends the wait early.
+    # Proxy-only needs a started container (runtime ports) with no public TCP port 22.
     assert 'c.get("ssh_proxy_only") is True' in loop
-    assert '"ssh_proxy_only": direct is None' in (ROOT / "tools/runpod_pod_identity.py").read_text()
+    assert 'p=c.get("runtime_ports"); up=isinstance(p, list) and len(p) > 0' in loop
+    assert 'e.get("type") == "tcp" and e.get("private") == 22 and bool(e.get("public"))' in loop
+    assert "proxy=running and up and not ssh22 and " in loop
+    identity = (ROOT / "tools/runpod_pod_identity.py").read_text()
+    assert '"ssh_proxy_only": direct is None' in identity
+    assert '"runtime_ports": None if runtime is None else runtime.get("ports")' in identity
     assert 'if [ "$PROXY_ONLY" -ge 3 ]; then' in body
     # The wait sits between the helpers (which start the watchdog) and the host-key pin.
     assert blocks(5).index(loop) == 2 and "ssh-keyscan" in blocks(5)[3]
     assert "re-run the capture until it does" not in section(5)
+    assert "Runpod reports `RUNNING` from the create reply on, before the container is up" in (
+        section(5)
+    )
     # A 20-minute start is a fifth of run A's setup allowance; the bootstrap keeps its 45.
     assert 1200 + 2700 < 100 * 60
+
+
+def test_the_create_reply_fixture_is_the_shape_that_used_to_read_as_proxy_only() -> None:
+    created = json.loads(CREATED)
+    # RUNNING, no runtime, no direct SSH: before the fix three of these stopped the wait.
+    assert created["status"] == "RUNNING" and created["ssh_proxy_only"] is True
+    assert created["runtime_ports"] is None and created["ssh_direct"] is None
+    started = json.loads(STARTED)
+    assert started["ssh_proxy_only"] is False and started["ssh_direct"]["port"] == 40022
+    assert started["runtime_ports"] == [HTTP_PORT, SSH_PORT]
 
 
 def run_running_wait(
     tmp_path: Path,
     shell: str,
     *,
-    running_at: int,
-    direct: str = DIRECT_SSH,
-    direct_at: int = 0,
+    started_at: int,
+    started: str = STARTED,
+    later: str | None = None,
+    later_at: int = 10**9,
     watchdog_pid: str | None = "4242",
+    receipt: Outcome | None = None,
 ) -> tuple[str, list[str], list[str]]:
     clock, calls, captures = tmp_path / "clock", tmp_path / "calls", tmp_path / "captures"
     clock.write_text("1000\n")
@@ -947,16 +1046,19 @@ def run_running_wait(
     control.mkdir()
     if watchdog_pid is not None:
         (control / "watchdog.pid").write_text(f"{watchdog_pid}\n")
-    # The capture before the helpers block saw a Pod that is not running yet.
-    (control / "pod-connection.json").write_text('{"status": null, "ssh_direct": null}\n')
+    receipt_text = write_receipt(control, receipt)
+    # The capture right after the create request reads the create reply's shape.
+    (control / "pod-connection.json").write_text(CREATED + "\n")
     environment = {
         **os.environ,
         "CLOCK": str(clock),
         "CALLS": str(calls),
         "CAPTURES": str(captures),
-        "RUNNING_AT": str(running_at),
-        "DIRECT": direct,
-        "DIRECT_AT": str(direct_at),
+        "STARTED_AT": str(started_at),
+        "LATER_AT": str(later_at),
+        "CREATED_CAPTURE": CREATED,
+        "STARTED_CAPTURE": started,
+        "LATER_CAPTURE": started if later is None else later,
         "CTRL": str(control),
         "POD_ID": VALUES["POD_ID"],
         "RUN": "A",
@@ -970,16 +1072,22 @@ def run_running_wait(
         timeout=120,
     )
     assert result.returncode == 0 and result.stderr == "", result.stderr
+    if receipt_text is not None:
+        assert (control / "watchdog-receipt.json").read_text() == receipt_text
     return result.stdout, calls.read_text().splitlines(), captures.read_text().splitlines()
+
+
+NOT_UP = "RUNNING without direct SSH: container not up yet\n"
 
 
 @pytest.mark.parametrize("shell", SHELLS)
 def test_the_wait_for_running_returns_once_the_pod_has_direct_ssh(
     tmp_path: Path, shell: str
 ) -> None:
-    out, calls, captures = run_running_wait(tmp_path, shell, running_at=1400)
-    assert "RUNNING with direct SSH" in out and "not RUNNING" not in out
-    assert "WARNING" not in out
+    out, calls, captures = run_running_wait(tmp_path, shell, started_at=1400)
+    assert out.endswith("RUNNING with direct SSH\n") and "not RUNNING" not in out
+    assert "WARNING" not in out and "proxy SSH only" not in out
+    assert out.count(NOT_UP) == 20  # Checked at 1000 and after each capture until 1400.
     assert calls == ["watchdog 1300"]  # Re-baselined after 300 s of waiting.
     control = tmp_path / "ctrl"
     assert len(captures) == 20 and set(captures) == {
@@ -989,13 +1097,42 @@ def test_the_wait_for_running_returns_once_the_pod_has_direct_ssh(
 
 
 @pytest.mark.parametrize("shell", SHELLS)
-@pytest.mark.parametrize("direct", [DIRECT_SSH, '{"host": null, "port": 40022}'])
-def test_the_wait_for_running_gives_up_after_20_minutes(
-    tmp_path: Path, shell: str, direct: str
+@pytest.mark.parametrize(
+    ("started", "later_at"),
+    [
+        (STARTED, 10**9),  # Up with direct SSH at once.
+        (PORT_FIRST, 1200),  # Port 22 mapped first, the direct address 80 s later.
+    ],
+    ids=["direct-at-once", "port-22-first"],
+)
+def test_the_wait_for_running_carries_on_while_runpod_says_running_before_the_container(
+    tmp_path: Path, shell: str, started: str, later_at: int
 ) -> None:
-    # Never RUNNING, or RUNNING with an incomplete direct address: the wait ends at its deadline.
-    running_at = 10**9 if direct == DIRECT_SSH else 1100
-    out, calls, captures = run_running_wait(tmp_path, shell, running_at=running_at, direct=direct)
+    # Runpod reports RUNNING from the create reply on: that shape persists for 120 s while
+    # the image is pulled, then the container is up. A healthy Pod is never told to go.
+    out, calls, captures = run_running_wait(
+        tmp_path, shell, started_at=1120, started=started, later=STARTED, later_at=later_at
+    )
+    assert out.count(NOT_UP) == 6  # 1000 to 1100: the create reply's shape.
+    assert "proxy SSH only" not in out and "terminate" not in out
+    assert out.endswith("RUNNING with direct SSH\n")
+    assert len(captures) == (6 if later_at > 10**8 else 10) and calls == []
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize(
+    ("started_at", "started"),
+    [
+        (10**9, STARTED),  # The container never comes up.
+        (1100, INCOMPLETE),  # Up with an incomplete direct address.
+        (1100, PORT_FIRST),  # Port 22 mapped, but no direct address ever.
+    ],
+    ids=["never-up", "incomplete-direct", "no-direct-ever"],
+)
+def test_the_wait_for_running_gives_up_after_20_minutes(
+    tmp_path: Path, shell: str, started_at: int, started: str
+) -> None:
+    out, calls, captures = run_running_wait(tmp_path, shell, started_at=started_at, started=started)
     assert (
         "run A: Pod podfixture01 is not RUNNING with direct SSH after 20 minutes; "
         "terminate it (step 13, TERMINATE=yes)" in out
@@ -1006,18 +1143,20 @@ def test_the_wait_for_running_gives_up_after_20_minutes(
 
 
 @pytest.mark.parametrize("shell", SHELLS)
-def test_the_wait_for_running_stops_early_for_a_pod_with_proxy_ssh_only(
+def test_the_wait_for_running_stops_early_for_a_started_pod_with_proxy_ssh_only(
     tmp_path: Path, shell: str
 ) -> None:
-    out, calls, captures = run_running_wait(tmp_path, shell, running_at=1100, direct="null")
+    # The create reply's shape until 1100, then a container that is up with runtime ports
+    # but no public TCP port 22 and no direct SSH: a Pod without a public IP.
+    out, calls, captures = run_running_wait(tmp_path, shell, started_at=1100, started=PROXY_ONLY)
     assert (
         "run A: Pod podfixture01 is RUNNING with proxy SSH only: it has no public IP, so no "
         "file can reach it; terminate it (step 13, TERMINATE=yes)" in out
     )
     assert "after 20 minutes" not in out
-    # Seen RUNNING behind the proxy at 1100, 1120 and 1140: three captures in a row.
-    assert len(captures) == 7 and out.count("RUNNING with proxy SSH only\n") == 3
-    assert calls == []
+    # Seen up behind the proxy at 1100, 1120 and 1140: three captures in a row.
+    assert out.count(NOT_UP) == 5 and out.count("RUNNING with proxy SSH only\n") == 3
+    assert len(captures) == 7 and calls == []
 
 
 @pytest.mark.parametrize("shell", SHELLS)
@@ -1025,9 +1164,11 @@ def test_the_wait_for_running_allows_a_direct_address_that_comes_late(
     tmp_path: Path, shell: str
 ) -> None:
     # Two proxy-only captures, then the direct address: the wait carries on and succeeds.
-    out, calls, captures = run_running_wait(tmp_path, shell, running_at=1100, direct_at=1140)
+    out, calls, captures = run_running_wait(
+        tmp_path, shell, started_at=1100, started=PROXY_ONLY, later=STARTED, later_at=1140
+    )
     assert out.count("RUNNING with proxy SSH only\n") == 2
-    assert out.rstrip().endswith("RUNNING with direct SSH")
+    assert out.endswith("RUNNING with direct SSH\n")
     assert "terminate" not in out and len(captures) == 7
 
 
@@ -1036,7 +1177,7 @@ def test_the_wait_for_running_warns_and_restarts_a_dead_watchdog(
     tmp_path: Path, shell: str
 ) -> None:
     # watchdog.pid names a process that is not this Pod's watchdog.
-    out, calls, _ = run_running_wait(tmp_path, shell, running_at=1400, watchdog_pid="999")
+    out, calls, _ = run_running_wait(tmp_path, shell, started_at=1400, watchdog_pid="999")
     assert out.count("WARNING run A: NO LIVE WATCHDOG guards Pod podfixture01") == 1
     assert calls == ["watchdog 1020", "watchdog 1320"]  # Restarted on the first pass.
 
@@ -1054,7 +1195,7 @@ def test_helpers_are_written_once_per_pod_and_sourced_by_every_terminal() -> Non
     text = RUNBOOK.read_text(encoding="utf-8")
     code = "\n".join(_code())
     body = helpers()
-    for name in ("watchdog() {", "podssh() {", "podscp() {"):
+    for name in ("watchdog() {", "keepalive() {", "podssh() {", "podssh_stdin() {", "podscp() {"):
         assert body.count(name) == 1 and code.count(name) == 1, name
     assert "alias " not in code  # Functions in the sourced file, never per-shell aliases.
     # Written once: an existing file is never replaced.
@@ -1086,11 +1227,17 @@ for argument in "$@"; do printf '%s\\n' "$argument"; done > "$STUB_DIR/$(basenam
 """
 STUB_WATCHDOG = """#!/usr/bin/env bash
 # Stands in for "uv run ... tools.runpod_watchdog": writes its pid to --pidfile, then waits.
+# It writes $STUB_RECEIPT to --receipt as its first poll would, and waits $STUB_LATE_STEPS
+# steps of 0.2 s before it writes either.
+echo "$$" >> "$STUB_DIR/uv.pids"
+trap 'exit 0' TERM
+step=0
+while [[ $step -lt ${STUB_LATE_STEPS:-0} ]]; do sleep 0.2; step=$((step + 1)); done
 while [[ $# -gt 0 ]]; do
   if [[ "$1" == --pidfile ]]; then echo "$$" > "$2"; fi
+  if [[ "$1" == --receipt && -n "${STUB_RECEIPT:-}" ]]; then echo "$STUB_RECEIPT" > "$2"; fi
   shift
 done
-trap 'exit 0' TERM
 while :; do sleep 0.2; done
 """
 
@@ -1110,6 +1257,7 @@ def helper_environment(tmp_path: Path) -> dict[str, str]:
         "STUB_DIR": str(stubs),
         "CTRL": str(control),
         "RUN": "A",
+        "POD_ID": VALUES["POD_ID"],
         "ORIGIN": str(ORIGIN),
         "POD_HOST": VALUES["POD_HOST"],
         "POD_PORT": VALUES["POD_PORT"],
@@ -1145,7 +1293,6 @@ def test_sourced_helpers_reach_only_this_pod_and_restart_only_this_watchdog(
         'podscp "$CTRL/revision.json" root@$POD_HOST:/workspace/revision.json\n'
         'watchdog && cat "$CTRL/watchdog.pid" > "$CTRL/first.pid"\n'
         'watchdog && cat "$CTRL/watchdog.pid" > "$CTRL/second.pid"\n'
-        'keepalive > "$CTRL/keepalive.out"\n'
     )
     pids: list[int] = []
     try:
@@ -1193,8 +1340,16 @@ def test_sourced_helpers_reach_only_this_pod_and_restart_only_this_watchdog(
         while alive(first) and time.monotonic() < deadline:
             time.sleep(0.1)
         assert not alive(first) and alive(second)  # The restart replaced only its own.
-        # keepalive's real ps check recognises the live watchdog: no warning, no restart.
-        assert (control / "keepalive.out").read_text() == ""
+        # keepalive's real ps checks recognise the live watchdog and see no stray one: no
+        # warning, no restart.
+        quiet = subprocess.run(
+            [shell, "-c", 'source "$CTRL/helpers.sh"\nkeepalive; echo "keepalive $?"\n'],
+            env={**environment, "BASE": str(int(time.time()))},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert quiet.stdout == "keepalive 0\n" and quiet.stderr == "", quiet.stderr
         assert int((control / "watchdog.pid").read_text()) == second
     finally:
         for pid in pids:
@@ -1203,18 +1358,196 @@ def test_sourced_helpers_reach_only_this_pod_and_restart_only_this_watchdog(
         bystander.wait()
 
 
-def run_keepalive(
-    tmp_path: Path, shell: str, *, watchdog_pid: str | None, base: int, fails: bool = False
-) -> tuple[str, list[str]]:
-    """Two passes of keepalive, 10 s apart, starting at clock 2000."""
+def run_helper_script(
+    shell: str, script: str, environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Source helpers.sh, make its 1 s waits short, then run ``script``."""
+    return subprocess.run(
+        [shell, "-c", 'source "$CTRL/helpers.sh"\nsleep() { command sleep 0.02; }\n' + script],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def wait_until(predicate: Any, seconds: float = 10) -> bool:
+    deadline = time.monotonic() + seconds
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return bool(predicate())
+
+
+def stub_watchdog(
+    environment: dict[str, str], pidfile: Path, *wrapper: str
+) -> subprocess.Popen[bytes]:
+    """A stub watchdog of this Pod writing ``pidfile``, run under ``wrapper`` if given."""
+    control, stubs = Path(environment["CTRL"]), Path(environment["STUB_DIR"])
+    command = [str(stubs / "uv"), "run", "--locked", "python", "-m", "tools.runpod_watchdog"]
+    command += ["--identity", f"{control}/pod-identity.json", "--pidfile", str(pidfile)]
+    return subprocess.Popen([*wrapper, *command], env=environment)
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_watchdog_restart_keeps_the_receipt_it_replaces(tmp_path: Path, shell: str) -> None:
+    environment = helper_environment(tmp_path)
+    control = Path(environment["CTRL"])
+    verdict = write_receipt(control, TERMINATED)
+    # The new watchdog's first poll finds the Pod gone and records only that.
+    later = json.dumps({"state": "absent", "reason": "pod_get_404", "pod_id": "podfixture01"})
+    result = run_helper_script(shell, "watchdog\n", {**environment, "STUB_RECEIPT": later})
+    pids = [int(pid) for pid in (Path(environment["STUB_DIR"]) / "uv.pids").read_text().split()]
+    try:
+        assert result.returncode == 0, result.stderr
+        base = re.search(r"idle baseline (\d+)\n", result.stdout)
+        assert base, result.stdout
+        (kept,) = control.glob("watchdog-receipt.json.prev-*")
+        assert kept.name == f"watchdog-receipt.json.prev-{base.group(1)}"
+        assert kept.read_text() == verdict  # Why the last watchdog deleted the Pod.
+        assert (control / "watchdog-receipt.json").read_text() == later + "\n"
+    finally:
+        for pid in pids:
+            stop(pid)
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_watchdog_that_starts_too_late_is_stopped_and_the_old_one_kept(
+    tmp_path: Path, shell: str
+) -> None:
+    environment = helper_environment(tmp_path)
+    control, stubs = Path(environment["CTRL"]), Path(environment["STUB_DIR"])
+    pidfile = control / "watchdog.pid"
+    old = stub_watchdog(environment, pidfile)
+    late: list[int] = []
+    try:
+        assert wait_until(lambda: pidfile.exists() and pidfile.read_text().strip() == str(old.pid))
+        # The new watchdog would write its pidfile only after 60 s, past the helper's wait.
+        result = run_helper_script(
+            shell, 'watchdog; echo "watchdog $?"\n', {**environment, "STUB_LATE_STEPS": "300"}
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.endswith(
+            f"run A: the new watchdog did not start within 60 s and was stopped; "
+            f"see {control}/watchdog.log\nwatchdog 1\n"
+        )
+        late = [int(pid) for pid in (stubs / "uv.pids").read_text().split() if int(pid) != old.pid]
+        assert len(late) == 1
+        # The process the helper just started is gone, so it can never write its pidfile
+        # later and leave an untracked watchdog with an old idle baseline.
+        assert wait_until(lambda: not alive(late[0])), "the late watchdog was left running"
+        # The watchdog that guarded the Pod still runs and is still the one on record.
+        assert old.poll() is None and pidfile.read_text().strip() == str(old.pid)
+    finally:
+        for pid in late:
+            stop(pid)
+        old.terminate()
+        old.wait()
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_keepalive_warns_about_a_watchdog_the_pidfile_does_not_name(
+    tmp_path: Path, shell: str
+) -> None:
+    environment = helper_environment(tmp_path)
+    control = Path(environment["CTRL"])
+    pidfile, strayfile = control / "watchdog.pid", control / "stray.pid"
+    # The named watchdog runs under a parent whose command line names the Pod too, as
+    # "uv run" does; an older watchdog of this Pod still runs unnamed.
+    parent = stub_watchdog(environment, pidfile, "bash", "-c", 'bash "$0" "$@"; exit 0')
+    stray = stub_watchdog(environment, strayfile)
+    pids = [parent.pid, stray.pid]
+    try:
+        assert wait_until(lambda: pidfile.exists() and strayfile.exists())
+        live = int(pidfile.read_text())
+        pids.append(live)
+        assert live != parent.pid and int(strayfile.read_text()) == stray.pid
+        result = run_helper_script(
+            shell,
+            'keepalive; echo "keepalive $?"\n',
+            {**environment, "BASE": str(int(time.time()))},
+        )
+        assert result.returncode == 0 and result.stderr == "", result.stderr
+        assert result.stdout == (
+            f"WARNING run A: a watchdog of Pod podfixture01 that {control}/watchdog.pid does "
+            f"not name still runs, with an old idle baseline: PID {stray.pid}. Check each "
+            "with ps -p <pid> -o command= and stop it with kill <pid>.\nkeepalive 0\n"
+        )
+        assert stray.poll() is None and alive(live)  # Warned about, never killed.
+    finally:
+        for pid in pids:
+            stop(pid)
+        for process in (parent, stray):
+            process.wait()
+
+
+STDIN_READER = """#!/usr/bin/env bash
+cat >> "$STUB_DIR/ssh.stdin"
+"""
+"""An ``ssh`` that reads its standard input, as the real one does for the remote command."""
+PASTED = "podssh 'test -e /workspace/rehearsal/bootstrap.log'\necho the next pasted line ran\n"
+
+
+def paste_into_bash(tmp_path: Path, pasted: str) -> tuple[str, str]:
+    """Feed a pasted block to bash on its standard input, as bash 3.2 reads a paste."""
     tmp_path.mkdir(parents=True, exist_ok=True)
-    clock, calls = tmp_path / "clock", tmp_path / "calls"
+    environment = helper_environment(tmp_path)
+    stubs, control = Path(environment["STUB_DIR"]), Path(environment["CTRL"])
+    (stubs / "ssh").write_text(STDIN_READER)
+    (stubs / "ssh.stdin").write_text("")
+    # BASH_ENV sources the helpers, so the paste itself is the two lines alone.
+    result = subprocess.run(
+        ["bash"],
+        input=pasted,
+        env={**environment, "BASH_ENV": str(control / "helpers.sh")},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0 and result.stderr == "", result.stderr
+    return result.stdout, (stubs / "ssh.stdin").read_text()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
+def test_podssh_leaves_the_rest_of_a_pasted_block_to_the_shell(tmp_path: Path) -> None:
+    out, consumed = paste_into_bash(tmp_path, PASTED)
+    assert out == "the next pasted line ran\n" and consumed == ""
+    # The same paste through podssh_stdin, which keeps its standard input as podssh once
+    # did, loses its second line to ssh: the failure this guards against.
+    out, consumed = paste_into_bash(
+        tmp_path / "kept", PASTED.replace("podssh ", "podssh_stdin ", 1)
+    )
+    assert out == "" and consumed == "echo the next pasted line ran\n"
+
+
+def test_only_the_key_delivery_keeps_podssh_stdin() -> None:
+    body = helpers()
+    assert 'podssh() {\n  podssh_stdin "$@" < /dev/null\n}\n' in body
+    assert body.count("\n  ssh ") == 1  # podssh_stdin holds the one pinned ssh command.
+    outside = "\n".join(all_blocks()).replace(body, "")
+    (use,) = [line for line in outside.splitlines() if "podssh_stdin" in line]
+    assert use.startswith("uv run --locked python -m tools.rehearsal_ops pod-env | podssh_stdin '")
+
+
+def run_keepalive(
+    tmp_path: Path,
+    shell: str,
+    *,
+    watchdog_pid: str | None,
+    base: int,
+    fails: bool = False,
+    receipt: Outcome | str | None = None,
+    processes: str = "",
+) -> tuple[str, list[str], list[str]]:
+    """Two passes of keepalive, 10 s apart, starting at clock 2000; and their statuses."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    clock, calls, statuses = tmp_path / "clock", tmp_path / "calls", tmp_path / "statuses"
     clock.write_text("2000\n")
     calls.write_text("")
     control = tmp_path / "ctrl"
     control.mkdir()
     if watchdog_pid is not None:
         (control / "watchdog.pid").write_text(f"{watchdog_pid}\n")
+    receipt_text = write_receipt(control, receipt)
     environment = {
         **os.environ,
         "CLOCK": str(clock),
@@ -1224,13 +1557,21 @@ def run_keepalive(
         "RUN": "A",
         "BASE": str(base),
         "WATCHDOG_FAILS": "1" if fails else "",
+        "PROCESSES": processes.format(ctrl=control),
     }
-    script = loop_stubs("") + "keepalive\nsleep 10\nkeepalive\n"
+    record = 'echo $? >> "$STATUSES"\n'
+    script = loop_stubs("") + f"keepalive; {record}sleep 10\nkeepalive; {record}"
     result = subprocess.run(
-        [shell, "-c", script], env=environment, capture_output=True, text=True, timeout=60
+        [shell, "-c", script],
+        env={**environment, "STATUSES": str(statuses)},
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     assert result.returncode == 0 and result.stderr == "", result.stderr
-    return result.stdout, calls.read_text().splitlines()
+    if receipt_text is not None:
+        assert (control / "watchdog-receipt.json").read_text() == receipt_text
+    return result.stdout, calls.read_text().splitlines(), statuses.read_text().splitlines()
 
 
 NO_WATCHDOG = (
@@ -1238,6 +1579,7 @@ NO_WATCHDOG = (
     "or names no live watchdog of this Pod."
 )
 RESTART_FAILED = "WARNING run A: the watchdog restart FAILED; see {ctrl}/watchdog.log."
+STRAY = "WARNING run A: a watchdog of Pod podfixture01 that {ctrl}/watchdog.pid does not name"
 
 
 def test_keepalive_checks_this_pods_watchdog_as_the_helper_does() -> None:
@@ -1246,16 +1588,29 @@ def test_keepalive_checks_this_pods_watchdog_as_the_helper_does() -> None:
         'ps -p "$LIVE" -o command= 2>/dev/null | grep -qF -- "--identity $CTRL/pod-identity.json"'
     )
     assert check in body
-    assert body.count("BASE=0") == 2 and body.count("WARNING") == 2
+    assert body.count("BASE=0") == 2 and body.count("WARNING") == 3
     assert "if [ $(( $(date +%s) - BASE )) -ge 300 ]; then" in body
+    # A final receipt of this Pod stops keepalive before it would restart the watchdog.
+    assert body.index("watchdog-receipt.json") < body.index("return 3") < body.index("Restarting")
+    for state in ("terminated", "absent", "identity_mismatch"):
+        assert f'"{state}"' in body
+    assert body.count("return 3") == 1 and body.rstrip().endswith("  return 0\n}")
+    # Every wait loop stops on that status, and calls keepalive in no other way.
+    code = "\n".join(_code())
+    assert code.count(KEEPALIVE_GONE) == 3 and code.count("keepalive") == 4
 
 
 @pytest.mark.parametrize("shell", SHELLS)
 def test_keepalive_is_quiet_while_this_pods_watchdog_lives(tmp_path: Path, shell: str) -> None:
-    out, calls = run_keepalive(tmp_path, shell, watchdog_pid="4242", base=1900)
-    assert out == "" and calls == []
-    out, calls = run_keepalive(tmp_path / "old", shell, watchdog_pid="4242", base=1700)
+    out, calls, statuses = run_keepalive(tmp_path, shell, watchdog_pid="4242", base=1900)
+    assert out == "" and calls == [] and statuses == ["0", "0"]
+    out, calls, _ = run_keepalive(tmp_path / "old", shell, watchdog_pid="4242", base=1700)
     assert "WARNING" not in out and calls == ["watchdog 2000"]  # 300 s since the baseline.
+    # A live watchdog is never second-guessed by a final receipt it has not written yet.
+    out, calls, statuses = run_keepalive(
+        tmp_path / "live", shell, watchdog_pid="4242", base=1900, receipt=TERMINATED
+    )
+    assert out == "" and calls == [] and statuses == ["0", "0"]
 
 
 @pytest.mark.parametrize("shell", SHELLS)
@@ -1263,18 +1618,97 @@ def test_keepalive_is_quiet_while_this_pods_watchdog_lives(tmp_path: Path, shell
 def test_keepalive_warns_and_restarts_a_missing_or_dead_watchdog(
     tmp_path: Path, shell: str, watchdog_pid: str | None
 ) -> None:
-    out, calls = run_keepalive(tmp_path, shell, watchdog_pid=watchdog_pid, base=1990)
+    out, calls, statuses = run_keepalive(tmp_path, shell, watchdog_pid=watchdog_pid, base=1990)
     assert out.count(NO_WATCHDOG.format(ctrl=tmp_path / "ctrl")) == 1
     assert calls == ["watchdog 2000"]  # At once, though the baseline was only 10 s old.
+    assert statuses == ["0", "0"] and "POD GONE" not in out
 
 
 @pytest.mark.parametrize("shell", SHELLS)
 def test_keepalive_warns_when_a_restart_fails_and_retries_on_the_next_pass(
     tmp_path: Path, shell: str
 ) -> None:
-    out, calls = run_keepalive(tmp_path, shell, watchdog_pid="4242", base=1700, fails=True)
+    out, calls, statuses = run_keepalive(
+        tmp_path, shell, watchdog_pid="4242", base=1700, fails=True
+    )
     assert out.count(RESTART_FAILED.format(ctrl=tmp_path / "ctrl")) == 2
     assert calls == ["watchdog failed 2000", "watchdog failed 2010"]  # Not 5 minutes later.
+    assert statuses == ["0", "0"]
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("watchdog_pid", [None, "999"])
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        TERMINATED,
+        Outcome("terminated", "cost_limit_delete_204_get_404", "podfixture01", 990.0, "stale"),
+        Outcome("absent", "pod_get_404", "podfixture01", 990.0),
+        Outcome("identity_mismatch", "identity_mismatch_no_delete", "podfixture01", 990.0),
+    ],
+    ids=["idle-delete", "cost-delete-with-detail", "absent", "identity-mismatch"],
+)
+def test_keepalive_stops_and_never_restarts_a_watchdog_that_ended_the_pod(
+    tmp_path: Path, shell: str, watchdog_pid: str | None, receipt: Outcome
+) -> None:
+    out, calls, statuses = run_keepalive(
+        tmp_path, shell, watchdog_pid=watchdog_pid, base=1990, receipt=receipt
+    )
+    verdict = (
+        f"{POD_GONE}state {receipt.state}, reason {receipt.reason}, detail {receipt.detail} "
+        f"({tmp_path}/ctrl/watchdog-receipt.json). It is NOT restarted. Follow step 14.\n"
+    )
+    assert out == verdict * 2 and statuses == ["3", "3"]
+    assert calls == []  # A restart would overwrite the receipt with absent/pod_get_404.
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        Outcome("watching", "within_limits", "podfixture01", 990.0),
+        Outcome("unknown", "pod_get_transport_error", "podfixture01", 990.0),
+        Outcome("terminated", "idle_gpu_limit_delete_204_get_404", "otherpod01", 990.0),
+        "not json",
+        '["terminated"]',
+    ],
+    ids=["watching", "unknown", "another-pods-receipt", "not-json", "not-an-object"],
+)
+def test_keepalive_restarts_a_watchdog_whose_receipt_is_not_final_for_this_pod(
+    tmp_path: Path, shell: str, receipt: Outcome | str
+) -> None:
+    out, calls, statuses = run_keepalive(
+        tmp_path, shell, watchdog_pid=None, base=1990, receipt=receipt
+    )
+    assert out.count(NO_WATCHDOG.format(ctrl=tmp_path / "ctrl")) == 1 and "POD GONE" not in out
+    assert calls == ["watchdog 2000"] and statuses == ["0", "0"]
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_keepalive_names_each_watchdog_of_this_pod_the_pidfile_does_not(
+    tmp_path: Path, shell: str
+) -> None:
+    mine = "tools.runpod_watchdog --mode rehearsal --identity {ctrl}/pod-identity.json"
+    processes = "\n".join(
+        [
+            f"4241 uv run --locked python -m {mine}",
+            f"4242 python -m {mine}",
+            f"5150 uv run --locked python -m {mine}",
+            f"5151 python -m {mine}",
+            "6161 python -m tools.runpod_watchdog --identity runs/b/podb/pod-identity.json",
+            "7171 python -m tools.pilot_supervisor --identity {ctrl}/pod-identity.json",
+        ]
+    )
+    out, calls, statuses = run_keepalive(
+        tmp_path, shell, watchdog_pid="4242", base=1900, processes=processes
+    )
+    # The named watchdog and its uv parent are this Pod's guard; run B's watchdog and this
+    # run's supervisor are not watchdogs of this Pod. Only 5150 and 5151 are strays.
+    warning = (
+        STRAY.format(ctrl=tmp_path / "ctrl") + " still runs, with an old idle baseline: PID "
+        "5150 5151. Check each with ps -p <pid> -o command= and stop it with kill <pid>.\n"
+    )
+    assert out == warning * 2 and calls == [] and statuses == ["0", "0"]
 
 
 # Step 7: one bootstrap per Pod, and a wait that notices a failed launch ------------------
@@ -1318,7 +1752,7 @@ def test_step_7_never_launches_a_second_bootstrap_and_checks_that_one_runs() -> 
     # The wait checks liveness with the bootstrap script's own name, and keeps re-baselining.
     assert f"podssh 'pgrep -f {BOOTSTRAP.name}' > /dev/null; ALIVE=$?" in wait
     assert '[ "$ALIVE" -eq 1 ]' in wait
-    assert "  sleep 30; keepalive\ndone\n" in wait and "then watchdog; fi" not in wait
+    assert f"  sleep 30; {KEEPALIVE_GONE}\ndone\n" in wait and "then watchdog; fi" not in wait
     assert "GIVE_UP=$(( $(date +%s) + 2700 ))" in wait
     assert "move the old log aside" in section(7)
     # A new commit also needs the workspace's old revision moved aside, or exit 6 repeats.
@@ -1339,6 +1773,7 @@ def run_bootstrap_wait(
     pgrep_none: int = 1,
     exits_during_pgrep: bool = False,
     watchdog_pid: str | None = "4242",
+    receipt: Outcome | None = None,
 ) -> tuple[str, list[str]]:
     clock, calls = tmp_path / "clock", tmp_path / "calls"
     clock.write_text("1000\n")
@@ -1347,6 +1782,7 @@ def run_bootstrap_wait(
     control.mkdir()
     if watchdog_pid is not None:
         (control / "watchdog.pid").write_text(f"{watchdog_pid}\n")
+    receipt_text = write_receipt(control, receipt)
     environment = {
         **os.environ,
         "CLOCK": str(clock),
@@ -1379,6 +1815,8 @@ def run_bootstrap_wait(
         timeout=120,
     )
     assert result.returncode == 0 and result.stderr == "", result.stderr
+    if receipt_text is not None:
+        assert (control / "watchdog-receipt.json").read_text() == receipt_text
     return result.stdout, calls.read_text().splitlines()
 
 
@@ -1730,6 +2168,8 @@ def run_wait(
     whole_block: bool = False,
     log_exists: bool = False,
     watchdog_fails: bool = False,
+    watchdog_pid: str | None = "4242",
+    receipt: Outcome | None = None,
 ) -> tuple[str, list[str]]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     clock, calls = tmp_path / "clock", tmp_path / "calls"
@@ -1737,7 +2177,9 @@ def run_wait(
     calls.write_text("")
     control = tmp_path / "ctrl"
     control.mkdir()
-    (control / "watchdog.pid").write_text("4242\n")
+    if watchdog_pid is not None:
+        (control / "watchdog.pid").write_text(f"{watchdog_pid}\n")
+    receipt_text = write_receipt(control, receipt)
     environment = {
         **os.environ,
         "CLOCK": str(clock),
@@ -1762,13 +2204,15 @@ def run_wait(
         timeout=60,
     )
     assert result.returncode == 0 and result.stderr == "", result.stderr
+    if receipt_text is not None:
+        assert (control / "watchdog-receipt.json").read_text() == receipt_text
     return result.stdout, calls.read_text().splitlines()
 
 
 def test_step_9_waits_with_a_deadline_and_rebaselines_like_step_7() -> None:
     loop = wait_loop()
     assert "GIVE_UP=$(( $(date +%s) + 1200 ))" in loop
-    assert "  sleep 10; keepalive\ndone\n" in loop and "then watchdog; fi" not in loop
+    assert f"  sleep 10; {KEEPALIVE_GONE}\ndone\n" in loop and "then watchdog; fi" not in loop
     assert "^WORKER_EXIT=" in loop and "tail -n 40 /workspace/rehearsal/run.log" in loop
     # Refused from the Mac when run.log exists, and again on the Pod before the launch.
     block = blocks(9)[0]
@@ -1833,6 +2277,29 @@ def test_step_9_wait_warns_on_a_failed_restart_and_retries_on_the_next_pass(
     out, calls = run_wait(tmp_path, shell, heartbeat_at=1400, exit_at=10**9, watchdog_fails=True)
     assert calls[:2] == ["watchdog failed 1300", "watchdog failed 1310"]
     assert out.count(RESTART_FAILED.format(ctrl=tmp_path / "ctrl")) == len(range(1300, 1401, 10))
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("step", [5, 7, 9])
+def test_every_wait_loop_stops_once_the_watchdog_has_ended_the_pod(
+    tmp_path: Path, shell: str, step: int
+) -> None:
+    # The watchdog deleted the Pod: it wrote its final receipt, removed its pidfile and exited.
+    gone: dict[str, Any] = {"watchdog_pid": None, "receipt": TERMINATED}
+    if step == 5:
+        out, calls, captures = run_running_wait(tmp_path, shell, started_at=10**9, **gone)
+        assert len(captures) == 1  # One pass, then the wait stops.
+    elif step == 7:
+        out, calls = run_bootstrap_wait(tmp_path, shell, alive_until=10**9, **gone)
+        assert calls[0] == "launch"
+        calls = calls[1:]
+    else:
+        out, calls = run_wait(tmp_path, shell, heartbeat_at=10**9, exit_at=10**9, **gone)
+    assert out.count(POD_GONE + "state terminated, reason idle_gpu_limit_delete_204_get_404") == 1
+    assert out.rstrip().endswith(GONE_LINE)
+    # Never restarted: the receipt that says why the Pod went is left as it was.
+    assert calls == [] and "NO LIVE WATCHDOG" not in out
+    assert "minutes" not in out and "TERMINATE=yes" not in out
 
 
 # Step 13: confirm by reading; DELETE only on shutdown_ready or TERMINATE=yes --------------
