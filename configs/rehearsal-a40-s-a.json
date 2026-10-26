@@ -56,6 +56,7 @@
     }
   },
   "checkpoint_seconds": 1800,
+  "checkpoint_save_seconds": 15,
   "expected_tokens_per_second": 56479,
   "validation_tokens_per_second": 100000,
   "speed_check_warmup_updates": 2,
@@ -77,6 +78,7 @@
   "r2": {
     "keep_rolling": 2,
     "storage_cap_usd_per_month": 5.0,
-    "drain_seconds": 480
+    "drain_seconds": 480,
+    "max_transfer_seconds": 900
   }
 }

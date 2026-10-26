@@ -164,6 +164,36 @@ def mirrored(unit: RehearsalSupervisor) -> dict[str, Any]:
     return json.loads((unit.root / "heartbeat.json").read_text())  # type: ignore[no-any-return]
 
 
+IDENTITY = PodIdentity.from_dict(
+    {
+        "id": POD,
+        "name": "rehearsal-a40-s-a",
+        "gpuId": "NVIDIA A40",
+        "gpuCount": 1,
+        "dataCenterId": "test",
+        "createdAt": "1970-01-01T00:16:40+00:00",
+    }
+)
+
+
+class AlivePod:
+    """The Runpod API showing this Pod alive; a DELETE would fail the test."""
+
+    def request(
+        self, method: str, url: str, headers: dict[str, str], timeout: float
+    ) -> tuple[int, bytes]:
+        assert method == "GET", "the watchdog must not delete this Pod"
+        pod = {
+            "id": POD,
+            "name": "rehearsal-a40-s-a",
+            "gpu": {"id": "NVIDIA A40", "count": 1},
+            "dataCenterId": "test",
+            "createdAt": "1970-01-01T00:16:40+00:00",
+            "cost": 0.6,
+        }
+        return 200, json.dumps(pod).encode()
+
+
 def test_run_a_stage_boundary_never_tears_down(tmp_path: Path) -> None:
     r2 = FakeR2()
     report, final = finished(r2, stages=("stage1",), status="running")
@@ -174,6 +204,65 @@ def test_run_a_stage_boundary_never_tears_down(tmp_path: Path) -> None:
     assert not unit.shutdown_ready and not archive.bundles and not r2.calls
     assert mirrored(unit)["status"] == "running"
     assert "github_receipt_verified" not in mirrored(unit)
+
+
+def test_uploading_is_treated_like_running_and_r2_growth_is_the_only_progress(
+    tmp_path: Path,
+) -> None:
+    r2 = FakeR2()
+    report, final = finished(r2, stages=("stage1",), status="completed")
+    prefix = run_prefix("A", POD)
+    pod = Pod(heartbeat("uploading", phase="finalizing", last_gpu_activity_unix=1500), report)
+    unit, archive = supervisor(tmp_path, pod, r2)
+    unit.cycle()  # The first listing is only a baseline.
+    assert not unit.shutdown_ready and not archive.bundles
+    local = mirrored(unit)
+    assert local["status"] == "uploading" and "transfer_progress_unix" not in local
+    assert not [call for call in r2.calls if call[0] in {"HEAD", "GET"}]  # No verification yet.
+    unit.now[0] = 1600.0  # type: ignore[attr-defined]
+    r2.put(f"rehearsal-runs/B/{POD}/stage1-final/checkpoint.pt", b"another run's object")
+    unit.cycle()
+    assert "transfer_progress_unix" not in mirrored(unit)  # Another prefix is not progress.
+    unit.now[0] = 1700.0  # type: ignore[attr-defined]
+    r2.put(prefix + "stage2-final/checkpoint.pt", b"a new label arrives")
+    unit.cycle()
+    assert mirrored(unit)["transfer_progress_unix"] == 1700.0 and not unit.shutdown_ready
+    unit.now[0] = 1800.0  # type: ignore[attr-defined]
+    unit.cycle()  # Nothing new: the stamp stays where the Mac last saw progress.
+    assert mirrored(unit)["transfer_progress_unix"] == 1700.0
+    # The watchdog reads the mirror: 700 s after the last GPU work the idle limit has
+    # passed, but the Mac saw progress 100 s ago, so it waits.
+    policy = Policy(45_000, 7.54, 600, 0.6, max_transfer_seconds=900, mode="rehearsal")
+    outcome = check_once(
+        RunpodClient("authored-test-key", AlivePod()),
+        IDENTITY,
+        policy,
+        unit.root / "heartbeat.json",
+        now=lambda: 2200,
+        observed=True,
+    )
+    assert outcome.state == "watching"
+
+    def broken() -> list[dict[str, Any]]:
+        raise RuntimeError("R2 list failed with HTTP 500")
+
+    r2.objects = broken  # type: ignore[method-assign]
+    unit.now[0] = 1900.0  # type: ignore[attr-defined]
+    unit.cycle()  # A failed listing stamps nothing and is recorded.
+    assert mirrored(unit)["transfer_progress_unix"] == 1700.0
+    assert json.loads((unit.root / "r2-progress-error.json").read_text()) == {
+        "error_type": "RuntimeError"
+    }
+
+
+def test_progress_is_never_stamped_while_training(tmp_path: Path) -> None:
+    r2 = FakeR2()
+    report, _ = finished(r2, stages=("stage1",), status="running")
+    unit, _ = supervisor(tmp_path, Pod(heartbeat("running"), report), r2)
+    unit.cycle()
+    r2.put(run_prefix("A", POD) + "stage1-step500/checkpoint.pt", b"a rolling label")
+    unit.cycle()
+    assert "transfer_progress_unix" not in mirrored(unit) and not r2.calls
 
 
 def test_stage_one_final_never_counts_as_a_completed_run_a(tmp_path: Path) -> None:

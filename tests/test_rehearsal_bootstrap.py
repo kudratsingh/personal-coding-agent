@@ -6,6 +6,7 @@ script's own inline checks (the armed receipt and the 0600 key file).
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -172,8 +173,36 @@ def test_rehearsal_arms_the_timer_first_and_keeps_the_key_secret(tmp_path: Path)
     for name in ("test_onepass_loader.py", "test_r2_uploader.py", "test_rehearsal_ops.py"):
         assert f"tests/{name}" in tests
     assert "tests/test_rehearsal_bootstrap.py" in tests
+    check_pod_test_list([name for name in tests if name.startswith("tests/")])
+    # The worker requires the compile check; the receipt tool refuses a report without it.
+    preflight = lines[index(lines, "tools.pilot_preflight")]
+    assert preflight.endswith("--device cuda:0 --compile-check"), preflight
     assert SECRET not in result.stdout + result.stderr + paths["log"].read_text()
     assert "R2 environment loaded for run A (names only)" in result.stdout
+
+
+NEEDS_DOCKER_OR_NETWORK = re.compile(
+    r"(?i)docker|SCRATCHCODER_SANDBOX_TESTS|socket\.create_connection|urlopen\("
+)
+
+
+def check_pod_test_list(listed: list[str]) -> None:
+    """The on-Pod list runs the worker's tests and nothing that needs Docker or the network."""
+    assert "tests/test_rehearsal_run.py" in listed  # The worker's own tests.
+    assert "tests/test_rehearsal_integration.py" in listed  # Worker records into the Mac side.
+    assert len(set(listed)) == len(listed)
+    for name in listed:
+        path = ROOT / name
+        assert path.is_file(), name  # A missing file would stop pytest on the Pod.
+        if path.name != Path(__file__).name:  # This file names the patterns it looks for.
+            assert not NEEDS_DOCKER_OR_NETWORK.search(path.read_text(encoding="utf-8")), name
+    # Every rehearsal test file runs there, except the data build's (Mac-only, Parquet).
+    expected = {
+        f"tests/{path.name}"
+        for path in (ROOT / "tests").glob("test_rehearsal_*.py")
+        if path.name != "test_rehearsal_build.py"
+    }
+    assert expected <= set(listed) and "tests/test_rehearsal_build.py" not in listed
 
 
 def test_a_readable_key_file_stops_after_the_timer_is_armed(tmp_path: Path) -> None:
@@ -226,6 +255,8 @@ def test_pilot_mode_is_unchanged(tmp_path: Path) -> None:
         "-p",
         "no:cacheprovider",
     ]
+    preflight = lines[index(lines, "tools.pilot_preflight")]
+    assert preflight.endswith("--device cuda:0") and "--compile-check" not in preflight
     assert not [line for line in lines if "rehearsal" in line]
     assert "R2 environment" not in result.stdout
     refused = run(setup(tmp_path / "again"), [*arguments, "--run", "A"])

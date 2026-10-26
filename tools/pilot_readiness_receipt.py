@@ -7,11 +7,15 @@ from files instead of by hand removes the chance that a typo passes a gate.
 ``check_readiness`` is applied before writing, so an unresolved gate never
 produces a receipt. Nothing here contacts Runpod or starts any resource.
 
-``rehearsal`` builds one receipt per rehearsal run (D-35) instead. Besides the
-pilot's gates it requires the Pod's R2 round-trip receipt, the fetch receipt and
-re-verification of exactly the run's pinned data, the pinned shared initialization,
-and the owner's statement that the Pod's R2 token is scoped to the one bucket;
-``check_rehearsal_readiness`` applies the D-35 limits before anything is written.
+``rehearsal`` builds one receipt per rehearsal run (D-35) instead, in exactly the form
+``tools.rehearsal_run run`` accepts. Besides the pilot's gates it requires the Pod's R2
+round-trip receipt, the fetch receipt and re-verification of exactly the run's pinned
+data, the pinned shared initialization, an A40 preflight with the compile check when the
+specification compiles, and the owner's statement that the Pod's R2 token is scoped to
+the one bucket. The specification is the worker's own file, checked against the D-35
+limits and the binding; the time left must pass the worker's launch rule
+(``rehearsal_run.launch_fit``). ``check_rehearsal_readiness`` applies the D-35 limits
+before anything is written.
 """
 
 from __future__ import annotations
@@ -20,7 +24,6 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -29,12 +32,14 @@ from scratchcoder.common.records import atomic_json
 from scratchcoder.data.shards import file_sha256
 from tools import rehearsal_ops
 from tools.gpu_pilot import TERMINATION_GUARANTEES, Specification, check_readiness
-from tools.pilot_feasibility import (
-    RehearsalOptions,
-    rehearsal_plans_from_binding,
-    rehearsal_time_budget,
-)
 from tools.rehearsal_binding import RUNS, load_binding, run_files
+from tools.rehearsal_run import Specification as RehearsalSpecification
+from tools.rehearsal_run import (
+    binding_targets,
+    launch_fit,
+    lifetime_end,
+    require_fit,
+)
 from tools.runpod_watchdog import CLOCK_SKEW_SECONDS, PodIdentity, Policy, parse_timestamp
 
 OWNER_GATES = (
@@ -111,19 +116,11 @@ def build_receipt(
 # ---------------------------------------------------------------------------
 # Rehearsal (D-35): one receipt per run, built on the Mac from the Pod's own evidence
 
-REHEARSAL_KIND = "rehearsal-readiness"
-REHEARSAL_OWNER_GATES = (
-    "owner_confirms_four_runpod_steps",
-    "cloud_data_pre_staged",
-    "external_watchdog_armed",
-    "hardware_preflight_passed",
-    "full_console_quote_confirmed",
-    "staging_storage_cost_bound",
-    "r2_token_bucket_scoped",
-)
+REHEARSAL_KIND = rehearsal_ops.READINESS_KIND
+REHEARSAL_OWNER_GATES = rehearsal_ops.OWNER_GATES
 """The owner's statements. A rehearsal moves checkpoints through R2, not SSH, so the
 pilot's ``ssh_transfer_tested`` is replaced by the evidence gates below."""
-REHEARSAL_EVIDENCE_GATES = ("r2_round_trip_tested", "r2_shards_staged_and_hash_checked")
+REHEARSAL_EVIDENCE_GATES = rehearsal_ops.EVIDENCE_GATES
 """Set only from the Pod's receipts: the R2 round trip and the fetched, re-hashed data."""
 
 
@@ -136,12 +133,48 @@ def _rehearsal_constants() -> dict[str, Any]:
         "cost_stop_usd": rehearsal_ops.COST_STOP_USD,
         "watchdog_cost_stop_usd": rehearsal_ops.WATCHDOG_COST_STOP_USD,
         "idle_seconds": rehearsal_ops.IDLE_SECONDS,
+        "max_transfer_seconds": rehearsal_ops.MAX_TRANSFER_SECONDS,
         "speed_check_seconds": rehearsal_ops.SPEED_CHECK_SECONDS,
         "reference_tokens_per_second": rehearsal_ops.REFERENCE_TOKENS_PER_SECOND,
         "minimum_speed_fraction": rehearsal_ops.MINIMUM_SPEED_FRACTION,
         "finalization_reserve_seconds": rehearsal_ops.FINALIZATION_RESERVE_SECONDS,
         "quoted_total_hourly": rehearsal_ops.QUOTED_TOTAL_HOURLY,
     }
+
+
+def check_d35_specification(spec: RehearsalSpecification, *, run: str) -> None:
+    """The worker's specification must be this run's and carry exactly the D-35 limits."""
+    if spec.run != run:
+        raise ValueError(f"the specification is run {spec.run}'s, not run {run}'s")
+    limits = spec.limits
+    approved = {
+        "pod_seconds": (limits.pod_seconds, rehearsal_ops.POD_LIFETIME_SECONDS),
+        "approved_cost_cap": (limits.approved_cost_cap, rehearsal_ops.APPROVED_COST_CAP_USD),
+        "estimated_total_cost": (
+            limits.estimated_total_cost,
+            rehearsal_ops.ESTIMATED_TOTAL_COST_USD,
+        ),
+        "cost_multiplier": (limits.cost_multiplier, rehearsal_ops.COST_MULTIPLIER),
+        "idle_seconds": (limits.idle_seconds, rehearsal_ops.IDLE_SECONDS),
+        "speed_check_seconds": (limits.speed_check_seconds, rehearsal_ops.SPEED_CHECK_SECONDS),
+        "minimum_speed_fraction": (
+            limits.minimum_speed_fraction,
+            rehearsal_ops.MINIMUM_SPEED_FRACTION,
+        ),
+        "finalization_reserve_seconds": (
+            limits.finalization_reserve_seconds,
+            rehearsal_ops.FINALIZATION_RESERVE_SECONDS,
+        ),
+        "quoted_total_hourly": (limits.quoted_total_hourly, rehearsal_ops.QUOTED_TOTAL_HOURLY),
+        "expected_tokens_per_second": (
+            spec.expected_tokens_per_second,
+            rehearsal_ops.REFERENCE_TOKENS_PER_SECOND,
+        ),
+        "max_transfer_seconds": (spec.max_transfer_seconds, rehearsal_ops.MAX_TRANSFER_SECONDS),
+    }
+    differ = [name for name, (value, expected) in approved.items() if value != expected]
+    if differ:
+        raise ValueError(f"the specification's {differ} differ from the D-35 values")
 
 
 def shards_staged_and_hash_checked(
@@ -214,11 +247,25 @@ def round_trip_passed(probe: dict[str, Any], *, run: str, pod_id: str) -> bool:
     return True
 
 
+def d35_lifetime_end(policy: Policy, *, origin: float, deadline: float) -> float:
+    """``rehearsal_run.lifetime_end`` at the D-35 values the specification must carry."""
+    return lifetime_end(
+        policy,
+        origin=origin,
+        deadline=deadline,
+        pod_seconds=rehearsal_ops.POD_LIFETIME_SECONDS,
+        cost_stop_usd=rehearsal_ops.COST_STOP_USD,
+        quoted_total_hourly=rehearsal_ops.QUOTED_TOTAL_HOURLY,
+    )
+
+
 def check_rehearsal_readiness(receipt: dict[str, Any], *, now: float, run: str) -> float:
     """Reject a rehearsal receipt with an unresolved gate or a limit already at risk.
 
     Returns the conservative billing origin. Every limit is checked against the D-35
-    ceilings; the remaining lifetime must still hold the run at the reference speed.
+    ceilings, the watchdog's transfer window must be the D-35 one, and the lifetime left
+    must still pass the worker's launch rule (``rehearsal_run.require_fit``) against the
+    plan the receipt recorded at the reference speed.
     """
     if receipt.get("kind") != REHEARSAL_KIND or receipt.get("run") != run:
         raise ValueError(f"not a rehearsal readiness receipt for run {run}")
@@ -244,6 +291,11 @@ def check_rehearsal_readiness(receipt: dict[str, Any], *, now: float, run: str) 
         or policy.quoted_total_hourly < rehearsal_ops.QUOTED_TOTAL_HOURLY
     ):
         raise ValueError("the watchdog policy is weaker than the D-35 limits")
+    if policy.max_transfer_seconds != rehearsal_ops.MAX_TRANSFER_SECONDS:
+        raise ValueError(
+            "the watchdog policy's max_transfer_seconds must be the D-35 upload window of "
+            f"{rehearsal_ops.MAX_TRANSFER_SECONDS} s"
+        )
     if receipt.get("r2_run_prefix") != rehearsal_ops.run_prefix(run, identity.pod_id):
         raise ValueError("the receipt's R2 prefix is not this run's Pod prefix")
     for name in ("binding_sha256", "initialization_sha256", "specification_sha256"):
@@ -269,17 +321,12 @@ def check_rehearsal_readiness(receipt: dict[str, Any], *, now: float, run: str) 
         or elapsed / 3600 * rehearsal_ops.QUOTED_TOTAL_HOURLY >= rehearsal_ops.COST_STOP_USD
     ):
         raise ValueError("pod already exceeds an operating limit")
-    remaining = min(origin + rehearsal_ops.POD_LIFETIME_SECONDS, deadline) - now
+    remaining = d35_lifetime_end(policy, origin=origin, deadline=deadline) - now
     fit = receipt.get("time_fit")
     if not isinstance(fit, dict):
         raise ValueError("the receipt carries no time fit")
     needed = finite_number(fit.get("reference_seconds_needed"), "reference seconds needed")
-    minimum = rehearsal_ops.SPEED_CHECK_SECONDS + rehearsal_ops.FINALIZATION_RESERVE_SECONDS
-    if needed <= 0 or remaining <= max(minimum, needed):
-        raise ValueError(
-            f"{remaining:,.0f} s of Pod lifetime left cannot hold the run even at the "
-            f"reference speed ({needed:,.0f} s needed)"
-        )
+    require_fit(remaining, needed)
     return origin
 
 
@@ -302,13 +349,23 @@ def build_rehearsal_receipt(
     billing_origin_unix: float,
     now: float | None = None,
 ) -> dict[str, Any]:
-    """Assemble one run's receipt from the Pod's evidence and the owner's confirmations."""
+    """Assemble one run's receipt from the Pod's evidence and the owner's confirmations.
+
+    The result is exactly what ``tools.rehearsal_run run`` accepts: its kind, run, gate
+    names, the four SHA-256 bindings, the Pod identity the worker takes its Pod ID from,
+    the watchdog policy with the billing origin, and the armed deadline.
+    """
     created_at = now if now is not None else time.time()
-    _load(specification)  # The worker's own file; bound here by its SHA-256.
+    # The worker's own file, parsed as the worker parses it and bound by its SHA-256.
+    spec = RehearsalSpecification.load(specification)
+    check_d35_specification(spec, run=run)
     bound = load_binding(binding, expected_sha256=binding_sha256)
+    binding_targets(spec, bound)  # The specification plans the binding's stages and updates.
     pod_identity = PodIdentity.from_dict(_load(identity))
     policy_value = _load(policy)
-    Policy(**policy_value)
+    if policy_value.get("billing_started_at_unix") not in (None, billing_origin_unix):
+        raise ValueError("the policy file's billing origin differs from --billing-origin-unix")
+    watchdog = Policy(**{**policy_value, "billing_started_at_unix": billing_origin_unix})
     timer = _load(self_destruct_receipt)
     if timer.get("pod_id") != pod_identity.pod_id or timer.get("state") != "armed":
         raise ValueError("self-destruct receipt is not armed for this Pod")
@@ -326,6 +383,13 @@ def build_rehearsal_receipt(
         or fused.get("status") != "passed"
     ):
         raise ValueError("the A40 preflight with fused attention has not passed on cuda:0")
+    compiled = preflight_report.get("compile_equivalence")
+    passed = isinstance(compiled, dict) and compiled.get("status") == "passed"
+    if spec.train.compile and not passed:
+        raise ValueError(
+            "the specification compiles, so the A40 preflight's compile_equivalence check "
+            "must have passed (tools.pilot_preflight --compile-check)"
+        )
     staged = shards_staged_and_hash_checked(
         bound,
         run=run,
@@ -341,15 +405,10 @@ def build_rehearsal_receipt(
         or initialization.get("method") not in {"downloaded", "present"}
     ):
         raise ValueError("the shared initialization was not fetched with its pinned SHA-256")
-    plan = rehearsal_plans_from_binding(bound)[run]
-    options = RehearsalOptions()
-    reference = rehearsal_time_budget(
-        plan, options, options.reference_tokens_per_second, startup_seconds=0
-    )
-    floor = rehearsal_time_budget(plan, options, options.floor_tokens_per_second, startup_seconds=0)
     deadline = finite_number(timer.get("deadline_unix"), "self-destruct deadline")
     origin = min(billing_origin_unix, parse_timestamp(pod_identity.created_at))
-    remaining = min(origin + rehearsal_ops.POD_LIFETIME_SECONDS, deadline) - created_at
+    end = d35_lifetime_end(watchdog, origin=origin, deadline=deadline)
+    fit = launch_fit(spec, bound, remaining_seconds=end - created_at)
     receipt: dict[str, Any] = {
         "schema_version": 1,
         "kind": REHEARSAL_KIND,
@@ -384,24 +443,7 @@ def build_rehearsal_receipt(
             "initialization_fetch": file_sha256(initialization_fetch),
         },
         "limits": _rehearsal_constants(),
-        "time_fit": {
-            "remaining_seconds": remaining,
-            "reference_seconds_needed": reference["total_seconds"],
-            "floor_seconds_needed": floor["total_seconds"],
-            "fits_at_reference": reference["total_seconds"] < remaining,
-            "fits_at_floor": floor["total_seconds"] < remaining,
-            "assumptions": {
-                key: value
-                for key, value in asdict(options).items()
-                if key
-                in {
-                    "validation_speed_factor",
-                    "compile_seconds_per_stage",
-                    "checkpoint_save_seconds",
-                    "finalization_reserve_seconds",
-                }
-            },
-        },
+        "time_fit": {**fit, "lifetime_end_unix": end, "checked_at_unix": created_at},
     }
     for gate in REHEARSAL_OWNER_GATES:
         receipt[gate] = owner.get(gate)

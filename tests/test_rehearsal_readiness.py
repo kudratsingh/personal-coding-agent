@@ -2,14 +2,18 @@
 
 import hashlib
 import json
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import torch
 
 from scratchcoder.common.records import atomic_json
 from scratchcoder.data.onepass import combine_digests
-from tools import rehearsal_binding
+from scratchcoder.data.shards import file_sha256
+from tools import rehearsal_binding, rehearsal_run
 from tools.pilot_feasibility import (
     default_rehearsal_plans,
     planned_updates,
@@ -20,7 +24,22 @@ from tools.pilot_readiness_receipt import (
     check_rehearsal_readiness,
     main,
 )
-from tools.rehearsal_binding import PACKING, RUNS, SUBSET_RULE, VALIDATION_STREAMS, run_files
+from tools.rehearsal_binding import (
+    PACKING,
+    RUNS,
+    SUBSET_RULE,
+    VALIDATION_STREAMS,
+    load_binding,
+    run_files,
+)
+from tools.rehearsal_run import (
+    LAUNCH_RULE,
+    Launch,
+    Specification,
+    binding_targets,
+    check_readiness,
+    planned_seconds,
+)
 
 POD = "podfixture01"
 CREATED = 1_800_000_000.0
@@ -28,12 +47,17 @@ CREATED_AT = "2027-01-15T08:00:00+00:00"
 PREFIX = "rehearsal-s-fixture/"
 INIT = "cd" * 32
 STREAMS = {
-    "stage1-web": ("web", "train", 3_000, 3),
-    "stage2-web": ("web", "train", 1_000, 1),
-    "stage2-python": ("python", "train", 2_000, 2),
-    "validation-web": ("web", "validation", 500, 1),
-    "validation-python": ("python", "validation", 400, 1),
+    "stage1-web": ("web", "train", 1_000_000_000, 1_200_000),
+    "stage2-web": ("web", "train", 400_000_000, 480_000),
+    "stage2-python": ("python", "train", 600_000_000, 700_000),
+    "validation-web": ("web", "validation", 6_948_391, 7_341),
+    "validation-python": ("python", "validation", 5_334_710, 4_848),
 }
+"""The S build's stage and validation sizes, so the checked-in specifications plan them."""
+CONFIGS = Path(__file__).resolve().parents[1] / "configs"
+SPECS = {"A": CONFIGS / "rehearsal-a40-s-a.json", "B": CONFIGS / "rehearsal-a40-s-b.json"}
+_A = json.loads(SPECS["A"].read_text(encoding="utf-8"))
+A_LIMITS, A_R2, A_STAGES = _A["limits"], _A["r2"], _A["stages"]
 
 
 def digest(label: str) -> str:
@@ -158,12 +182,14 @@ def fixtures(tmp_path: Path, run: str = "A", **change: Any) -> dict[str, Any]:
     binding_sha256 = hashlib.sha256(data).hexdigest()
     prefix = f"rehearsal-runs/{run}/{POD}/"
     values: dict[str, Any] = {
-        "specification": {"run": run, "limits": {"pod_seconds": 45_000}},
+        "specification": json.loads(SPECS[run].read_text(encoding="utf-8")),
         "preflight": {
             "status": "completed",
             "hardware_precision_and_resume_checked": True,
             "device": "cuda:0",
+            "hardware": {"device": "cuda:0", "name": "NVIDIA A40", "uuid": "GPU-fixture"},
             "fused_attention": {"status": "passed"},
+            "compile_equivalence": {"status": "passed"},
         },
         "identity": {
             "id": POD,
@@ -179,7 +205,7 @@ def fixtures(tmp_path: Path, run: str = "A", **change: Any) -> dict[str, Any]:
             "max_cost_usd": 7.54,
             "max_idle_seconds": 600,
             "quoted_total_hourly": 0.6,
-            "max_transfer_seconds": 0,
+            "max_transfer_seconds": 900,
             "billing_started_at_unix": CREATED - 5,
             "idle_baseline_unix": CREATED + 100,
         },
@@ -266,9 +292,19 @@ def test_receipt_binds_the_pods_evidence_and_passes_the_d35_gate(tmp_path: Path)
     assert receipt["initialization_sha256"] == INIT
     assert receipt["watchdog_policy"]["billing_started_at_unix"] == CREATED - 5
     assert receipt["limits"]["cost_stop_usd"] == pytest.approx(7.55004)
+    assert receipt["limits"]["max_transfer_seconds"] == 900
+    assert receipt["watchdog_policy"]["max_transfer_seconds"] == 900
     fit = receipt["time_fit"]
-    assert fit["fits_at_reference"] and fit["fits_at_floor"]
     assert fit["remaining_seconds"] == pytest.approx(45_000 - 180 - 5 - 1_800)
+    # The worker's launch rule, at the reference speed, from the worker's own plan.
+    spec = Specification.load(SPECS["A"])
+    targets, full = binding_targets(spec, synthetic_binding())
+    plan = planned_seconds(spec, stage_targets=targets, full_validation_targets=full)
+    assert fit["reference_seconds_needed"] == pytest.approx(plan["total_seconds"])
+    assert fit["rule"] == LAUNCH_RULE and fit["fits_at_reference"]
+    # 43,015 s left holds the run at 56,479 tok/s (38,107 s) but not at the floor (44,401 s).
+    assert fit["fits_at_floor"] is False
+    assert fit["floor_seconds_needed"] == pytest.approx(44_401, abs=1)
     assert "ssh_transfer_tested" not in receipt
     assert check_rehearsal_readiness(receipt, now=CREATED + 1_801, run="A") == CREATED - 5
     with pytest.raises(ValueError, match="run B"):
@@ -291,9 +327,19 @@ def test_run_b_receipt_covers_the_mixed_stage(tmp_path: Path) -> None:
         ({"data_verification": {"stages": {"A": []}}}, "stage order"),
         ({"initialization_fetch": {"sha256": "ef" * 32}}, "initialization"),
         ({"preflight": {"fused_attention": {"status": "failed"}}}, "fused attention"),
+        ({"preflight": {"compile_equivalence": {"status": "failed"}}}, "compile_equivalence"),
+        ({"preflight": {"compile_equivalence": None}}, "--compile-check"),
         ({"policy": {"mode": "pilot", "max_wall_seconds": 5_400}}, "D-35"),
         ({"policy": {"max_cost_usd": 7.6}}, "D-35"),
         ({"policy": {"quoted_total_hourly": 0.5}}, "D-35"),
+        ({"policy": {"max_transfer_seconds": 0}}, "max_transfer_seconds"),
+        ({"policy": {"max_transfer_seconds": 1_800}}, "max_transfer_seconds"),
+        ({"policy": {"billing_started_at_unix": CREATED + 30}}, "billing origin"),
+        ({"specification": {"run": "B"}}, "run design"),
+        ({"specification": {"limits": {**A_LIMITS, "idle_seconds": 500}}}, "D-35"),
+        ({"specification": {"expected_tokens_per_second": 50_000}}, "D-35"),
+        ({"specification": {"r2": {**A_R2, "max_transfer_seconds": 1_000}}}, "D-35"),
+        ({"specification": {"stages": [{**A_STAGES[0], "updates": 7_631}, A_STAGES[1]]}}, "spec's"),
         ({"self_destruct_receipt": {"state": "dry_run_complete"}}, "not armed"),
         ({"self_destruct_receipt": {"deadline_unix": CREATED + 50_000}}, "lifetime"),
         ({"confirmations": {"owner_accepts_best_effort_termination": False}}, "acceptance"),
@@ -348,12 +394,113 @@ def test_cli_writes_nothing_when_a_gate_fails_and_the_pilot_cli_is_untouched(
 
 def test_binding_plans_match_the_packing_and_the_s_build_defaults() -> None:
     plans = rehearsal_plans_from_binding(synthetic_binding())
-    # 3,000 + 3,000 tokens: three and six 1,024-token windows, one partial update each.
-    assert plans["A"].stages == (("stage1", 1), ("stage2", 1))
-    assert plans["B"].stages == (("mixed", 1),)
-    assert plans["A"].validation_targets == 900
+    # 10^9 tokens per A stage: 976,563 windows of 1,024 tokens in 7,630 updates.
+    assert plans["A"].stages == (("stage1", 7_630), ("stage2", 7_630))
+    assert plans["B"].stages == (("mixed", 15_259),)
+    assert plans["A"].validation_targets == 6_948_391 + 5_334_710
     defaults = default_rehearsal_plans()
     assert defaults["A"].stages == (("stage1", 7_630), ("stage2", 7_630))
     assert defaults["B"].stages == (("mixed", 15_259),)
     assert planned_updates(1024 * 128) == 1 and planned_updates(1024 * 128 + 1) == 2
     assert json.dumps(defaults["A"].updates) == "15260"
+
+
+# The receipt tool's output, read by the worker ----------------------------------------
+
+
+def worker_identity(values: dict[str, Any]) -> dict[str, str]:
+    """The four SHA-256s the worker computes from its own command line."""
+    return {
+        "specification_sha256": file_sha256(values["specification"]),
+        "binding_sha256": values["binding_sha256"],
+        "preflight_sha256": file_sha256(values["preflight"]),
+        "initialization_sha256": values["initialization_sha256"],
+    }
+
+
+@pytest.mark.parametrize("run", ["A", "B"])
+def test_the_worker_accepts_exactly_the_receipt_the_tool_builds(tmp_path: Path, run: str) -> None:
+    values = fixtures(tmp_path, run=run)
+    path = tmp_path / "readiness-receipt.json"
+    atomic_json(path, build_rehearsal_receipt(**values))  # What the receipt command writes.
+    receipt = json.loads(path.read_text(encoding="utf-8"))
+    spec = Specification.load(values["specification"])
+    binding = load_binding(values["binding"], expected_sha256=values["binding_sha256"])
+    later = values["now"] + 600  # The worker starts ten minutes after the receipt.
+
+    def check(value: dict[str, Any], **change: Any) -> Launch:
+        return check_readiness(
+            value,
+            now=later,
+            spec=change.pop("spec", spec),
+            binding=binding,
+            **{**worker_identity(values), **change},
+        )
+
+    launch = check(receipt)
+    # The Pod ID comes from the receipt's captured identity: no RUNPOD_POD_ID is needed.
+    assert launch.pod_id == POD and receipt["r2_run_prefix"] == f"rehearsal-runs/{run}/{POD}/"
+    # One billing origin, one armed deadline and one launch rule on both sides.
+    assert launch.origin == CREATED - 5 == receipt["watchdog_policy"]["billing_started_at_unix"]
+    assert launch.end == receipt["self_destruct_deadline_unix"]
+    assert launch.end == receipt["time_fit"]["lifetime_end_unix"]
+    assert launch.spec.limits.pod_seconds == launch.end - launch.origin
+    assert launch.fit["rule"] == receipt["time_fit"]["rule"]
+    needed = receipt["time_fit"]["reference_seconds_needed"]
+    assert launch.fit["reference_seconds_needed"] == needed
+    assert launch.fit["remaining_seconds"] == receipt["time_fit"]["remaining_seconds"] - 600
+    # A tampered specification: the same content in other bytes is another file.
+    resorted = tmp_path / "resorted-spec.json"
+    resorted.write_text(json.dumps(json.loads(values["specification"].read_text()), sort_keys=True))
+    assert Specification.load(resorted) == spec  # Key order never changes what it says.
+    with pytest.raises(ValueError, match="specification differs"):
+        check(receipt, specification_sha256=file_sha256(resorted))
+    with pytest.raises(ValueError, match="binding identity differs"):
+        check(receipt, binding_sha256="0" * 64)
+    report = json.loads(values["preflight"].read_text())
+    values["preflight"].write_text(json.dumps({**report, "note": "edited after the receipt"}))
+    with pytest.raises(ValueError, match="preflight report differs"):
+        check(receipt)
+    with pytest.raises(ValueError, match="initialization identity differs"):
+        check(receipt, preflight_sha256=receipt["preflight_sha256"], initialization_sha256="e" * 64)
+    other = "B" if run == "A" else "A"
+    with pytest.raises(ValueError, match=f"receipt for run {other}"):
+        check(receipt, spec=Specification.load(SPECS[other]))
+
+
+def test_the_worker_command_line_passes_every_gate_with_a_built_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    values = fixtures(tmp_path)
+    receipt_path = tmp_path / "readiness-receipt.json"
+    atomic_json(receipt_path, build_rehearsal_receipt(**values))
+    output = tmp_path / "rehearsal-run"
+    argv = ["run", "--output", str(output), "--root", str(tmp_path / "data")]
+    for flag, value in (
+        ("--specification", values["specification"]),
+        ("--binding", values["binding"]),
+        ("--binding-sha256", values["binding_sha256"]),
+        ("--initialization", tmp_path / "initialization.pt"),
+        ("--initialization-sha256", values["initialization_sha256"]),
+        ("--readiness", receipt_path),
+        ("--preflight", values["preflight"]),
+    ):
+        argv += [flag, str(value)]
+    preflight = json.loads(values["preflight"].read_text())
+    clock = SimpleNamespace(time=lambda: values["now"] + 600, monotonic=time.monotonic)
+    monkeypatch.setattr(rehearsal_run, "time", clock)
+    monkeypatch.setattr(rehearsal_run, "training_device", lambda name: torch.device("cpu"))
+    monkeypatch.setattr(rehearsal_run, "hardware_description", lambda _: preflight["hardware"])
+    for name in ("RUNPOD_POD_ID", "R2_ENDPOINT", "R2_BUCKET", *rehearsal_run.SECRET_VARIABLES):
+        monkeypatch.delenv(name, raising=False)
+    # The worker's launch does not source /etc/rp_environment: without RUNPOD_POD_ID it
+    # takes the receipt's Pod and passes every gate, stopping first at the missing R2 key.
+    with pytest.raises(ValueError, match="R2_POD_ACCESS_KEY_ID"):
+        rehearsal_run.main(argv)
+    monkeypatch.setenv("RUNPOD_POD_ID", POD)
+    with pytest.raises(ValueError, match="R2_POD_ACCESS_KEY_ID"):
+        rehearsal_run.main(argv)
+    monkeypatch.setenv("RUNPOD_POD_ID", "another-pod")
+    with pytest.raises(ValueError, match="not the one the receipt identifies"):
+        rehearsal_run.main(argv)
+    assert not output.exists()

@@ -1,13 +1,14 @@
 """Rehearsal pretraining worker for runs A and B (D-35) on one existing Pod; never provisions.
 
 ``run`` (Pod)
-    Check the readiness receipt, the A40 preflight (with its compile check), the data
-    binding and the shared initialization. Then train each stage of one run over every
-    bound document exactly once, validate on a fixed subset every ``interval`` global
-    updates and on both full validation streams at each stage end, and send checkpoints
-    to R2 in the background. The heartbeat reads ``running`` throughout, across run A's
-    stage boundary too, and ``awaiting_transfer`` only once every milestone and
-    ``report.json`` are verified in R2.
+    Check the readiness receipt that ``python -m tools.pilot_readiness_receipt rehearsal``
+    wrote, the A40 preflight (with its compile check), the data binding and the shared
+    initialization. Then train each stage of one run over every bound document exactly
+    once, validate on a fixed subset every ``interval`` global updates and on both full
+    validation streams at each stage end, and send checkpoints to R2 in the background.
+    The heartbeat reads ``running`` throughout, across run A's stage boundary too,
+    ``uploading`` while the last checkpoints drain to R2 with the GPU idle, and
+    ``awaiting_transfer`` only once every milestone and ``report.json`` are verified in R2.
 ``smoke`` (CPU)
     Both runs on tiny authored shards with an in-memory bucket; nothing touches a network.
 ``write-initialization`` (Mac)
@@ -79,7 +80,8 @@ from tools.rehearsal_binding import (
     r2_credentials,
     verify_binding,
 )
-from tools.runpod_watchdog import MODE_WALL_SECONDS
+from tools.rehearsal_ops import READINESS_GATES, READINESS_KIND, UPLOADING_STATUS, run_prefix
+from tools.runpod_watchdog import MAX_TRANSFER_SECONDS, MODE_WALL_SECONDS, PodIdentity, Policy
 
 SCHEMA_VERSION = 1
 SPECIFICATION_KIND = "rehearsal-run-specification"
@@ -93,23 +95,30 @@ MAX_IDLE_SECONDS = 600
 MAX_APPROVED_COST_USD = 10.0
 HEARTBEAT_REFRESH_SECONDS = 5.0
 FULL_VALIDATION_SORT_WINDOWS = 512
+FINALIZE_MARGIN_SECONDS = 120.0
+"""Kept free at the end of the watchdog's transfer window after the drain: the HEAD checks,
+the ``report.json`` upload and the supervisor's own verification and archive."""
 HARD_STOPS = frozenset({"pod_wall_limit", "cost_limit", "idle_gpu_limit"})
 NO_FINALIZATION_STOPS = frozenset({"pod_wall_limit", "cost_limit"})
 """Stops that never wait for uploads: finalization must not extend a wall or cost limit."""
-REHEARSAL_GATES = (
-    "owner_confirms_four_runpod_steps",
-    "cloud_data_pre_staged",
-    "external_watchdog_armed",
-    "pod_self_destruct_armed",
-    "hardware_preflight_passed",
-    "full_console_quote_confirmed",
-    "staging_storage_cost_bound",
-    "r2_round_trip_tested",
-    "r2_shards_staged_and_hash_checked",
-    "r2_token_bucket_scoped",
+REHEARSAL_GATES = READINESS_GATES
+"""Receipt gates, each an explicit ``true``, as the receipt builder sets them. The pilot's
+``ssh_transfer_tested`` is replaced by ``r2_round_trip_tested``: checkpoints leave the Pod
+through R2, not SSH."""
+LAUNCH_RULE = (
+    "at launch the Pod lifetime left, to the first of the wall, the armed in-Pod deadline, "
+    "the watchdog's wall and either cost stop, must hold the whole planned run at the "
+    "reference speed: every update at expected_tokens_per_second, every validation "
+    "at validation_tokens_per_second, startup_seconds per stage, the planned checkpoint saves "
+    "and the finalization reserve"
 )
-"""Receipt gates, each an explicit ``true``. The pilot's ``ssh_transfer_tested`` is replaced
-by ``r2_round_trip_tested``: checkpoints leave the Pod through R2, not SSH."""
+SPEED_CHECK_RULE = (
+    "after speed_check_seconds of training the run stops if its post-compile throughput is "
+    "below minimum_speed_fraction x expected_tokens_per_second, or if its projected finish "
+    "at the measured rates (remaining updates, validations, recompilation, checkpoint saves "
+    "and the finalization reserve) passes the end of the Pod lifetime; the second rule binds "
+    "even when the throughput passes"
+)
 SECRET_VARIABLES = (
     "R2_POD_ACCESS_KEY_ID",
     "R2_POD_SECRET_ACCESS_KEY",
@@ -139,6 +148,7 @@ SPECIFICATION_KEYS = {
     "stages",
     "validation",
     "checkpoint_seconds",
+    "checkpoint_save_seconds",
     "expected_tokens_per_second",
     "validation_tokens_per_second",
     "speed_check_warmup_updates",
@@ -188,7 +198,7 @@ LIMIT_KEYS = {
     "rising_steps",
     "starting_cost_usd",
 }
-R2_KEYS = {"keep_rolling", "storage_cap_usd_per_month", "drain_seconds"}
+R2_KEYS = {"keep_rolling", "storage_cap_usd_per_month", "drain_seconds", "max_transfer_seconds"}
 
 
 def _exact(value: Any, keys: set[str], name: str) -> dict[str, Any]:
@@ -214,9 +224,10 @@ def rehearsal_limits(
 ) -> Limits:
     """The pilot's ``Limits`` for a rehearsal run, which has no probes.
 
-    ``startup_seconds`` (data checks, model build, the first validation and compilation)
-    takes the probe window's place. Training may run until only the finalization reserve
-    is left before the Pod wall, so the training budget is the wall minus that reserve.
+    ``startup_seconds`` takes the probe window's place: the launch plan charges it once
+    per stage, for the model build, the parent check and compilation (stage 1 also checks
+    the data). Training may run until only the finalization reserve is left before the
+    Pod lifetime ends, so the training budget is the lifetime minus that reserve.
     """
     return Limits(
         probe_seconds=startup_seconds,
@@ -307,7 +318,11 @@ class Specification:
     limits: Limits
     warmup_fraction: float
     checkpoint_seconds: float
+    checkpoint_save_seconds: float
+    """A planning bound for one save, its SHA-256 and export; the speed check uses the
+    measured save time once a save has happened."""
     expected_tokens_per_second: float
+    """The reference speed: the launch rule's basis and the speed floor's reference."""
     validation_tokens_per_second: float
     """A planning rate for launch fit only; the speed check uses the measured rate."""
     speed_check_warmup_updates: int
@@ -315,6 +330,9 @@ class Specification:
     keep_rolling: int
     storage_cap_usd_per_month: float
     drain_seconds: float
+    max_transfer_seconds: float
+    """The watchdog policy's transfer window: an ``uploading`` heartbeat may hold the Pod
+    this long after the last GPU work. The final drain and checks end inside it."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.run, str) or self.run not in RUNS:
@@ -350,11 +368,13 @@ class Specification:
             raise ValueError("rehearsal limits must come from rehearsal_limits")
         for name in (
             "checkpoint_seconds",
+            "checkpoint_save_seconds",
             "expected_tokens_per_second",
             "validation_tokens_per_second",
             "quoted_gpu_hourly",
             "storage_cap_usd_per_month",
             "drain_seconds",
+            "max_transfer_seconds",
         ):
             if finite_number(getattr(self, name), name) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -365,12 +385,18 @@ class Specification:
             raise ValueError("speed-check warmup must be a nonnegative integer below every stage")
         if type(self.keep_rolling) is not int or self.keep_rolling < 1:
             raise ValueError("keep_rolling must be a positive integer")
+        if self.max_transfer_seconds > MAX_TRANSFER_SECONDS:
+            raise ValueError(f"max_transfer_seconds exceeds the {MAX_TRANSFER_SECONDS} s ceiling")
         if (
-            self.drain_seconds >= self.limits.idle_seconds
+            self.drain_seconds + FINALIZE_MARGIN_SECONDS > self.max_transfer_seconds
             or self.drain_seconds >= self.limits.finalization_reserve_seconds
         ):
-            # A final drain waits without GPU work, so it must end before the idle limit.
-            raise ValueError("drain_seconds must be shorter than the idle limit and the reserve")
+            # A final drain waits without GPU work: it and the checks after it must end
+            # inside the watchdog's transfer window, and the drain inside the reserve.
+            raise ValueError(
+                "drain_seconds plus the finalize margin must fit max_transfer_seconds, "
+                "and the drain must be shorter than the finalization reserve"
+            )
 
     @property
     def tokens_per_update(self) -> int:
@@ -437,16 +463,21 @@ class Specification:
             not isinstance(value, str) for value in streams.values()
         ):
             raise ValueError("validation streams must map labels to stream names")
+        # A JSON object has no order, and sorted-key writers (atomic_json) reorder it:
+        # the streams are read in the binding's validation order whatever the file's order.
+        rank = {name: index for index, name in enumerate(VALIDATION_STREAMS)}
+        ordered = sorted(streams.items(), key=lambda item: rank.get(item[1], len(rank)))
         r2 = _exact(top["r2"], R2_KEYS, "r2")
         return cls(
             run=top["run"],
             model=ModelConfig(**_exact(top["model"], MODEL_KEYS, "model")),
             train=train,
             stages=tuple(stages),
-            validation=ValidationPlan(**{**validation, "streams": tuple(streams.items())}),
+            validation=ValidationPlan(**{**validation, "streams": tuple(ordered)}),
             limits=rehearsal_limits(**_exact(top["limits"], LIMIT_KEYS, "limits")),
             warmup_fraction=top["warmup_fraction"],
             checkpoint_seconds=top["checkpoint_seconds"],
+            checkpoint_save_seconds=top["checkpoint_save_seconds"],
             expected_tokens_per_second=top["expected_tokens_per_second"],
             validation_tokens_per_second=top["validation_tokens_per_second"],
             speed_check_warmup_updates=top["speed_check_warmup_updates"],
@@ -454,51 +485,207 @@ class Specification:
             keep_rolling=r2["keep_rolling"],
             storage_cap_usd_per_month=r2["storage_cap_usd_per_month"],
             drain_seconds=r2["drain_seconds"],
+            max_transfer_seconds=r2["max_transfer_seconds"],
         )
 
 
 def planned_seconds(
-    spec: Specification, *, stage_targets: Sequence[int], full_validation_targets: int
+    spec: Specification,
+    *,
+    stage_targets: Sequence[int],
+    full_validation_targets: int,
+    tokens_per_second: float | None = None,
 ) -> dict[str, float]:
-    """Pod seconds the whole run needs at the speed floor, by part.
+    """Pod seconds the whole run needs from the worker's start at one training speed, by part.
 
-    Training runs at ``minimum_speed_fraction`` of the expected rate. Validation counts
-    every interval subset (global update 0 included) and each stage's full validation at
-    the planning validation rate. Startup and the finalization reserve are added.
+    ``tokens_per_second`` defaults to the reference speed, ``expected_tokens_per_second``:
+    the launch rule's basis. Validation counts every interval subset (global update 0
+    included) and each stage's full validation at the planning validation rate. Startup
+    is charged once per stage. Checkpoints are one save per ``checkpoint_seconds`` of
+    training and validation plus one per stage end, each ``checkpoint_save_seconds``
+    long. The finalization reserve comes last.
     """
-    floor = spec.limits.minimum_speed_fraction * spec.expected_tokens_per_second
+    rate = finite_number(
+        spec.expected_tokens_per_second if tokens_per_second is None else tokens_per_second,
+        "training tokens per second",
+    )
+    if rate <= 0 or len(stage_targets) != len(spec.stages):
+        raise ValueError("the plan needs a positive speed and one target count per stage")
     targets = sum(stage_targets)
     interval = spec.validation.interval_updates
     validations = len(range(0, spec.total_updates + 1, interval))
     subset = spec.validation.subset_target_tokens * len(spec.validation.streams)
     validation_tokens = validations * subset + len(spec.stages) * full_validation_targets
+    training = targets / rate
+    validation = validation_tokens / spec.validation_tokens_per_second
+    saves = math.floor((training + validation) / spec.checkpoint_seconds) + len(spec.stages)
     parts = {
-        "training_seconds": targets / floor,
-        "validation_seconds": validation_tokens / spec.validation_tokens_per_second,
-        "startup_seconds": spec.limits.probe_seconds,
+        "training_seconds": training,
+        "validation_seconds": validation,
+        "startup_seconds": len(spec.stages) * spec.limits.probe_seconds,
+        "checkpoint_seconds": saves * spec.checkpoint_save_seconds,
         "finalization_reserve_seconds": spec.limits.finalization_reserve_seconds,
     }
     return {
+        "tokens_per_second": rate,
         "training_targets": float(targets),
-        "speed_floor_tokens_per_second": floor,
         "interval_validations": float(validations),
         "validation_tokens": float(validation_tokens),
         "validation_tokens_per_second": spec.validation_tokens_per_second,
+        "checkpoint_saves": float(saves),
         **parts,
         "total_seconds": math.fsum(parts.values()),
     }
 
 
-def check_readiness(
-    receipt: dict[str, Any], *, now: float, spec: Specification, required_seconds: float
-) -> float:
-    """Reject unresolved gates, or a Pod whose remaining lifetime cannot hold the whole run.
+def binding_targets(spec: Specification, binding: Mapping[str, Any]) -> tuple[list[int], int]:
+    """Each stage's targets and both full validation streams' targets, from a checked binding.
 
-    ``required_seconds`` is ``planned_seconds(...)["total_seconds"]``: every update at the
-    speed floor, every validation, startup and the finalization reserve. The lifetime
-    left is measured to the earlier of the wall and the armed in-pod deadline. Returns
-    the conservative billing origin.
+    The binding's stages, streams and planned updates must be the specification's.
     """
+    stages = binding["runs"][spec.run]["stages"]
+    bound = [(stage["name"], tuple(stage["streams"]), stage["planned_updates"]) for stage in stages]
+    if bound != [(plan.name, plan.streams, plan.updates) for plan in spec.stages]:
+        raise ValueError("the binding's stages, streams or planned updates differ from the spec's")
+    full = sum(
+        int(binding["streams"][stream]["tokens"]) - int(binding["streams"][stream]["documents"])
+        for _, stream in spec.validation.streams
+    )  # Every document's tokens after its BOS.
+    return [int(stage["targets"]) for stage in stages], full
+
+
+def lifetime_end(
+    policy: Policy,
+    *,
+    origin: float,
+    deadline: float,
+    pod_seconds: float,
+    cost_stop_usd: float,
+    quoted_total_hourly: float,
+    starting_cost_usd: float = 0.0,
+) -> float:
+    """The first moment a guard ends the Pod: the wall, the armed in-Pod deadline, the
+    watchdog's wall, or the worker's or the watchdog's cost stop at its quoted rate.
+
+    The worker passes its limits; the receipt builder passes the same D-35 values."""
+    return min(
+        origin + pod_seconds,
+        deadline,
+        origin + policy.max_wall_seconds,
+        origin + (cost_stop_usd - starting_cost_usd) / quoted_total_hourly * 3600,
+        origin
+        + (policy.max_cost_usd - policy.starting_cost_usd) / policy.quoted_total_hourly * 3600,
+    )
+
+
+def require_fit(remaining_seconds: float, needed_seconds: float) -> None:
+    """The launch rule's one comparison, shared by the worker and the receipt builder."""
+    remaining = finite_number(remaining_seconds, "remaining seconds")
+    needed = finite_number(needed_seconds, "reference seconds needed")
+    if needed <= 0 or remaining < needed:
+        raise ValueError(
+            f"{remaining:,.0f} s of Pod lifetime left cannot hold the run at the reference "
+            f"speed ({needed:,.0f} s needed)"
+        )
+
+
+def launch_fit(
+    spec: Specification, binding: Mapping[str, Any], *, remaining_seconds: float
+) -> dict[str, Any]:
+    """The launch rule's record: the plan at the reference speed against the lifetime left.
+
+    The plan at the speed floor is recorded too, for information: a run that only fits
+    at the reference speed may be stopped by the speed check's projected-finish rule.
+    """
+    stage_targets, full = binding_targets(spec, binding)
+    reference = planned_seconds(spec, stage_targets=stage_targets, full_validation_targets=full)
+    floor = planned_seconds(
+        spec,
+        stage_targets=stage_targets,
+        full_validation_targets=full,
+        tokens_per_second=spec.limits.minimum_speed_fraction * spec.expected_tokens_per_second,
+    )
+    remaining = finite_number(remaining_seconds, "remaining seconds")
+    return {
+        "rule": LAUNCH_RULE,
+        "speed_check_rule": SPEED_CHECK_RULE,
+        "remaining_seconds": remaining,
+        "reference_tokens_per_second": reference["tokens_per_second"],
+        "reference_seconds_needed": reference["total_seconds"],
+        "floor_tokens_per_second": floor["tokens_per_second"],
+        "floor_seconds_needed": floor["total_seconds"],
+        "fits_at_reference": 0 < reference["total_seconds"] <= remaining,
+        "fits_at_floor": 0 < floor["total_seconds"] <= remaining,
+        "reference": reference,
+        "floor": floor,
+    }
+
+
+def check_receipt_identity(
+    receipt: Mapping[str, Any],
+    *,
+    run: str,
+    specification_sha256: str,
+    binding_sha256: str,
+    preflight_sha256: str,
+    initialization_sha256: str,
+) -> None:
+    """The receipt must be a rehearsal readiness receipt for this run and these files."""
+    if receipt.get("kind") != READINESS_KIND or receipt.get("run") != run:
+        raise ValueError(f"the receipt is not a {READINESS_KIND} receipt for run {run}")
+    for name, value, message in (
+        ("specification_sha256", specification_sha256, "specification differs"),
+        ("binding_sha256", binding_sha256, "binding identity differs"),
+        ("preflight_sha256", preflight_sha256, "preflight report differs"),
+        ("initialization_sha256", initialization_sha256, "initialization identity differs"),
+    ):
+        if receipt.get(name) != value:
+            raise ValueError(f"{message} from the readiness receipt")
+
+
+@dataclass(frozen=True)
+class Launch:
+    """What a checked receipt fixes for the run."""
+
+    origin: float
+    """The conservative billing origin: the earlier of the create request and the Pod's
+    provider creation time."""
+    end: float
+    """``lifetime_end``: the first moment any guard ends the Pod."""
+    pod_id: str
+    """From the receipt's captured identity; ``RUNPOD_POD_ID`` is often absent over SSH."""
+    spec: Specification
+    """The specification, its Pod lifetime shortened to ``end - origin`` when that is less."""
+    fit: dict[str, Any]
+
+
+def check_readiness(
+    receipt: dict[str, Any],
+    *,
+    now: float,
+    spec: Specification,
+    binding: Mapping[str, Any],
+    specification_sha256: str,
+    binding_sha256: str,
+    preflight_sha256: str,
+    initialization_sha256: str,
+) -> Launch:
+    """Accept exactly a receipt from ``pilot_readiness_receipt rehearsal`` for this launch.
+
+    The receipt's kind, run and the specification, binding, preflight and initialization
+    SHA-256s must match; every gate must be ``true``; the termination guarantee, Pod
+    identity, watchdog policy (``mode: rehearsal``, this run's transfer window) and armed
+    deadline are checked as in the pilot, and the R2 prefix must be this Pod's. Then the
+    launch rule: the lifetime left must hold the whole run at the reference speed.
+    """
+    check_receipt_identity(
+        receipt,
+        run=spec.run,
+        specification_sha256=specification_sha256,
+        binding_sha256=binding_sha256,
+        preflight_sha256=preflight_sha256,
+        initialization_sha256=initialization_sha256,
+    )
     missing = [name for name in REHEARSAL_GATES if receipt.get(name) is not True]
     if missing:
         raise ValueError("rehearsal launch readiness gates are unresolved: " + ", ".join(missing))
@@ -510,15 +697,34 @@ def check_readiness(
         or limits.approved_cost_cap > MAX_APPROVED_COST_USD
     ):
         raise ValueError("specification exceeds the rehearsal wall, idle or cost ceiling")
-    origin, termination = termination_window(receipt, now=now, limits=limits)
-    remaining = min(origin + limits.pod_seconds, termination) - now
-    needed = finite_number(required_seconds, "required seconds")
-    if remaining < needed:
+    origin, deadline = termination_window(receipt, now=now, limits=limits)
+    policy = Policy(**receipt["watchdog_policy"])
+    if policy.mode != "rehearsal":
+        raise ValueError('the watchdog policy must say "mode": "rehearsal"')
+    if policy.max_transfer_seconds != spec.max_transfer_seconds:
         raise ValueError(
-            f"pod lifetime left ({remaining:,.0f} s) cannot fit the whole run at the speed "
-            f"floor ({needed:,.0f} s)"
+            f"the watchdog allows {policy.max_transfer_seconds:g} s of uploading after GPU "
+            f"work; the worker plans {spec.max_transfer_seconds:g} s"
         )
-    return origin
+    pod_id = PodIdentity.from_dict(receipt["pod_identity"]).pod_id
+    if receipt.get("r2_run_prefix") != run_prefix(spec.run, pod_id):
+        raise ValueError("the receipt's R2 prefix is not this run's Pod prefix")
+    end = lifetime_end(
+        policy,
+        origin=origin,
+        deadline=deadline,
+        pod_seconds=limits.pod_seconds,
+        cost_stop_usd=limits.cost_stop,
+        quoted_total_hourly=limits.quoted_total_hourly,
+        starting_cost_usd=limits.starting_cost_usd,
+    )
+    fit = launch_fit(spec, binding, remaining_seconds=end - now)
+    require_fit(fit["remaining_seconds"], fit["reference_seconds_needed"])
+    if end - origin < limits.pod_seconds:
+        # The in-pod timer (or a guard) ends the Pod before the wall; every deadline plans
+        # against that moment.
+        spec = spec.with_limits(pod_seconds=end - origin)
+    return Launch(origin, end, pod_id, spec, fit)
 
 
 def check_preflight(
@@ -786,13 +992,16 @@ class Worker:
         self.pod_end = pod_created + spec.limits.pod_seconds
         # Longest first, so a secret that contains another is redacted whole.
         self.secrets = tuple(sorted({s for s in secrets if len(s) >= 4}, key=len, reverse=True))
-        self.prefix = f"{R2_ROOT}{spec.run}/{pod_id}/"
+        self.prefix = run_prefix(spec.run, pod_id)  # The layout the Mac side verifies.
         self.last_activity = clock()
         self.last_heartbeat = 0.0
         self.last_saved = 0.0
         self.training_started: float | None = None
         self.training_deadline: float | None = None
         self.stop_reason: str | None = None
+        self.uploading = False
+        """True while finalization drains, checks and uploads to R2: the heartbeat then
+        reads ``uploading``, which the watchdog allows for ``max_transfer_seconds``."""
         self.phase = "initializing"
         self.stage_name = spec.stages[0].name
         self.global_update = 0
@@ -895,6 +1104,7 @@ class Worker:
             },
             "speed_check": {
                 "status": "pending",
+                "rule": SPEED_CHECK_RULE,
                 "after_seconds": limits.speed_check_seconds,
                 "floor_tokens_per_second": limits.minimum_speed_fraction
                 * spec.expected_tokens_per_second,
@@ -952,7 +1162,11 @@ class Worker:
 
     def heartbeat(self) -> None:
         status = self.report["status"]
-        if status in {"completed", "time_limited"}:
+        if self.uploading:
+            # Finalization: no GPU work, the last checkpoints and the report go to R2. The
+            # watchdog allows this for max_transfer_seconds; the supervisor never tears down.
+            status = UPLOADING_STATUS
+        elif status in {"completed", "time_limited"}:
             # Training is over; the run is done only once its durable copy is verified.
             status = "awaiting_transfer" if self.r2_final is not None else "running"
         value: dict[str, Any] = {
@@ -1251,8 +1465,10 @@ class Worker:
         Throughput counts only updates after each stage's first
         ``speed_check_warmup_updates`` (compilation). The projected finish adds, at the
         measured rates, the remaining targets, every remaining validation, a
-        recompilation per later stage, the measured save time of the remaining
-        checkpoints and the finalization reserve; it must not pass the Pod end.
+        recompilation per later stage, the remaining checkpoint saves (at the measured
+        save time, or ``checkpoint_save_seconds`` before the first save) and the
+        finalization reserve; it must not pass the Pod end, the armed deadline when that
+        comes first. Either failure stops the run (``SPEED_CHECK_RULE``).
         """
         record = self.report["speed_check"]
         if record["status"] != "pending" or self.training_started is None:
@@ -1276,7 +1492,11 @@ class Worker:
         validation_tokens = self.remaining_validation_tokens(self.global_update)
         training_seconds = remaining_targets / rate
         later_stages = len(self.spec.stages) - self.active.index - 1
-        save = math.fsum(self.save_seconds) / len(self.save_seconds) if self.save_seconds else 0.0
+        save = (
+            math.fsum(self.save_seconds) / len(self.save_seconds)
+            if self.save_seconds
+            else self.spec.checkpoint_save_seconds
+        )
         saves = int(training_seconds // self.spec.checkpoint_seconds) + later_stages + 1
         parts = {
             "training_seconds": training_seconds,
@@ -1298,7 +1518,9 @@ class Worker:
             measured_validation_tokens_per_second=validation_rate,
             remaining_targets=remaining_targets,
             remaining_validation_tokens=validation_tokens,
-            checkpoint_save_seconds_basis="measured" if self.save_seconds else "none measured yet",
+            checkpoint_save_seconds_basis=(
+                "measured" if self.save_seconds else "planned checkpoint_save_seconds"
+            ),
             projected_seconds=parts,
             projected_finish_unix=finish,
             pod_end_unix=self.pod_end,
@@ -1537,10 +1759,13 @@ class Worker:
     # Finalization ----------------------------------------------------------------------
 
     def drain_budget(self) -> float:
-        """Seconds the final drain may wait: inside the idle window and the Pod end."""
+        """Seconds the final drain may wait: ``drain_seconds``, inside the Pod end, and
+        inside the watchdog's transfer window less the margin for the checks after it."""
         now = self.clock()
-        idle_left = self.spec.limits.idle_seconds - (now - self.last_activity) - 30
-        return max(0.0, min(self.spec.drain_seconds, idle_left, self.pod_end - now - 60))
+        transfer_left = (
+            self.spec.max_transfer_seconds - (now - self.last_activity) - FINALIZE_MARGIN_SECONDS
+        )
+        return max(0.0, min(self.spec.drain_seconds, transfer_left, self.pod_end - now - 60))
 
     def _stored(self, key: str) -> str | None:
         found, _ = self.store.retry(partial(self.store.stored_sha256, key))
@@ -1576,14 +1801,19 @@ class Worker:
     def finalize(self) -> None:
         """Drain uploads, verify them, upload ``report.json`` and write the last heartbeat.
 
-        A wall or cost stop never waits for uploads. A completed or time-limited run whose
-        milestones or report cannot be verified in R2 ends ``failed``.
+        The heartbeat reads ``uploading`` until this ends, whatever the training outcome,
+        so the Mac side never reads a final status while uploads still run. A wall or cost
+        stop never waits for uploads. A completed or time-limited run whose milestones or
+        report cannot be verified in R2 ends ``failed``. ``r2_final`` is published only when
+        a verified stage-final milestone closes the run (every earlier milestone verified
+        too); a stopped run without one gets none, and the supervisor archives diagnostics.
         """
         self.phase = "finalizing"
         trained = self.report["status"]
         hurry = self.report.get("stop_reason") in NO_FINALIZATION_STOPS
         receipt: dict[str, Any] = {"training_status": trained}
         report_key = self.prefix + "report.json"
+        self.uploading = not hurry
         try:
             self.heartbeat()
             budget = 0.0 if hurry else self.drain_budget()
@@ -1612,15 +1842,20 @@ class Worker:
             if self._stored(report_key) != report_sha256:
                 raise RuntimeError("report.json differs in R2 after upload")
             receipt["report_sha256"] = report_sha256
-            last = [label for label in self.labels if labels.get(label)]
-            final = self.milestones[-1] if durable else (last[-1] if last else None)
-            files = {name: digest for name, _, digest in self.label_files.get(final or "", [])}
-            self.r2_final = {
-                "report_key": report_key,
-                "report_sha256": report_sha256,
-                "checkpoint_key": None if final is None else f"{self.prefix}{final}/checkpoint.pt",
-                "checkpoint_sha256": files.get("checkpoint.pt"),
-            }
+            if durable:
+                # The last milestone, a stage-final label, is what the supervisor verifies;
+                # a rolling label never closes a run.
+                final = self.milestones[-1]
+                files = {name: digest for name, _, digest in self.label_files[final]}
+                self.r2_final = {
+                    "report_key": report_key,
+                    "report_sha256": report_sha256,
+                    "checkpoint_key": f"{self.prefix}{final}/checkpoint.pt",
+                    "checkpoint_sha256": files["checkpoint.pt"],
+                }
+            else:
+                last = [label for label in self.labels if labels.get(label)]
+                receipt["last_verified_label"] = last[-1] if last else None
         except Exception as error:
             receipt["error"] = f"{type(error).__name__}: {error}"
             if self.report["status"] in {"completed", "time_limited"}:
@@ -1633,6 +1868,7 @@ class Worker:
             receipt["r2_final"] = self.r2_final
             receipt["status"] = self.report["status"]
             self.write_json(self.root / "finalization.json", receipt)
+            self.uploading = False
             self.heartbeat()
 
 
@@ -1651,9 +1887,30 @@ SMOKE_STREAMS = {
 """Each authored stream's document and shard counts."""
 
 
+class _Reply:
+    """A GET answer in the shape ``Store.download``'s opener returns."""
+
+    def __init__(self, status: int, body: bytes) -> None:
+        self.status, self._body, self._offset = status, body, 0
+
+    def read(self, size: int = -1) -> bytes:
+        end = len(self._body) if size < 0 else self._offset + size
+        block = self._body[self._offset : end]
+        self._offset += len(block)
+        return block
+
+    def __enter__(self) -> _Reply:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+
 class MemoryBucket:
     """One R2 bucket held in memory and served through ``Store``'s transport, for smokes.
 
+    It answers like R2 where the Mac side depends on it: HEAD carries ``content-length``
+    and the SHA-256 metadata, and GET returns an object's bytes (``Store.download``).
     ``fault`` may answer a request instead of the bucket: given (method, key) it returns
     (status, body) or None.
     """
@@ -1688,7 +1945,18 @@ class MemoryBucket:
             if method == "HEAD":
                 if key not in self.objects:
                     return 404, {}, b""
-                return 200, {"x-amz-meta-sha256": self.digests[key]}, b""
+                return (
+                    200,
+                    {
+                        "x-amz-meta-sha256": self.digests[key],
+                        "content-length": str(len(self.objects[key])),
+                    },
+                    b"",
+                )
+            if method == "GET":
+                if key not in self.objects:
+                    return 404, {}, b"NoSuchKey"
+                return 200, {"content-length": str(len(self.objects[key]))}, self.objects[key]
             if method == "DELETE":
                 self.objects.pop(key, None)
                 self.digests.pop(key, None)
@@ -1703,8 +1971,13 @@ class MemoryBucket:
                 return 200, {}, b""
         return 405, {}, b"unsupported"
 
+    def open(self, request: Request) -> _Reply:
+        """``Store.download``'s opener: the same answers, nothing leaves the process."""
+        status, _, body = self(request)
+        return _Reply(status, body)
+
     def store(self, credentials: Credentials = SMOKE_CREDENTIALS) -> Store:
-        return Store(credentials, transport=self, sleep=lambda _: None)
+        return Store(credentials, transport=self, opener=self.open, sleep=lambda _: None)
 
 
 def author_streams(root: Path, tokenizer: ByteBPE) -> dict[str, list[tuple[str, TokenShard]]]:
@@ -1806,6 +2079,7 @@ def smoke_specification(
                 "streams": {"web": "validation-web", "python": "validation-python"},
             },
             "checkpoint_seconds": 0.05,
+            "checkpoint_save_seconds": 1.0,
             "expected_tokens_per_second": 1.0,
             "validation_tokens_per_second": 1.0,
             "speed_check_warmup_updates": 2,
@@ -1824,7 +2098,12 @@ def smoke_specification(
                 "rising_steps": 25,
                 "starting_cost_usd": 0.0,
             },
-            "r2": {"keep_rolling": 2, "storage_cap_usd_per_month": 5.0, "drain_seconds": 30},
+            "r2": {
+                "keep_rolling": 2,
+                "storage_cap_usd_per_month": 5.0,
+                "drain_seconds": 30,
+                "max_transfer_seconds": 900,
+            },
         }
     )
 
@@ -1867,8 +2146,12 @@ def authored_run_data(
     )
 
 
-def smoke(output: Path) -> dict[str, Any]:
-    """Runs A and B from one shared initialization on authored shards, on CPU, offline."""
+def smoke(output: Path, *, bucket: MemoryBucket | None = None) -> dict[str, Any]:
+    """Runs A and B from one shared initialization on authored shards, on CPU, offline.
+
+    Both runs write to one in-memory ``bucket`` (a new one unless given), as the two Pods
+    share one R2 bucket, under their own ``rehearsal-runs/<run>/smoke-<run>/`` prefixes.
+    """
     torch.set_num_threads(1)
     if output.exists() or output.is_symlink():
         raise FileExistsError("smoke output must be a new directory")
@@ -1877,7 +2160,7 @@ def smoke(output: Path) -> dict[str, Any]:
     specs = {run: smoke_specification(run, streams) for run in RUNS}
     initialization = output / "initialization.pt"
     initial_sha256 = write_initialization(list(specs.values()), tokenizer.sha256, initialization)
-    bucket = MemoryBucket()
+    bucket = MemoryBucket() if bucket is None else bucket
     reports = {}
     for run, spec in specs.items():
         reports[run] = Worker(
@@ -1917,34 +2200,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if spec.train.precision != "bfloat16":
         raise ValueError("the A40 rehearsal specification must use bfloat16 autocast")
     receipt = _object(args.readiness)
-    if receipt.get("specification_sha256") != file_sha256(args.specification):
-        raise ValueError("specification differs from the operational receipt")
-    if receipt.get("binding_sha256") != args.binding_sha256:
-        raise ValueError("binding identity differs from the operational receipt")
-    if receipt.get("preflight_sha256") != file_sha256(args.preflight):
-        raise ValueError("preflight report differs from bound receipt")
-    if receipt.get("initialization_sha256", args.initialization_sha256) != (
-        args.initialization_sha256
-    ):
-        raise ValueError("initialization identity differs from the operational receipt")
+    identity = {
+        "specification_sha256": file_sha256(args.specification),
+        "binding_sha256": args.binding_sha256,
+        "preflight_sha256": file_sha256(args.preflight),
+        "initialization_sha256": args.initialization_sha256,
+    }
+    check_receipt_identity(receipt, run=spec.run, **identity)  # Before reading anything large.
     binding = load_binding(args.binding, expected_sha256=args.binding_sha256)
-    stage_targets = [stage["targets"] for stage in binding["runs"][spec.run]["stages"]]
-    full = sum(
-        binding["streams"][stream]["tokens"] - binding["streams"][stream]["documents"]
-        for _, stream in spec.validation.streams
-    )
-    plan = planned_seconds(spec, stage_targets=stage_targets, full_validation_targets=full)
-    created = check_readiness(
-        receipt, now=time.time(), spec=spec, required_seconds=plan["total_seconds"]
-    )
-    armed = finite_number(receipt["self_destruct_deadline_unix"], "self-destruct deadline")
-    if armed - created < spec.limits.pod_seconds:
-        # The in-pod timer fires before the wall; every deadline plans against it.
-        spec = spec.with_limits(pod_seconds=armed - created)
+    launch = check_readiness(receipt, now=time.time(), spec=spec, binding=binding, **identity)
+    spec = launch.spec
     hardware = hardware_description(training_device("cuda:0"))
     check_preflight(_object(args.preflight), hardware=hardware, spec=spec)
-    pod_id = receipt["pod_identity"]["id"]
-    if os.environ.get("RUNPOD_POD_ID", pod_id) != pod_id:
+    # The worker's SSH launch does not source /etc/rp_environment, so RUNPOD_POD_ID is
+    # usually absent: the Pod ID is the receipt's captured identity, cross-checked if set.
+    pod_id = launch.pod_id
+    if os.environ.get("RUNPOD_POD_ID") not in (None, "", pod_id):
         raise ValueError("this Pod is not the one the receipt identifies")
     credentials = r2_credentials(os.environ, key_prefix="R2_POD_")
     data = load_run_data(args.binding, args.root, expected_sha256=args.binding_sha256, spec=spec)
@@ -1962,7 +2233,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         initialization_sha256=args.initialization_sha256,
         store=Store(credentials),
         pod_id=pod_id,
-        pod_created=created,
+        pod_created=launch.origin,
         device="cuda:0",
         secrets=[
             credentials.access_key_id,
@@ -1972,9 +2243,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         extra={
             "hardware": hardware,
             "readiness_receipt": sanitize(receipt),
-            "specification_sha256": file_sha256(args.specification),
-            "preflight_sha256": file_sha256(args.preflight),
-            "launch_plan": plan,
+            "specification_sha256": identity["specification_sha256"],
+            "preflight_sha256": identity["preflight_sha256"],
+            "pod_id_source": "readiness receipt pod_identity",
+            "launch_fit": launch.fit,
+            "pod_lifetime_end_unix": launch.end,
         },
     )
     return worker.execute()
@@ -1994,7 +2267,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     smoke_parser = commands.add_parser("smoke", help="both runs on tiny authored data, CPU")
     smoke_parser.add_argument("--output", type=Path, required=True)
     initial = commands.add_parser("write-initialization", help="the shared initialization (Mac)")
-    initial.add_argument("--specification", type=Path, action="append", required=True)
+    initial.add_argument(
+        "--specification",
+        type=Path,
+        action="append",
+        required=True,
+        help="give it once per run (A and B): both must share the model and seed",
+    )
     initial.add_argument("--binding", type=Path, required=True)
     initial.add_argument("--binding-sha256", required=True)
     initial.add_argument("--output", type=Path, required=True)
@@ -2003,6 +2282,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(smoke(args.output), indent=1, sort_keys=True))
     elif args.command == "write-initialization":
         specs = [Specification.load(path) for path in args.specification]
+        if sorted(spec.run for spec in specs) != sorted(RUNS):
+            parser.error(f"--specification must name one specification per run {sorted(RUNS)}")
         binding = load_binding(args.binding, expected_sha256=args.binding_sha256)
         identity = binding["tokenizer"]["identity"]
         digest = write_initialization(specs, identity, args.output)

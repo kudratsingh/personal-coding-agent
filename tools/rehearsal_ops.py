@@ -51,6 +51,13 @@ COST_STOP_USD = min(APPROVED_COST_CAP_USD, ESTIMATED_TOTAL_COST_USD * COST_MULTI
 WATCHDOG_COST_STOP_USD = 7.54
 """The Mac watchdog's cost stop, one cent inside the worker's so it is never the weaker."""
 IDLE_SECONDS = 600
+MAX_TRANSFER_SECONDS = 900
+"""How long after its last GPU work an ``uploading`` worker may keep the Pod (watchdog policy).
+
+The worker's last drain to R2 leaves the GPU idle. 900 s equals the finalization reserve, the
+time every run already plans for its final save, uploads and checks; it is half of the
+watchdog's 1,800 s ceiling, costs at most $0.15 more per Pod at $0.60/h, and moves two 1.6 GB
+labels at about 4 MB/s. The watchdog grants it only while the Mac sees new objects in R2."""
 SPEED_CHECK_SECONDS = 900
 REFERENCE_TOKENS_PER_SECOND = 56_479.0
 """The pilot's measured eager 35,974 tok/s times its measured 1.57x compile speedup."""
@@ -64,6 +71,24 @@ VALIDATION_INTERVAL_UPDATES = 500
 VALIDATION_TARGETS_PER_DOMAIN = 1_000_000
 TOKENS_PER_UPDATE = 16 * 8 * 1024
 
+READINESS_KIND = "rehearsal-readiness"
+"""The ``kind`` of the receipt ``pilot_readiness_receipt rehearsal`` writes and the worker reads."""
+OWNER_GATES = (
+    "owner_confirms_four_runpod_steps",
+    "cloud_data_pre_staged",
+    "external_watchdog_armed",
+    "hardware_preflight_passed",
+    "full_console_quote_confirmed",
+    "staging_storage_cost_bound",
+    "r2_token_bucket_scoped",
+)
+"""The owner's statements. A rehearsal moves checkpoints through R2, not SSH, so the
+pilot's ``ssh_transfer_tested`` is replaced by the evidence gates below."""
+EVIDENCE_GATES = ("r2_round_trip_tested", "r2_shards_staged_and_hash_checked")
+"""Set only from the Pod's receipts: the R2 round trip and the fetched, re-hashed data."""
+READINESS_GATES = (*OWNER_GATES, *EVIDENCE_GATES, "pod_self_destruct_armed")
+"""Every gate the receipt sets and the worker requires to be an explicit ``true``."""
+
 RUN_ROOT = "rehearsal-runs"
 REPORT_MAX_BYTES = 1_000_000
 """The worker's report.json stays below this, which is also the GitHub archive limit."""
@@ -72,6 +97,10 @@ FINAL_LABEL_FILES = (*LABEL_FILES, "ticket.json")
 R2_FINAL_KEYS = frozenset({"report_key", "report_sha256", "checkpoint_key", "checkpoint_sha256"})
 SUCCESS_STATUSES = ("completed", "time_limited")
 FAILURE_STATUSES = ("stopped", "failed")
+UPLOADING_STATUS = "uploading"
+"""The worker's heartbeat while it drains to R2, checks R2 and uploads ``report.json``."""
+IN_PROGRESS_STATUSES = ("running", UPLOADING_STATUS)
+"""Heartbeat statuses that never approve teardown, whatever stage the run is in."""
 POD_KEY_PREFIX = "R2_POD_"
 MAC_KEY_PREFIX = "R2_"
 POD_ENVIRONMENT = ("R2_ENDPOINT", "R2_BUCKET", "R2_POD_ACCESS_KEY_ID", "R2_POD_SECRET_ACCESS_KEY")
@@ -172,10 +201,12 @@ def verify_final(
 
     HEAD must show the expected SHA-256 for the final checkpoint and ``report.json``
     and the final label's other files must exist. ``report.json`` is then downloaded
-    pinned to its SHA-256 and must close this run: its stages are the run's stages in
-    order (a completed run A lists both, so stage 1's end is never completion), its
-    last stage's final checkpoint is the heartbeat's, and every earlier stage's final
-    milestone is in R2 with the hash the report records.
+    pinned to its SHA-256 and must close this run. The worker lists every planned stage
+    in order, a stage it never started as ``pending`` with no final checkpoint. The
+    stages with a final checkpoint must come first; the last of them is the heartbeat's
+    checkpoint, and every earlier one's milestone is in R2 with the hash the report
+    records. A completed run must have closed every stage, so run A's stage-1 end is
+    never completion; a time-limited or stopped run A may close at ``stage1-final``.
     """
     final, stage = check_r2_final(r2_final, run=run, pod_id=pod_id)
     prefix = run_prefix(run, pod_id)
@@ -215,11 +246,16 @@ def verify_final(
     expected = list(run_stages(run))
     if names != expected[: len(names)]:
         raise ValueError(f"the report's stages {names} differ from run {run}'s {expected}")
-    if status == "completed" and names != expected:
-        raise ValueError(f"a completed run {run} must report every stage {expected}")
-    if names[-1] != stage:
-        raise ValueError("the final checkpoint does not close the report's last stage")
-    if entries[-1].get("final_checkpoint_sha256") != final["checkpoint_sha256"]:
+    closed = 0
+    while closed < len(entries) and entries[closed].get("final_checkpoint_sha256") is not None:
+        closed += 1
+    if any(entry.get("final_checkpoint_sha256") is not None for entry in entries[closed:]):
+        raise ValueError("a stage after an unfinished one reports a final checkpoint")
+    if status == "completed" and (names != expected or closed != len(expected)):
+        raise ValueError(f"a completed run {run} must report every stage {expected} closed")
+    if closed == 0 or names[closed - 1] != stage:
+        raise ValueError("the final checkpoint does not close the report's last finished stage")
+    if entries[closed - 1].get("final_checkpoint_sha256") != final["checkpoint_sha256"]:
         raise ValueError("the report's final checkpoint SHA-256 differs from the heartbeat's")
     milestones = [
         head_sha256(
@@ -227,7 +263,7 @@ def verify_final(
             f"{prefix}{entry['name']}-final/checkpoint.pt",
             expected=_hex(entry.get("final_checkpoint_sha256"), f"{entry['name']} checkpoint"),
         )
-        for entry in entries[:-1]
+        for entry in entries[: closed - 1]
     ]
     milestones.append(checkpoint_head)
     return {

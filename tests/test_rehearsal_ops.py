@@ -172,6 +172,59 @@ def test_verify_final_refuses_anything_short_of_the_run_closing(
         verify_final(bucket, final, run="A", pod_id=POD, destination=tmp_path)
 
 
+def test_verify_final_reads_the_workers_full_stage_list(tmp_path: Path) -> None:
+    """The worker lists every planned stage; one it never trained is pending, unclosed."""
+    bucket = Bucket()
+    prefix = run_prefix("A", POD)
+    checkpoint = b"A stage1 weights"
+    bucket.put(f"{prefix}stage1-final/checkpoint.pt", checkpoint)
+    for other in ("checkpoint.pt.sha256", "record.json", "updates.jsonl", "ticket.json"):
+        bucket.put(f"{prefix}stage1-final/{other}", other.encode())
+    stages: list[dict[str, Any]] = [
+        {"name": "stage1", "status": "completed", "final_checkpoint_sha256": sha(checkpoint)},
+        {"name": "stage2", "status": "pending", "final_checkpoint_sha256": None},
+    ]
+
+    def final_for(status: str) -> dict[str, str]:
+        report = json.dumps({"status": status, "stages": stages}).encode()
+        bucket.put(prefix + "report.json", report)
+        return {
+            "report_key": prefix + "report.json",
+            "report_sha256": sha(report),
+            "checkpoint_key": f"{prefix}stage1-final/checkpoint.pt",
+            "checkpoint_sha256": sha(checkpoint),
+        }
+
+    # A run A time-limited between its stages, or stopped in stage 2, closes at stage 1.
+    for status in ("time_limited", "stopped"):
+        result = verify_final(
+            bucket,
+            final_for(status),
+            run="A",
+            pod_id=POD,
+            destination=tmp_path / status,
+            statuses=(status,),
+        )
+        assert result["report_status"] == status
+        assert [row["key"] for row in result["stage_milestones"]] == [
+            f"{prefix}stage1-final/checkpoint.pt"
+        ]
+    # Stage 1's end is never a completed run A.
+    with pytest.raises(ValueError, match="every stage"):
+        verify_final(bucket, final_for("completed"), run="A", pod_id=POD, destination=tmp_path)
+    # A final checkpoint after an unfinished stage is refused.
+    stages[0]["final_checkpoint_sha256"] = None
+    stages[1]["final_checkpoint_sha256"] = sha(checkpoint)
+    with pytest.raises(ValueError, match="after an unfinished one"):
+        verify_final(
+            bucket,
+            final_for("time_limited"),
+            run="A",
+            pod_id=POD,
+            destination=tmp_path,
+        )
+
+
 def test_summary_is_small_and_omits_loss_curves() -> None:
     report = {
         "status": "completed",

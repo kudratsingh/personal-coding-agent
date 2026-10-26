@@ -13,7 +13,8 @@
 # with the 45,000-second lifetime ceiling first, then loads the Pod's R2 key from a
 # 0600 file the operator delivered over SSH stdin (never echoed), tests an R2 round
 # trip, fetches and re-verifies the run's pinned data and the shared initialization,
-# runs the CPU tests including the rehearsal ones, and runs the A40 preflight:
+# runs the CPU tests including the worker's (none needs Docker or the network), and
+# runs the A40 preflight with its compile check (--compile-check):
 #   bash tools/pilot_pod_bootstrap.sh --mode rehearsal --run A|B --deadline-unix <unix> \
 #        --workspace /workspace/rehearsal --repo /workspace/repo \
 #        --r2-env /workspace/rehearsal/r2-pod.env --binding /workspace/rehearsal/binding.json \
@@ -212,17 +213,30 @@ if [[ "$RUN_TESTS" == "1" ]]; then
     tests/test_training.py tests/test_training_control.py tests/test_gpu_pilot.py
     tests/test_pilot.py tests/test_pilot_data.py tests/test_pilot_preflight.py)
   if [[ "$MODE" == "rehearsal" ]]; then
-    # The one-pass loader, validation, R2 and every rehearsal test file, the runner's included.
+    # The one-pass loader, validation, R2, the worker (tests/test_rehearsal_run.py), the
+    # worker-to-Mac integration and the Mac-side tools the worker's records feed. None
+    # needs Docker or the network; the data build's tests stay on the Mac.
     TESTS+=(tests/test_onepass_loader.py tests/test_onepass_order.py
       tests/test_validation_windows.py tests/test_validation.py
-      tests/test_r2_store.py tests/test_r2_uploader.py tests/test_rehearsal_*.py)
+      tests/test_r2_store.py tests/test_r2_uploader.py
+      tests/test_rehearsal_run.py tests/test_rehearsal_integration.py
+      tests/test_rehearsal_binding.py tests/test_rehearsal_ops.py
+      tests/test_rehearsal_readiness.py tests/test_rehearsal_supervisor.py
+      tests/test_rehearsal_watchdog.py tests/test_rehearsal_feasibility.py
+      tests/test_rehearsal_runbook.py tests/test_rehearsal_bootstrap.py)
   fi
   python3 -m pytest "${TESTS[@]}" -q -p no:cacheprovider 2>&1 | tail -5
 fi
 
-# 5. Hardware precision/resume preflight on the single A40.
+# 5. Hardware precision/resume preflight on the single A40; the rehearsal worker also
+#    requires the compiled-against-eager check, and its readiness receipt checks it passed.
+PREFLIGHT_ARGS=()
+if [[ "$MODE" == "rehearsal" ]]; then
+  PREFLIGHT_ARGS=(--compile-check)
+fi
 if [[ ! -f "$WORKSPACE/preflight-a40/report.json" ]]; then
-  python3 -m tools.pilot_preflight --output "$WORKSPACE/preflight-a40" --device cuda:0
+  python3 -m tools.pilot_preflight --output "$WORKSPACE/preflight-a40" --device cuda:0 \
+    ${PREFLIGHT_ARGS[@]+"${PREFLIGHT_ARGS[@]}"}
 fi
 python3 -c "import hashlib,sys; print('preflight sha256', hashlib.sha256(open('$WORKSPACE/preflight-a40/report.json','rb').read()).hexdigest())"
 echo "bootstrap complete; self-destruct receipt: $RECEIPT"

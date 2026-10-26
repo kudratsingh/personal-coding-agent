@@ -7,8 +7,10 @@ an explicitly identified existing Pod and cannot guarantee API availability.
 copies a checkpoint over SSH: the worker uploads its checkpoints to R2 itself, and once
 its heartbeat says ``awaiting_transfer`` with ``r2_final``, the supervisor checks the final
 milestone and ``report.json`` in R2 with the Mac's own key, archives the small records
-privately, and only then reports ``shutdown_ready``. A ``running`` heartbeat, including
-run A's boundary between its two stages, never leads to teardown.
+privately, and only then reports ``shutdown_ready``. A ``running`` or ``uploading``
+heartbeat, including run A's boundary between its two stages, never leads to teardown.
+While the worker uploads, new objects under its R2 prefix (listed with the Mac's key) are
+the Mac-observed progress that lets the watchdog wait out the transfer window.
 """
 
 from __future__ import annotations
@@ -38,9 +40,11 @@ from tools.rehearsal_binding import RUNS, r2_credentials
 from tools.rehearsal_ops import (
     FAILURE_STATUSES,
     IDLE_SECONDS,
+    IN_PROGRESS_STATUSES,
     MAC_KEY_PREFIX,
     REPORT_MAX_BYTES,
     SUCCESS_STATUSES,
+    UPLOADING_STATUS,
     ObjectStore,
     check_r2_final,
     run_prefix,
@@ -389,6 +393,12 @@ MAC_ONLY_HEARTBEAT_KEYS = (
     "r2_final_verified",
 )
 READY_STATUSES = frozenset({"awaiting_transfer", *SUCCESS_STATUSES})
+PROGRESS_STATUSES = frozenset({UPLOADING_STATUS, "awaiting_transfer"})
+"""Heartbeat statuses during which new R2 objects count as transfer progress."""
+DEFAULT_FAILURE_GRACE_SECONDS = 60.0
+"""The worker writes ``stopped`` or ``failed`` only after its own drain and report upload
+(it reads ``uploading`` until then), so the grace only covers a status change in flight;
+the idle limit counts from the last GPU work, before that drain."""
 
 
 class SupervisedStore(ObjectStore, Protocol):
@@ -411,9 +421,15 @@ class RehearsalSupervisor(Supervisor):
     - the worker reported ``stopped`` or ``failed`` with no ``r2_final`` for the failure
       grace period, and its diagnostics are archived.
 
-    A ``running`` heartbeat never approves teardown, whatever stage the run is in. A
-    mismatching or missing R2 object never approves it either; the watchdog's idle,
-    wall and cost limits still bound the Pod.
+    A ``running`` or ``uploading`` heartbeat never approves teardown, whatever stage the
+    run is in. A mismatching or missing R2 object never approves it either; the
+    watchdog's idle, transfer, wall and cost limits still bound the Pod.
+
+    While the heartbeat reads ``uploading`` or ``awaiting_transfer``, the mirror lists
+    the run's R2 prefix with the Mac's key. The first listing is a baseline; any object
+    (key and size) not seen before stamps ``transfer_progress_unix``, the Mac-observed
+    progress the watchdog requires before it lets an idle GPU wait out the policy's
+    ``max_transfer_seconds``. The Pod can never stamp it itself.
     """
 
     def __init__(
@@ -427,7 +443,7 @@ class RehearsalSupervisor(Supervisor):
         store: SupervisedStore,
         archive: Callable[[Path], dict[str, Any]],
         clock: Callable[[], float] = time.time,
-        failure_grace_seconds: float = 300.0,
+        failure_grace_seconds: float = DEFAULT_FAILURE_GRACE_SECONDS,
     ) -> None:
         run_prefix(run, pod_id)
         if not 0 < failure_grace_seconds <= IDLE_SECONDS:
@@ -436,16 +452,43 @@ class RehearsalSupervisor(Supervisor):
             root, fetch=fetch, pull=_no_ssh_pull, archive=archive, clock=clock, reuse_output=True
         )
         self.run, self.pod_id, self.store = run, pod_id, store
+        self.prefix = run_prefix(run, pod_id)
         self.fetch_report = fetch_report
         self.failure_grace_seconds = failure_grace_seconds
         self.r2_verified: dict[str, Any] | None = None
         self.failure_seen_unix: float | None = None
         self.summary: dict[str, Any] | None = None
+        self.r2_seen: set[tuple[str, int]] | None = None
+        self.progress_lock = threading.Lock()
+
+    def observe_r2_progress(self) -> None:
+        """Stamp ``transfer_progress_unix`` when the run's prefix holds a new object.
+
+        A listing error is recorded and stamps nothing: without fresh progress the
+        watchdog's idle limit applies again.
+        """
+        try:
+            listed = {
+                (str(item["key"]), int(item["bytes"]))
+                for item in self.store.objects()
+                if str(item["key"]).startswith(self.prefix)
+            }
+        except Exception as error:  # recorded; the mirror keeps running
+            atomic_json(self.root / "r2-progress-error.json", {"error_type": type(error).__name__})
+            return
+        with self.progress_lock:
+            if self.r2_seen is not None and listed - self.r2_seen:
+                self.transfer_progress_unix = self.clock()
+            self.r2_seen = listed if self.r2_seen is None else self.r2_seen | listed
 
     def refresh_heartbeat(self) -> dict[str, Any]:
         heartbeat = self.fetch("heartbeat.json")
         for key in MAC_ONLY_HEARTBEAT_KEYS:
             heartbeat.pop(key, None)  # Only the Mac's own checks may set these.
+        if heartbeat.get("status") in PROGRESS_STATUSES and not self.shutdown_ready:
+            self.observe_r2_progress()
+        if self.transfer_progress_unix is not None:
+            heartbeat["transfer_progress_unix"] = self.transfer_progress_unix
         if self.r2_verified is not None:
             # The durable copy is verified in R2 even if the GitHub archive still lags.
             heartbeat.update(r2_final_verified=True, mac_receipt_verified=True)
@@ -482,7 +525,12 @@ class RehearsalSupervisor(Supervisor):
             if now - self.failure_seen_unix >= self.failure_grace_seconds:
                 self.diagnose(raw, report)
             return
-        # "running" (every stage, and run A's boundary between them) or unknown: wait.
+        if status in IN_PROGRESS_STATUSES:
+            # "running" (every stage, and run A's boundary between them) or "uploading"
+            # (the worker's last drain to R2): never teardown, never verification yet.
+            self.failure_seen_unix = None
+            return
+        # An unknown status: wait; the watchdog treats a malformed heartbeat on its own.
         self.failure_seen_unix = None
 
     def finish(self, r2_final: object, raw: bytes, *, statuses: Sequence[str]) -> None:
@@ -577,7 +625,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--failure-grace-seconds",
         type=float,
-        default=300.0,
+        default=DEFAULT_FAILURE_GRACE_SECONDS,
         help="rehearsal: wait this long for r2_final after a stopped/failed heartbeat",
     )
     return parser

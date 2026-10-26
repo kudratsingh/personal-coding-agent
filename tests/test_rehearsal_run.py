@@ -27,20 +27,26 @@ from scratchcoder.model.gpt import expected_parameters
 from scratchcoder.tokenizer.bpe import ByteBPE
 from scratchcoder.train.trainer import Trainer
 from scratchcoder.train.validation import ValidationWindow
-from tools import rehearsal_binding
+from tools import rehearsal_binding, rehearsal_ops
 from tools.pilot_preflight import run_preflight
 from tools.pod_self_destruct import ABSOLUTE_DEADLINE_SECONDS
 from tools.r2_store import Credentials
 from tools.rehearsal_binding import ORDER_SEED, RUNS, SUBSET_RULE, VALIDATION_STREAMS
+from tools.rehearsal_ops import EVIDENCE_GATES, OWNER_GATES
 from tools.rehearsal_run import (
+    FINALIZE_MARGIN_SECONDS,
     INITIALIZATION_RUN_ID,
+    LAUNCH_RULE,
     MAX_REPORT_BYTES,
     REHEARSAL_GATES,
+    SPEED_CHECK_RULE,
+    Launch,
     MemoryBucket,
     Specification,
     Worker,
     author_streams,
     authored_run_data,
+    binding_targets,
     check_preflight,
     check_readiness,
     environment_secrets,
@@ -202,8 +208,12 @@ def test_specifications_encode_the_approved_runs() -> None:
         assert spec.validation.interval_updates == 500
         assert spec.validation.subset_target_tokens == SUBSET_RULE["target_tokens_per_domain"]
         assert tuple(stream for _, stream in spec.validation.streams) == VALIDATION_STREAMS
-        assert spec.checkpoint_seconds == 1800
-        assert spec.expected_tokens_per_second == 56_479
+        assert spec.checkpoint_seconds == 1800 and spec.checkpoint_save_seconds == 15
+        assert spec.drain_seconds == 480
+        assert spec.max_transfer_seconds == rehearsal_ops.MAX_TRANSFER_SECONDS == 900
+        assert (
+            spec.expected_tokens_per_second == 56_479 == rehearsal_ops.REFERENCE_TOKENS_PER_SECOND
+        )
         assert spec.quoted_gpu_hourly == 0.59 and spec.limits.quoted_total_hourly == 0.6
         limits = spec.limits
         assert limits.pod_seconds == 45_000 == MODE_WALL_SECONDS["rehearsal"]
@@ -241,7 +251,7 @@ def test_specification_files_are_plain_json_without_private_material() -> None:
         assert json.loads(text)["kind"] == "rehearsal-run-specification"
 
 
-def test_launch_plan_fits_the_wall_at_the_speed_floor() -> None:
+def test_launch_plan_is_the_whole_run_at_the_reference_speed() -> None:
     plans = {
         run: planned_seconds(
             Specification.load(path),
@@ -250,19 +260,35 @@ def test_launch_plan_fits_the_wall_at_the_speed_floor() -> None:
         )
         for run, path in SPECS.items()
     }
-    floor = 0.85 * 56_479
-    for plan in plans.values():
-        assert plan["speed_floor_tokens_per_second"] == pytest.approx(floor)
-        assert plan["training_seconds"] == pytest.approx(2 * 10**9 / floor)  # 41,660 s
-        assert plan["interval_validations"] == 31  # Global updates 0, 500, ..., 15,000.
-        assert plan["total_seconds"] < 45_000
     stages = {"A": 2, "B": 1}
     for run, plan in plans.items():
+        assert plan["tokens_per_second"] == 56_479  # The reference speed, not the floor.
+        assert plan["training_seconds"] == pytest.approx(2 * 10**9 / 56_479)  # 35,411 s
+        assert plan["interval_validations"] == 31  # Global updates 0, 500, ..., 15,000.
         tokens = 31 * 2 * 1_000_000 + stages[run] * FULL_VALIDATION_TARGETS
         assert plan["validation_tokens"] == tokens
-    # Pod setup before the worker starts may take at most this long (about 21 and 23 min).
-    assert 45_000 - plans["A"]["total_seconds"] == pytest.approx(1_274, abs=1)
-    assert 45_000 - plans["B"]["total_seconds"] == pytest.approx(1_397, abs=1)
+        assert plan["validation_seconds"] == pytest.approx(tokens / 100_000)
+        assert plan["startup_seconds"] == 300 * stages[run]  # Once per stage.
+        # One save per 1,800 s of training and validation, plus one per stage end, at 15 s.
+        saves = math.floor((plan["training_seconds"] + plan["validation_seconds"]) / 1_800)
+        assert plan["checkpoint_saves"] == saves + stages[run]
+        assert plan["checkpoint_seconds"] == 15 * plan["checkpoint_saves"]
+        assert plan["finalization_reserve_seconds"] == 900
+        parts = ("training", "validation", "startup", "checkpoint", "finalization_reserve")
+        assert plan["total_seconds"] == pytest.approx(sum(plan[f"{p}_seconds"] for p in parts))
+    # Pod setup before the worker starts may take up to this long before the armed
+    # deadline 180 s inside the wall: about 112 and 119 minutes.
+    assert 44_820 - plans["A"]["total_seconds"] == pytest.approx(6_713, abs=1)
+    assert 44_820 - plans["B"]["total_seconds"] == pytest.approx(7_151, abs=1)
+    # At the speed floor the same run needs about 6,300 s more.
+    floor = planned_seconds(
+        Specification.load(SPECS["A"]),
+        stage_targets=[10**9, 10**9],
+        full_validation_targets=FULL_VALIDATION_TARGETS,
+        tokens_per_second=0.85 * 56_479,
+    )
+    assert floor["training_seconds"] == pytest.approx(41_660, abs=1)
+    assert floor["total_seconds"] < 44_820
 
 
 def raw_spec() -> dict[str, Any]:
@@ -288,7 +314,10 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
     "interval": lambda v: v["validation"].update(interval_updates=0),
     "validation streams": lambda v: v["validation"].update(streams={"web": "validation-web"}),
     "autocast": lambda v: v["validation"].update(autocast_bf16=1),
-    "drain": lambda v: v["r2"].update(drain_seconds=600),
+    "drain": lambda v: v["r2"].update(drain_seconds=800),  # 800 + 120 > the 900 s window.
+    "transfer window": lambda v: v["r2"].update(max_transfer_seconds=1_801),
+    "transfer missing": lambda v: v["r2"].pop("max_transfer_seconds"),
+    "save seconds": lambda v: v.update(checkpoint_save_seconds=0),
     "keep rolling": lambda v: v["r2"].update(keep_rolling=0),
     "price": lambda v: v.update(quoted_gpu_hourly=0.61),
     "speed warmup": lambda v: v.update(speed_check_warmup_updates=8000),
@@ -321,8 +350,49 @@ def test_limits_keep_the_reserve_rule_when_changed() -> None:
 # Readiness and preflight gates ---------------------------------------------------------
 
 
-def receipt(**changes: Any) -> dict[str, Any]:
+HASHES = {
+    "specification_sha256": "1" * 64,
+    "binding_sha256": "2" * 64,
+    "preflight_sha256": "3" * 64,
+    "initialization_sha256": "4" * 64,
+}
+
+
+def bound_counts() -> dict[str, Any]:
+    """The S build's counts in the shape ``check_readiness`` reads from a checked binding."""
+    stages = {
+        "A": [
+            ("stage1", ["stage1-web"], 7_630, 10**9),
+            ("stage2", ["stage2-python", "stage2-web"], 7_630, 10**9),
+        ],
+        "B": [("mixed", ["stage1-web", "stage2-web", "stage2-python"], 15_259, 2 * 10**9)],
+    }
+    return {
+        "runs": {
+            run: {
+                "stages": [
+                    {"name": name, "streams": streams, "planned_updates": updates, "targets": t}
+                    for name, streams, updates, t in rows
+                ]
+            }
+            for run, rows in stages.items()
+        },
+        "streams": {
+            "validation-web": {"tokens": 6_948_391, "documents": 7_341},
+            "validation-python": {"tokens": 5_334_710, "documents": 4_848},
+        },
+    }
+
+
+BOUND = bound_counts()
+
+
+def receipt(run: str = "A", **changes: Any) -> dict[str, Any]:
+    """The receipt the receipt builder writes, in the fields the worker reads."""
     value: dict[str, Any] = {
+        "kind": "rehearsal-readiness",
+        "run": run,
+        **HASHES,
         **{gate: True for gate in REHEARSAL_GATES},
         "termination_guarantee": "redundant_best_effort",
         "owner_accepts_best_effort_termination": True,
@@ -338,53 +408,105 @@ def receipt(**changes: Any) -> dict[str, Any]:
         "pod_created_at_unix": 1000,
         "watchdog_policy": {
             "max_wall_seconds": 45_000,
-            "max_cost_usd": 7.55,
+            "max_cost_usd": 7.54,
             "max_idle_seconds": 600,
             "quoted_total_hourly": 0.6,
+            "max_transfer_seconds": 900,
             "billing_started_at_unix": 1000,
             "mode": "rehearsal",
         },
         "self_destruct_deadline_unix": 1000 + 45_000 - 180,
+        "r2_run_prefix": f"rehearsal-runs/{run}/pod123/",
     }
     value.update(changes)
     return value
 
 
+def ready(value: dict[str, Any], *, now: float, spec: Specification, **hashes: str) -> Launch:
+    return check_readiness(value, now=now, spec=spec, binding=BOUND, **{**HASHES, **hashes})
+
+
 def test_readiness_requires_every_rehearsal_gate_and_the_whole_run_to_fit() -> None:
     spec = Specification.load(SPECS["A"])
-    need = 43_726.0
-    assert check_readiness(receipt(), now=1001, spec=spec, required_seconds=need) == 1000
+    need = planned_seconds(
+        spec, stage_targets=[10**9, 10**9], full_validation_targets=FULL_VALIDATION_TARGETS
+    )["total_seconds"]
+    launch = ready(receipt(), now=1001, spec=spec)
+    assert (launch.origin, launch.pod_id, launch.end) == (1000, "pod123", 1000 + 44_820)
+    # Every deadline plans against the armed in-Pod deadline, 180 s inside the wall.
+    assert launch.spec.limits.pod_seconds == 44_820
+    assert launch.fit["reference_seconds_needed"] == pytest.approx(need)
+    assert launch.fit["fits_at_reference"] and launch.fit["rule"] == LAUNCH_RULE
     assert "ssh_transfer_tested" not in REHEARSAL_GATES  # R2 replaces the SSH transfer path.
+    assert set(REHEARSAL_GATES) == {
+        *OWNER_GATES,
+        *EVIDENCE_GATES,
+        "pod_self_destruct_armed",
+    }  # The receipt builder's gate names.
     for gate in REHEARSAL_GATES:
+        unresolved = {**receipt(), gate: None}
         with pytest.raises(ValueError, match=gate):
-            check_readiness(receipt(**{gate: None}), now=1001, spec=spec, required_seconds=need)
-    # The armed deadline (180 s inside the wall) bounds the lifetime left.
-    latest = 1000 + 45_000 - 180 - need
-    assert check_readiness(receipt(), now=latest, spec=spec, required_seconds=need) == 1000
-    with pytest.raises(ValueError, match="cannot fit the whole run"):
-        check_readiness(receipt(), now=latest + 1, spec=spec, required_seconds=need)
+            ready(unresolved, now=1001, spec=spec)
+    # The launch rule: the lifetime left must hold the whole run at the reference speed.
+    latest = 1000 + 44_820 - need
+    assert ready(receipt(), now=latest, spec=spec).fit["remaining_seconds"] == pytest.approx(need)
+    with pytest.raises(ValueError, match="cannot hold the run at the reference speed"):
+        ready(receipt(), now=latest + 1, spec=spec)
     with pytest.raises(ValueError, match="owner acceptance"):
-        check_readiness(
-            receipt(owner_accepts_best_effort_termination=False),
-            now=1001,
-            spec=spec,
-            required_seconds=need,
-        )
+        ready(receipt(owner_accepts_best_effort_termination=False), now=1001, spec=spec)
     policy = receipt()["watchdog_policy"]
     with pytest.raises(ValueError, match="weaker"):
-        check_readiness(
-            receipt(watchdog_policy={**policy, "max_cost_usd": 8.0}),
-            now=1001,
-            spec=spec,
-            required_seconds=need,
-        )
+        ready(receipt(watchdog_policy={**policy, "max_cost_usd": 8.0}), now=1001, spec=spec)
     with pytest.raises(ValueError, match="pilot ceiling"):  # A 45,000 s policy must say rehearsal.
-        check_readiness(
-            receipt(watchdog_policy={**policy, "mode": "pilot"}),
-            now=1001,
-            spec=spec,
-            required_seconds=need,
-        )
+        ready(receipt(watchdog_policy={**policy, "mode": "pilot"}), now=1001, spec=spec)
+    for window in (0, 600, 1_800):
+        with pytest.raises(ValueError, match="uploading after GPU work"):
+            changed = {**policy, "max_transfer_seconds": window}
+            ready(receipt(watchdog_policy=changed), now=1001, spec=spec)
+    with pytest.raises(ValueError, match="R2 prefix"):
+        ready(receipt(r2_run_prefix="rehearsal-runs/A/other/"), now=1001, spec=spec)
+
+
+def test_readiness_binds_kind_run_and_every_hash() -> None:
+    spec = Specification.load(SPECS["A"])
+    for change, message in (
+        ({"kind": "pilot-readiness"}, "not a rehearsal-readiness receipt for run A"),
+        ({"run": "B"}, "not a rehearsal-readiness receipt for run A"),
+        ({"specification_sha256": "0" * 64}, "specification differs"),
+        ({"binding_sha256": "0" * 64}, "binding identity differs"),
+        ({"preflight_sha256": "0" * 64}, "preflight report differs"),
+        ({"initialization_sha256": "0" * 64}, "initialization identity differs"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            ready(receipt(**change), now=1001, spec=spec)
+    without = {key: value for key, value in receipt().items() if key != "initialization_sha256"}
+    with pytest.raises(ValueError, match="initialization identity"):
+        ready(without, now=1001, spec=spec)  # No longer optional.
+    assert ready(receipt("B"), now=1001, spec=Specification.load(SPECS["B"])).pod_id == "pod123"
+
+
+def test_lifetime_ends_at_the_first_guard() -> None:
+    spec = Specification.load(SPECS["A"])
+    policy = receipt()["watchdog_policy"]
+    # A shorter watchdog wall, or a higher watchdog rate whose $7.54 stop comes first,
+    # ends the Pod before the armed deadline; the worker plans against that moment.
+    for change, end in (
+        ({"max_wall_seconds": 44_000}, 1000 + 44_000),
+        ({"quoted_total_hourly": 0.61}, 1000 + 7.54 / 0.61 * 3600),
+    ):
+        launch = ready(receipt(watchdog_policy={**policy, **change}), now=1001, spec=spec)
+        assert launch.end == pytest.approx(end)
+        assert launch.spec.limits.pod_seconds == pytest.approx(end - 1000)
+
+
+def test_the_binding_must_plan_the_specifications_stages() -> None:
+    spec = Specification.load(SPECS["A"])
+    other = bound_counts()
+    other["runs"]["A"]["stages"][0]["planned_updates"] = 7_631
+    with pytest.raises(ValueError, match="planned updates differ"):
+        binding_targets(spec, other)
+    targets, full = binding_targets(spec, BOUND)
+    assert targets == [10**9, 10**9] and full == FULL_VALIDATION_TARGETS
 
 
 @pytest.mark.parametrize(
@@ -393,13 +515,9 @@ def test_readiness_requires_every_rehearsal_gate_and_the_whole_run_to_fit() -> N
 def test_readiness_refuses_a_specification_above_the_rehearsal_ceilings(
     changes: dict[str, float],
 ) -> None:
-    spec = Specification.load(SPECS["A"])
-    if "idle_seconds" in changes:
-        spec = replace(spec, drain_seconds=300).with_limits(**changes)
-    else:
-        spec = spec.with_limits(**changes)
+    spec = Specification.load(SPECS["A"]).with_limits(**changes)
     with pytest.raises(ValueError, match="ceiling"):
-        check_readiness(receipt(), now=1001, spec=spec, required_seconds=1)
+        ready(receipt(), now=1001, spec=spec)
 
 
 def test_preflight_gate_requires_the_compile_and_fused_attention_checks() -> None:
@@ -730,7 +848,15 @@ def test_heartbeat_runs_across_the_stage_boundary_and_ends_after_r2_verification
     for run, beats in completed.beats.items():
         worker, report = completed.workers[run], completed.reports[run]
         statuses = [beat["status"] for beat in beats]
-        assert set(statuses[:-1]) == {"running"} and statuses[-1] == "awaiting_transfer"
+        first = statuses.index("uploading")
+        # Training reads running; the final drain to R2 reads uploading; then the proof.
+        assert set(statuses[:first]) == {"running"} and statuses[-1] == "awaiting_transfer"
+        assert set(statuses[first:-1]) == {"uploading"}
+        uploading = beats[first:-1]
+        assert {beat["phase"] for beat in uploading} == {"finalizing"}
+        assert all("r2_final" not in beat for beat in uploading)
+        # No GPU work while uploading: the activity stamp never moves, only updated_at.
+        assert len({beat["last_gpu_activity_unix"] for beat in beats[first:]}) == 1
         final = beats[-1]
         assert final["bucket_holds_report"] is True
         assert "r2_final" not in beats[-2]
@@ -817,9 +943,40 @@ def test_speed_check_stops_a_run_below_the_throughput_floor(data: Authored) -> N
     check = result["speed_check"]
     assert check["status"] == "failed" and check["reason"] == "throughput_below_limit"
     assert check["measured_tokens_per_second"] < check["floor_tokens_per_second"]
+    assert check["rule"] == SPEED_CHECK_RULE
     report, beat = finished(worker)
     assert beat["status"] == "stopped" and report["stages"][0]["status"] == "running"
     assert not worker.milestones
+    # No stage-final milestone closes anything: no r2_final, so the supervisor's
+    # diagnostics path (not its verification) applies.
+    assert "r2_final" not in beat
+
+
+def test_speed_check_counts_planned_saves_before_the_first_save(data: Authored) -> None:
+    clock = Clock()
+    spec = replace(tiny_spec(data, "A"), checkpoint_seconds=1e6, checkpoint_save_seconds=7.0)
+    worker = make_worker(data, "A", spec=spec, clock=clock)
+    stepping(worker, clock)
+    result = worker.execute()
+    check = result["speed_check"]
+    assert check["status"] == "passed"
+    assert check["checkpoint_save_seconds_basis"] == "planned checkpoint_save_seconds"
+    # Stage 1's final save and stage 2's: two planned saves of 7 s each.
+    assert check["projected_seconds"]["checkpoint_seconds"] == 14.0
+
+
+def test_final_drain_waits_inside_the_watchdog_transfer_window(data: Authored) -> None:
+    clock = Clock()
+    spec = replace(tiny_spec(data, "B", finalization_reserve_seconds=600), drain_seconds=480.0)
+    worker = make_worker(data, "B", spec=spec, clock=clock)
+    window = spec.max_transfer_seconds - FINALIZE_MARGIN_SECONDS  # 780 s after GPU work.
+    for idle, budget in ((0, 480), (500, window - 500), (window, 0), (2_000, 0)):
+        clock.now = worker.last_activity + idle
+        assert worker.drain_budget() == pytest.approx(budget)
+    clock.now = worker.pod_end - 100  # Never past the Pod end, less a minute.
+    worker.last_activity = clock.now
+    assert worker.drain_budget() == pytest.approx(40)
+    worker.uploader.close()
 
 
 def test_speed_check_stops_a_run_projected_to_pass_the_deadline(data: Authored) -> None:
@@ -1297,11 +1454,16 @@ def test_run_command_refuses_mismatched_receipts_before_creating_output(tmp_path
         str(output),
     ]
     good = {
+        "kind": "rehearsal-readiness",
+        "run": "A",
         "specification_sha256": file_sha256(SPECS["A"]),
         "binding_sha256": "a" * 64,
         "preflight_sha256": file_sha256(preflight),
+        "initialization_sha256": "b" * 64,
     }
     for change, message in (
+        ({"kind": "readiness"}, "not a rehearsal-readiness receipt"),
+        ({"run": "B"}, "not a rehearsal-readiness receipt for run A"),
         ({"specification_sha256": "0" * 64}, "specification differs"),
         ({"binding_sha256": "0" * 64}, "binding identity"),
         ({"preflight_sha256": "0" * 64}, "preflight report"),

@@ -34,8 +34,11 @@ MAX_GPU_IDLE_SECONDS = 600
 MAX_TRANSFER_SECONDS = 1_800
 CLOCK_SKEW_SECONDS = 60.0  # Tolerated difference between Pod, provider and Mac clocks.
 TRANSFER_STATUSES = frozenset(
-    {"awaiting_transfer", "completed", "time_limited", "stopped", "failed"}
+    {"awaiting_transfer", "completed", "time_limited", "stopped", "failed", "uploading"}
 )
+MODE_STATUSES = {"pilot": frozenset(), "rehearsal": frozenset({"uploading"})}
+"""Worker statuses beyond the pilot's that a mode's heartbeat may carry. A rehearsal worker
+reads ``uploading`` while it drains its last checkpoints to R2 with the GPU idle."""
 _SAFE_POD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 
@@ -240,8 +243,14 @@ class Heartbeat:
     transfer_progress_unix: float | None = None
 
 
-def read_heartbeat(path: Path, *, now: float, max_idle_seconds: float) -> Heartbeat:
-    """Return last GPU activity and a failure reason; absent means just-created."""
+def read_heartbeat(
+    path: Path, *, now: float, max_idle_seconds: float, mode: str = "pilot"
+) -> Heartbeat:
+    """Return last GPU activity and a failure reason; absent means just-created.
+
+    ``mode`` adds that mode's statuses (``MODE_STATUSES``); under a pilot policy an
+    ``uploading`` heartbeat stays malformed, exactly as before.
+    """
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
@@ -268,6 +277,7 @@ def read_heartbeat(path: Path, *, now: float, max_idle_seconds: float) -> Heartb
         "shutdown_ready",
         "stopped",
         "failed",
+        *MODE_STATUSES.get(mode, frozenset()),
     }
     if (
         type(value.get("schema_version")) is not int
@@ -411,7 +421,10 @@ def check_once(
     clock_valid = _is_number(raw_now) and math.isfinite(raw_now)
     checked_at = float(raw_now) if clock_valid else 0.0
     heartbeat = read_heartbeat(
-        heartbeat_path, now=checked_at, max_idle_seconds=policy.max_idle_seconds
+        heartbeat_path,
+        now=checked_at,
+        max_idle_seconds=policy.max_idle_seconds,
+        mode=policy.mode,
     )
     try:
         status, body = client.get_pod(identity.pod_id, policy.request_timeout_seconds)
@@ -535,9 +548,10 @@ def check_once(
 def _transfer_in_progress(heartbeat: Heartbeat, policy: Policy, now: float) -> bool:
     """Allow a bounded transfer window after GPU work when the Mac shows live progress.
 
-    Progress stamps come from the Mac-side supervisor (staged bytes growing),
-    never from the worker, so a hung Pod cannot extend its own lease. The wall
-    and cost limits still apply unchanged.
+    Progress stamps come from the Mac-side supervisor (staged bytes growing; in
+    rehearsal mode, new objects under the run's R2 prefix seen with the Mac's own
+    key), never from the worker, so a hung Pod cannot extend its own lease. The
+    wall and cost limits still apply unchanged.
     """
     return (
         policy.max_transfer_seconds > 0

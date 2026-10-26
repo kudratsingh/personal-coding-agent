@@ -217,6 +217,61 @@ def test_worker_commands_follow_the_shared_contract(monkeypatch: pytest.MonkeyPa
         parse("tools.rehearsal_run", run, monkeypatch)
 
 
+def test_write_initialization_takes_both_specifications(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = by_module("tools.rehearsal_run")
+    (initial,) = [argv for argv, _ in rows if argv[0] == "write-initialization"]
+    args = parse("tools.rehearsal_run", initial, monkeypatch)
+    assert sorted(str(path) for path in args.specification) == [
+        "configs/rehearsal-a40-s-a.json",
+        "configs/rehearsal-a40-s-b.json",
+    ]
+    from tools.rehearsal_run import Specification
+
+    assert sorted(Specification.load(ROOT / path).run for path in args.specification) == ["A", "B"]
+    # The command refuses one specification alone (both runs must share the init).
+    with pytest.raises(SystemExit):
+        importlib.import_module("tools.rehearsal_run").main(
+            [
+                "write-initialization",
+                "--specification",
+                str(ROOT / "configs/rehearsal-a40-s-a.json"),
+                "--binding",
+                "unused.json",
+                "--binding-sha256",
+                BINDING_SHA256,
+                "--output",
+                "unused.pt",
+            ]
+        )
+
+
+def test_receipt_and_supervisor_commands_read_the_files_the_worker_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ((receipt, _),) = by_module("tools.pilot_readiness_receipt")
+    assert receipt[0] == "rehearsal"
+    namespace = parse("tools.pilot_readiness_receipt", receipt, monkeypatch)
+    (run,) = [argv for argv, _ in by_module("tools.rehearsal_run") if argv[0] == "run"]
+    worker = dict(zip(run[1::2], run[2::2], strict=True))
+    assert str(namespace.specification) == worker["--specification"]  # Same file, same hash.
+    assert namespace.binding_sha256 == worker["--binding-sha256"]
+    assert namespace.initialization_sha256 == worker["--initialization-sha256"]
+    assert namespace.run == VALUES["RUN"]
+    assert str(namespace.policy) == f"{VALUES['CTRL']}/policy.json"
+    # The receipt reads the Mac copy of the Pod's preflight report the worker reads.
+    code = "\n".join(_code())
+    assert (
+        "podscp root@$POD_HOST:/workspace/rehearsal/preflight-a40/report.json "
+        '"$CTRL/preflight-a40-report.json"' in code
+    )
+    assert str(namespace.preflight) == f"{VALUES['CTRL']}/preflight-a40-report.json"
+    assert (
+        'podscp "$CTRL/readiness-receipt.json" '
+        "root@$POD_HOST:/workspace/rehearsal/readiness-receipt.json" in code
+    )
+    assert worker["--readiness"] == "/workspace/rehearsal/readiness-receipt.json"
+
+
 def _watchdog() -> argparse.Namespace:
     rows = by_module("tools.runpod_watchdog")
     assert len(rows) == 1, "the runbook launches the watchdog from one helper only"
@@ -240,6 +295,8 @@ def test_watchdog_runs_in_rehearsal_mode_with_the_d35_limits() -> None:
     assert policy.max_cost_usd == rehearsal_ops.WATCHDOG_COST_STOP_USD == 7.54
     assert policy.max_cost_usd < rehearsal_ops.COST_STOP_USD
     assert policy.quoted_total_hourly == 0.60
+    # The worker's final drain reads "uploading"; the watchdog allows it this long.
+    assert policy.max_transfer_seconds == rehearsal_ops.MAX_TRANSFER_SECONDS == 900
     assert (policy.billing_started_at_unix, policy.idle_baseline_unix) == (ORIGIN, NOW)
     assert args.heartbeat == Path(VALUES["CTRL"]) / "supervisor" / "heartbeat.json"
     assert args.pidfile == Path(VALUES["CTRL"]) / "watchdog.pid"
