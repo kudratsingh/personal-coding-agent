@@ -582,7 +582,8 @@ def gz_trees(trees: list[dict[str, Any]]) -> bytes:
 
 def test_committed_spec_records_the_terms_finding_and_blocks_the_download(tmp_path: Path) -> None:
     spec = sft_data.load_language_spec(ROOT / "configs" / "sft-language-oasst2.json")
-    assert spec["owner_ruling_on"] is None and spec["dataset"] == "OpenAssistant/oasst2"
+    assert spec["owner_ruling"] is None and spec["owner_ruling_on"] is None
+    assert spec["dataset"] == "OpenAssistant/oasst2"
     assert "no LICENSE file" in spec["terms_finding"]
     hub = FakeHub({})
     with pytest.raises(PermissionError, match="owner"):
@@ -595,7 +596,11 @@ def test_fetch_and_adapt_after_a_recorded_ruling(tmp_path: Path) -> None:
     data = gz_trees(authored_trees())
     spec = sft_data.load_language_spec(
         spec_file(
-            tmp_path, owner_ruling_on="2026-10-01", max_tokens=60, max_download_bytes=len(data)
+            tmp_path,
+            owner_ruling="approved",
+            owner_ruling_on="2026-10-01",
+            max_tokens=60,
+            max_download_bytes=len(data),
         )
     )
     directory = tmp_path / "intake"
@@ -639,7 +644,12 @@ def test_fetch_refuses_oversized_plans_and_bad_specs(tmp_path: Path) -> None:
     name = "2023-11-05_oasst2_ready.trees.jsonl.gz"
     data = gz_trees(authored_trees())
     spec = sft_data.load_language_spec(
-        spec_file(tmp_path, owner_ruling_on="2026-10-01", max_download_bytes=len(data) - 1)
+        spec_file(
+            tmp_path,
+            owner_ruling="approved",
+            owner_ruling_on="2026-10-01",
+            max_download_bytes=len(data) - 1,
+        )
     )
     with pytest.raises(RuntimeError, match="approved maximum"):
         sft_data.fetch(spec, tmp_path / "x", hub_factory=lambda _: FakeHub({name: data}))
@@ -648,5 +658,36 @@ def test_fetch_refuses_oversized_plans_and_bad_specs(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         sft_data.load_language_spec(spec_file(tmp_path, files=["data/train.parquet"]))
     with pytest.raises(ValueError):
-        sft_data.load_language_spec(spec_file(tmp_path, owner_ruling_on="2999-01-01"))
+        sft_data.load_language_spec(
+            spec_file(tmp_path, owner_ruling="approved", owner_ruling_on="2999-01-01")
+        )
+
+
+@pytest.mark.parametrize(
+    ("ruling", "on"),
+    [
+        (None, "2026-10-01"),  # A date alone is not a ruling.
+        ("approved", None),
+        ("yes", "2026-10-01"),
+        ("Approved", "2026-10-01"),
+        (True, "2026-10-01"),
+    ],
+)
+def test_spec_rejects_an_incomplete_or_unknown_ruling(
+    tmp_path: Path, ruling: object, on: object
+) -> None:
+    with pytest.raises(ValueError, match="owner_ruling"):
+        sft_data.load_language_spec(spec_file(tmp_path, owner_ruling=ruling, owner_ruling_on=on))
+
+
+def test_a_rejected_ruling_never_downloads(tmp_path: Path) -> None:
+    name = "2023-11-05_oasst2_ready.trees.jsonl.gz"
+    data = gz_trees(authored_trees())
+    spec = sft_data.load_language_spec(
+        spec_file(tmp_path, owner_ruling="rejected", owner_ruling_on="2026-10-01")
+    )
+    hub = FakeHub({name: data})
+    with pytest.raises(PermissionError, match="did not approve"):
+        sft_data.fetch(spec, tmp_path / "intake", hub_factory=lambda _: hub)
+    assert hub.calls == 0 and not (tmp_path / "intake").exists()
     assert asdict(BuildConfig())["language_dev"] == 300

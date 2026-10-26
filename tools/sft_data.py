@@ -4,7 +4,7 @@ Three stages, each refusing to overwrite a completed result:
 
 ``download``
     Fetch the language source's pinned files with size and SHA-256 receipts. It
-    refuses until the spec records the owner's ruling on the source's terms.
+    refuses unless the spec records the owner's approval of the source's terms.
 ``language``
     Adapt the downloaded OpenAssistant trees to chat-v1 conversations
     (``scratchcoder.data.oasst``) and screen them: e-mail addresses, benchmark and
@@ -63,6 +63,8 @@ RL_CANDIDATES = 1000
 RL_CANDIDATES_WITH_ACECODE = 2000
 RL_SALT = "rl-candidate-v1"
 LANGUAGE_SALT = "language-dev-v1"
+RULINGS = ("approved", "rejected")
+"""The owner's possible rulings on a language source's terms; only approval downloads."""
 
 
 # ---------------------------------------------------------------------------- build
@@ -344,6 +346,7 @@ def load_language_spec(path: Path) -> dict[str, Any]:
             "license_label",
             "terms_finding",
             "terms_reviewed_on",
+            "owner_ruling",
             "owner_ruling_on",
             "max_download_bytes",
             "max_tokens",
@@ -355,7 +358,11 @@ def load_language_spec(path: Path) -> dict[str, Any]:
     _text(spec, ("dataset", "terms_finding"), "language spec")
     _hex(spec["revision"], 40, "language revision")
     _accepted(spec["terms_reviewed_on"], "language terms review")
-    if spec["owner_ruling_on"] is not None:
+    if (spec["owner_ruling"] is None) != (spec["owner_ruling_on"] is None):
+        raise ValueError("owner_ruling and owner_ruling_on are both set or both null")
+    if spec["owner_ruling"] is not None:
+        if spec["owner_ruling"] not in RULINGS:
+            raise ValueError("owner_ruling is approved, rejected or null")
         _accepted(spec["owner_ruling_on"], "owner ruling")
     if spec["license_label"] not in TRAINING_LICENSES:
         raise ValueError("the language license label is not on the D-05 allowlist")
@@ -378,10 +385,14 @@ def fetch(
     *,
     hub_factory: Callable[[str | None], Hub] = Hub,
 ) -> dict[str, Any]:
-    """Download the spec's files at the pinned revision; refuse without a ruling."""
-    if spec["owner_ruling_on"] is None:
+    """Download the spec's files at the pinned revision; refuse without an approval."""
+    if spec["owner_ruling"] is None:
         raise PermissionError(
             "the source's terms await the owner's ruling (D-05); nothing was downloaded"
+        )
+    if spec["owner_ruling"] != "approved":
+        raise PermissionError(
+            "the owner did not approve the source's terms (D-05); nothing was downloaded"
         )
     receipts_path = directory / "download-receipts.json"
     if receipts_path.exists():

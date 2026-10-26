@@ -5,7 +5,7 @@
 ## Status
 
 - **Code rows** can be built now from the 2026-10-25 pool.
-- **The language intake is stopped.** The terms check found no license file and no license grant in the contributor terms; see [the terms finding](#language-intake-openassistant-oasst2). Nothing was downloaded. The `download` stage refuses until the owner's ruling is recorded in the spec.
+- **The language intake is stopped.** The terms check found no license file and no license grant in the contributor terms; see [the terms finding](#language-intake-openassistant-oasst2). Nothing was downloaded. The `download` stage refuses unless the spec records the owner's approval.
 - **AceCode is flagged** and left out of every source list by default. It is used only with `--include-acecode`.
 
 ## Build
@@ -76,7 +76,7 @@ No license or contributor grant beyond the metadata label was found, and the por
 
 ### Once the owner rules
 
-1. **Record the ruling.** The owner sets `owner_ruling_on` in the spec to the ruling date.
+1. **Record the ruling.** The owner sets `owner_ruling` in the spec to `approved` or `rejected` and `owner_ruling_on` to the ruling date. The two are set together or left null together. `download` runs only when `owner_ruling` is `approved`; a date alone, or a rejection, downloads nothing.
 2. **Download.** `download` checks that the pinned revision resolves to itself and that the file listing matches. It refuses a plan above `max_download_bytes`, then fetches `2023-11-05_oasst2_ready.trees.jsonl.gz` (54,370,156 bytes) over HTTPS. Each file is size- and SHA-256-checked, and the receipts go in `download-receipts.json`.
 
    ```sh
