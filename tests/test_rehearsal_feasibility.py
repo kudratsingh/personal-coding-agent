@@ -36,9 +36,11 @@ PLAN = RehearsalPlan("B", (("mixed", 1_000),), 2_000_000)
 def test_time_budget_adds_every_phase_by_hand() -> None:
     reference = rehearsal_time_budget(PLAN, SMALL, SMALL.reference_tokens_per_second)
     validation_rate = 2 * 131_072
-    running = 1_000 + 2 * 2_000_000 / validation_rate + 2_000_000 / validation_rate + 10
+    # Full validations at updates 250, 500 and 750 and at the stage end.
+    running = 1_000 + 2 * 2_000_000 / validation_rate + 4 * 2_000_000 / validation_rate + 10
     assert reference["training_seconds"] == pytest.approx(1_000)
     assert reference["interval_validations"] == 2
+    assert reference["full_validations"] == 4
     assert reference["checkpoints"] == 2  # One 600-second save during training, one at the end.
     assert reference["total_seconds"] == pytest.approx(100 + running + 2 * 5 + 200)
     assert reference["usable_lifetime_seconds"] == 4_900 and reference["fits"]
@@ -64,8 +66,9 @@ def test_d35_runs_fit_at_the_reference_speed_and_the_quote_bounds_spend() -> Non
         assert row["cost"]["wall_bound_usd"] == pytest.approx(7.5)
         assert row["cost"]["fits"] and row["cost"]["wall_within_cost_stop"]
         assert row["container_disk"]["fits"]
-    assert report["runs"]["A"]["reference"]["full_validations"] == 2
-    assert report["runs"]["B"]["reference"]["full_validations"] == 1
+    # Both full streams at each quarter and end of every stage: 8 passes for A, 4 for B.
+    assert report["runs"]["A"]["reference"]["full_validations"] == 8
+    assert report["runs"]["B"]["reference"]["full_validations"] == 4
     assert report["r2_storage"]["monthly_usd"] < 1
     assert report["disclaimer"] == REHEARSAL_DISCLAIMER
     # The upload rate the receipt requires: two labels of at least the measured checkpoint

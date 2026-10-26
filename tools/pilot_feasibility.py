@@ -1025,10 +1025,13 @@ def rehearsal_time_budget(
     """Seconds from the create request to the end of finalization at one training speed.
 
     Startup, then training, interval validations every 500 global updates on 1,000,000
-    targets per domain, a full validation of both streams and one compile per stage,
-    a checkpoint every 30 minutes plus one per stage end, then the finalization reserve.
-    It fits when the total is within the lifetime less the self-destruct margin.
+    targets per domain, a full validation of both streams at each quarter and end of
+    every stage, one compile per stage, a checkpoint every 30 minutes plus one per stage
+    end, then the finalization reserve. It fits when the total is within the lifetime
+    less the self-destruct margin.
     """
+    from tools.rehearsal_run import quarter_updates
+
     rate = _number(tokens_per_second, "tokens per second")
     startup = options.startup_seconds if startup_seconds is None else startup_seconds
     _count_number(startup, "startup seconds")
@@ -1039,7 +1042,8 @@ def rehearsal_time_budget(
     interval_seconds = (
         interval_validations * 2 * options.subset_targets_per_domain / validation_rate
     )
-    full_seconds = stages * plan.validation_targets / validation_rate
+    full_validations = sum(len(quarter_updates(updates)) + 1 for _, updates in plan.stages)
+    full_seconds = full_validations * plan.validation_targets / validation_rate
     compile_seconds = stages * options.compile_seconds_per_stage
     running = training + interval_seconds + full_seconds + compile_seconds
     checkpoints = math.floor(running / options.checkpoint_interval_seconds) + stages
@@ -1053,7 +1057,7 @@ def rehearsal_time_budget(
         "training_seconds": training,
         "interval_validations": interval_validations,
         "interval_validation_seconds": interval_seconds,
-        "full_validations": stages,
+        "full_validations": full_validations,
         "full_validation_seconds": full_seconds,
         "compile_seconds": compile_seconds,
         "checkpoints": checkpoints,
