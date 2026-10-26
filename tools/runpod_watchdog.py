@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -590,6 +591,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=900.0,
         help="exit with status 3 if the captured identity is never seen alive within this time",
     )
+    parser.add_argument(
+        "--pidfile",
+        type=Path,
+        help="write this process's PID here, so one Pod's watchdog can be restarted alone",
+    )
     return parser
 
 
@@ -623,6 +629,43 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         parser.error(str(error))
     client = RunpodClient(token, UrllibTransport())
+    if args.pidfile is None:
+        return _watch(client, identity, policy, args)
+    write_pidfile(args.pidfile)
+    # A SIGTERM from the runbook's per-run restart unwinds through ``finally`` below.
+    previous = signal.signal(signal.SIGTERM, _exit_on_signal)
+    try:
+        return _watch(client, identity, policy, args)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        release_pidfile(args.pidfile)
+
+
+def _exit_on_signal(signum: int, frame: object) -> None:
+    raise SystemExit(128 + signum)
+
+
+def write_pidfile(path: Path) -> None:
+    """Atomically record this process's PID; a restart reads it to stop only this one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(f"{os.getpid()}\n")
+    os.replace(temp_name, path)
+
+
+def release_pidfile(path: Path) -> None:
+    """Remove the PID file only while it still names this process."""
+    try:
+        if path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _watch(
+    client: RunpodClient, identity: PodIdentity, policy: Policy, args: argparse.Namespace
+) -> int:
     state_path = args.receipt.with_name(args.receipt.name + ".observed.json")
     observed = load_observed(state_path, identity)
     started = time.time()

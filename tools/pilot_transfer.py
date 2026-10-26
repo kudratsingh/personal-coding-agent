@@ -257,8 +257,12 @@ def _ssh_command(
 
 
 def child_environment() -> dict[str, str]:
-    """Environment for ssh/gh children without the Runpod API key."""
-    return {key: value for key, value in os.environ.items() if key != "RUNPOD_API_KEY"}
+    """Environment for ssh/gh children without the Runpod API key or any R2 credential."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key != "RUNPOD_API_KEY" and not key.startswith("R2_")
+    }
 
 
 def _request(
