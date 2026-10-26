@@ -111,7 +111,10 @@ def test_run_layout_and_limits_follow_d35() -> None:
             run_prefix("A", bad)
     with pytest.raises(ValueError):
         run_prefix("C", POD)
-    assert rehearsal_ops.COST_STOP_USD == pytest.approx(7.55004)
+    # The hard stop is the $10 cap (owner, 2026-10-25): 6.2917 x 1.6 = $10.07, capped.
+    assert rehearsal_ops.COST_STOP_USD == rehearsal_ops.APPROVED_COST_CAP_USD == 10.0
+    assert rehearsal_ops.WATCHDOG_COST_STOP_USD == 9.99
+    assert rehearsal_ops.MINIMUM_SPEED_FRACTION == 0.9
     assert rehearsal_ops.WATCHDOG_COST_STOP_USD < rehearsal_ops.COST_STOP_USD
     assert rehearsal_ops.TOKENS_PER_UPDATE == 131_072
     assert rehearsal_ops.POD_LIFETIME_SECONDS * rehearsal_ops.QUOTED_TOTAL_HOURLY / 3600 == 7.5

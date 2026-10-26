@@ -234,8 +234,9 @@ def test_specifications_encode_the_approved_runs() -> None:
         assert limits.pod_seconds == ABSOLUTE_DEADLINE_SECONDS
         assert limits.finalization_reserve_seconds == 900
         assert (limits.approved_cost_cap, limits.estimated_total_cost) == (10.0, 6.2917)
-        assert limits.cost_multiplier == 1.2 and round(limits.cost_stop, 2) == 7.55
-        assert (limits.minimum_speed_fraction, limits.speed_check_seconds) == (0.85, 900)
+        # The hard stop is the $10 cap; the speed check stops below 90% (owner, 2026-10-25).
+        assert limits.cost_multiplier == 1.6 and limits.cost_stop == 10.0
+        assert (limits.minimum_speed_fraction, limits.speed_check_seconds) == (0.9, 900)
         assert limits.idle_seconds == 600 and limits.rising_steps == 25  # As in the pilot.
         # 45,000 s at the quoted rate stays under the cost stop, so the wall binds first.
         assert limits.pod_seconds / 3600 * limits.quoted_total_hourly < limits.cost_stop
@@ -299,20 +300,20 @@ def test_launch_plan_is_the_whole_run_at_the_reference_speed() -> None:
     # deadline 180 s inside the wall: about 100 and 113 minutes.
     assert 44_820 - plans["A"]["total_seconds"] == pytest.approx(5_977, abs=1)
     assert 44_820 - plans["B"]["total_seconds"] == pytest.approx(6_783, abs=1)
-    # At the speed floor the same run needs about 6,300 s more: run A no longer fits.
+    # At the 90% floor the same run needs about 3,970 s more, and both still fit.
     floors = {
         run: planned_seconds(
             Specification.load(path),
             stage_targets=[10**9, 10**9] if run == "A" else [2 * 10**9],
             full_validation_targets=FULL_VALIDATION_TARGETS,
-            tokens_per_second=0.85 * 56_479,
+            tokens_per_second=0.9 * 56_479,
         )
         for run, path in SPECS.items()
     }
-    assert floors["A"]["training_seconds"] == pytest.approx(41_660, abs=1)
-    assert floors["A"]["total_seconds"] == pytest.approx(45_152, abs=1)
-    assert floors["B"]["total_seconds"] == pytest.approx(44_331, abs=1)
-    assert floors["B"]["total_seconds"] < 44_820 < floors["A"]["total_seconds"]
+    assert floors["A"]["training_seconds"] == pytest.approx(39_346, abs=1)
+    assert floors["A"]["total_seconds"] == pytest.approx(42_808, abs=1)
+    assert floors["B"]["total_seconds"] == pytest.approx(42_002, abs=1)
+    assert floors["B"]["total_seconds"] < floors["A"]["total_seconds"] < 44_820
 
 
 def test_quarter_updates_are_rounded_quarters_strictly_inside_the_stage() -> None:
@@ -492,7 +493,7 @@ def test_readiness_requires_every_rehearsal_gate_and_the_whole_run_to_fit() -> N
         ready(receipt(owner_accepts_best_effort_termination=False), now=1001, spec=spec)
     policy = receipt()["watchdog_policy"]
     with pytest.raises(ValueError, match="weaker"):
-        ready(receipt(watchdog_policy={**policy, "max_cost_usd": 8.0}), now=1001, spec=spec)
+        ready(receipt(watchdog_policy={**policy, "max_cost_usd": 10.5}), now=1001, spec=spec)
     with pytest.raises(ValueError, match="pilot ceiling"):  # A 45,000 s policy must say rehearsal.
         ready(receipt(watchdog_policy={**policy, "mode": "pilot"}), now=1001, spec=spec)
     for window in (0, 600, 1_800):

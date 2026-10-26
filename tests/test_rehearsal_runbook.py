@@ -318,7 +318,7 @@ def test_watchdog_runs_in_rehearsal_mode_with_the_d35_limits() -> None:
     policy = policy_from_args(args)
     assert policy.mode == "rehearsal"
     assert (policy.max_wall_seconds, policy.max_idle_seconds) == (45_000, 600)
-    assert policy.max_cost_usd == rehearsal_ops.WATCHDOG_COST_STOP_USD == 7.54
+    assert policy.max_cost_usd == rehearsal_ops.WATCHDOG_COST_STOP_USD == 9.99
     assert policy.max_cost_usd < rehearsal_ops.COST_STOP_USD
     assert policy.quoted_total_hourly == 0.60
     # The worker's final drain reads "uploading"; the watchdog allows it this long.
