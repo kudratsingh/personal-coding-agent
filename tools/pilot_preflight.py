@@ -29,6 +29,16 @@ LOGITS_RTOL = 0.03
 LOSS_ATOL = 0.001
 LOSS_RTOL = 0.001
 GRADIENT_RELATIVE_NORM_MAX = 0.03
+# Compiled against eager training forward (opt-in check; the rehearsal requires it). Float32
+# differs only by reordered reductions; bfloat16 autocast also by where casts are fused.
+COMPILE_TOLERANCES = {
+    "float32": {"loss_atol": 1e-4, "loss_rtol": 1e-4, "gradient_relative_norm_max": 1e-3},
+    "bfloat16": {
+        "loss_atol": LOSS_ATOL * 10,
+        "loss_rtol": LOSS_RTOL * 10,
+        "gradient_relative_norm_max": GRADIENT_RELATIVE_NORM_MAX,
+    },
+}
 RESUME_STEPS = 4
 A40_MIN_MEMORY_BYTES = 44 * 1024**3
 # The A40 Pod (driver 595.91.07, torch 2.9.1) reports 45,490 MiB to PyTorch and 46,068 MiB to
@@ -239,6 +249,61 @@ def _attention_check(device: torch.device) -> dict[str, Any]:
     }
 
 
+def _compile_check(device: torch.device) -> dict[str, Any]:
+    """Compare ``torch.compile`` with eager training forward and backward on a tiny shape.
+
+    Both models start from the same weights with fused attention, as rehearsal training
+    runs, and the compiled one is wrapped exactly as the trainer wraps it. Each precision
+    compares the loss and every parameter gradient within its tolerance.
+    """
+    torch.manual_seed(1618)
+    model_config = ModelConfig(vocab_size=272, width=32, layers=2, heads=4, context=16)
+    inputs = torch.randint(0, model_config.vocab_size, (4, 16), device=device)
+    targets = torch.randint(0, model_config.vocab_size, (4, 16), device=device)
+    initial = GPT(model_config).state_dict()
+    results: dict[str, Any] = {}
+    for precision, tolerance in COMPILE_TOLERANCES.items():
+        eager, compiled = GPT(model_config).to(device), GPT(model_config).to(device)
+        eager.load_state_dict(initial)
+        compiled.load_state_dict(initial)
+        eager.set_fused_attention(True)
+        compiled.set_fused_attention(True)
+        forward = torch.compile(compiled, dynamic=True)
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=precision == "bfloat16"
+        ):
+            eager_loss = cross_entropy(eager(inputs), targets)
+            compiled_loss = cross_entropy(forward(inputs), targets)
+        eager_loss.backward()  # type: ignore[no-untyped-call]  # PyTorch's Tensor stub.
+        compiled_loss.backward()  # type: ignore[no-untyped-call]  # PyTorch's Tensor stub.
+        torch.testing.assert_close(
+            compiled_loss, eager_loss, atol=tolerance["loss_atol"], rtol=tolerance["loss_rtol"]
+        )
+        relative_errors: list[float] = []
+        for left, right in zip(compiled.parameters(), eager.parameters(), strict=True):
+            if left.grad is None or right.grad is None or not bool(torch.isfinite(left.grad).all()):
+                raise AssertionError("compiled training produced a missing or nonfinite gradient")
+            reference_norm = float(right.grad.norm())
+            error = float((left.grad - right.grad).norm())
+            relative = error / reference_norm if reference_norm else error
+            if relative > tolerance["gradient_relative_norm_max"]:
+                raise AssertionError(f"compiled {precision} gradient differs beyond tolerance")
+            relative_errors.append(relative)
+        results[precision] = {
+            **tolerance,
+            "loss_absolute_error": abs(float(compiled_loss.detach()) - float(eager_loss.detach())),
+            "max_gradient_relative_norm_error": max(relative_errors),
+        }
+    return {
+        "status": "passed",
+        "same_initial_weights": True,
+        "compile_mode": "torch.compile(model, dynamic=True), default backend",
+        "attention": "fused",
+        "precisions": results,
+        "torch_version": str(torch.__version__),
+    }
+
+
 def _make_trainer(config: RunConfig, root: Path, name: str, device: torch.device) -> Trainer:
     rng = random.Random(config.train.seed)
     sources = {
@@ -314,8 +379,14 @@ def _resume_check(root: Path, device: torch.device) -> dict[str, Any]:
     }
 
 
-def run_preflight(output: Path, *, device: str = "cpu") -> dict[str, Any]:
-    """Run authored tiny precision and resume checks; never downloads or provisions."""
+def run_preflight(
+    output: Path, *, device: str = "cpu", compile_check: bool = False
+) -> dict[str, Any]:
+    """Run authored tiny precision and resume checks; never downloads or provisions.
+
+    ``compile_check`` adds the compiled-against-eager comparison that the rehearsal
+    worker requires; the pilot's preflight leaves it off.
+    """
     selected = resolve_device(device)
     if output.exists() or output.is_symlink():
         raise FileExistsError("preflight output must be a new directory")
@@ -347,6 +418,8 @@ def run_preflight(output: Path, *, device: str = "cpu") -> dict[str, Any]:
     try:
         report["precision"] = _precision_check(selected)
         report["fused_attention"] = _attention_check(selected)
+        if compile_check:
+            report["compile_equivalence"] = _compile_check(selected)
         report["exact_resume"] = _resume_check(output / "resume", selected)
         report["hardware_precision_and_resume_checked"] = selected.type == "cuda"
         report["status"] = "completed"
@@ -370,13 +443,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device", default="cpu", help="cpu or explicit CUDA ordinal such as cuda:0"
     )
+    parser.add_argument(
+        "--compile-check",
+        action="store_true",
+        help="also compare torch.compile with eager training (required by the rehearsal runs)",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        report = run_preflight(args.output, device=args.device)
+        report = run_preflight(args.output, device=args.device, compile_check=args.compile_check)
     except (FileExistsError, OSError, ValueError, AssertionError, RuntimeError) as error:
         print(f"pilot-preflight: {type(error).__name__}: {error}", file=sys.stderr)
         return 1

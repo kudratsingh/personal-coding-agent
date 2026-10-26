@@ -1,0 +1,1361 @@
+"""Offline tests for the rehearsal worker: tiny authored shards, a fake clock, an in-memory R2."""
+
+import copy
+import functools
+import hashlib
+import json
+import math
+from collections.abc import Callable, Iterator
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+import torch
+
+from scratchcoder.common.config import ModelConfig, RunConfig
+from scratchcoder.data.onepass import (
+    combine_digests,
+    document_sha256,
+    multiset_digest,
+    order_digest,
+    pass_order,
+)
+from scratchcoder.data.shards import TokenShard, file_sha256
+from scratchcoder.model.gpt import expected_parameters
+from scratchcoder.tokenizer.bpe import ByteBPE
+from scratchcoder.train.trainer import Trainer
+from scratchcoder.train.validation import ValidationWindow
+from tools import rehearsal_binding
+from tools.pilot_preflight import run_preflight
+from tools.pod_self_destruct import ABSOLUTE_DEADLINE_SECONDS
+from tools.r2_store import Credentials
+from tools.rehearsal_binding import ORDER_SEED, RUNS, SUBSET_RULE, VALIDATION_STREAMS
+from tools.rehearsal_run import (
+    INITIALIZATION_RUN_ID,
+    MAX_REPORT_BYTES,
+    REHEARSAL_GATES,
+    MemoryBucket,
+    Specification,
+    Worker,
+    author_streams,
+    authored_run_data,
+    check_preflight,
+    check_readiness,
+    environment_secrets,
+    length_sorted,
+    load_run_data,
+    main,
+    planned_seconds,
+    smoke_specification,
+    verify_initialization,
+    write_initialization,
+)
+from tools.runpod_watchdog import MODE_WALL_SECONDS
+
+CONFIGS = Path(__file__).resolve().parents[1] / "configs"
+SPECS = {"A": CONFIGS / "rehearsal-a40-s-a.json", "B": CONFIGS / "rehearsal-a40-s-b.json"}
+SECRET = "r2pod-secret-Zq81LmT0vXk3Jw"
+KEY_ID = "r2pod-key-id-Hc5Nd2Rr"
+CREDENTIALS = Credentials("https://acct.r2.cloudflarestorage.com", KEY_ID, SECRET, "rehearsal")
+# Real S build (docs/rehearsal-data.md): validation tokens minus one BOS per document.
+FULL_VALIDATION_TARGETS = (6_948_391 - 7_341) + (5_334_710 - 4_848)
+
+
+class Clock:
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@dataclass
+class Authored:
+    root: Path
+    tokenizer: ByteBPE
+    streams: dict[str, list[tuple[str, TokenShard]]]
+    initialization: Path
+    initialization_sha256: str
+
+
+def authored(root: Path) -> Authored:
+    tokenizer = ByteBPE()
+    streams = author_streams(root / "data", tokenizer)
+    specs = [smoke_specification(run, streams) for run in RUNS]
+    path = root / "initialization.pt"
+    return Authored(
+        root, tokenizer, streams, path, write_initialization(specs, tokenizer.sha256, path)
+    )
+
+
+@pytest.fixture
+def data(tmp_path: Path) -> Authored:
+    return authored(tmp_path)
+
+
+def tiny_spec(data: Authored, run: str, **limits: Any) -> Specification:
+    """The smoke specification with fake-clock-friendly cadences.
+
+    Every 3 global updates, A's stage 1 (8 updates) ends between two validations, so
+    stage 2's validations fall at other stage-local steps than global ones.
+    """
+    spec = smoke_specification(run, data.streams)
+    spec = replace(
+        spec,
+        checkpoint_seconds=3.0,
+        validation=replace(spec.validation, interval_updates=3),
+    )
+    return spec.with_limits(**{"speed_check_seconds": 5, **limits})
+
+
+def make_worker(
+    data: Authored,
+    run: str,
+    *,
+    spec: Specification | None = None,
+    clock: Clock | None = None,
+    bucket: MemoryBucket | None = None,
+    name: str | None = None,
+    secrets: tuple[str, ...] = (),
+) -> Worker:
+    spec = spec or tiny_spec(data, run)
+    return Worker(
+        spec,
+        data.root / (name or f"run-{run}"),
+        authored_run_data(spec, data.streams, data.tokenizer),
+        initialization=data.initialization,
+        initialization_sha256=data.initialization_sha256,
+        store=(bucket or MemoryBucket()).store(CREDENTIALS),
+        pod_id=f"pod-{run.lower()}",
+        pod_created=1000.0,
+        clock=clock or Clock(),
+        secrets=secrets,
+    )
+
+
+Hook = Callable[[Trainer, dict[str, float]], dict[str, float] | None]
+
+
+def stepping(worker: Worker, clock: Clock, seconds: float = 1.0, hook: Hook | None = None) -> None:
+    """Advance the fake clock before each recorded update; ``hook`` may change its metrics."""
+    original = worker.on_step
+
+    def advance(trainer: Trainer, metrics: dict[str, float]) -> None:
+        clock.now += seconds
+        if hook is not None:
+            metrics = hook(trainer, metrics) or metrics
+        original(trainer, metrics)
+
+    worker.on_step = advance  # type: ignore[method-assign]
+
+
+def heartbeat(worker: Worker) -> dict[str, Any]:
+    value: dict[str, Any] = json.loads((worker.root / "heartbeat.json").read_text())
+    return value
+
+
+def rows(worker: Worker) -> list[dict[str, Any]]:
+    lines = (worker.root / "updates.jsonl").read_text().splitlines()
+    return [json.loads(line) for line in lines]
+
+
+# The checked-in specifications --------------------------------------------------------
+
+
+APPROVED_TRAIN = {
+    "seed": 0,
+    "batch_size": 16,
+    "sequence_length": 1024,
+    "accumulation_steps": 8,
+    "min_lr_ratio": 0.1,
+    "weight_decay": 0.1,
+    "gradient_clip": 1.0,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "adam_epsilon": 1e-08,
+    "precision": "bfloat16",
+    "attention": "fused",
+    "optimizer_foreach": True,
+    "z_loss": 0.0,
+    "schedule": "cosine",
+    "compile": True,
+}
+
+
+def test_specifications_encode_the_approved_runs() -> None:
+    a, b = Specification.load(SPECS["A"]), Specification.load(SPECS["B"])
+    for spec in (a, b):
+        model = spec.model
+        assert (model.vocab_size, model.width, model.layers, model.heads, model.context) == (
+            65_536,
+            768,
+            12,
+            12,
+            1024,
+        )
+        assert model.qk_norm is False and expected_parameters(model) == 135_285_504
+        assert spec.to_dict()["train"] == APPROVED_TRAIN
+        assert spec.tokens_per_update == 131_072 == rehearsal_binding.PACKING["tokens_per_update"]
+        assert spec.warmup_fraction == 0.02
+        assert spec.validation.interval_updates == 500
+        assert spec.validation.subset_target_tokens == SUBSET_RULE["target_tokens_per_domain"]
+        assert tuple(stream for _, stream in spec.validation.streams) == VALIDATION_STREAMS
+        assert spec.checkpoint_seconds == 1800
+        assert spec.expected_tokens_per_second == 56_479
+        assert spec.quoted_gpu_hourly == 0.59 and spec.limits.quoted_total_hourly == 0.6
+        limits = spec.limits
+        assert limits.pod_seconds == 45_000 == MODE_WALL_SECONDS["rehearsal"]
+        assert limits.pod_seconds == ABSOLUTE_DEADLINE_SECONDS
+        assert limits.finalization_reserve_seconds == 900
+        assert (limits.approved_cost_cap, limits.estimated_total_cost) == (10.0, 6.2917)
+        assert limits.cost_multiplier == 1.2 and round(limits.cost_stop, 2) == 7.55
+        assert (limits.minimum_speed_fraction, limits.speed_check_seconds) == (0.85, 900)
+        assert limits.idle_seconds == 600 and limits.rising_steps == 25  # As in the pilot.
+        # 45,000 s at the quoted rate stays under the cost stop, so the wall binds first.
+        assert limits.pod_seconds / 3600 * limits.quoted_total_hourly < limits.cost_stop
+    stage1, stage2 = a.stages
+    assert ((stage1.name, stage1.streams), (stage2.name, stage2.streams)) == RUNS["A"]
+    assert (stage1.learning_rate, stage2.learning_rate) == (0.0006, 0.0003)
+    (mixed,) = b.stages
+    assert (mixed.name, mixed.streams) == RUNS["B"][0] and mixed.learning_rate == 0.0006
+    # The binding's counts at the S packing: 1e9 tokens per A stage, 2e9 for B.
+    packed = rehearsal_binding._packed
+    assert stage1.updates == stage2.updates == packed(10**9)["planned_updates"] == 7_630
+    assert mixed.updates == packed(2 * 10**9)["planned_updates"] == 15_259
+    assert stage1.warmup_updates == stage2.warmup_updates == round(0.02 * 7_630) == 153
+    assert mixed.warmup_updates == round(0.02 * 15_259) == 305
+    assert (a.total_updates, b.total_updates) == (15_260, 15_259)
+    # Apart from the run and its stages the two specifications are identical.
+    left, right = a.to_dict(), b.to_dict()
+    for value in (left, right):
+        del value["run"], value["stages"], value["train"]
+    assert left == right
+
+
+def test_specification_files_are_plain_json_without_private_material() -> None:
+    for path in SPECS.values():
+        text = path.read_text()
+        assert "/Users/" not in text and "sha256" not in text and "R2_" not in text
+        assert json.loads(text)["kind"] == "rehearsal-run-specification"
+
+
+def test_launch_plan_fits_the_wall_at_the_speed_floor() -> None:
+    plans = {
+        run: planned_seconds(
+            Specification.load(path),
+            stage_targets=[10**9, 10**9] if run == "A" else [2 * 10**9],
+            full_validation_targets=FULL_VALIDATION_TARGETS,
+        )
+        for run, path in SPECS.items()
+    }
+    floor = 0.85 * 56_479
+    for plan in plans.values():
+        assert plan["speed_floor_tokens_per_second"] == pytest.approx(floor)
+        assert plan["training_seconds"] == pytest.approx(2 * 10**9 / floor)  # 41,660 s
+        assert plan["interval_validations"] == 31  # Global updates 0, 500, ..., 15,000.
+        assert plan["total_seconds"] < 45_000
+    stages = {"A": 2, "B": 1}
+    for run, plan in plans.items():
+        tokens = 31 * 2 * 1_000_000 + stages[run] * FULL_VALIDATION_TARGETS
+        assert plan["validation_tokens"] == tokens
+    # Pod setup before the worker starts may take at most this long (about 21 and 23 min).
+    assert 45_000 - plans["A"]["total_seconds"] == pytest.approx(1_274, abs=1)
+    assert 45_000 - plans["B"]["total_seconds"] == pytest.approx(1_397, abs=1)
+
+
+def raw_spec() -> dict[str, Any]:
+    value: dict[str, Any] = json.loads(SPECS["A"].read_text())
+    return value
+
+
+MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
+    "extra key": lambda v: v.update(notes="x"),
+    "missing key": lambda v: v.pop("r2"),
+    "train steps": lambda v: v["train"].update(steps=10),
+    "train missing": lambda v: v["train"].pop("compile"),
+    "kind": lambda v: v.update(kind="pilot"),
+    "run": lambda v: v.update(run="C"),
+    "run type": lambda v: v.update(run=["A"]),
+    "stage streams": lambda v: v["stages"][1].update(streams=["stage2-web", "stage2-python"]),
+    "stage name": lambda v: v["stages"][0].update(name="first"),
+    "one stage": lambda v: v["stages"].pop(),
+    "warmup": lambda v: v["stages"][0].update(warmup_updates=152),
+    "updates type": lambda v: v["stages"][0].update(updates="7630"),
+    "learning rate": lambda v: v["stages"][1].update(learning_rate=0),
+    "z-loss": lambda v: v["train"].update(z_loss=0.0001),
+    "interval": lambda v: v["validation"].update(interval_updates=0),
+    "validation streams": lambda v: v["validation"].update(streams={"web": "validation-web"}),
+    "autocast": lambda v: v["validation"].update(autocast_bf16=1),
+    "drain": lambda v: v["r2"].update(drain_seconds=600),
+    "keep rolling": lambda v: v["r2"].update(keep_rolling=0),
+    "price": lambda v: v.update(quoted_gpu_hourly=0.61),
+    "speed warmup": lambda v: v.update(speed_check_warmup_updates=8000),
+    "limits key": lambda v: v["limits"].pop("idle_seconds"),
+    "no reserve": lambda v: v["limits"].update(finalization_reserve_seconds=0),
+    "speed fraction": lambda v: v["limits"].update(minimum_speed_fraction=1.5),
+    "context": lambda v: v["model"].update(context=512),
+}
+
+
+@pytest.mark.parametrize("name", sorted(MUTATIONS))
+def test_specification_schema_is_strict(name: str) -> None:
+    value = raw_spec()
+    Specification.from_dict(copy.deepcopy(value))
+    MUTATIONS[name](value)
+    with pytest.raises(ValueError):
+        Specification.from_dict(value)
+
+
+def test_limits_keep_the_reserve_rule_when_changed() -> None:
+    spec = Specification.load(SPECS["A"])
+    shorter = spec.with_limits(pod_seconds=44_000)
+    assert shorter.limits.pod_seconds == 44_000
+    assert shorter.limits.training_seconds == 44_000 - 900
+    assert shorter.limits.training_deadline(pod_created=0, training_started=500) == 43_100
+    with pytest.raises(ValueError):
+        replace(spec, limits=replace(spec.limits, training_seconds=100))
+
+
+# Readiness and preflight gates ---------------------------------------------------------
+
+
+def receipt(**changes: Any) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        **{gate: True for gate in REHEARSAL_GATES},
+        "termination_guarantee": "redundant_best_effort",
+        "owner_accepts_best_effort_termination": True,
+        "termination_evidence": "self-destruct receipt and watchdog policy",
+        "pod_identity": {
+            "id": "pod123",
+            "name": "rehearsal-a",
+            "gpuId": "NVIDIA A40",
+            "gpuCount": 1,
+            "dataCenterId": "CA-MTL-1",
+            "createdAt": "1970-01-01T00:16:40Z",
+        },
+        "pod_created_at_unix": 1000,
+        "watchdog_policy": {
+            "max_wall_seconds": 45_000,
+            "max_cost_usd": 7.55,
+            "max_idle_seconds": 600,
+            "quoted_total_hourly": 0.6,
+            "billing_started_at_unix": 1000,
+            "mode": "rehearsal",
+        },
+        "self_destruct_deadline_unix": 1000 + 45_000 - 180,
+    }
+    value.update(changes)
+    return value
+
+
+def test_readiness_requires_every_rehearsal_gate_and_the_whole_run_to_fit() -> None:
+    spec = Specification.load(SPECS["A"])
+    need = 43_726.0
+    assert check_readiness(receipt(), now=1001, spec=spec, required_seconds=need) == 1000
+    assert "ssh_transfer_tested" not in REHEARSAL_GATES  # R2 replaces the SSH transfer path.
+    for gate in REHEARSAL_GATES:
+        with pytest.raises(ValueError, match=gate):
+            check_readiness(receipt(**{gate: None}), now=1001, spec=spec, required_seconds=need)
+    # The armed deadline (180 s inside the wall) bounds the lifetime left.
+    latest = 1000 + 45_000 - 180 - need
+    assert check_readiness(receipt(), now=latest, spec=spec, required_seconds=need) == 1000
+    with pytest.raises(ValueError, match="cannot fit the whole run"):
+        check_readiness(receipt(), now=latest + 1, spec=spec, required_seconds=need)
+    with pytest.raises(ValueError, match="owner acceptance"):
+        check_readiness(
+            receipt(owner_accepts_best_effort_termination=False),
+            now=1001,
+            spec=spec,
+            required_seconds=need,
+        )
+    policy = receipt()["watchdog_policy"]
+    with pytest.raises(ValueError, match="weaker"):
+        check_readiness(
+            receipt(watchdog_policy={**policy, "max_cost_usd": 8.0}),
+            now=1001,
+            spec=spec,
+            required_seconds=need,
+        )
+    with pytest.raises(ValueError, match="pilot ceiling"):  # A 45,000 s policy must say rehearsal.
+        check_readiness(
+            receipt(watchdog_policy={**policy, "mode": "pilot"}),
+            now=1001,
+            spec=spec,
+            required_seconds=need,
+        )
+
+
+@pytest.mark.parametrize(
+    "changes", [{"pod_seconds": 45_001}, {"idle_seconds": 601}, {"approved_cost_cap": 10.5}]
+)
+def test_readiness_refuses_a_specification_above_the_rehearsal_ceilings(
+    changes: dict[str, float],
+) -> None:
+    spec = Specification.load(SPECS["A"])
+    if "idle_seconds" in changes:
+        spec = replace(spec, drain_seconds=300).with_limits(**changes)
+    else:
+        spec = spec.with_limits(**changes)
+    with pytest.raises(ValueError, match="ceiling"):
+        check_readiness(receipt(), now=1001, spec=spec, required_seconds=1)
+
+
+def test_preflight_gate_requires_the_compile_and_fused_attention_checks() -> None:
+    spec = Specification.load(SPECS["B"])
+    hardware = {"device": "cuda:0", "name": "NVIDIA A40", "uuid": "GPU-1"}
+    passed = {
+        "status": "completed",
+        "hardware_precision_and_resume_checked": True,
+        "device": "cuda:0",
+        "hardware": hardware,
+        "fused_attention": {"status": "passed"},
+        "compile_equivalence": {"status": "passed"},
+    }
+    check_preflight(passed, hardware=hardware, spec=spec)
+    without = {key: value for key, value in passed.items() if key != "compile_equivalence"}
+    with pytest.raises(ValueError, match="compile equivalence"):
+        check_preflight(without, hardware=hardware, spec=spec)
+    with pytest.raises(ValueError, match="fused attention"):
+        check_preflight(
+            {**passed, "fused_attention": {"status": "failed"}}, hardware=hardware, spec=spec
+        )
+    for bad in ({"device": "cpu"}, {"status": "failed"}, {"hardware": {"name": "other"}}):
+        with pytest.raises(ValueError, match="matching A40"):
+            check_preflight({**passed, **bad}, hardware=hardware, spec=spec)
+
+
+@functools.lru_cache(maxsize=1)
+def _toolchain_available() -> bool:
+    """Whether torch.compile can build even a trivial CPU function on this machine."""
+    try:
+        compiled = torch.compile(lambda x: x * 2 + 1)
+        return bool(torch.equal(compiled(torch.ones(4)), torch.full((4,), 3.0)))
+    except Exception:
+        return False
+
+
+def test_compile_equivalence_check_is_opt_in_and_passes_on_cpu(tmp_path: Path) -> None:
+    pilot = run_preflight(tmp_path / "pilot")
+    assert "compile_equivalence" not in pilot  # The pilot's preflight is unchanged.
+    if not _toolchain_available():
+        pytest.skip("torch.compile cannot build even a trivial CPU function here")
+    report = run_preflight(tmp_path / "rehearsal", compile_check=True)
+    check = report["compile_equivalence"]
+    assert report["status"] == "completed" and check["status"] == "passed"
+    assert set(check["precisions"]) == {"float32", "bfloat16"}
+    for result in check["precisions"].values():
+        assert result["loss_absolute_error"] <= result["loss_atol"] + result["loss_rtol"]
+        assert result["max_gradient_relative_norm_error"] <= result["gradient_relative_norm_max"]
+    assert check["precisions"]["float32"]["gradient_relative_norm_max"] == 1e-3
+
+
+# The shared initialization -------------------------------------------------------------
+
+
+def test_initialization_is_the_seed_zero_model_in_parent_format(data: Authored) -> None:
+    state = torch.load(data.initialization, map_location="cpu", weights_only=True)
+    spec = smoke_specification("A", data.streams)
+    assert set(state) == {"config", "tokenizer_hash", "model", "run_id"}
+    assert state["config"] == {"model": asdict(spec.model)}
+    assert state["run_id"] == INITIALIZATION_RUN_ID
+    assert state["tokenizer_hash"] == data.tokenizer.sha256
+    assert file_sha256(data.initialization) == data.initialization_sha256
+    # Deterministic bytes, so the Mac-side hash can be recomputed.
+    again = data.root / "again.pt"
+    specs = [smoke_specification(run, data.streams) for run in RUNS]
+    assert write_initialization(specs, data.tokenizer.sha256, again) == data.initialization_sha256
+    with pytest.raises(FileExistsError):
+        write_initialization(specs, data.tokenizer.sha256, again)
+    # A parent-loading trainer starts from exactly the weights a seed-0 trainer builds.
+    train = spec.stage_train(0)
+    fresh = Trainer(
+        RunConfig(model=spec.model, train=train),
+        [],  # type: ignore[arg-type]  # Never read: no update runs.
+        run_id="fresh",
+        run_root=data.root / "trainers",
+        data_hash="x",
+        tokenizer_hash=data.tokenizer.sha256,
+    )
+    parented = Trainer(
+        RunConfig(model=spec.model, train=train, parent_checkpoint=str(data.initialization)),
+        [],  # type: ignore[arg-type]
+        run_id="parented",
+        run_root=data.root / "trainers",
+        data_hash="x",
+        tokenizer_hash=data.tokenizer.sha256,
+    )
+    for name, tensor in fresh.model.state_dict().items():
+        assert torch.equal(tensor, parented.model.state_dict()[name])
+    assert parented.optimizer.steps == [0] * len(parented.optimizer.steps)
+
+
+def test_initialization_writer_and_verifier_refuse_mismatches(data: Authored) -> None:
+    spec = smoke_specification("A", data.streams)
+    other = replace(spec, train=replace(spec.train, seed=1))
+    with pytest.raises(ValueError, match="share one model and seed"):
+        write_initialization([spec, other], data.tokenizer.sha256, data.root / "x.pt")
+    with pytest.raises(ValueError, match="SHA-256"):
+        write_initialization([spec], "not-a-digest", data.root / "x.pt")
+    verify_initialization(
+        data.initialization,
+        expected_sha256=data.initialization_sha256,
+        model=spec.model,
+        tokenizer_identity=data.tokenizer.sha256,
+    )
+    for kwargs, message in (
+        ({"expected_sha256": "0" * 64}, "SHA-256"),
+        ({"tokenizer_identity": "1" * 64}, "tokenizer"),
+        ({"model": replace(spec.model, width=32, heads=2)}, "model"),
+    ):
+        arguments: dict[str, Any] = {
+            "expected_sha256": data.initialization_sha256,
+            "model": spec.model,
+            "tokenizer_identity": data.tokenizer.sha256,
+            **kwargs,
+        }
+        with pytest.raises(ValueError, match=message):
+            verify_initialization(data.initialization, **arguments)
+
+
+# Both runs on authored data ------------------------------------------------------------
+
+
+@dataclass
+class Completed:
+    data: Authored
+    bucket: MemoryBucket
+    workers: dict[str, Worker]
+    reports: dict[str, dict[str, Any]]
+    beats: dict[str, list[dict[str, Any]]]
+
+
+@pytest.fixture(scope="module")
+def completed(tmp_path_factory: pytest.TempPathFactory) -> Completed:
+    """Runs A and B on one bucket, a fake clock advancing 1 s per update, every heartbeat kept."""
+    data = authored(tmp_path_factory.mktemp("rehearsal"))
+    bucket = MemoryBucket()
+    workers, reports, beats = {}, {}, {}
+    for run in RUNS:
+        clock = Clock()
+        worker = make_worker(data, run, clock=clock, bucket=bucket)
+        stepping(worker, clock)
+        seen: list[dict[str, Any]] = []
+        original = worker.heartbeat
+
+        def capture(worker: Worker = worker, original: Any = original, seen: Any = seen) -> None:
+            original()
+            beat = heartbeat(worker)
+            beat["bucket_holds_report"] = worker.prefix + "report.json" in bucket.objects
+            seen.append(beat)
+
+        worker.heartbeat = capture  # type: ignore[method-assign]
+        workers[run], reports[run], beats[run] = worker, worker.execute(), seen
+    return Completed(data, bucket, workers, reports, beats)
+
+
+def test_both_runs_complete_with_the_bound_tickets(completed: Completed) -> None:
+    a, b = completed.reports["A"], completed.reports["B"]
+    assert a["status"] == b["status"] == "completed"
+    for report in (a, b):
+        for stage in report["stages"]:
+            ticket, expected = stage["ticket"], stage["expected_ticket"]
+            assert stage["expected_ticket_match"] is True and ticket["complete"] is True
+            assert ticket["multiset_sha256"] == expected["multiset_sha256"]
+            assert ticket["order_sha256"] == expected["order_sha256"]
+            assert ticket["targets"] == expected["targets"] == stage["tokens"]
+        assert report["run_ticket"]["match"] is True
+    stages = [stage["ticket"]["multiset_sha256"] for stage in a["stages"]]
+    # A's two stages read exactly B's multiset, and both equal the bound value.
+    assert combine_digests(*stages) == b["stages"][0]["ticket"]["multiset_sha256"]
+    assert a["run_ticket"]["multiset_sha256"] == b["run_ticket"]["multiset_sha256"]
+    assert a["run_ticket"]["expected_multiset_sha256"] == a["run_ticket"]["multiset_sha256"]
+    assert a["run_ticket"]["targets"] == b["run_ticket"]["targets"]
+    assert a["initial_weights_sha256"] == b["initial_weights_sha256"]
+    assert a["validation_identity"] == b["validation_identity"]
+    # One shared initialization and one fixed subset: identical step-0 validations.
+    assert a["stages"][0]["validations"][0] == {
+        **b["stages"][0]["validations"][0],
+        "seconds": a["stages"][0]["validations"][0]["seconds"],
+    }
+
+
+def test_every_target_is_read_once_and_the_last_update_is_masked(completed: Completed) -> None:
+    for run, worker in completed.workers.items():
+        report = completed.reports[run]
+        updates = rows(worker)
+        assert [row["update"] for row in updates] == list(range(1, worker.spec.total_updates + 1))
+        for stage in report["stages"]:
+            mine = [row for row in updates if row["stage"] == stage["name"]]
+            assert [row["stage_update"] for row in mine] == list(
+                range(1, stage["planned_updates"] + 1)
+            )
+            assert stage["updates"] == stage["planned_updates"]
+            full = worker.spec.tokens_per_update
+            assert all(row["tokens"] == full for row in mine[:-1])
+            last = stage["planned_targets"] - full * (stage["planned_updates"] - 1)
+            assert mine[-1]["tokens"] == last and 0 < last <= full
+        assert report["training_tokens_processed"] == worker.total_targets
+
+
+def test_stage_two_starts_from_the_verified_stage_one_weights_with_a_fresh_optimizer(
+    completed: Completed,
+) -> None:
+    worker, report = completed.workers["A"], completed.reports["A"]
+    stage1, stage2 = report["stages"]
+    assert stage1["parent_checkpoint_sha256"] == report["initial_weights_sha256"]
+    assert stage2["parent_checkpoint_sha256"] == stage1["final_checkpoint_sha256"]
+    records = {
+        name: json.loads((worker.root / "runs" / f"rehearsal-A-{name}" / "record.json").read_text())
+        for name in ("stage1", "stage2")
+    }
+    assert records["stage1"]["parent_run_id"] == INITIALIZATION_RUN_ID
+    assert records["stage2"]["parent_run_id"] == "rehearsal-A-stage1"
+    assert records["stage2"]["config"]["parent_checkpoint"] == str(
+        worker.root / "checkpoints" / "stage1" / "final.pt"
+    )
+    for record, stage in zip(records.values(), report["stages"], strict=True):
+        train = record["config"]["train"]
+        assert (train["learning_rate"], train["warmup_steps"], train["steps"]) == (
+            stage["learning_rate"],
+            stage["warmup_updates"],
+            stage["planned_updates"],
+        )
+        final = torch.load(
+            worker.root / "exports" / f"{stage['name']}-final" / "checkpoint.pt",
+            map_location="cpu",
+            weights_only=True,
+        )
+        # A fresh AdamW per stage: its counters hold this stage's updates only.
+        assert final["optimizer"]["steps"] == [stage["planned_updates"]] * len(
+            final["optimizer"]["steps"]
+        )
+        assert final["step"] == stage["planned_updates"]
+    updates = rows(worker)
+    for stage in report["stages"]:
+        mine = [row for row in updates if row["stage"] == stage["name"]]
+        peak, warmup = stage["learning_rate"], stage["warmup_updates"]
+        assert mine[0]["learning_rate"] == pytest.approx(peak / warmup)  # A fresh warmup.
+        assert mine[warmup - 1]["learning_rate"] == pytest.approx(peak)
+        assert mine[-1]["learning_rate"] == pytest.approx(peak * 0.1)  # min_lr_ratio.
+
+
+def test_validation_runs_on_global_updates_and_full_streams_at_each_stage_end(
+    completed: Completed,
+) -> None:
+    for run, report in completed.reports.items():
+        worker = completed.workers[run]
+        interval = worker.spec.validation.interval_updates
+        start = 0
+        for index, stage in enumerate(report["stages"]):
+            end = start + stage["planned_updates"]
+            first = start if index == 0 else start + 1
+            expected = [u for u in range(first, end + 1) if u % interval == 0]
+            assert [row["global_update"] for row in stage["validations"]] == expected
+            for row in stage["validations"]:
+                for label in ("web", "python"):
+                    assert row[label]["tokens"] == worker.spec.validation.subset_target_tokens
+            full = stage["full_validation"]
+            assert full["global_update"] == end
+            for label, shard in worker.data.validation:
+                upper = sum(length - 1 for _, length in shard.offsets)
+                assert full[label]["tokens"] == upper  # Every authored token is one byte.
+            start = end
+    # A's stage-2 cadence continues A's global count rather than restarting.
+    a = completed.reports["A"]["stages"]
+    assert a[1]["validations"][0]["global_update"] > a[0]["planned_updates"]
+
+
+def test_checkpoints_reach_r2_as_rolling_labels_and_milestones(completed: Completed) -> None:
+    bucket = completed.bucket
+    for run, worker in completed.workers.items():
+        report = completed.reports[run]
+        labels = [label for stage in report["stages"] for label in stage["r2_labels"]]
+        rolling = [label for label in labels if not label.endswith("-final")]
+        assert rolling and all(
+            label.split("-step")[0] in {stage["name"] for stage in report["stages"]}
+            for label in rolling
+        )
+        assert worker.milestones == [f"{stage['name']}-final" for stage in report["stages"]]
+        held = {
+            key.removeprefix(worker.prefix).split("/")[0]
+            for key in bucket.objects
+            if key.startswith(worker.prefix) and key != worker.prefix + "report.json"
+        }
+        assert set(worker.milestones) <= held
+        assert len(held - set(worker.milestones)) <= worker.spec.keep_rolling  # Retention.
+        for label in held:
+            files = {
+                key.rsplit("/", 1)[1]
+                for key in bucket.objects
+                if key.startswith(f"{worker.prefix}{label}/")
+            }
+            names = {"checkpoint.pt", "checkpoint.pt.sha256", "record.json", "updates.jsonl"}
+            assert files == (names | {"ticket.json"} if label.endswith("-final") else names)
+            checkpoint = bucket.objects[f"{worker.prefix}{label}/checkpoint.pt"]
+            digest = bucket.objects[f"{worker.prefix}{label}/checkpoint.pt.sha256"].decode()
+            assert digest == f"{file_sha256_bytes(checkpoint)}  checkpoint.pt\n"
+            record = json.loads(bucket.objects[f"{worker.prefix}{label}/record.json"])
+            assert record["status"] == "running"  # A label is never the run's completion.
+        for stage in report["stages"]:
+            label = f"{stage['name']}-final"
+            ticket = json.loads(bucket.objects[f"{worker.prefix}{label}/ticket.json"])
+            assert ticket["ticket"] == stage["ticket"] and ticket["expected_ticket_match"] is True
+            checkpoint = bucket.objects[f"{worker.prefix}{label}/checkpoint.pt"]
+            assert file_sha256_bytes(checkpoint) == stage["final_checkpoint_sha256"]
+            log = bucket.objects[f"{worker.prefix}{label}/updates.jsonl"].decode().splitlines()
+            assert json.loads(log[-1])["update"] == stage_end(report, stage["name"])  # Cumulative.
+        # Locally only the milestones and the newest rolling label remain.
+        exports = {path.name for path in (worker.root / "exports").iterdir()}
+        assert exports - set(worker.milestones) <= {rolling[-1]}
+
+
+def file_sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def stage_end(report: dict[str, Any], name: str) -> int:
+    total = 0
+    for stage in report["stages"]:
+        total += int(stage["planned_updates"])
+        if stage["name"] == name:
+            return total
+    raise AssertionError(name)
+
+
+def test_heartbeat_runs_across_the_stage_boundary_and_ends_after_r2_verification(
+    completed: Completed,
+) -> None:
+    for run, beats in completed.beats.items():
+        worker, report = completed.workers[run], completed.reports[run]
+        statuses = [beat["status"] for beat in beats]
+        assert set(statuses[:-1]) == {"running"} and statuses[-1] == "awaiting_transfer"
+        final = beats[-1]
+        assert final["bucket_holds_report"] is True
+        assert "r2_final" not in beats[-2]
+        r2 = final["r2_final"]
+        assert r2["report_key"] == f"rehearsal-runs/{run}/pod-{run.lower()}/report.json"
+        assert r2["checkpoint_key"] == f"{worker.prefix}{worker.milestones[-1]}/checkpoint.pt"
+        assert r2["checkpoint_sha256"] == report["stages"][-1]["final_checkpoint_sha256"]
+        stored = completed.bucket.objects[r2["report_key"]]
+        assert stored == (worker.root / "report.json").read_bytes()
+        assert file_sha256_bytes(stored) == r2["report_sha256"]
+        assert json.loads(stored)["status"] == "completed"
+        assert all(type(beat["step"]) is int for beat in beats)
+        assert {"schema_version", "phase", "last_gpu_activity_unix", "updated_at_unix"} <= set(
+            final
+        )
+    a = completed.beats["A"]
+    stages = [beat["stage"] for beat in a]
+    boundary = stages.index("stage2")
+    assert a[boundary - 1]["phase"].startswith("stage1") and a[boundary]["status"] == "running"
+    assert {beat["status"] for beat in a if beat["phase"] == "stage1-full-validation"} == {
+        "running"
+    }
+
+
+def test_reports_and_heartbeats_stay_within_their_bounds(completed: Completed) -> None:
+    for worker in completed.workers.values():
+        assert (worker.root / "report.json").stat().st_size < MAX_REPORT_BYTES
+        assert (worker.root / "heartbeat.json").stat().st_size < 65_536
+        report = completed.reports[worker.spec.run]
+        assert "loss_curves" not in report  # Per-update rows live in updates.jsonl.
+        assert report["speed_check"]["status"] == "passed"
+        assert report["cost"]["quoted_accrued_cost_usd"] < report["cost"]["cost_stop_usd"]
+
+
+def test_report_at_the_real_run_scale_stays_far_below_one_megabyte(data: Authored) -> None:
+    worker = make_worker(data, "A")
+    for index, stage in enumerate(worker.stage_records):
+        result = {"loss": 1.0, "bits_per_byte": 1.0, "tokens": 1e6, "bytes": 4e6}
+        stage["validations"] = [
+            {"global_update": 500 * k, "web": result, "python": result, "seconds": 30.0}
+            for k in range(16 * index, 16 * index + 16)
+        ]
+        stage["ticket"] = {"multiset_sha256": "0" * 64, "per_stream": {"a": {"tokens": 1}}}
+    # About 25 rolling saves in 45,000 s at the 1,800 s cadence, plus the milestones.
+    row = {
+        "label": "stage1-step12345",
+        "stage": "stage1",
+        "global_update": 12_345,
+        "stage_update": 4_715,
+        "milestone": False,
+        "path": "checkpoints/stage1/last.pt",
+        "save_seconds": 9.5,
+        "size_bytes": 1_623_507_391,
+        "sha256": "0" * 64,
+        "training_tokens_processed": 1_618_083_840,
+    }
+    worker.checkpoints.extend(copy.deepcopy(row) for _ in range(30))
+    worker.report["r2"]["uploader"] = {"verified": [f"stage1-step{i}" for i in range(30)]}
+    worker.publish()
+    assert (worker.root / "report.json").stat().st_size < 100_000
+    before = (worker.root / "report.json").read_bytes()
+    worker.report["padding"] = "x" * MAX_REPORT_BYTES
+    with pytest.raises(ValueError, match="over 1,000,000"):
+        worker.publish()
+    assert (worker.root / "report.json").read_bytes() == before
+    worker.uploader.close()
+
+
+# Stops ---------------------------------------------------------------------------------
+
+
+def finished(worker: Worker) -> tuple[dict[str, Any], dict[str, Any]]:
+    report = json.loads((worker.root / "report.json").read_text())
+    return report, heartbeat(worker)
+
+
+def test_speed_check_stops_a_run_below_the_throughput_floor(data: Authored) -> None:
+    clock = Clock()
+    spec = replace(tiny_spec(data, "B"), expected_tokens_per_second=1e12)
+    worker = make_worker(data, "B", spec=spec, clock=clock)
+    stepping(worker, clock)
+    result = worker.execute()
+    assert result["status"] == "stopped" and result["stop_reason"] == "throughput_below_limit"
+    check = result["speed_check"]
+    assert check["status"] == "failed" and check["reason"] == "throughput_below_limit"
+    assert check["measured_tokens_per_second"] < check["floor_tokens_per_second"]
+    report, beat = finished(worker)
+    assert beat["status"] == "stopped" and report["stages"][0]["status"] == "running"
+    assert not worker.milestones
+
+
+def test_speed_check_stops_a_run_projected_to_pass_the_deadline(data: Authored) -> None:
+    clock = Clock()
+    spec = replace(tiny_spec(data, "A", pod_seconds=400), expected_tokens_per_second=0.1)
+    worker = make_worker(data, "A", spec=spec, clock=clock)
+
+    def slow(trainer: Trainer, metrics: dict[str, float]) -> dict[str, float]:
+        return {**metrics, "step_seconds": 100.0}  # Measured throughput 0.32 tok/s.
+
+    stepping(worker, clock, hook=slow)
+    result = worker.execute()
+    assert result["status"] == "stopped"
+    assert result["stop_reason"] == "projected_finish_after_deadline"
+    check = result["speed_check"]
+    assert check["measured_tokens_per_second"] >= check["floor_tokens_per_second"]
+    assert check["projected_finish_unix"] > check["pod_end_unix"] == 1400
+    parts = check["projected_seconds"]
+    assert parts["finalization_reserve_seconds"] == 120
+    assert parts["training_seconds"] == pytest.approx(check["remaining_targets"] / 0.32)
+    assert parts["recompile_seconds"] == 0  # Every update looked alike: nothing to recompile.
+    assert check["remaining_validation_tokens"] > 0
+
+
+def test_speed_check_excludes_the_compiling_first_updates(data: Authored) -> None:
+    clock = Clock()
+    spec = replace(tiny_spec(data, "A"), expected_tokens_per_second=10.0)
+    worker = make_worker(data, "A", spec=spec, clock=clock)
+
+    def compiling(trainer: Trainer, metrics: dict[str, float]) -> dict[str, float]:
+        if trainer.step <= 2:
+            return {**metrics, "step_seconds": 1000.0}
+        return metrics
+
+    stepping(worker, clock, hook=compiling)
+    result = worker.execute()
+    assert result["status"] == "completed"
+    check = result["speed_check"]
+    assert check["status"] == "passed" and check["measured_tokens_per_second"] > 8.5
+    # Stage 2 will compile again; the estimate is the first updates' excess time.
+    assert check["projected_seconds"]["recompile_seconds"] > 1900
+
+
+@pytest.mark.parametrize(("jump", "reason"), [(1300.0, "cost_limit"), (4000.0, "pod_wall_limit")])
+def test_wall_and_cost_stops_end_the_run_without_waiting_for_uploads(
+    data: Authored, jump: float, reason: str
+) -> None:
+    clock = Clock()
+    spec = tiny_spec(data, "A", quoted_total_hourly=3.6)
+    spec = replace(spec, quoted_gpu_hourly=3.0)
+    worker = make_worker(data, "A", spec=spec, clock=clock)
+
+    def leap(trainer: Trainer, metrics: dict[str, float]) -> None:
+        if trainer.step == 4:  # Not a validation update: the limit is seen by the update.
+            clock.now += jump
+
+    stepping(worker, clock, hook=leap)
+    result = worker.execute()
+    assert result["status"] == "stopped" and result["stop_reason"] == reason
+    report, beat = finished(worker)
+    assert beat["status"] == "stopped" and "r2_final" not in beat
+    assert not worker.milestones
+    final = json.loads((worker.root / "finalization.json").read_text())
+    assert final["drain_budget_seconds"] == 0 and "report_sha256" not in final
+
+
+def test_idle_and_rising_loss_stop_the_run(data: Authored) -> None:
+    clock = Clock()
+    idle = make_worker(data, "B", clock=clock, name="idle")
+    original = idle.on_step
+
+    def stall(trainer: Trainer, metrics: dict[str, float]) -> None:
+        original(trainer, metrics)
+        if trainer.step == 4:
+            clock.now += 700  # No GPU work for longer than the idle limit.
+
+    idle.on_step = stall  # type: ignore[method-assign]
+    assert idle.execute()["stop_reason"] == "idle_gpu_limit"
+    assert heartbeat(idle)["status"] == "stopped"
+    clock = Clock()
+    rising = make_worker(
+        data, "B", spec=tiny_spec(data, "B", rising_steps=5), clock=clock, name="rising"
+    )
+    stepping(rising, clock, hook=lambda t, m: {**m, "loss": 10.0 + t.step})
+    result = rising.execute()
+    assert result["status"] == "stopped" and result["stop_reason"] == "loss_rising"
+    assert result["stages"][0]["updates"] == 6  # Five consecutive increases after update 1.
+
+
+def test_nonfinite_loss_fails_the_run(data: Authored) -> None:
+    clock = Clock()
+    worker = make_worker(data, "B", clock=clock)
+    stepping(worker, clock, hook=lambda t, m: {**m, "loss": math.nan} if t.step == 3 else m)
+    with pytest.raises(FloatingPointError):
+        worker.execute()
+    report, beat = finished(worker)
+    assert report["status"] == "failed" and report["error_type"] == "FloatingPointError"
+    assert beat["status"] == "failed"
+
+
+def test_finalization_reserve_ends_a_stage_early_with_a_verified_milestone(data: Authored) -> None:
+    clock = Clock()
+    spec = tiny_spec(data, "A", pod_seconds=300)  # Training deadline 1180 = 1300 - 120.
+    bucket = MemoryBucket()
+    worker = make_worker(data, "A", spec=spec, clock=clock, bucket=bucket)
+    stepping(worker, clock, seconds=20.0)
+    result = worker.execute()
+    assert result["status"] == "time_limited"
+    assert result["training_stop_reason"] == "finalization_reserve"
+    stage1, stage2 = result["stages"]
+    assert stage1["status"] == "completed" and stage1["expected_ticket_match"] is True
+    assert stage2["status"] == "time_limited" and 0 < stage2["updates"] < stage2["planned_updates"]
+    assert stage2["ticket"]["complete"] is False and stage2["expected_ticket_match"] is False
+    assert stage2["full_validation"] == {"status": "skipped", "reason": "finalization_reserve"}
+    assert result["run_ticket"]["match"] is False
+    beat = heartbeat(worker)
+    assert beat["status"] == "awaiting_transfer"
+    assert beat["r2_final"]["checkpoint_key"].endswith("/stage2-final/checkpoint.pt")
+    assert f"{worker.prefix}stage2-final/ticket.json" in bucket.objects
+
+
+def refuse_put(part: str) -> Callable[[str, str], tuple[int, bytes] | None]:
+    def fault(method: str, key: str) -> tuple[int, bytes] | None:
+        return (403, b"AccessDenied") if method == "PUT" and part in key else None
+
+    return fault
+
+
+def test_unverified_r2_copies_never_read_awaiting_transfer(data: Authored) -> None:
+    for name, broken in (("milestone", "stage2-final/"), ("report", "report.json")):
+        clock = Clock()
+        bucket = MemoryBucket()
+        bucket.fault = refuse_put(broken)
+        worker = make_worker(data, "A", clock=clock, bucket=bucket, name=name)
+        stepping(worker, clock)
+        result = worker.execute()
+        assert result["status"] == "failed" and result["training_status"] == "completed"
+        assert result["failure"] == (
+            "r2_milestones_unverified" if name == "milestone" else "r2_finalization"
+        )
+        beat = heartbeat(worker)
+        assert beat["status"] == "failed"
+        if name == "report":
+            assert "r2_final" not in beat
+
+
+def test_a_tampered_stage_one_checkpoint_is_refused_as_the_stage_two_parent(
+    data: Authored, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock()
+    worker = make_worker(data, "A", clock=clock)
+    stepping(worker, clock)
+    original = worker.save
+
+    def corrupt(trainer: Trainer, path: Path, label: str, **kwargs: Any) -> str:
+        digest = original(trainer, path, label, **kwargs)
+        if label == "stage1-final":
+            raw = bytearray(path.read_bytes())
+            raw[-1] ^= 0xFF
+            path.write_bytes(bytes(raw))
+        return digest
+
+    monkeypatch.setattr(worker, "save", corrupt)
+    with pytest.raises(ValueError, match="parent checkpoint bytes differ"):
+        worker.execute()
+    report, beat = finished(worker)
+    assert report["status"] == "failed" and beat["status"] == "failed"
+    assert not (worker.root / "runs" / "rehearsal-A-stage2").exists()
+
+
+def test_a_ticket_that_differs_from_the_binding_stops_before_the_next_stage(
+    data: Authored,
+) -> None:
+    spec = tiny_spec(data, "A")
+    bound = authored_run_data(spec, data.streams, data.tokenizer)
+    first = bound.stages[0]
+    common: dict[str, Any] = {
+        "initialization": data.initialization,
+        "initialization_sha256": data.initialization_sha256,
+        "store": MemoryBucket().store(CREDENTIALS),
+        "pod_id": "pod-a",
+        "pod_created": 1000.0,
+    }
+    # The loader reads every document, but the bound multiset names other ones.
+    wrong = replace(first, expected={**first.expected, "multiset_sha256": "0" * 64})
+    clock = Clock()
+    worker = Worker(
+        spec,
+        data.root / "mismatch",
+        replace(bound, stages=(wrong, *bound.stages[1:])),
+        clock=clock,
+        **common,
+    )
+    stepping(worker, clock)
+    result = worker.execute()
+    assert result["status"] == "stopped" and result["stop_reason"] == "ticket_mismatch"
+    stage1, stage2 = result["stages"]
+    assert stage1["ticket"]["complete"] is True and stage1["expected_ticket_match"] is False
+    assert stage1["final_checkpoint_sha256"] and stage2["status"] == "pending"
+    assert not (worker.root / "runs" / "rehearsal-A-stage2").exists()
+    # A loader whose plan differs from the binding is refused before any update.
+    other = replace(first, expected={**first.expected, "targets": first.expected["targets"] + 1})
+    clock = Clock()
+    worker = Worker(
+        spec,
+        data.root / "plan",
+        replace(bound, stages=(other, *bound.stages[1:])),
+        clock=clock,
+        **common,
+    )
+    with pytest.raises(ValueError, match="loader's plan differs"):
+        worker.execute()
+    assert rows(worker) == []
+
+
+def test_no_secret_value_reaches_any_record(
+    data: Authored, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("R2_POD_SECRET_ACCESS_KEY", SECRET)
+    monkeypatch.setenv("R2_POD_ACCESS_KEY_ID", KEY_ID)
+    monkeypatch.setenv("RUNPOD_API_KEY", "rpa_pod-scoped-key-9f8e7d6c")
+    clock = Clock()
+    bucket = MemoryBucket()
+    leak = f"SignatureDoesNotMatch AWSAccessKeyId={KEY_ID} secret={SECRET}".encode()
+    # One rolling upload fails with an answer that echoes the credentials.
+    bucket.fault = lambda method, key: (403, leak) if method == "PUT" and "-step" in key else None
+    worker = make_worker(
+        data,
+        "A",
+        clock=clock,
+        bucket=bucket,
+        secrets=(KEY_ID, SECRET, *environment_secrets()),
+    )
+    stepping(worker, clock)
+    result = worker.execute()
+    assert result["status"] == "completed"
+    assert result["r2"]["uploader"]["failures"]  # The echo was recorded, redacted.
+    assert "[REDACTED]" in (worker.root / "report.json").read_text()
+    values = [SECRET.encode(), KEY_ID.encode(), b"rpa_pod-scoped-key-9f8e7d6c"]
+    for path in worker.root.rglob("*"):
+        if path.is_file():
+            content = path.read_bytes()
+            assert not any(value in content for value in values), path
+    for key, content in bucket.objects.items():
+        assert not any(value in content for value in values), key
+
+
+# Glue between the binding and the worker -----------------------------------------------
+
+
+SMOKE_PACKING = {
+    "sequence_length": 8,
+    "microbatch": 2,
+    "accumulation": 2,
+    "windows_per_update": 4,
+    "tokens_per_update": 32,
+}
+SPLITS = {
+    "stage1-web": ("web", "stage1"),
+    "stage2-web": ("web", "stage2"),
+    "stage2-python": ("python", "train"),
+    "validation-web": ("web", "validation"),
+    "validation-python": ("python", "validation"),
+}
+
+
+def write_binding(data: Authored) -> tuple[Path, str]:
+    """A binding over the authored shards that ``check_binding`` accepts at the tiny packing."""
+    root, prefix = data.root / "data", "rehearsal-s-test/"
+    tokenizer_path = root / "tokenizer" / "tokenizer.json"
+    data.tokenizer.save(tokenizer_path)
+    streams: dict[str, Any] = {}
+    for name, (domain, split) in SPLITS.items():
+        shards: list[dict[str, Any]] = []
+        for sha256, shard in data.streams[name]:
+            file = shard.path.relative_to(root).as_posix()
+            manifest = shard.path.with_name(shard.path.name + ".json")
+            shards.append(
+                {
+                    "file": file,
+                    "sha256": sha256,
+                    "manifest_sha256": file_sha256(manifest),
+                    "size_bytes": shard.path.stat().st_size,
+                    "manifest_size_bytes": manifest.stat().st_size,
+                    "documents": len(shard),
+                    "tokens": sum(length for _, length in shard.offsets),
+                    "key": prefix + file,
+                    "manifest_key": prefix + file + ".json",
+                }
+            )
+        tokens = sum(shard["tokens"] for shard in shards)
+        streams[name] = {
+            "domain": domain,
+            "split": split,
+            "quota_tokens": None if split == "validation" else tokens,
+            "tokens": tokens,
+            "documents": sum(shard["documents"] for shard in shards),
+            "multiset_sha256": multiset_digest(
+                document_sha256(np.asarray(shard[i], dtype=np.uint16))
+                for _, shard in data.streams[name]
+                for i in range(len(shard))
+            ),
+            "shards": shards,
+        }
+    runs: dict[str, Any] = {}
+    for run, stages in RUNS.items():
+        rows = []
+        for stage, names in stages:
+            held = [shard for name in names for shard in streams[name]["shards"]]
+            order = pass_order(
+                [(shard["sha256"], shard["documents"]) for shard in held], ORDER_SEED
+            )
+            rows.append(
+                {
+                    "name": stage,
+                    "streams": list(names),
+                    "shards": [shard["file"] for shard in held],
+                    "order_seed": ORDER_SEED,
+                    "order_sha256": order_digest(order),
+                    "documents": sum(shard["documents"] for shard in held),
+                    **rehearsal_binding._packed(sum(shard["tokens"] for shard in held)),
+                    "multiset_sha256": combine_digests(
+                        *(streams[name]["multiset_sha256"] for name in names)
+                    ),
+                }
+            )
+        runs[run] = {
+            "stages": rows,
+            "documents": sum(row["documents"] for row in rows),
+            "tokens": sum(row["tokens"] for row in rows),
+            "multiset_sha256": combine_digests(*(row["multiset_sha256"] for row in rows)),
+        }
+    path = data.root / "binding.json"
+    binding = {
+        "schema_version": 1,
+        "kind": rehearsal_binding.KIND,
+        "created_at": "2026-10-25T00:00:00+00:00",
+        "written_to": str(path),
+        "binder": {"git_commit": "f" * 40, "dirty": False},
+        "build": {
+            "name": "authored",
+            **{
+                key: "a" * 64
+                for key in (
+                    "spec_sha256",
+                    "report_sha256",
+                    "verification_sha256",
+                    "tokens_identity",
+                    "build_identity",
+                    "holdout_sha256",
+                )
+            },
+            "git_commit": "f" * 40,
+            "admission": {"approved": True},
+            "documents": {"file": "documents.jsonl", "sha256": "b" * 64},
+            "exclusions": {"file": "exclusions.jsonl", "sha256": "c" * 64},
+        },
+        "r2_prefix": prefix,
+        "packing": SMOKE_PACKING,
+        "tokenizer": {
+            "path": "tokenizer/tokenizer.json",
+            "source": str(tokenizer_path),
+            "key": prefix + "tokenizer/tokenizer.json",
+            "sha256": file_sha256(tokenizer_path),
+            "size_bytes": tokenizer_path.stat().st_size,
+            "identity": data.tokenizer.sha256,
+            "vocab_size": data.tokenizer.vocab_size,
+            "bos_id": 256,
+        },
+        "stream_order": list(SPLITS),
+        "streams": streams,
+        "runs": runs,
+        "same_multiset": {run: runs[run]["multiset_sha256"] for run in RUNS},
+        "validation": {"streams": list(VALIDATION_STREAMS), "subset_rule": SUBSET_RULE},
+    }
+    rehearsal_binding.check_binding(binding)
+    path.write_bytes(rehearsal_binding._serialized(binding))
+    return path, file_sha256(path)
+
+
+@pytest.fixture
+def tiny_binding(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """The binding rules at the authored data's vocabulary and packing."""
+    monkeypatch.setattr(rehearsal_binding, "VOCAB_SIZE", 272)
+    monkeypatch.setattr(rehearsal_binding, "SEQUENCE_LENGTH", 8)
+    monkeypatch.setattr(rehearsal_binding, "PACKING", SMOKE_PACKING)
+    yield
+
+
+def test_load_run_data_pairs_a_verified_binding_with_the_specification(
+    data: Authored, tiny_binding: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path, sha256 = write_binding(data)
+    for run in RUNS:
+        spec = tiny_spec(data, run)
+        loaded = load_run_data(path, data.root / "data", expected_sha256=sha256, spec=spec)
+        authored_data = authored_run_data(spec, data.streams, data.tokenizer)
+        assert loaded.multiset_sha256 == authored_data.multiset_sha256
+        for left, right in zip(loaded.stages, authored_data.stages, strict=True):
+            assert left.expected == right.expected  # The binding's ticket is the shards' own.
+            assert np.array_equal(left.order, right.order)
+            assert [(n, s) for n, _, s in left.shards] == [(n, s) for n, _, s in right.shards]
+        assert [label for label, _ in loaded.validation] == ["web", "python"]
+    # The loaded data trains end to end.
+    clock = Clock()
+    spec = tiny_spec(data, "B")
+    worker = Worker(
+        spec,
+        data.root / "bound-B",
+        load_run_data(path, data.root / "data", expected_sha256=sha256, spec=spec),
+        initialization=data.initialization,
+        initialization_sha256=data.initialization_sha256,
+        store=MemoryBucket().store(CREDENTIALS),
+        pod_id="pod-b",
+        pod_created=1000.0,
+        clock=clock,
+    )
+    stepping(worker, clock)
+    assert worker.execute()["status"] == "completed"
+    # A specification that plans other updates than the binding is refused.
+    spec = smoke_specification("B", data.streams)
+    (stage,) = spec.stages
+    longer = replace(
+        stage, updates=stage.updates + 5, warmup_updates=round(0.2 * (stage.updates + 5))
+    )
+    other = replace(
+        spec,
+        stages=(longer,),
+        train=replace(spec.train, steps=longer.updates, warmup_steps=longer.warmup_updates),
+    )
+    with pytest.raises(ValueError, match="plans"):
+        load_run_data(path, data.root / "data", expected_sha256=sha256, spec=other)
+    # The Mac-side writer takes the tokenizer identity from the pinned binding.
+    files = []
+    for run in RUNS:
+        file = data.root / f"spec-{run}.json"
+        file.write_text(json.dumps(smoke_specification(run, data.streams).to_dict()))
+        assert Specification.load(file) == smoke_specification(run, data.streams)
+        files += ["--specification", str(file)]
+    output = data.root / "cli-init.pt"
+    command = ["write-initialization", *files, "--binding", str(path), "--output", str(output)]
+    assert main([*command, "--binding-sha256", sha256]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["sha256"] == file_sha256(output) == data.initialization_sha256
+    assert printed["tokenizer_identity"] == data.tokenizer.sha256 and printed["seed"] == 0
+    assert printed["parameters"] == expected_parameters(spec.model)
+    with pytest.raises(ValueError, match="SHA-256"):
+        main([*command[:-1], str(data.root / "other.pt"), "--binding-sha256", "0" * 64])
+
+
+def test_run_command_refuses_mismatched_receipts_before_creating_output(tmp_path: Path) -> None:
+    preflight = tmp_path / "preflight.json"
+    preflight.write_text("{}")
+    readiness = tmp_path / "receipt.json"
+    output = tmp_path / "out"
+    arguments = [
+        "run",
+        "--specification",
+        str(SPECS["A"]),
+        "--binding",
+        str(tmp_path / "binding.json"),
+        "--binding-sha256",
+        "a" * 64,
+        "--root",
+        str(tmp_path),
+        "--initialization",
+        str(tmp_path / "init.pt"),
+        "--initialization-sha256",
+        "b" * 64,
+        "--readiness",
+        str(readiness),
+        "--preflight",
+        str(preflight),
+        "--output",
+        str(output),
+    ]
+    good = {
+        "specification_sha256": file_sha256(SPECS["A"]),
+        "binding_sha256": "a" * 64,
+        "preflight_sha256": file_sha256(preflight),
+    }
+    for change, message in (
+        ({"specification_sha256": "0" * 64}, "specification differs"),
+        ({"binding_sha256": "0" * 64}, "binding identity"),
+        ({"preflight_sha256": "0" * 64}, "preflight report"),
+        ({"initialization_sha256": "0" * 64}, "initialization identity"),
+    ):
+        readiness.write_text(json.dumps({**good, **change}))
+        with pytest.raises(ValueError, match=message):
+            main(arguments)
+        assert not output.exists()
+
+
+def test_cli_smoke_runs_both_runs_offline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["smoke", "--output", str(tmp_path / "smoke")]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["status"] == {"A": "completed", "B": "completed"}
+    assert summary["same_multiset"] is True and summary["tickets_match"] is True
+    for run in RUNS:
+        beat = json.loads((tmp_path / "smoke" / f"run-{run}" / "heartbeat.json").read_text())
+        assert beat["status"] == "awaiting_transfer"
+
+
+def test_length_sorted_batches_keep_every_window_once() -> None:
+    windows = [ValidationWindow(tuple(range(1, 3 + n % 5)), 1) for n in range(11)]
+    result = list(length_sorted(windows, 4))
+    assert sorted(map(len_tokens, result)) == sorted(map(len_tokens, windows))
+    for start in range(0, 11, 4):
+        chunk = [len(window.tokens) for window in result[start : start + 4]]
+        assert chunk == sorted(chunk)
+
+
+def len_tokens(window: ValidationWindow) -> int:
+    return len(window.tokens)
+
+
+def test_worker_refuses_mismatched_inputs(data: Authored) -> None:
+    spec = tiny_spec(data, "A")
+    run_data = authored_run_data(spec, data.streams, data.tokenizer)
+    common: dict[str, Any] = {
+        "initialization": data.initialization,
+        "initialization_sha256": data.initialization_sha256,
+        "store": MemoryBucket().store(CREDENTIALS),
+        "pod_created": 1000.0,
+    }
+    with pytest.raises(ValueError, match="stages differ"):
+        Worker(tiny_spec(data, "B"), data.root / "x", run_data, pod_id="p", **common)
+    with pytest.raises(ValueError, match="Pod ID"):
+        Worker(spec, data.root / "x", run_data, pod_id="../p", **common)
+    (data.root / "exists").mkdir()
+    with pytest.raises(FileExistsError):
+        Worker(spec, data.root / "exists", run_data, pod_id="p", **common)
+    bigger = replace(
+        spec, model=ModelConfig(vocab_size=300, width=16, layers=1, heads=2, context=8)
+    )
+    with pytest.raises(ValueError, match="vocabulary"):
+        Worker(bigger, data.root / "y", run_data, pod_id="p", **common)
