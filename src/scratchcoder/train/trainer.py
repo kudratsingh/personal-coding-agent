@@ -58,6 +58,22 @@ def synchronized_time(device: torch.device) -> float:
     return time.perf_counter()
 
 
+# Train options added after checkpoints already existed, with the value those checkpoints used.
+ADDED_TRAIN_DEFAULTS = {"loss_normalization": "capacity"}
+
+
+def _with_added_defaults(saved: Any) -> Any:
+    """A saved config with options it predates filled in, so older checkpoints still resume.
+
+    Only absent keys are filled, each with the behavior the older code always had; a key the
+    checkpoint does record is compared as saved.
+    """
+    if not isinstance(saved, dict) or not isinstance(saved.get("train"), dict):
+        return saved
+    train = {**ADDED_TRAIN_DEFAULTS, **saved["train"]}
+    return {**saved, "train": train}
+
+
 class Trainer:
     def __init__(
         self,
@@ -456,7 +472,7 @@ class Trainer:
             not isinstance(state, dict)
             or type(state.get("version")) is not int
             or state["version"] != 1
-            or state.get("config") != asdict(self.config)
+            or _with_added_defaults(state.get("config")) != asdict(self.config)
         ):
             raise ValueError("checkpoint configuration differs")
         if (

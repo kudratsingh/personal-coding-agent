@@ -2,6 +2,7 @@
 
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -177,6 +178,35 @@ def test_a_stop_inside_an_update_rolls_back_and_resumes_exactly(tmp_path: Path) 
     assert resumed.train() == expected[1:]
     for left, right in zip(reference.model.parameters(), resumed.model.parameters(), strict=True):
         torch.testing.assert_close(left, right, atol=0, rtol=0)
+
+
+def test_a_checkpoint_saved_before_the_option_existed_still_resumes(tmp_path: Path) -> None:
+    run = RunConfig(
+        model=ModelConfig(vocab_size=VOCAB, width=16, layers=1, heads=2, context=16),
+        train=TrainConfig(steps=2, sequence_length=8, batch_size=2, accumulation_steps=2),
+    )
+    documents = {"web": [[1, 2, 3, 4, 5, 6, 7] * 3], "py": [[10, 11, 12] * 6]}
+
+    def mixed() -> MixedLoader:
+        return MixedLoader(
+            documents, {"web": 0.5, "py": 0.5}, sequence_length=8, batch_size=2, seed=3
+        )
+
+    trainer = make_trainer(run, mixed(), tmp_path, "older")
+    trainer.train(should_stop=lambda: trainer.step >= 1)
+    trainer.checkpoint(tmp_path / "older.pt")
+    state = torch.load(tmp_path / "older.pt", weights_only=False)
+    del state["config"]["train"]["loss_normalization"]
+    torch.save(state, tmp_path / "older.pt")
+    (tmp_path / "older.pt.sha256").unlink(missing_ok=True)
+    resumed = make_trainer(run, mixed(), tmp_path, "resumed")
+    resumed.resume(tmp_path / "older.pt")
+    assert resumed.step == 1
+    targets = RunConfig(
+        model=run.model, train=replace(run.train, loss_normalization="update_targets")
+    )
+    with pytest.raises(ValueError, match="configuration differs"):
+        make_trainer(targets, mixed(), tmp_path, "changed").resume(tmp_path / "older.pt")
 
 
 def test_update_targets_rejects_z_loss_and_empty_updates(tmp_path: Path) -> None:
