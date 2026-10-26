@@ -1,6 +1,6 @@
 # Rehearsal run operations (D-35)
 
-The owner approved two rehearsal pretraining runs of the S model (decision D-35), each on its own Runpod A40 Pod at the same time. **Run A** trains `stage1` on English and then `stage2` on Python plus unseen English, with a fresh optimizer and schedule from stage 1's final weights. **Run B** trains one `mixed` stage on the same tokens. Both start from one shared saved initialization. This page describes the Mac-side and Pod-side operations around the training worker; the step-by-step commands are in the [rehearsal runbook](../REHEARSAL_RUNBOOK.md). Nothing here launches a Pod by itself, and no rehearsal run has happened yet.
+The owner approved two rehearsal pretraining runs of the S model (decision D-35), each on its own Runpod A40 Pod at the same time. **Run A** trains `stage1` on English and then `stage2` on Python plus unseen English, with a fresh optimizer and schedule from stage 1's final weights. **Run B** trains one `mixed` stage on the same tokens. Both start from one shared saved initialization. This page describes the Mac-side and Pod-side operations around the training worker; the step-by-step commands are in the [rehearsal runbook](../REHEARSAL_RUNBOOK.md). Nothing here launches a Pod by itself. Both runs completed on 2026-10-26: see [Measured results](#measured-results-2026-10-26).
 
 ## Approved limits per run
 
@@ -112,6 +112,69 @@ With none at risk, the run gets the 60-second grace (its own drain is already ov
 
 These projections use their own assumptions and are not the launch gate; the launch rule above is. At the quoted $0.60/h the 60,000 s wall falls at the $10.00 stop, so the cap is the binding limit; at a higher rate the cost stop ends the Pod first, and the receipt refuses any Pod costing more than the $0.60/h quote. Each Pod needs 16 to 18 GB of its 40 GB container disk with headroom, and the bucket holds about 16 GB ($0.09 a month). These are projections from one measured pilot, not rehearsal measurements: a run near the floor speed whose setup took long will be stopped by the 900-second projected-finish rule.
 
+## Measured results (2026-10-26)
+
+Both Pods were created at about 02:59 PDT on 2026-10-26, each with an A40 in Runpod's EU-SE-1. Training began at about 03:36, and both runs completed. Neither the cost stop nor the speed check fired, and neither run needed the SSH-pull fallback.
+
+### Validation
+
+Every figure is on the full validation streams: 6,941,050 English tokens (34,418,761 bytes) and 5,278,970 Python tokens (20,754,400 bytes). Each cell gives loss / bits per byte.
+
+| Checkpoint | Training tokens | Peak learning rate | English (web) | Python |
+| --- | --- | ---: | --- | --- |
+| Run A, end of stage 1 | 1B English | 6e-4 | 3.622 / 1.0538 | 6.310 / 2.3156 |
+| Run A, end of stage 2 (final) | 2B: 1B more, of which 0.9B Python and 0.1B unseen English | 3e-4, fresh warmup | 3.894 / 1.1328 | 2.111 / 0.7747 |
+| Run B, mixed (final) | 2B, the same tokens shuffled together | 6e-4 | 3.656 / 1.0637 | 2.133 / 0.7827 |
+
+For scale, the shared untrained initialization scored 3.249 (English) and 4.055 (Python) bits per byte on the 1M-token interval subsets.
+
+### Finding
+
+The owner accepted this comparison on 2026-10-26:
+
+- **Python:** two-stage was lower by 0.0079 bits per byte: 1.02% of two-stage's value, 1.01% of mixed's. That is just over the pre-registered 1% threshold, so the rule alone does not call it "no measurable difference". With one seed per arm, the owner reads it as a tie within noise.
+- **English:** mixed was better by 0.0691 bits per byte, 6.1% of two-stage's value.
+- **Forgetting:** stage 2 cost run A 0.0790 bits per byte of English, +7.5% on its end-of-stage-1 value, even with 10% English kept in.
+- **What it compares:** two recipes, not order alone. Run A's stage 2 also started a fresh optimizer and schedule, at half the peak learning rate (3e-4 against 6e-4).
+- **Not measured:** two pre-registered endpoints.
+  - The dev pass rate after matched SFT will not be measured, because post-training continues on run B only.
+  - ARC-Easy accuracy at the end of stage 1 and at the end of each run has not been measured yet.
+
+**Consequences:**
+- The main model will pretrain on one mixed stage with one learning-rate schedule. Its planned token streams stay the same, shuffled together: 9B web English plus 9B of Python with 10% English, so 9.9B English and 8.1B Python in all. That run still needs its own approval.
+- The two-stage code path stays, as an experiment rather than the plan.
+- The rest of the rehearsal (SFT, the short RL run with its "more SFT" control, and full evaluation) continues from run B's checkpoint.
+
+### Operations
+
+| | Run A | Run B |
+| --- | ---: | ---: |
+| Pod | `g9id1yi7fzq5mq` | `sn8esbi4mfiqkb` |
+| Pod creation to training start | 2,207 s | 2,247 s |
+| Speed check after 900 s of training | 57,918 tok/s (102.5% of reference) | 57,039 tok/s (101.0%) |
+| Training wall clock | 36,434 s (10.12 h) | 36,546 s (10.15 h) |
+| Of which validation | 1,683 s | 1,169 s |
+| Tokens per second over the whole training wall clock | 54,894 | 54,726 |
+| R2 upload rate measured at readiness | 22.5 MB/s | 11.0 MB/s |
+| Last GPU work to Pod deleted | 46 s | 40 s |
+| Pod creation to deletion | 38,686 s (10.75 h) | 38,832 s (10.79 h) |
+| Billed by Runpod (11 hourly records, fetched 15:08 PDT) | $6.40 | $6.44 |
+
+**What happened at launch:** the setup time includes a failed first bootstrap. On both Pods, three CPU tests failed that pass on the Mac:
+- one runbook parse test under the Pod image's Python 3.12.3 argparse;
+- one test that assumed a file a real Pod holds is absent;
+- one timing-dependent test.
+
+PR #89 fixed them, and both Pods were re-bootstrapped at that commit, which cost about 25 minutes each.
+
+**During and after the run:**
+- Each supervisor recorded an SSH timeout during training, and run A one heartbeat-mirror timeout. Each recovered on its next cycle; the error files keep only the latest error.
+- Each Pod was deleted from the Mac after a verified `shutdown_ready`: the final checkpoint and report checked by SHA-256 in R2, plus the Mac and GitHub archive receipts. The supervisor's API guard deleted run A; for run B the guard and the watchdog both did. DELETE returned 204, then GET returned 404.
+
+**What R2 keeps:** the final checkpoints `stage1-final`, `stage2-final` and `mixed-final`, and each run's `report.json`. The rolling checkpoints were deleted. The bucket holds 60 objects, 10.96 GB: 6.08 GB of staged shards and the initialization, and 4.88 GB of run outputs.
+
+**Against the plan:** the projected fit was 11.0 h (A) and 10.8 h (B) at the reference speed, and the cost estimate $6.29 per run. The Pods lived 10.75 h and 10.79 h and were billed $6.40 and $6.44: 1.7% and 2.4% over the estimate, and well under the $10 cap.
+
 ## Verification
 
 `uv run --locked pytest tests/test_rehearsal_run.py tests/test_rehearsal_integration.py tests/test_rehearsal_runbook.py tests/test_rehearsal_supervisor.py tests/test_rehearsal_ops.py tests/test_rehearsal_bootstrap.py tests/test_rehearsal_readiness.py tests/test_rehearsal_feasibility.py tests/test_rehearsal_watchdog.py` runs offline. The tests cover:
@@ -128,7 +191,8 @@ These projections use their own assumptions and are not the launch gate; the lau
 
 ## Limitations
 
-- No rehearsal run has been measured; every time and cost figure above is a projection.
+- The limits, time rules and projected fit above are the pre-launch plan; the measured values are in [Measured results](#measured-results-2026-10-26). Each arm ran once, with one seed.
+- The runbook's step 15 billing check passed at 14:03 PDT, about 19 minutes after teardown, while the final hour was still accruing: it read $6.01 per run. A re-fetch at 15:08 PDT gave the final $6.40 and $6.44. Fetch billing again until two reads agree.
 - Termination is layered best-effort (in-Pod timer, Mac watchdog, supervisor guard, worker deadlines); Runpod offers no provider-enforced Pod lifetime.
 - The Mac must stay awake and online for the whole run: a sleeping Mac stops the heartbeat mirror, and on waking the watchdog would read a stale heartbeat and delete the Pod.
 - R2 progress is seen only when an object completes, so a slow final upload shows the Mac no R2 progress until it ends; one still unfinished at 360 s is left to the SSH pull. The receipt's 9.17 MB/s requirement is measured once, before training; R2 may be slower at the end.
