@@ -130,7 +130,26 @@ The first build attempt stopped on a Python file with a NUL byte after an indent
 
 ### Limitations
 
-- The final verified task-pool holdout does not exist yet. Its exclusion must be repeated before training, and the build rebuilt if it removes any document; `final_training_admission` is therefore false.
+- At the time of this result the task-pool holdout did not exist yet; it was applied the same day (next section).
 - Repository license lists are The Stack's detected licenses, not a legal warranty.
 - Only exact duplicates are removed; the sources' own near-deduplication is relied on.
 - Shards, units and raw files exist only on the owner's Mac (about 17 GB); no storage account exists. They can be rebuilt from the pinned sources and this spec.
+
+## Holdout exclusion and admission (2026-10-25)
+
+The owner accepted the build and asked for the task pool's dev and test holdout to be removed from it before the shards were admitted for training (D-30). The [task pool](task-pool.md) holdout has 4,000 tasks: 2,000 dev and 2,000 test.
+
+`build --holdout` re-read every surviving document from the reviewed units, so nothing was re-tokenized. It matched them against 13-word spans of the holdout's prompts (3,925), reference solutions (3,961) and assert-style tests (4,970). It did not index I/O case data or any field shorter than 13 words (3,040 fields), because those would match unrelated text.
+
+| Item | Value |
+| --- | --- |
+| Documents scanned | 2,442,582 |
+| Documents matched and dropped | **2,940**: 120 web, 2,821 Python, 16,151,951 UTF-8 bytes |
+| Quotas after reassembly | still exact: 1,000,000,000 / 100,000,000 / 900,000,000 shard tokens |
+| Validation streams | web 6,948,391, Python 5,283,806 shard tokens |
+| Verification | passed; no excluded document is in any shard |
+| Admission | `final_training_admission: true`, admitted 2026-10-25 against holdout file `796a4cdb…` |
+| `tokens_identity` | `f8dd217e67fa459dabf18f37bcb6853b935a05c3fda1dae96a74301c1c9fe7d0` |
+| `build_identity` | `004b478f71a591ba8e4dde6caf765d0060d33ca0dac9600f6069139e31e809fe` |
+
+This admitted build supersedes the pre-holdout one above. The build records and shard hashes are in the owner's private artifacts repository.

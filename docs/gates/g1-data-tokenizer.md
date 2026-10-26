@@ -44,4 +44,4 @@ Current recount times: **65.55425s web / 50.73031s Python**, four workers.
 The **100MB real reference/fast identity condition remains unmet**; no second
 production fit or full-pool exclusion is claimed. On 2026-10-24 the owner approved
 the S rehearsal build only, effective after the pilot report; it ran on 2026-10-25
-([results](../rehearsal-data.md)). Training admission still waits for the final pool holdout.
+([results](../rehearsal-data.md)). After the task-pool holdout exclusion the shards were admitted for training on 2026-10-25.
