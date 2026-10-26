@@ -216,3 +216,34 @@ def test_download_refuses_a_longer_body_at_once(tmp_path: Path) -> None:
         )
     assert sleeps == [] and len(answers) == 1
     assert not (tmp_path / "a.bin").exists() and not (tmp_path / "a.bin.part").exists()
+
+
+def test_bounded_store_gives_every_request_its_short_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    timeouts: list[float] = []
+
+    class Opener:
+        def open(self, request: Request, timeout: float) -> Any:
+            timeouts.append(timeout)
+            raise TimeoutError("no answer")
+
+    monkeypatch.setattr(r2_store, "build_opener", lambda *_: Opener())
+    credentials = Credentials("https://r2.example.com", "key-id", "secret", "bucket")
+    store = r2_store.bounded_store(credentials, timeout=7.0, attempts=2)
+    store.sleep = lambda _: None
+    with pytest.raises(TimeoutError):
+        store.retry(lambda: store.head("k/a.bin"))
+    assert timeouts == [7.0, 7.0]  # Two attempts, each with the short socket timeout.
+    with pytest.raises(TimeoutError):
+        store.download("k/a.bin", tmp_path / "a.bin", sha256="0" * 64, size=1)
+    assert timeouts[2:] == [7.0, 7.0]
+    # The default store keeps its long timeout for bulk transfers.
+    default = Store(credentials, sleep=lambda _: None)
+    with pytest.raises(TimeoutError):
+        default.retry(lambda: default.head("k/a.bin"))
+    assert timeouts[4:] == [r2_store.REQUEST_TIMEOUT_SECONDS] * 4
+    with pytest.raises(ValueError, match="positive timeout"):
+        r2_store.bounded_store(credentials, timeout=0.0)
+    with pytest.raises(ValueError, match="at least one attempt"):
+        r2_store.bounded_store(credentials, attempts=0)

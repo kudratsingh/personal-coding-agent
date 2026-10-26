@@ -171,14 +171,23 @@ Opener = Callable[[Request], Any]
 """Opens a request and returns a response with ``status``, ``headers`` and ``read(n)``."""
 
 
-def _urllib_open(request: Request) -> Any:
-    return build_opener(_NoRedirect()).open(request, timeout=300)
+REQUEST_TIMEOUT_SECONDS = 300.0
+"""The socket timeout of every request a default ``Store`` makes."""
+BOUNDED_REQUEST_TIMEOUT_SECONDS = 20.0
+BOUNDED_ATTEMPTS = 2
+"""``bounded_store``'s defaults: one call gives up within about 2 x 20 s plus 2 s backoff."""
 
 
-def _urllib_transport(request: Request) -> tuple[int, Mapping[str, str], bytes]:
+def _urllib_open(request: Request, *, timeout: float = REQUEST_TIMEOUT_SECONDS) -> Any:
+    return build_opener(_NoRedirect()).open(request, timeout=timeout)
+
+
+def _urllib_transport(
+    request: Request, *, timeout: float = REQUEST_TIMEOUT_SECONDS
+) -> tuple[int, Mapping[str, str], bytes]:
     opener = build_opener(_NoRedirect())
     try:
-        with opener.open(request, timeout=300) as reply:
+        with opener.open(request, timeout=timeout) as reply:
             return reply.status, dict(reply.headers), reply.read()
     except HTTPError as error:
         body = error.read()
@@ -367,6 +376,30 @@ class Store:
             raise ValueError(f"{key}: {path} is not the declared {size:,} bytes")
         _, attempts = self.retry(partial(self._put, key, path, sha256, size))
         return attempts
+
+
+def bounded_store(
+    credentials: Credentials,
+    *,
+    timeout: float = BOUNDED_REQUEST_TIMEOUT_SECONDS,
+    attempts: int = BOUNDED_ATTEMPTS,
+) -> Store:
+    """A store for checks that must end in time: each socket operation of a request times
+    out after ``timeout`` seconds, and a call makes at most ``attempts`` tries.
+
+    The default ``Store`` waits up to 300 s per request and tries four times, about 20
+    minutes against an R2 endpoint that accepts connections but never answers. That is
+    right for bulk transfers and wrong for a check that a deadline depends on: the worker's
+    checks after its final drain and the Mac supervisor's listing and HEAD checks.
+    """
+    if not 0 < timeout <= REQUEST_TIMEOUT_SECONDS or attempts < 1:
+        raise ValueError("a bounded store needs a positive timeout and at least one attempt")
+    return Store(
+        credentials,
+        transport=partial(_urllib_transport, timeout=timeout),
+        opener=partial(_urllib_open, timeout=timeout),
+        attempts=attempts,
+    )
 
 
 def upload(
