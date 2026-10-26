@@ -3,26 +3,35 @@
 The worker's CPU smoke trains both runs into one in-memory bucket. Every heartbeat it
 writes is kept with the ``report.json`` and the bucket's objects at that moment, then
 replayed to a real ``RehearsalSupervisor`` through fake SSH and a fake GitHub, with the
-Mac's own key reading the same bucket. Nothing touches a network.
+Mac's own key reading the same bucket. A worker whose stage-final milestone R2 refuses
+hands its ``finalization.json`` and ``report.json`` to the supervisor, which pulls the
+export with the pilot's verified pull, served by the fixed Pod-side program on the
+worker's own directory. Nothing touches a network.
 """
 
 import base64
 import json
+import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
+from test_rehearsal_run import Clock, authored, make_worker, refuse_put, short_window, stepping
 
+from scratchcoder.data.shards import file_sha256
 from scratchcoder.tokenizer.bpe import ByteBPE
 from tools import pilot_supervisor, rehearsal_run
-from tools.pilot_supervisor import RehearsalSupervisor, archive_bundle
+from tools.pilot_supervisor import RECOVERED_ARTIFACTS, RehearsalSupervisor, archive_bundle
+from tools.pilot_transfer import _REMOTE_SCRIPT, pull_artifacts
 from tools.r2_store import Credentials
 from tools.rehearsal_binding import RUNS
 from tools.rehearsal_ops import run_prefix
 from tools.rehearsal_run import MemoryBucket, Worker, smoke
+from tools.runpod_watchdog import PodIdentity, Policy, RunpodClient, check_once
 
 MAC_KEY = Credentials(
     "https://smoke.r2.cloudflarestorage.com", "mac-key-id", "mac-secret-key", "smoke-bucket"
@@ -290,3 +299,198 @@ def test_a_run_a_stopped_in_stage_two_closes_at_its_verified_stage_one_milestone
     assert [row["key"] for row in unit.r2_verified["stage_milestones"]] == [
         f"{prefix}stage1-final/checkpoint.pt"
     ]
+
+
+# A milestone R2 refused: the worker's own records, then the SSH pull before teardown ---------
+
+EXPORT_ROW_KEYS = {
+    "label",
+    "export",
+    "export_path",
+    "checkpoint_sha256",
+    "checkpoint_size_bytes",
+    "files",
+}
+"""The shared contract: one ``unverified_milestones`` row (``Worker.export_listing``)."""
+POD_IDENTITY = {
+    "id": "pod-a",
+    "name": "rehearsal-a40-s-a",
+    "gpuId": "NVIDIA A40",
+    "gpuCount": 1,
+    "dataCenterId": "test",
+    "createdAt": "1970-01-01T00:16:40+00:00",  # The worker fixture's pod_created, 1000.0.
+}
+
+
+def pod_program(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+    """Fake SSH: the pull's fixed Pod-side program, run here on the worker's directory.
+
+    The request arrives on stdin exactly as it would over SSH; only the transport differs.
+    """
+    assert argv[0] == "ssh"
+    return subprocess.run([sys.executable, "-I", "-c", _REMOTE_SCRIPT], **kwargs)
+
+
+class Runpod:
+    """The Runpod API showing the worker's Pod alive, then gone after a DELETE."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def request(
+        self, method: str, url: str, headers: dict[str, str], timeout: float
+    ) -> tuple[int, bytes]:
+        self.calls.append(method)
+        if method == "DELETE":
+            return 204, b""
+        if "DELETE" in self.calls:
+            return 404, b""
+        pod = {
+            "id": POD_IDENTITY["id"],
+            "name": POD_IDENTITY["name"],
+            "gpu": {"id": POD_IDENTITY["gpuId"], "count": 1},
+            "dataCenterId": POD_IDENTITY["dataCenterId"],
+            "createdAt": POD_IDENTITY["createdAt"],
+            "cost": 0.6,
+        }
+        return 200, json.dumps(pod).encode()
+
+
+def test_a_milestone_r2_refused_is_pulled_from_the_workers_export_before_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real worker's ``finalization.json`` and ``report.json`` after R2 refused its
+    stage-final milestone, read by the real supervisor: pulled, checked, archived, and
+    only then is teardown approved."""
+    data = authored(tmp_path / "pod")
+    clock, bucket = Clock(), MemoryBucket()
+    bucket.fault = refuse_put("stage2-final/")  # R2 never accepts run A's last milestone.
+    worker = make_worker(
+        data, "A", spec=short_window(data), clock=clock, bucket=bucket, upload_retry_seconds=0.05
+    )
+    stepping(worker, clock)
+    worker.execute()
+    beat = json.loads((worker.root / "heartbeat.json").read_text())
+    report = json.loads((worker.root / "report.json").read_text())
+    finalization = json.loads((worker.root / "finalization.json").read_text())
+    assert (beat["status"], beat["failure"]) == ("failed", "r2_milestones_unverified")
+    assert "r2_final" not in beat
+    # The rows the supervisor must read: the digest is checkpoint_sha256, not a bare sha256.
+    (row,) = finalization["unverified_milestones"]
+    assert row == report["r2"]["unverified_milestones"][0]
+    assert set(row) == EXPORT_ROW_KEYS and row["label"] == "stage2-final"
+    export = worker.root / "exports" / "stage2-final"
+    assert row["export_path"] == str(export)
+    checkpoint = (export / "checkpoint.pt").read_bytes()
+
+    github = GitHub()
+    monkeypatch.setattr(pilot_supervisor, "_gh", github)
+    for name in ("key", "known_hosts"):
+        (tmp_path / name).write_text("synthetic placeholder\n")
+    holder: list[RehearsalSupervisor] = []
+    activity = float(beat["last_gpu_activity_unix"])
+    now = [activity + 480]  # The handover: 420 s of the transfer window are left.
+    pulls: list[tuple[str, float]] = []
+    stamps: list[object] = []
+    archived: list[tuple[Path, bool]] = []
+
+    def run_ssh(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        result = pod_program(argv, **kwargs)
+        if json.loads(kwargs["input"]).get("artifact") == "checkpoint.pt":
+            now[0] += 5  # The mirror thread meanwhile: staged weights are Mac-seen progress.
+            stamps.append(holder[0].refresh_heartbeat().get("transfer_progress_unix"))
+        return result
+
+    def recover(name: str, destination: Path, timeout: float) -> Path:
+        assert not holder[0].shutdown_ready  # Never approved while the pull runs.
+        pulls.append((name, timeout))
+        # _rehearsal_main's pull, with SSH replaced by the Pod-side program.
+        return pull_artifacts(
+            host="root@203.0.113.7",
+            port=40022,
+            identity_file=tmp_path / "key",
+            known_hosts=tmp_path / "known_hosts",
+            remote_dir=f"{worker.root}/{name}",
+            destination=destination,
+            bundle_name=PurePosixPath(name).name,
+            artifacts=RECOVERED_ARTIFACTS,
+            timeout=timeout,
+            run_ssh=run_ssh,
+        )
+
+    def archive(bundle: Path) -> dict[str, Any]:
+        unit = holder[0]
+        archived.append((bundle, unit.shutdown_ready))
+        assert (unit.recovery_root / "stage2-final" / "checkpoint.pt").read_bytes() == checkpoint
+        return archive_bundle(
+            bundle,
+            REPOSITORY,
+            run_id="pod-a",
+            files=("report.json", "summary.json"),
+            root="rehearsal-runs/A",
+            message="Save rehearsal report and summary",
+        )
+
+    def fetch(name: str) -> dict[str, Any]:
+        value: dict[str, Any] = json.loads((worker.root / name).read_text())
+        return value
+
+    unit = RehearsalSupervisor(
+        tmp_path / "ctrl",
+        run="A",
+        pod_id="pod-a",
+        fetch=fetch,
+        fetch_report=lambda: (worker.root / "report.json").read_bytes(),
+        store=bucket.store(MAC_KEY),
+        archive=archive,
+        clock=lambda: now[0],
+        fetch_finalization=lambda: (worker.root / "finalization.json").read_bytes(),
+        recover=recover,
+        pod_created_unix=1000.0,
+    )
+    holder.append(unit)
+    unit.cycle()
+    ((pulled_name, pull_timeout),) = pulls
+    assert pulled_name == "exports/stage2-final" and pull_timeout == pytest.approx(420.0)
+    assert stamps == [activity + 485]
+    # Pulled and checked against the worker's checkpoint_sha256, archived, then approved.
+    pulled = unit.recovery_root / "stage2-final"
+    assert (pulled / "checkpoint.pt").read_bytes() == checkpoint
+    assert file_sha256(pulled / "checkpoint.pt") == row["checkpoint_sha256"]
+    receipt = json.loads((pulled / "transfer-receipt.json").read_text())
+    assert receipt["status"] == "verified" and receipt["remote_dir"] == row["export_path"]
+    assert archived == [(unit.root / "diagnostics", False)] and unit.shutdown_ready
+    prefix = f"repos/{REPOSITORY}/contents/rehearsal-runs/A/pod-a/diagnostics"
+    assert github.files[f"{prefix}/report.json"] == (worker.root / "report.json").read_bytes()
+    recovery = json.loads(github.files[f"{prefix}/summary.json"])["milestone_recovery"]
+    assert recovery["failure"] == "r2_milestones_unverified"
+    assert recovery["pulled_over_ssh"] == [
+        {
+            "label": "stage2-final",
+            "remote_export": row["export"],
+            "path": str(pulled / "checkpoint.pt"),
+            "sha256": row["checkpoint_sha256"],
+            "size_bytes": row["checkpoint_size_bytes"],
+        }
+    ]
+    # stage1-final reached R2: the Mac's own HEAD confirms it and nothing is pulled for it.
+    assert [item["key"] for item in recovery["verified_in_r2_by_mac"]] == [
+        f"{run_prefix('A', 'pod-a')}stage1-final/checkpoint.pt"
+    ]
+    assert not (unit.root / pilot_supervisor.MILESTONE_ERROR_FILE).exists()
+    local = mirrored(unit)
+    assert local["status"] == "shutdown_ready" and local["github_receipt_verified"] is True
+    # The watchdog now ends the Pod on the verified receipts, not on a limit.
+    outcome = check_once(
+        RunpodClient("authored-test-key", Runpod()),
+        PodIdentity.from_dict(POD_IDENTITY),
+        Policy(45_000, 7.54, 600, 0.6, max_transfer_seconds=900, mode="rehearsal"),
+        unit.root / "heartbeat.json",
+        now=lambda: now[0],
+        sleep=lambda _: None,
+        observed=True,
+    )
+    assert (outcome.state, outcome.reason) == (
+        "terminated",
+        "shutdown_ready_verified_receipts_delete_204_get_404",
+    )
