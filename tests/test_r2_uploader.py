@@ -401,8 +401,10 @@ def test_resubmitting_an_older_milestone_keeps_newer_rolling_labels(
     uploader.submit("stage1-final", checkpoint(tmp_path, "stage1-final"), milestone=True)
     wait_for(lambda: bool(uploader.status()["retrying"]))  # Waiting out its backoff.
     fake.hold.clear()
+    fake.putting.clear()  # stage1-final's refused PUT already set it.
     uploader.submit("stage2-step8", checkpoint(tmp_path, "stage2-step8"), milestone=False)
     assert fake.putting.wait(5)
+    wait_for(lambda: uploader.status()["in_flight"] == "stage2-step8")
     uploader.submit("stage2-step9", checkpoint(tmp_path, "stage2-step9"), milestone=False)
     # Finalization resubmits the older milestone: due at once, the newer weights kept.
     uploader.submit("stage1-final", checkpoint(tmp_path, "stage1-final"), milestone=True)
