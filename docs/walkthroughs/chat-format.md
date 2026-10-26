@@ -53,7 +53,8 @@ A language conversation uses the same turns without the python block. For `Hi` /
 - **`<|assistant_end|>` carries loss.** The model must learn when to stop. For code tasks `<|python_end|>` carries loss too, so the model learns to close its block.
 - **The prompt is a prefix of the row.** A test checks this for every task shape. If the prompt and the training row disagreed, for example in whitespace, the model would be scored on a context it never saw.
 - **Extraction works on token IDs, not text.** Decoded text cannot tell a real `<|python_start|>` from those bytes typed inside code, but the IDs can.
-- **Pool I/O tasks and the `\nprint(` stop.** A stdin/stdout program usually prints at the top level, so `base-pool-completion-v1` cuts it at its first top-level `print(`. This is the protocol as declared. It affects only base-model pool scores, which are labelled cross-protocol.
+- **Pool I/O tasks and the `\nprint(` stop.** A stdin/stdout program that prints at the top level is cut at its first top-level `print(` by `base-pool-completion-v1`. This is the protocol as declared. Applied to the 2026-10-25 pool's reference solutions, the stops cut 8 of the 26 dev I/O tasks and 705 of the 1,514 train I/O tasks, all at `\nprint(`. In the 1,850 dev OpenCodeInstruct tasks they cut 700 references, removing only trailing example code. It affects only base-model pool scores, which are labelled cross-protocol.
+- **Benchmarks are cross-protocol too.** `base-completion-rstrip-v1` scores the benchmark prompt plus the completion, so imports and helper functions in the prompt are part of the program. chat-v1 scores the extracted block alone, so the model must write those itself. Base-versus-chat benchmark comparisons are therefore cross-protocol, like the pool ones.
 
 ## Verification
 
