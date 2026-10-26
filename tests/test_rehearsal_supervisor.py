@@ -5,13 +5,14 @@ import hashlib
 import json
 import shutil
 import subprocess
+from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
 
 from scratchcoder.common.records import atomic_json
-from tools import pilot_supervisor
+from tools import pilot_supervisor, r2_store
 from tools.pilot_supervisor import (
     RehearsalSupervisor,
     archive_bundle,
@@ -19,6 +20,7 @@ from tools.pilot_supervisor import (
     unverified_milestones,
 )
 from tools.pilot_transfer import child_environment
+from tools.r2_store import Store
 from tools.rehearsal_ops import run_prefix
 from tools.runpod_watchdog import Outcome, PodIdentity, Policy, RunpodClient, check_once
 
@@ -35,6 +37,7 @@ class FakeR2:
     def __init__(self) -> None:
         self.objects_by_key: dict[str, tuple[bytes, str]] = {}
         self.calls: list[tuple[str, str]] = []
+        self.listings = 0
 
     def put(self, key: str, data: bytes, *, meta: str | None = None) -> None:
         self.objects_by_key[key] = (data, meta or sha(data))
@@ -56,7 +59,21 @@ class FakeR2:
         return {"key": key, "bytes": size, "sha256": sha256, "attempts": 1, "seconds": 0.0}
 
     def objects(self) -> list[dict[str, Any]]:
+        self.listings += 1
         return [{"key": key, "bytes": len(data)} for key, (data, _) in self.objects_by_key.items()]
+
+
+class Stalled(FakeR2):
+    """A bounded store against an R2 endpoint that accepts connections but never answers:
+    every listing and HEAD ends in the socket timeout ``bounded_store`` sets."""
+
+    def head(self, key: str) -> dict[str, str] | None:
+        self.calls.append(("HEAD", key))
+        raise TimeoutError("The read operation timed out")
+
+    def objects(self) -> list[dict[str, Any]]:
+        self.listings += 1
+        raise TimeoutError("The read operation timed out")
 
 
 class Pod:
@@ -214,6 +231,27 @@ class AlivePod:
             "cost": 0.6,
         }
         return 200, json.dumps(pod).encode()
+
+
+class Runpod:
+    """The Runpod API showing this Pod alive until a DELETE, then gone."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def request(
+        self, method: str, url: str, headers: dict[str, str], timeout: float
+    ) -> tuple[int, bytes]:
+        self.calls.append(method)
+        if method == "DELETE":
+            return 204, b""
+        if "DELETE" in self.calls:
+            return 404, b""
+        return AlivePod().request("GET", url, headers, timeout)
+
+
+REHEARSAL = Policy(45_000, 7.54, 600, 0.6, max_transfer_seconds=900, mode="rehearsal")
+"""The rehearsal watchdog's policy: 600 s idle, a 900 s transfer window."""
 
 
 def test_run_a_stage_boundary_never_tears_down(tmp_path: Path) -> None:
@@ -544,13 +582,17 @@ def unverified_run(
     in_r2: tuple[str, ...] = ("stage1",),
     status: str = "failed",
     flags: bool = True,
+    size: int = 0,
 ) -> tuple[bytes, dict[str, bytes]]:
-    """Run A's report after a final drain that left ``stage2-final`` only on the Pod."""
+    """Run A's report after a final drain that left ``stage2-final`` only on the Pod.
+
+    ``size`` pads each checkpoint to that many bytes.
+    """
     prefix = run_prefix("A", POD)
     disk: dict[str, bytes] = {}
     rows = []
     for name in ("stage1", "stage2"):
-        checkpoint = f"checkpoint of A {name}".encode()
+        checkpoint = f"checkpoint of A {name}".encode().ljust(size, b".")
         disk[f"{name}-final"] = checkpoint
         if name in in_r2:
             r2.put(f"{prefix}{name}-final/checkpoint.pt", checkpoint)
@@ -564,14 +606,47 @@ def unverified_run(
     return json.dumps(report, sort_keys=True).encode(), disk
 
 
-def listing(disk: dict[str, bytes], *labels: str) -> bytes:
-    """The worker's finalization.json naming each unverified milestone's export."""
+def export_row(label: str, checkpoint: bytes) -> dict[str, Any]:
+    """One unverified milestone as ``rehearsal_run.Worker.export_listing`` writes it."""
+    directory = f"/workspace/rehearsal-run/exports/{label}"
+    files = [
+        {
+            "name": name,
+            "path": f"{directory}/{name}",
+            "sha256": sha(data),
+            "size_bytes": len(data),
+        }
+        for name, data in (
+            ("checkpoint.pt", checkpoint),
+            ("checkpoint.pt.sha256", sha(checkpoint).encode()),
+            ("record.json", b"{}"),
+            ("updates.jsonl", b"{}\n"),
+            ("ticket.json", b"{}"),
+        )
+    ]
+    return {
+        "label": label,
+        "export": f"exports/{label}",
+        "export_path": directory,
+        "checkpoint_sha256": sha(checkpoint),
+        "checkpoint_size_bytes": len(checkpoint),
+        "files": files,
+    }
+
+
+def listing(disk: dict[str, bytes], *labels: str, legacy: bool = False) -> bytes:
+    """The worker's finalization.json naming each unverified milestone's export.
+
+    ``legacy`` writes an older row: only ``label``, ``path`` and ``sha256``.
+    """
     rows = [
         {
             "label": label,
             "path": f"/workspace/rehearsal-run/exports/{label}",
             "sha256": sha(disk[label]),
         }
+        if legacy
+        else export_row(label, disk[label])
         for label in labels
     ]
     return json.dumps({"status": "failed", "unverified_milestones": rows}).encode()
@@ -602,12 +677,14 @@ def recovering(
     return unit, archive, recovery
 
 
+@pytest.mark.parametrize("legacy", [False, True])
 def test_an_unverified_milestone_is_pulled_checked_and_archived_before_teardown(
-    tmp_path: Path,
+    tmp_path: Path, legacy: bool
 ) -> None:
     r2 = FakeR2()
     report, disk = unverified_run(r2)
-    unit, archive, recovery = recovering(tmp_path, r2, report, listing(disk, "stage2-final"), disk)
+    rows = listing(disk, "stage2-final", legacy=legacy)
+    unit, archive, recovery = recovering(tmp_path, r2, report, rows, disk)
     unit.cycle()  # No grace timer: the pull starts at once, inside the transfer window.
     assert recovery.calls == [("exports/stage2-final", 500.0)]
     assert recovery.progress == [1901.0]  # The staged bytes stamped Mac-seen progress.
@@ -737,27 +814,11 @@ def test_the_watchdog_still_ends_a_pod_whose_milestones_are_not_secured(tmp_path
     unit.cycle()
     assert not unit.shutdown_ready
 
-    class Deleting:
-        def __init__(self) -> None:
-            self.calls: list[str] = []
-
-        def request(
-            self, method: str, url: str, headers: dict[str, str], timeout: float
-        ) -> tuple[int, bytes]:
-            self.calls.append(method)
-            if method == "DELETE":
-                return 204, b""
-            if "DELETE" in self.calls:
-                return 404, b""
-            return AlivePod().request("GET", url, headers, timeout)
-
-    policy = Policy(45_000, 7.54, 600, 0.6, max_transfer_seconds=900, mode="rehearsal")
-
     def watchdog(now: float) -> Outcome:
         return check_once(
-            RunpodClient("authored-test-key", Deleting()),
+            RunpodClient("authored-test-key", Runpod()),
             IDENTITY,
-            policy,
+            REHEARSAL,
             unit.root / "heartbeat.json",
             now=lambda: now,
             sleep=lambda _: None,
@@ -819,9 +880,196 @@ def test_finalization_and_report_must_agree_on_a_milestones_sha256(tmp_path: Pat
     assert not unit.shutdown_ready and not recovery.calls
 
 
+def test_the_mirror_and_the_at_risk_checks_use_the_bounded_store(tmp_path: Path) -> None:
+    """R2 accepts connections and never answers. The mirror's listing and the at-risk
+    HEAD time out in the bounded store, are recorded and stamp nothing; the milestone R2
+    could not confirm is pulled too. The default store is never asked."""
+    r2 = FakeR2()  # The default store: it holds stage1-final, for verification only.
+    report, disk = unverified_run(r2)
+    stalled = Stalled()
+    beat = {"phase": "finalizing", "last_gpu_activity_unix": 1500}
+    pod = Pod(heartbeat("uploading", **beat), report, listing(disk, "stage2-final"))
+    holder: list[RehearsalSupervisor] = []
+    recovery = Recovery(holder, disk)
+    unit, archive = supervisor(
+        tmp_path,
+        pod,
+        r2,
+        quick_store=stalled,
+        fetch_finalization=pod.fetch_finalization,
+        recover=recovery,
+        transfer_window_seconds=900,
+    )
+    holder.append(unit)
+    assert supervisor(tmp_path / "default", pod, r2)[0].quick_store is r2  # The default.
+    unit.now[0] = 1800.0  # type: ignore[attr-defined]
+    for _ in range(2):
+        unit.refresh_heartbeat()  # The mirror thread, every 5 s while the worker uploads.
+    assert stalled.listings == 2 and r2.listings == 0
+    assert json.loads((unit.root / "r2-progress-error.json").read_text()) == {
+        "error_type": "TimeoutError"
+    }
+    assert "transfer_progress_unix" not in mirrored(unit) and unit.r2_seen is None
+    pod.heartbeat = heartbeat("failed", failure="r2_milestones_unverified", **beat)
+    unit.now[0] = 1900.0  # type: ignore[attr-defined]
+    unit.cycle()
+    # The last stage first, then stage1-final, which the Mac's HEAD could not confirm.
+    assert [name for name, _ in recovery.calls] == ["exports/stage2-final", "exports/stage1-final"]
+    assert stalled.calls == [("HEAD", f"{run_prefix('A', POD)}stage1-final/checkpoint.pt")]
+    assert stalled.listings == 3  # The two mirror listings, then the diagnostics one.
+    assert not r2.calls and r2.listings == 0
+    assert unit.shutdown_ready and archive.bundles == [unit.root / "diagnostics"]
+    summary = json.loads((unit.root / "diagnostics" / "summary.json").read_text())
+    assert summary["r2_listing_error"] == "TimeoutError"
+    assert summary["milestone_recovery"]["verified_in_r2_by_mac"] == []
+
+
+# The SSH pull inside the watchdog's transfer window, on one fake clock -------------------
+
+T0 = 10_000.0
+"""The worker's last GPU work (``last_gpu_activity_unix``): the end of its final save."""
+HANDOVER = T0 + 480
+"""The worker's final heartbeat, ``failed`` / ``r2_milestones_unverified``, by contract."""
+
+
+class FinalDrain(Pod):
+    """The worker after its last GPU work: ``uploading`` and refreshed until the handover,
+    then its final heartbeat, written once. ``now`` is the shared fake clock."""
+
+    def __init__(self, report: bytes, finalization: bytes) -> None:
+        super().__init__(heartbeat("uploading"), report, finalization)
+        self.now = [0.0]
+
+    def fetch(self, name: str) -> dict[str, Any]:
+        common = {"phase": "finalizing", "pod_id": POD, "last_gpu_activity_unix": T0}
+        if self.now[0] < HANDOVER:
+            self.heartbeat = heartbeat("uploading", updated_at_unix=self.now[0], **common)
+        else:
+            self.heartbeat = heartbeat(
+                "failed", updated_at_unix=HANDOVER, failure="r2_milestones_unverified", **common
+            )
+        return super().fetch(name)
+
+
+@pytest.mark.parametrize("pulled", [True, False])
+def test_the_ssh_pull_holds_the_pod_only_while_its_bytes_reach_the_mac(
+    tmp_path: Path, pulled: bool
+) -> None:
+    """R2 never shows a new object. The worker hands over at T0 + 480 s; the pull's staged
+    bytes grow from T0 + 490 s to T0 + 800 s and it publishes at T0 + 855 s. The real
+    mirror (``refresh_heartbeat``) and watchdog (``check_once``) share one fake clock."""
+    quick = FakeR2()  # The Mac's bounded store: stage1-final, and never anything new.
+    report, disk = unverified_run(quick, size=64 * 1024)
+    store = FakeR2()  # The default store: verification and downloads only.
+    pod = FinalDrain(report, listing(disk, "stage2-final"))
+    holder: list[RehearsalSupervisor] = []
+    api = Runpod()
+    seen: dict[float, tuple[str, str]] = {}
+    checks = (599, 610, 700, 850) if pulled else (599, 600)
+
+    def watchdog(after: float) -> tuple[str, str]:
+        outcome = check_once(
+            RunpodClient("authored-test-key", api),
+            IDENTITY,
+            REHEARSAL,
+            holder[0].root / "heartbeat.json",
+            now=lambda: T0 + after,
+            sleep=lambda _: None,
+            observed=True,
+        )
+        seen[after] = (outcome.state, outcome.reason)
+        return seen[after]
+
+    def pull(name: str, destination: Path, timeout: float) -> Path:
+        unit = holder[0]
+        assert (name, destination, timeout) == ("exports/stage2-final", unit.recovery_root, 420)
+        data = disk["stage2-final"]
+        staging = destination / ".stage2-final.staging-timeline"
+        for after in sorted({*range(485, 860, 5), *checks}):
+            if "DELETE" in api.calls:
+                raise RuntimeError("SSH artifact stream failed: Connection closed by remote host")
+            unit.now[0] = T0 + after  # type: ignore[attr-defined]
+            if after % 5 == 0:  # The mirror thread's tick.
+                if pulled and 490 <= after <= 800:
+                    staging.mkdir(exist_ok=True)
+                    arrived = len(data) * (after - 485) // 315  # All of it by T0 + 800.
+                    (staging / "checkpoint.pt").write_bytes(data[:arrived])
+                    if after == 800:
+                        (staging / "record.json").write_bytes(b"{}")
+                unit.refresh_heartbeat()
+            if after in checks:
+                watchdog(after)
+            assert not unit.shutdown_ready and mirrored(unit)["status"] == "failed"
+        if not pulled:
+            raise TimeoutError("artifact transfer exceeded its total timeout")
+        rows: list[dict[str, Any]] = [
+            {"kind": "checkpoint", "name": "checkpoint.pt", "sha256": sha(data)},
+            {"kind": "record", "name": "record.json", "sha256": sha(b"{}")},
+        ]
+        rows[0]["size_bytes"], rows[1]["size_bytes"] = len(data), 2
+        (staging / "transfer-receipt.json").write_text(
+            json.dumps({"status": "verified", "artifacts": rows})
+        )
+        staging.replace(destination / "stage2-final")  # Verified and published at T0 + 855.
+        return destination / "stage2-final"
+
+    unit, archive = supervisor(
+        tmp_path,
+        pod,
+        store,
+        quick_store=quick,
+        fetch_finalization=pod.fetch_finalization,
+        recover=pull,
+        transfer_window_seconds=900,
+    )
+    holder.append(unit)
+    pod.now = unit.now  # type: ignore[attr-defined]
+    for after in range(5, 480, 5):  # The final drain: the supervisor cycles every 5 s.
+        unit.now[0] = T0 + after  # type: ignore[attr-defined]
+        unit.cycle()
+        if after == 300:
+            assert watchdog(after)[0] == "watching"
+    local = mirrored(unit)
+    assert local["status"] == "uploading" and "transfer_progress_unix" not in local
+    assert quick.listings == 95  # One per mirror refresh, none of them new.
+    unit.now[0] = HANDOVER  # type: ignore[attr-defined]
+    unit.cycle()  # Reads the final heartbeat and pulls stage2-final over SSH.
+    assert quick.calls == [("HEAD", f"{run_prefix('A', POD)}stage1-final/checkpoint.pt")]
+    assert not store.calls and store.listings == 0
+    if pulled:
+        assert seen == {
+            300: ("watching", "within_limits"),
+            **{after: ("watching", "within_limits") for after in checks},
+        }
+        assert "DELETE" not in api.calls
+        # Teardown is approved once the pull is verified, and the watchdog acts on it.
+        assert unit.shutdown_ready and archive.bundles == [unit.root / "diagnostics"]
+        summary = json.loads((unit.root / "diagnostics" / "summary.json").read_text())
+        (row,) = summary["milestone_recovery"]["pulled_over_ssh"]
+        assert (row["label"], row["sha256"]) == ("stage2-final", sha(disk["stage2-final"]))
+        local = mirrored(unit)
+        assert local["status"] == "shutdown_ready" and local["transfer_progress_unix"] == T0 + 800
+        ending = watchdog(860)
+        assert ending == ("terminated", "shutdown_ready_verified_receipts_delete_204_get_404")
+    else:
+        # No byte reached the Mac: nothing stamps progress, and the idle limit ends the Pod.
+        assert seen[599] == ("watching", "within_limits")
+        assert seen[600] == ("terminated", "idle_gpu_limit_delete_204_get_404")
+        assert "transfer_progress_unix" not in mirrored(unit)
+        assert not unit.shutdown_ready and not archive.bundles
+        assert (unit.root / "MILESTONES-NOT-SECURED.json").exists()
+
+
 def test_unverified_milestone_listings_are_parsed_strictly() -> None:
-    digest = "a" * 64
+    worker = export_row("stage2-final", b"stage 2 weights")
+    digest = worker["checkpoint_sha256"]
+    keyed = {key: value for key, value in worker.items() if key != "label"}
     for listed in (
+        [worker],  # The worker's own row (rehearsal_run.Worker.export_listing).
+        {"stage2-final": keyed},
+        [{**worker, "sha256": digest}],  # Every copy of the digest agrees.
+        [{"label": "stage2-final", "checkpoint_sha256": digest}],
+        # Older rows: sha256 and a path.
         [{"label": "stage2-final", "sha256": digest}],
         [{"path": "exports/stage2-final", "sha256": digest}],
         [{"path": "/workspace/rehearsal-run/exports/stage2-final/checkpoint.pt", "sha256": digest}],
@@ -831,18 +1079,31 @@ def test_unverified_milestone_listings_are_parsed_strictly() -> None:
         found = unverified_milestones({"unverified_milestones": listed}, run="A")
         assert found == {"stage2-final": digest}, listed
     assert unverified_milestones({"status": "failed"}, run="A") == {}
-    for bad in (
-        [{"label": "stage2-step15000", "sha256": digest}],  # A rolling label never closes.
-        [{"label": "mixed-final", "sha256": digest}],  # Run B's milestone.
-        [{"label": "stage1-final", "path": "exports/stage2-final", "sha256": digest}],
-        [{"path": "elsewhere/stage2-final", "sha256": digest}],
-        [{"label": "stage2-final"}],
-        [{"label": "stage2-final", "sha256": "A" * 64}],
-        [{"sha256": digest}],
-        ["stage2-final"],
-        "stage2-final",
+    other = "b" * 64
+    files = worker["files"]
+    for bad, message in (
+        ([{"label": "stage2-step15000", "sha256": digest}], "not a stage-final"),  # Rolling.
+        ([{"label": "mixed-final", "sha256": digest}], "not a stage-final"),  # Run B's.
+        ([{"label": "stage1-final", "path": "exports/stage2-final", "sha256": digest}], "single"),
+        ([{**worker, "export": "exports/stage1-final"}], "single"),
+        ([{"path": "elsewhere/stage2-final", "sha256": digest}], "export path"),
+        ([{"label": "stage2-final"}], "no checkpoint SHA-256"),
+        ([{"label": "stage2-final", "sha256": "A" * 64}], "no checkpoint SHA-256"),
+        ([{**worker, "checkpoint_sha256": "A" * 64}], "two checkpoint SHA-256s"),
+        ([{**worker, "checkpoint_sha256": None}], "two checkpoint SHA-256s"),
+        ([{key: value for key, value in worker.items() if key != "checkpoint_sha256"}], "no"),
+        ([{**worker, "sha256": other}], "two checkpoint SHA-256s"),
+        ([{**worker, "files": [{**files[0], "sha256": other}, *files[1:]]}], "two checkpoint"),
+        ([{**worker, "files": [{**files[0], "sha256": None}, *files[1:]]}], "two checkpoint"),
+        ([{**worker, "files": [*files, {**files[0], "sha256": other}]}], "two checkpoint"),
+        ([{**worker, "files": {"checkpoint.pt": digest}}], "files malformed"),
+        ([{**worker, "files": ["checkpoint.pt"]}], "files malformed"),
+        ([worker, {**worker, "checkpoint_sha256": other, "files": []}], "listed with two"),
+        ([{"sha256": digest}], "single"),
+        (["stage2-final"], "must be an object"),
+        ("stage2-final", "a list or an object"),
     ):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=message):
             unverified_milestones({"unverified_milestones": bad}, run="A")
 
 
@@ -1054,3 +1315,41 @@ def test_cli_refuses_an_incomplete_rehearsal_setup_before_any_connection(
     assert error.value.code == 2
     assert message in capsys.readouterr().err
     assert not (tmp_path / "supervisor").exists()
+
+
+def test_main_bounds_the_checks_a_deadline_depends_on_with_the_macs_own_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RUNPOD_API_KEY", "placeholder")
+    monkeypatch.setenv("R2_ENDPOINT", "https://account.r2.cloudflarestorage.com")
+    monkeypatch.setenv("R2_BUCKET", "rehearsal")
+    monkeypatch.setenv("R2_ACCESS_KEY_ID", "placeholder-mac-key-id")
+    monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "placeholder-mac-secret")
+    monkeypatch.setenv("R2_POD_ACCESS_KEY_ID", "placeholder-pod-key-id")
+    built: dict[str, Any] = {}
+
+    class Built(Exception):
+        pass
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        built.update(kwargs)
+        raise Built  # Stop before the first SSH request.
+
+    def no_ssh(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("no SSH in this test")
+
+    monkeypatch.setattr("tools.pilot_supervisor.subprocess.run", no_ssh)
+    monkeypatch.setattr(pilot_supervisor, "RehearsalSupervisor", capture)
+    policy = {**REHEARSAL_POLICY, "max_transfer_seconds": 900}
+    with pytest.raises(Built):
+        pilot_supervisor.main(_cli(tmp_path, policy, ["--mode", "rehearsal", "--run", "A"]))
+    store, quick = built["store"], built["quick_store"]
+    assert isinstance(store, Store) and isinstance(quick, Store) and store is not quick
+    assert quick.credentials == store.credentials  # The same Mac key, never the Pod's.
+    assert store.credentials.access_key_id == "placeholder-mac-key-id"
+    # verify_final and its downloads keep the default timeouts and attempts.
+    assert store.attempts == 4 and store.transport is r2_store._urllib_transport
+    # The listing and HEAD checks: 20 s per socket operation, at most 2 attempts.
+    assert quick.attempts == r2_store.BOUNDED_ATTEMPTS == 2
+    for call in (quick.transport, quick.opener):
+        assert isinstance(call, partial) and call.keywords == {"timeout": 20.0}

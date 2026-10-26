@@ -9,11 +9,12 @@ with ``r2_final``, the supervisor checks the final milestone and ``report.json``
 the Mac's own key, archives the small records privately, and only then reports
 ``shutdown_ready``. A ``running`` or ``uploading`` heartbeat, including run A's boundary
 between its two stages, never leads to teardown. While the worker uploads, new objects
-under its R2 prefix (listed with the Mac's key) are the Mac-observed progress that lets the
-watchdog wait out the transfer window. The one checkpoint copy over SSH is the fallback for
-a stage-final milestone the worker could not verify in R2: the supervisor pulls it with the
-pilot's verified pull, checks its SHA-256, archives the records and only then approves
-teardown; if that fails it never approves, and the watchdog's limits end the Pod.
+under its R2 prefix (listed with the Mac's key, through a store bounded to 20 s per socket
+operation) are the Mac-observed progress that lets the watchdog wait out the transfer
+window. The one checkpoint copy over SSH is the fallback for a stage-final milestone the
+worker could not verify in R2: the supervisor pulls it with the pilot's verified pull,
+checks its SHA-256, archives the records and only then approves teardown; if that fails
+it never approves, and the watchdog's limits end the Pod.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ import torch
 from scratchcoder.common.records import atomic_json
 from scratchcoder.data.shards import file_sha256
 from tools.pilot_transfer import Artifact, _ssh_command, child_environment, pull_artifacts
-from tools.r2_store import SHA256_HEX, Store
+from tools.r2_store import SHA256_HEX, Store, bounded_store
 from tools.rehearsal_binding import RUNS, r2_credentials
 from tools.rehearsal_ops import (
     FAILURE_STATUSES,
@@ -426,6 +427,9 @@ RECOVERED_ARTIFACTS = (Artifact("checkpoint", "checkpoint.pt"), Artifact("record
 """What the SSH fallback pulls from ``exports/<label>/``: the weights and the label's record."""
 EXPORT_PATH_KEYS = ("path", "export_path", "local_path", "export")
 """Keys under which ``finalization.json`` may give an unverified milestone's export path."""
+CHECKPOINT_DIGEST_KEYS = ("checkpoint_sha256", "sha256")
+"""Keys under which an unverified milestone gives its checkpoint's SHA-256: the worker's
+``checkpoint_sha256`` (``rehearsal_run.Worker.export_listing``), else an older row's ``sha256``."""
 
 Recover = Callable[[str, Path, float], Path]
 """Pull ``exports/<label>`` (relative to the worker's root) into a destination directory
@@ -462,13 +466,34 @@ def _export_label(path: object) -> str:
     return parts[-1]
 
 
+def _listed_digest(row: dict[Any, Any], label: str) -> str:
+    """The checkpoint SHA-256 of one unverified milestone; every copy it gives must agree."""
+    given = [row[key] for key in CHECKPOINT_DIGEST_KEYS if key in row]
+    if not given:
+        raise ValueError(f"unverified milestone {label} carries no checkpoint SHA-256")
+    files = row.get("files", [])
+    if not isinstance(files, list) or not all(isinstance(item, dict) for item in files):
+        raise ValueError(f"unverified milestone {label} lists its files malformed")
+    given += [item.get("sha256") for item in files if item.get("name") == "checkpoint.pt"]
+    digest = given[0]
+    if any(value != digest for value in given):
+        raise ValueError(f"unverified milestone {label} gives two checkpoint SHA-256s")
+    if not isinstance(digest, str) or not SHA256_HEX.fullmatch(digest):
+        raise ValueError(f"unverified milestone {label} carries no checkpoint SHA-256")
+    return digest
+
+
 def unverified_milestones(finalization: object, *, run: str) -> dict[str, str]:
     """Each milestone ``finalization.json`` lists as unverified in R2: label to SHA-256.
 
     The worker lists them under ``unverified_milestones``, as a list of objects or a map
-    from label to object, each with the checkpoint's ``sha256`` and its local export
-    ``path`` (and optionally its ``label``). Every identifier given must name the same
-    stage-final milestone of this run; the SSH pull always reads ``exports/<label>``.
+    from label to object, in ``rehearsal_run.Worker.export_listing``'s shape: the
+    ``label``, its ``export`` (``exports/<label>``) and ``export_path``, the checkpoint's
+    ``checkpoint_sha256`` and size, and every file under ``files``. An older row gives
+    ``sha256`` and ``path`` instead. Every identifier given must name the same stage-final
+    milestone of this run, and every checkpoint SHA-256 given (``checkpoint_sha256``,
+    ``sha256`` and the ``files`` row named ``checkpoint.pt``) must be the same; the SSH
+    pull always reads ``exports/<label>``.
     """
     if not isinstance(finalization, dict):
         raise ValueError("finalization.json must be an object")
@@ -494,9 +519,7 @@ def unverified_milestones(finalization: object, *, run: str) -> dict[str, str]:
             raise ValueError(f"an unverified milestone names no single label: {sorted(names)}")
         (label,) = names
         _milestone_stage(label, run=run)
-        digest = row.get("sha256")
-        if not isinstance(digest, str) or not SHA256_HEX.fullmatch(digest):
-            raise ValueError(f"unverified milestone {label} carries no checkpoint SHA-256")
+        digest = _listed_digest(row, label)
         if found.get(label, digest) != digest:
             raise ValueError(f"unverified milestone {label} is listed with two SHA-256s")
         found[label] = digest
@@ -572,6 +595,13 @@ class RehearsalSupervisor(Supervisor):
     ``max_transfer_seconds``. Bytes arriving from an SSH pull stamp it too. The Pod can
     never stamp it itself.
 
+    Every R2 call a deadline depends on goes through ``quick_store`` (``main`` builds it
+    with ``r2_store.bounded_store``: 20 s per socket operation, 2 attempts): the mirror's
+    listing, the at-risk HEAD checks and the diagnostics listing. An R2 endpoint that
+    stalls then holds the mirror or the start of a pull for a 20 s socket timeout per
+    request instead of 300 s, and its error is recorded and stamps nothing.
+    ``verify_final`` and its downloads use ``store``.
+
     A heartbeat naming another Pod, or updated before this Pod's creation, is ignored
     (``runpod_watchdog.foreign_heartbeat``): it is never mirrored and never acted on.
     """
@@ -592,6 +622,7 @@ class RehearsalSupervisor(Supervisor):
         recover: Recover | None = None,
         transfer_window_seconds: float = REHEARSAL_TRANSFER_SECONDS,
         pod_created_unix: float | None = None,
+        quick_store: SupervisedStore | None = None,
     ) -> None:
         run_prefix(run, pod_id)
         if not 0 < failure_grace_seconds <= IDLE_SECONDS:
@@ -602,6 +633,7 @@ class RehearsalSupervisor(Supervisor):
             root, fetch=fetch, pull=_no_ssh_pull, archive=archive, clock=clock, reuse_output=True
         )
         self.run, self.pod_id, self.store = run, pod_id, store
+        self.quick_store = store if quick_store is None else quick_store
         self.prefix = run_prefix(run, pod_id)
         self.fetch_report = fetch_report
         self.fetch_finalization = fetch_finalization
@@ -626,13 +658,14 @@ class RehearsalSupervisor(Supervisor):
     def observe_r2_progress(self) -> None:
         """Stamp ``transfer_progress_unix`` when the run's prefix holds a new object.
 
-        A listing error is recorded and stamps nothing: without fresh progress the
-        watchdog's idle limit applies again.
+        The listing uses the bounded ``quick_store``, so a stalled R2 cannot hold the
+        mirror thread for long. A listing error, a timeout included, is recorded and
+        stamps nothing: without fresh progress the watchdog's idle limit applies again.
         """
         try:
             listed = {
                 (str(item["key"]), int(item["bytes"]))
-                for item in self.store.objects()
+                for item in self.quick_store.objects()
                 if str(item["key"]).startswith(self.prefix)
             }
         except Exception as error:  # recorded; the mirror keeps running
@@ -776,8 +809,9 @@ class RehearsalSupervisor(Supervisor):
         ``r2_milestones_unverified`` or ``r2_finalization`` the answer is never ``None``:
         ``finalization.json`` must be readable (an error is raised and retried each cycle),
         and every milestone the report records that the worker did not list is checked in
-        R2 with the Mac's key; any that fails is at risk too. After any other failure, the
-        milestones ``finalization.json`` lists or the report flags as unverified are.
+        R2 with the Mac's key, by HEAD through the bounded ``quick_store``; any that fails
+        or times out is at risk too. After any other failure, the milestones
+        ``finalization.json`` lists or the report flags as unverified are.
         """
         recovery = report.get("failure") in RECOVERY_FAILURES
         try:
@@ -808,7 +842,7 @@ class RehearsalSupervisor(Supervisor):
                 continue
             try:
                 row = head_sha256(
-                    self.store, f"{self.prefix}{label}/checkpoint.pt", expected=digest
+                    self.quick_store, f"{self.prefix}{label}/checkpoint.pt", expected=digest
                 )
             except Exception:  # missing, mismatched or unreachable: secure it over SSH
                 at_risk[label] = digest
@@ -935,10 +969,11 @@ class RehearsalSupervisor(Supervisor):
         )
         prefix = run_prefix(self.run, self.pod_id)
         try:
+            # Bounded: a stalled listing must not hold teardown after a verified pull.
             summary["r2_labels_present"] = sorted(
                 {
                     str(item["key"])[len(prefix) :].split("/", 1)[0]
-                    for item in self.store.objects()
+                    for item in self.quick_store.objects()
                     if str(item["key"]).startswith(prefix)
                 }
             )
@@ -1164,9 +1199,13 @@ def _rehearsal_main(
         parser.error(f"--failure-grace-seconds must be within the {IDLE_SECONDS}-second idle limit")
     try:
         # The Mac's own key: it checks what the Pod's key wrote.
-        store = Store(r2_credentials(os.environ, key_prefix=MAC_KEY_PREFIX))
+        credentials = r2_credentials(os.environ, key_prefix=MAC_KEY_PREFIX)
     except ValueError as error:
         parser.error(f"Mac R2 credentials: {error}")
+    store = Store(credentials)  # verify_final and its downloads.
+    # The same key, bounded to 20 s per socket operation and 2 attempts, for the checks the
+    # watchdog's transfer window depends on: the mirror's listing and the at-risk HEADs.
+    quick_store = bounded_store(credentials)
     root = f"rehearsal-runs/{args.run}"
 
     def archive(bundle: Path) -> dict[str, Any]:
@@ -1203,6 +1242,7 @@ def _rehearsal_main(
             ssh, args.remote_root, "report.json", max_bytes=REPORT_MAX_BYTES
         ),
         store=store,
+        quick_store=quick_store,
         archive=archive,
         failure_grace_seconds=args.failure_grace_seconds,
         fetch_finalization=lambda: fetch_status_bytes(ssh, args.remote_root, "finalization.json"),
