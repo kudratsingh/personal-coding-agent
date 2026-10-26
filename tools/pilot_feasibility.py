@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import Any
 
 from scratchcoder.common.config import ModelConfig
 from scratchcoder.model.gpt import expected_parameters
+from tools import rehearsal_ops as d35
 
 GPU_DISCLAIMER = (
     "All GPU numbers are analytical or CPU-proxy estimates; no A40 measurement exists yet"
@@ -859,6 +861,406 @@ def render_markdown(report: Mapping[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Rehearsal (D-35): two concurrent single-A40 runs, A (stage1 then stage2) and B (mixed)
+
+REHEARSAL_DISCLAIMER = (
+    "Rehearsal figures are projections from one measured pilot (35,974 tok/s eager, 1.57x "
+    "compiled) and stated assumptions; no rehearsal run has been measured"
+)
+# The S build's recorded counts (docs/rehearsal-data.md), used when no binding is given.
+S_BUILD_STAGE_TOKENS: dict[str, tuple[tuple[str, int], ...]] = {
+    "A": (("stage1", 1_000_000_000), ("stage2", 1_000_000_000)),
+    "B": (("mixed", 2_000_000_000),),
+}
+S_BUILD_VALIDATION_TOKENS = 6_948_391 + 5_334_710
+S_BUILD_DATA_BYTES = 2 * (2_000_000_000 + S_BUILD_VALIDATION_TOKENS)
+DEFAULT_REHEARSAL_STARTUP_SECONDS = 1_200.0
+"""Create request to first update: image pull, bootstrap, 4 GB fetch, tests, preflight."""
+DEFAULT_COMPILE_SECONDS_PER_STAGE = 120.0
+"""The pilot measured a one-off compile of about 48 s; each stage is allowed 120 s."""
+DEFAULT_VALIDATION_SPEED_FACTOR = 2.0
+"""Forward-only validation tokens per second relative to training (about 3x in FLOPs)."""
+DEFAULT_CHECKPOINT_SAVE_SECONDS = 15.0
+"""One 1.6 GB save plus its SHA-256 on the Pod; uploads to R2 run in the background."""
+DEFAULT_KEEP_ROLLING = 2
+CONTAINER_DISK_USD_PER_GB_MONTH = 0.10
+HOURS_PER_MONTH = 730.0
+COMPILE_CACHE_BYTES = 2 * GB
+
+
+@dataclass(frozen=True)
+class RehearsalPlan:
+    """One run's stages with their planned optimizer updates."""
+
+    run: str
+    stages: tuple[tuple[str, int], ...]
+    validation_targets: int
+
+    def __post_init__(self) -> None:
+        if not self.stages or any(_integer(updates, "updates") <= 0 for _, updates in self.stages):
+            raise ValueError("a rehearsal plan needs stages with positive planned updates")
+        _integer(self.validation_targets, "validation targets")
+
+    @property
+    def updates(self) -> int:
+        return sum(updates for _, updates in self.stages)
+
+
+def planned_updates(tokens: int, *, sequence_length: int = 1024, per_update: int = 128) -> int:
+    """The binding's packing: every token is a target; the last window and update are partial."""
+    windows = -(-_integer(tokens, "tokens") // sequence_length)
+    return -(-windows // per_update)
+
+
+def default_rehearsal_plans() -> dict[str, RehearsalPlan]:
+    return {
+        run: RehearsalPlan(
+            run,
+            tuple((name, planned_updates(tokens)) for name, tokens in stages),
+            S_BUILD_VALIDATION_TOKENS,
+        )
+        for run, stages in S_BUILD_STAGE_TOKENS.items()
+    }
+
+
+def rehearsal_plans_from_binding(binding: Mapping[str, Any]) -> dict[str, RehearsalPlan]:
+    """Each run's stages and planned updates, and the validation size, from a binding."""
+    from tools.rehearsal_binding import RUNS, VALIDATION_STREAMS, check_binding
+
+    checked = check_binding(binding)
+    validation = sum(checked["streams"][name]["tokens"] for name in VALIDATION_STREAMS)
+    return {
+        run: RehearsalPlan(
+            run,
+            tuple(
+                (stage["name"], stage["planned_updates"])
+                for stage in checked["runs"][run]["stages"]
+            ),
+            validation,
+        )
+        for run in RUNS
+    }
+
+
+def binding_data_bytes(binding: Mapping[str, Any]) -> int:
+    """Bytes of every bound shard, manifest and the tokenizer (what R2 holds per build)."""
+    total = int(binding["tokenizer"]["size_bytes"])
+    for stream in binding["streams"].values():
+        for shard in stream["shards"]:
+            total += int(shard["size_bytes"]) + int(shard["manifest_size_bytes"])
+    return total
+
+
+@dataclass(frozen=True)
+class RehearsalOptions:
+    """The D-35 limits (from ``tools.rehearsal_ops``) and the projection's assumptions."""
+
+    reference_tokens_per_second: float = d35.REFERENCE_TOKENS_PER_SECOND
+    minimum_speed_fraction: float = d35.MINIMUM_SPEED_FRACTION
+    startup_seconds: float = DEFAULT_REHEARSAL_STARTUP_SECONDS
+    compile_seconds_per_stage: float = DEFAULT_COMPILE_SECONDS_PER_STAGE
+    validation_speed_factor: float = DEFAULT_VALIDATION_SPEED_FACTOR
+    checkpoint_save_seconds: float = DEFAULT_CHECKPOINT_SAVE_SECONDS
+    quoted_gpu_hourly: float = d35.QUOTED_GPU_HOURLY
+    container_disk_gb: float = d35.CONTAINER_DISK_GB
+    lifetime_seconds: float = d35.POD_LIFETIME_SECONDS
+    self_destruct_margin_seconds: float = d35.SELF_DESTRUCT_MARGIN_SECONDS
+    finalization_reserve_seconds: float = d35.FINALIZATION_RESERVE_SECONDS
+    cost_stop_usd: float = d35.COST_STOP_USD
+    validation_interval_updates: int = d35.VALIDATION_INTERVAL_UPDATES
+    subset_targets_per_domain: int = d35.VALIDATION_TARGETS_PER_DOMAIN
+    checkpoint_interval_seconds: float = d35.CHECKPOINT_SECONDS
+    tokens_per_update: int = d35.TOKENS_PER_UPDATE
+
+    def __post_init__(self) -> None:
+        for name in (
+            "reference_tokens_per_second",
+            "validation_speed_factor",
+            "quoted_gpu_hourly",
+            "lifetime_seconds",
+            "cost_stop_usd",
+            "checkpoint_interval_seconds",
+        ):
+            _number(getattr(self, name), name)
+        for name in (
+            "startup_seconds",
+            "compile_seconds_per_stage",
+            "checkpoint_save_seconds",
+            "container_disk_gb",
+            "self_destruct_margin_seconds",
+            "finalization_reserve_seconds",
+        ):
+            _count_number(getattr(self, name), name)
+        for name in (
+            "validation_interval_updates",
+            "subset_targets_per_domain",
+            "tokens_per_update",
+        ):
+            _integer(getattr(self, name), name)
+        if not 0 < _number(self.minimum_speed_fraction, "minimum_speed_fraction") <= 1:
+            raise ValueError("minimum_speed_fraction must be in (0, 1]")
+        if self.self_destruct_margin_seconds >= self.lifetime_seconds:
+            raise ValueError("the self-destruct margin must be shorter than the lifetime")
+
+    @property
+    def floor_tokens_per_second(self) -> float:
+        return self.reference_tokens_per_second * self.minimum_speed_fraction
+
+
+def rehearsal_total_hourly(gpu_hourly: float, container_disk_gb: float) -> float:
+    """GPU quote plus the container disk's hourly share, rounded up to the cent."""
+    raw = _number(gpu_hourly, "GPU hourly") + _count_number(container_disk_gb, "disk") * (
+        CONTAINER_DISK_USD_PER_GB_MONTH / HOURS_PER_MONTH
+    )
+    return math.ceil(round(raw * 100, 6)) / 100
+
+
+def rehearsal_time_budget(
+    plan: RehearsalPlan,
+    options: RehearsalOptions,
+    tokens_per_second: float,
+    *,
+    startup_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Seconds from the create request to the end of finalization at one training speed.
+
+    Startup, then training, interval validations every 500 global updates on 1,000,000
+    targets per domain, a full validation of both streams and one compile per stage,
+    a checkpoint every 30 minutes plus one per stage end, then the finalization reserve.
+    It fits when the total is within the lifetime less the self-destruct margin.
+    """
+    rate = _number(tokens_per_second, "tokens per second")
+    startup = options.startup_seconds if startup_seconds is None else startup_seconds
+    _count_number(startup, "startup seconds")
+    stages = len(plan.stages)
+    validation_rate = rate * options.validation_speed_factor
+    training = plan.updates * options.tokens_per_update / rate
+    interval_validations = plan.updates // options.validation_interval_updates
+    interval_seconds = (
+        interval_validations * 2 * options.subset_targets_per_domain / validation_rate
+    )
+    full_seconds = stages * plan.validation_targets / validation_rate
+    compile_seconds = stages * options.compile_seconds_per_stage
+    running = training + interval_seconds + full_seconds + compile_seconds
+    checkpoints = math.floor(running / options.checkpoint_interval_seconds) + stages
+    checkpoint_seconds = checkpoints * options.checkpoint_save_seconds
+    after_startup = running + checkpoint_seconds + options.finalization_reserve_seconds
+    total = startup + after_startup
+    usable = options.lifetime_seconds - options.self_destruct_margin_seconds
+    return {
+        "tokens_per_second": rate,
+        "startup_seconds": startup,
+        "training_seconds": training,
+        "interval_validations": interval_validations,
+        "interval_validation_seconds": interval_seconds,
+        "full_validations": stages,
+        "full_validation_seconds": full_seconds,
+        "compile_seconds": compile_seconds,
+        "checkpoints": checkpoints,
+        "checkpoint_seconds": checkpoint_seconds,
+        "finalization_reserve_seconds": options.finalization_reserve_seconds,
+        "total_seconds": total,
+        "usable_lifetime_seconds": usable,
+        "margin_seconds": usable - total,
+        "latest_startup_seconds": usable - after_startup,
+        "fits": total <= usable,
+    }
+
+
+def build_rehearsal_report(
+    plans: Mapping[str, RehearsalPlan],
+    options: RehearsalOptions,
+    *,
+    source: str,
+    data_bytes: int = S_BUILD_DATA_BYTES,
+) -> dict[str, Any]:
+    """Time, cost, R2 storage and container-disk fit for each rehearsal run."""
+    from tools.r2_store import monthly_storage_usd
+
+    hourly = rehearsal_total_hourly(options.quoted_gpu_hourly, options.container_disk_gb)
+    wall_cost = options.lifetime_seconds * hourly / 3600
+    model = ModelConfig(vocab_size=65_536, width=768, layers=12, heads=12, context=1024)
+    parameters = expected_parameters(model)
+    initialization_bytes = parameters * 4 + CHECKPOINT_OVERHEAD_BYTES
+    checkpoint = MEASURED_UNTRAINED_CHECKPOINT_BYTES
+    runs: dict[str, Any] = {}
+    stored = data_bytes + initialization_bytes
+    for run, plan in sorted(plans.items()):
+        reference = rehearsal_time_budget(plan, options, options.reference_tokens_per_second)
+        floor = rehearsal_time_budget(plan, options, options.floor_tokens_per_second)
+        # A run that would outlast the wall is cut there, so the wall bounds its spend.
+        planned_cost = min(floor["total_seconds"], options.lifetime_seconds) * hourly / 3600
+        r2_checkpoints = len(plan.stages) + DEFAULT_KEEP_ROLLING
+        stored += r2_checkpoints * checkpoint
+        # Both runs read every bound stream, so each Pod holds all the data. Local
+        # checkpoints: the rolling pair, each stage's final and one save in progress.
+        disk = (
+            data_bytes
+            + initialization_bytes
+            + (DEFAULT_KEEP_ROLLING + len(plan.stages) + 1) * checkpoint
+            + COMPILE_CACHE_BYTES
+        )
+        runs[run] = {
+            "stages": [{"name": name, "planned_updates": updates} for name, updates in plan.stages],
+            "updates": plan.updates,
+            "tokens_per_update": options.tokens_per_update,
+            "reference": reference,
+            "floor": floor,
+            "time_fit_at_floor": floor["fits"],
+            "cost": {
+                "planned_at_floor_usd": planned_cost,
+                "wall_bound_usd": wall_cost,
+                "cost_stop_usd": options.cost_stop_usd,
+                "fits": planned_cost <= options.cost_stop_usd,
+                "wall_within_cost_stop": wall_cost <= options.cost_stop_usd,
+            },
+            "r2_checkpoints_kept": r2_checkpoints,
+            "container_disk": {
+                "estimated_bytes": disk,
+                "with_headroom_bytes": int(disk * DISK_HEADROOM),
+                "container_disk_gb": options.container_disk_gb,
+                "fits": disk * DISK_HEADROOM <= options.container_disk_gb * GB,
+            },
+        }
+    return {
+        "schema_version": 1,
+        "kind": "rehearsal-feasibility",
+        "source": source,
+        "options": asdict(options),
+        "floor_tokens_per_second": options.floor_tokens_per_second,
+        "quoted_total_hourly": hourly,
+        "runs": runs,
+        "two_runs_wall_bound_usd": 2 * wall_cost,
+        "r2_storage": {
+            "bytes": stored,
+            "monthly_usd": monthly_storage_usd(stored),
+            "assumption": "data, initialization, every stage-final milestone and two rolling "
+            "checkpoints per run, at the measured 1,623,502,465-byte checkpoint size",
+        },
+        "disclaimer": REHEARSAL_DISCLAIMER,
+    }
+
+
+def render_rehearsal_markdown(report: Mapping[str, Any]) -> str:
+    options = report["options"]
+    lines = [
+        "# Rehearsal feasibility (D-35)",
+        "",
+        f"Source: {report['source']}. Reference {options['reference_tokens_per_second']:,.0f} "
+        f"tok/s; the speed floor is {options['minimum_speed_fraction']:.0%} of it, "
+        f"{report['floor_tokens_per_second']:,.0f} tok/s. Quote ${options['quoted_gpu_hourly']:.2f}"
+        f"/h GPU, ${report['quoted_total_hourly']:.2f}/h with the "
+        f"{options['container_disk_gb']:g} GB container disk.",
+        "",
+        "| Run | Updates | Speed | Training | Validation | Checkpoints | Total | Lifetime "
+        "left | Fits | Latest startup |",
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |",
+    ]
+    for run, row in report["runs"].items():
+        for label in ("reference", "floor"):
+            budget = row[label]
+            validation = budget["interval_validation_seconds"] + budget["full_validation_seconds"]
+            lines.append(
+                f"| {run} | {row['updates']:,} | {label} {budget['tokens_per_second']:,.0f} | "
+                f"{_minutes(budget['training_seconds'])} | {_minutes(validation)} | "
+                f"{budget['checkpoints']} ({_minutes(budget['checkpoint_seconds'])}) | "
+                f"{_minutes(budget['total_seconds'])} | "
+                f"{_minutes(budget['usable_lifetime_seconds'])} | "
+                f"{'yes' if budget['fits'] else '**no**'} | "
+                f"{_minutes(budget['latest_startup_seconds'])} |"
+            )
+    lines += ["", "## Cost and storage", ""]
+    for run, row in report["runs"].items():
+        cost = row["cost"]
+        disk = row["container_disk"]
+        lines.append(
+            f"- Run {run}: ${cost['planned_at_floor_usd']:.2f} planned at the floor, "
+            f"${cost['wall_bound_usd']:.2f} at the 45,000-second wall, against the "
+            f"${cost['cost_stop_usd']:.2f} stop: {'fits' if cost['fits'] else '**does not fit**'}"
+            f"; container disk {disk['with_headroom_bytes'] / GB:,.1f} GB with headroom of "
+            f"{disk['container_disk_gb']:g} GB: {'fits' if disk['fits'] else '**does not fit**'}."
+        )
+    storage = report["r2_storage"]
+    lines += [
+        f"- Both runs at their walls: ${report['two_runs_wall_bound_usd']:.2f}.",
+        f"- R2 storage {storage['bytes'] / GB:,.1f} GB, ${storage['monthly_usd']:.2f}/month "
+        f"({storage['assumption']}).",
+        "",
+        f"**{report['disclaimer']}.**",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def build_rehearsal_parser() -> argparse.ArgumentParser:
+    defaults = RehearsalOptions()
+    parser = argparse.ArgumentParser(
+        prog="python -m tools.pilot_feasibility rehearsal",
+        description="Time, cost and storage fit of the two D-35 rehearsal runs.",
+    )
+    parser.add_argument("--binding", type=Path, help="the rehearsal data binding (else S counts)")
+    parser.add_argument("--binding-sha256", help="pin the binding to this SHA-256")
+    parser.add_argument("--quoted-gpu-hourly", type=float, default=defaults.quoted_gpu_hourly)
+    parser.add_argument("--startup-seconds", type=float, default=defaults.startup_seconds)
+    parser.add_argument(
+        "--reference-tokens-per-second", type=float, default=defaults.reference_tokens_per_second
+    )
+    parser.add_argument(
+        "--validation-speed-factor", type=float, default=defaults.validation_speed_factor
+    )
+    parser.add_argument(
+        "--compile-seconds-per-stage", type=float, default=defaults.compile_seconds_per_stage
+    )
+    parser.add_argument(
+        "--checkpoint-save-seconds", type=float, default=defaults.checkpoint_save_seconds
+    )
+    parser.add_argument("--output", type=Path, help="optional JSON report path")
+    return parser
+
+
+def rehearsal_main(argv: Sequence[str]) -> int:
+    parser = build_rehearsal_parser()
+    args = parser.parse_args(argv)
+    try:
+        options = RehearsalOptions(
+            reference_tokens_per_second=args.reference_tokens_per_second,
+            startup_seconds=args.startup_seconds,
+            compile_seconds_per_stage=args.compile_seconds_per_stage,
+            validation_speed_factor=args.validation_speed_factor,
+            checkpoint_save_seconds=args.checkpoint_save_seconds,
+            quoted_gpu_hourly=args.quoted_gpu_hourly,
+        )
+        if args.binding is None:
+            if args.binding_sha256 is not None:
+                parser.error("--binding-sha256 needs --binding")
+            report = build_rehearsal_report(
+                default_rehearsal_plans(), options, source="the S build's recorded counts"
+            )
+        else:
+            from tools.rehearsal_binding import check_binding, load_binding
+
+            if args.binding_sha256 is None:
+                binding = check_binding(json.loads(args.binding.read_text(encoding="utf-8")))
+            else:
+                binding = load_binding(args.binding, expected_sha256=args.binding_sha256)
+            report = build_rehearsal_report(
+                rehearsal_plans_from_binding(binding),
+                options,
+                source=f"binding {args.binding}",
+                data_bytes=binding_data_bytes(binding),
+            )
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    if args.output is not None:
+        args.output.write_text(
+            json.dumps(report, indent=2, allow_nan=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    print(render_rehearsal_markdown(report), end="")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 
 
@@ -918,8 +1320,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments[:1] == ["rehearsal"]:
+        return rehearsal_main(arguments[1:])
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
     try:
         spec = PilotSpecification.load(args.specification)
         options = FeasibilityOptions(
