@@ -108,7 +108,8 @@ A message missing any of these fields counts as `missing_metadata`. Labels must 
 
 1. any e-mail address in any message;
 2. a word n-gram match against HumanEval, HumanEval+ and MBPP+ prompts, solutions and tests, ARC-Easy questions and choices, and the pool's dev and test tasks. This is the pool's 13-gram screen with at least three words per n-gram;
-3. a first user turn that near-duplicates a benchmark or holdout prompt, at 5-word-shingle Jaccard of 0.85 or more.
+3. a first user turn that near-duplicates a benchmark or holdout prompt, at 5-word-shingle Jaccard of 0.85 or more;
+4. a first user turn that near-duplicates, by the same measure, the first user turn of a conversation already kept (`repeated_prompt`). The earliest conversation in input order is kept. As in the pool's own screen, this keeps one copy of a repeated prompt, so the language dev set and the training rows never share an opening prompt.
 
 The record counts every message by reason, every dropped tree by reason, each screen, the exchanges per conversation and the total tokens.
 

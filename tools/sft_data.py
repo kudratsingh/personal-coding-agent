@@ -450,7 +450,10 @@ def screen_conversations(
     In order: an e-mail address anywhere drops it; then n-gram matches against the
     benchmarks' prompts, solutions and tests, ARC-Easy questions and choices, and the
     pool dev/test tasks; then a first user turn that near-duplicates a benchmark or
-    holdout prompt.
+    holdout prompt; then a first user turn that near-duplicates the first user turn of
+    a conversation already kept, as the pool screen does for task prompts. The earliest
+    conversation in input order is the one kept, so no prompt reaches both the language
+    dev set and the training rows.
     """
     protected = [*benchmarks, *holdouts]
     texts = [
@@ -463,17 +466,22 @@ def screen_conversations(
     duplicates = SimilarityIndex()
     for task in protected:
         duplicates.add(task.prompt)
+    repeats = SimilarityIndex()
     counts: Counter[str] = Counter()
     kept = []
     for conversation in conversations:
         counts["seen"] += 1
+        opening = conversation.messages[0].text
         if has_email(conversation):
             counts["email_address"] += 1
         elif any(contamination.contains(message.text) for message in conversation.messages):
             counts["contamination"] += 1
-        elif duplicates.contains(conversation.messages[0].text):
+        elif duplicates.contains(opening):
             counts["near_duplicate"] += 1
+        elif repeats.contains(opening):
+            counts["repeated_prompt"] += 1
         else:
+            repeats.add(opening)
             kept.append(conversation)
             counts["kept"] += 1
     return kept, dict(sorted(counts.items()))

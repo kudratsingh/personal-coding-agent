@@ -466,6 +466,30 @@ def test_screens_drop_email_benchmark_arc_holdout_and_near_duplicate_text() -> N
     }
 
 
+def test_screens_keep_one_conversation_per_repeated_opening_prompt() -> None:
+    opening = "How do I sort a list of numbers in Python without changing the original list?"
+    items = [
+        chat("first", opening, "Use sorted(numbers)."),
+        chat("same", opening, "Call sorted on it."),
+        # One extra word: 5-word-shingle Jaccard 11/12, above the 0.85 threshold.
+        chat("near", opening.rstrip("?") + " please?", "sorted() returns a copy."),
+        chat("spaced", "  " + opening.upper() + "  ", "Same words, other case."),
+        chat("other", "Tell me a joke about cats", "No."),
+        chat("rejected", "Write to me", "Sure: person@example.org"),
+        chat("after", "Write to me", "Hello."),  # A dropped opening is not a seen prompt.
+    ]
+    kept, counts = screen_conversations(
+        items, benchmarks=[], choices=[], holdouts=[], min_alpha_tokens=3
+    )
+    assert [item.id for item in kept] == ["first", "other", "after"]
+    assert counts == {"email_address": 1, "kept": 3, "repeated_prompt": 3, "seen": 7}
+    # The earliest in input order is kept, whatever its position.
+    kept, _ = screen_conversations(
+        list(reversed(items[:3])), benchmarks=[], choices=[], holdouts=[], min_alpha_tokens=3
+    )
+    assert [item.id for item in kept] == ["near"]
+
+
 # ------------------------------------------------------------------ language spec
 
 
