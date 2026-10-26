@@ -16,6 +16,7 @@ from scratchcoder.data.oasst import (
     adapt_trees,
     conversation_from_json,
     conversation_json,
+    message_reason,
 )
 from scratchcoder.data.sft import SFTRow, read_rows
 from scratchcoder.data.shards import file_sha256
@@ -412,6 +413,52 @@ def test_adapter_fails_closed_on_missing_metadata_and_duplicate_trees() -> None:
     assert counts["tree:root_missing_metadata"] == 1
     with pytest.raises(ValueError, match="unique"):
         adapt_trees([tree("t", message("p", "prompter", "a"))] * 2, TOKENIZER)
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {"name": ["pii"], "value": [1.0], "count": [3]},  # Columnar, not the README's form.
+        {"pii": [1.0]},
+        {"pii": {"value": "0"}},
+        {"pii": {"value": False}},
+        {"pii": {"count": 3}},
+        {"spam": {"value": None}},
+        [],
+        "",
+    ],
+)
+def test_labels_in_any_other_shape_fail_closed(labels: object) -> None:
+    assert message_reason(message("p", "prompter", "Hi", labels=labels)) == "missing_metadata"
+
+
+def test_pii_labels_drop_nonzero_values_and_unlabelled_messages_are_counted() -> None:
+    assert message_reason(message("p", "prompter", "Hi")) is None
+    assert message_reason(message("p", "prompter", "Hi", labels={"pii": {"value": 0}})) is None
+    flagged = {"pii": {"value": 0.25, "count": 4}}
+    assert message_reason(message("p", "prompter", "Hi", labels=flagged)) == "pii_label"
+    no_label = [{"spam": {"value": 0.0, "count": 3}}, {}, None]
+    for labels in no_label:
+        assert message_reason(message("p", "prompter", "Hi", labels=labels)) is None
+    bare = message("p", "prompter", "Hi")
+    del bare["labels"]
+    assert message_reason(bare) is None
+    root = message(
+        "p",
+        "prompter",
+        "Hello there?",
+        labels=None,
+        replies=[
+            message("a", "assistant", "Hi.", rank=0, labels={}),
+            message("b", "assistant", "Hey.", rank=1, labels=None),
+        ],
+    )
+    kept, counts = adapt_trees([tree("t", root)], TOKENIZER)
+    assert [item.message_ids for item in kept] == [("p", "a")]
+    assert counts["message:eligible"] == 3
+    assert counts["message:eligible_no_pii_label"] == 3  # Every eligible message, chosen or not.
+    assert counts["kept_messages_no_pii_label"] == 2  # Only the chosen path's messages.
+    assert counts["tree:kept_with_no_pii_label"] == 1
 
 
 def choice(question: str) -> ChoiceTask:

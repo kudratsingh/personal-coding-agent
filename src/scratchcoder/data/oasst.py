@@ -1,8 +1,10 @@
 """OpenAssistant conversation trees to chat-v1 language conversations.
 
 Each tree is a prompter message with nested replies. A message is eligible only if it
-is English, not synthetic, not deleted, accepted by review, carries no PII label and
-has text. From each exported tree the adapter follows the best-ranked eligible reply
+is English, not synthetic, not deleted, accepted by review, carries no nonzero PII label
+and has text. Labels, when present, must be the README's mapping form (each label name
+maps to an object with a numeric ``value``); any other shape is ``missing_metadata``.
+Eligible messages that carry no PII label at all are counted separately. From each exported tree the adapter follows the best-ranked eligible reply
 at every turn (rank 0 first, unranked replies last, message ID breaking ties), so the
 chosen path never contains an ineligible message. It then keeps the longest prefix
 that ends on an assistant turn and renders to at most ``max_tokens`` chat-v1 tokens.
@@ -33,6 +35,8 @@ class Node:
     reason: str | None
     """Why the message is ineligible, or None."""
     replies: tuple[Node, ...]
+    pii_labelled: bool = True
+    """Whether the message carries a PII label (only meaningful when eligible)."""
 
 
 @dataclass(frozen=True)
@@ -58,22 +62,37 @@ def message_reason(raw: Mapping[str, Any]) -> str | None:
         return "deleted"
     if raw["review_result"] is not True:
         return "failed_review"
-    labels = raw.get("labels") or {}
-    if not isinstance(labels, Mapping):
+    labels = raw.get("labels")
+    if labels is None:
+        labels = {}
+    if not isinstance(labels, Mapping) or any(
+        not isinstance(entry, Mapping) or not _numeric(entry.get("value"))
+        for entry in labels.values()
+    ):
         return "missing_metadata"
     pii = labels.get("pii")
-    if pii is not None and (not isinstance(pii, Mapping) or pii.get("value", 1) != 0):
+    if pii is not None and pii["value"] != 0:
         return "pii_label"
     if not isinstance(raw["text"], str) or not raw["text"].strip():
         return "empty_text"
     return None
 
 
+def _numeric(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
 def parse_node(raw: Mapping[str, Any], counts: Counter[str]) -> Node:
-    """One message and its replies; ``counts`` gains every message's reason."""
+    """One message and its replies; ``counts`` gains every message's reason.
+
+    An eligible message with no PII label also counts as ``message:eligible_no_pii_label``.
+    """
     reason = message_reason(raw)
     counts["messages_seen"] += 1
     counts[f"message:{reason or 'eligible'}"] += 1
+    pii_labelled = reason is not None or "pii" in (raw.get("labels") or {})
+    if not pii_labelled:
+        counts["message:eligible_no_pii_label"] += 1
     rank = raw.get("rank")
     replies = raw.get("replies") or []
     if not isinstance(replies, list):
@@ -85,6 +104,7 @@ def parse_node(raw: Mapping[str, Any], counts: Counter[str]) -> Node:
         rank=rank if type(rank) is int else None,
         reason=reason,
         replies=tuple(parse_node(reply, counts) for reply in replies),
+        pii_labelled=pii_labelled,
     )
 
 
@@ -159,6 +179,10 @@ def adapt_trees(
         if length < len(path) - (path[-1].role == "user"):
             counts["tree:truncated_to_fit"] += 1
         tokens = 1 + sum(2 + len(encoder.encode(node.text)) for node in chosen)
+        unlabelled = sum(not node.pii_labelled for node in chosen)
+        if unlabelled:
+            counts["kept_messages_no_pii_label"] += unlabelled
+            counts["tree:kept_with_no_pii_label"] += 1
         kept.append(
             Conversation(
                 id=tree_id,

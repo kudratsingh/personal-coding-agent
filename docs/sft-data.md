@@ -100,7 +100,7 @@ No license or contributor grant beyond the metadata label was found, and the por
 - its `pii` label value, if present, is zero;
 - its text is not empty.
 
-A message missing any of these fields counts as `missing_metadata`. Labels must be the README's mapping form.
+A message missing any of these fields counts as `missing_metadata`. Labels must be the README's mapping form: each label name maps to an object with a numeric `value`. Labels in any other shape, such as lists or columnar `{"name": [...], "value": [...]}` objects, also count as `missing_metadata`. A message with no labels, or no `pii` label, stays eligible, as the owner's condition filters on the PII labels. Such messages are counted: `message:eligible_no_pii_label` over all eligible messages, and `kept_messages_no_pii_label` and `tree:kept_with_no_pii_label` over the kept conversations. The manual sample scan should cover them.
 
 **Choosing a conversation.** Only trees in `ready_for_export` state with an eligible English prompter root are used. From each tree the adapter follows the best-ranked eligible reply at every turn: rank 0 first, unranked replies last, message ID breaking ties. A chosen path therefore never contains an ineligible message. The conversation is the longest prefix of that path that ends on an assistant turn and renders to at most 960 chat-v1 tokens. A tree whose first exchange is over 960 tokens is dropped. One conversation comes from each tree.
 
@@ -116,6 +116,6 @@ The record counts every message by reason, every dropped tree by reason, each sc
 ## Limitations
 
 - **No language data yet.** Until the owner rules, the build can make code rows only.
-- **Untested on the real file.** The adapter assumes the README's message fields and mapping-form labels. A different real format shows up as `missing_metadata` counts, not as silent passes.
-- **PII.** The e-mail screen and the PII label do not find every kind of personal data. A manual sample scan is still needed before training.
+- **Untested on the real file.** The adapter assumes the README's message fields and mapping-form labels. Missing fields and labels in another shape show up as `missing_metadata` counts, not as silent passes.
+- **PII.** The e-mail screen and the PII label do not find every kind of personal data, and messages that no reviewer labelled for PII are kept (and counted). A manual sample scan is still needed before training.
 - **Code rows.** They inherit the pool's limitations, including its unchecked seed provenance.
