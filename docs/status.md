@@ -31,7 +31,7 @@ Full-validation bits per byte:
 
 **Decision:** the main model will pretrain on one mixed stage with one schedule. It keeps its planned token streams, 9B web English plus 9B of Python with 10% English, shuffled together. The two-stage code path stays as an experiment.
 
-**Next:** the rest of the rehearsal continues from run B's checkpoint: SFT on code and language, a short RL run with a "more SFT" control, and full evaluation. Each is a separate proposal and needs owner approval before any spend.
+**Next:** the rest of the rehearsal continues from run B's checkpoint: SFT on code and language, a short RL run with a "more SFT" control, and full evaluation. One proposal covers all three, priced at the measured A40 speed; nothing is spent before owner approval.
 
 **Cost and teardown:** run A was billed $6.40 and run B $6.44, each under its $10 cap. Both Pods were deleted after their final checkpoints were verified in R2.
 
