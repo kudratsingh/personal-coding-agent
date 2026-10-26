@@ -253,6 +253,19 @@ def test_chat_protocol_descriptions() -> None:
         chat.protocol("other")
 
 
+@pytest.mark.parametrize("mode", ["chat", "chat-benchmark", "base-pool"])
+def test_post_training_protocols_record_the_strip_they_apply(mode: str) -> None:
+    # Every one of these modes strips the task text; the record must say so and name how.
+    record = prompt_protocol(mode)
+    assert record["prompt_stripped"] is True
+    assert "strip()" in record["protocol"]["prompt_strip"]
+    padded = pool_task(prompt="\n  Add one.  \n", public_tests="\n\nassert f(1) == 2\n\n")
+    assert task_user_text(padded) == "Add one.\n\nassert f(1) == 2"
+    assert pool_prompt(padded) == '"""\nAdd one.\n\nassert f(1) == 2\n"""\n'
+    benchmark = pool_task(prompt="\n\ndef f(x):\n    pass\n\n")
+    assert chat.benchmark_user_text(benchmark) == "def f(x):\n    pass"
+
+
 def test_base_pool_prompt_by_hand() -> None:
     assert pool_prompt(pool_task()) == '"""\nAdd one.\n\nassert f(1) == 2\n"""\n'
     quoted = pool_task(prompt='Return """ as text.')

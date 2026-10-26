@@ -221,10 +221,15 @@ def protocol(user_turn: str = "pool") -> dict[str, Any]:
     if user_turn not in {"pool", "benchmark"}:
         raise ValueError("user_turn must be pool or benchmark")
     return {
-        "prompt_stripped": False,
+        "prompt_stripped": True,
         "protocol": {
             "name": PROTOCOL,
             "prompt_format": "<|bos|><|user_start|>{user}<|user_end|><|assistant_start|>",
+            "prompt_strip": (
+                "task prompt.strip() and public test.strip()"
+                if user_turn == "pool"
+                else "benchmark prompt.strip()"
+            ),
             "user_turn": (
                 "task prompt.strip() + blank line + public test.strip()"
                 if user_turn == "pool"

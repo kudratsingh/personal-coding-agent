@@ -72,10 +72,11 @@ def prompt_protocol(mode: str = "base", *, stops: Sequence[str] = BASE_STOPS) ->
         }
     if mode == "base-pool":
         return {
-            "prompt_stripped": False,
+            "prompt_stripped": True,
             "protocol": {
                 "name": POOL_PROTOCOL,
                 "prompt_format": 'module docstring: """\\n{prompt}\\n\\n{public test}\\n"""\\n',
+                "prompt_strip": "task prompt.strip() and public test.strip()",
                 "stop_strings": list(POOL_STOPS),
                 "max_new_tokens": f"min({POOL_MAX_NEW_TOKENS}, context - prompt tokens)",
                 "candidate_assembly": "retained-completion",

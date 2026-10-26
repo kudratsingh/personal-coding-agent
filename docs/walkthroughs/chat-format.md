@@ -44,7 +44,7 @@ A language conversation uses the same turns without the python block. For `Hi` /
 - **Budget:** `pool_budget(prompt_tokens)` is `min(512, 1,024 − prompt_tokens)`. A value below one means no room to generate.
 - **Stops:** `truncate_pool_completion` cuts at the first of `\nif __name__`, `\nprint(`, `\nassert`, `\n"""` and `\n# Test`. The retained text is the program. These are prefix matches, so `\n# Testing` also stops. Because the prompt ends with a newline, a completion that begins with `assert` keeps nothing.
 
-`prompt_protocol("chat")`, `prompt_protocol("chat-benchmark")` and `prompt_protocol("base-pool")` give the descriptions that reports record.
+`prompt_protocol("chat")`, `prompt_protocol("chat-benchmark")` and `prompt_protocol("base-pool")` give the descriptions that reports record. All three strip the task text, so each records `prompt_stripped: true` and names the rule in `prompt_strip`.
 
 ## Design choices and common mistakes
 
