@@ -35,12 +35,14 @@ from tools.pilot_preflight import run_preflight
 from tools.pod_self_destruct import ABSOLUTE_DEADLINE_SECONDS
 from tools.r2_store import Credentials
 from tools.rehearsal_binding import ORDER_SEED, RUNS, SUBSET_RULE, VALIDATION_STREAMS
-from tools.rehearsal_ops import EVIDENCE_GATES, OWNER_GATES
+from tools.rehearsal_ops import EVIDENCE_GATES, OWNER_GATES, PULL_RESERVE_SECONDS
 from tools.rehearsal_run import (
     DEFAULT_REVISION,
     FINALIZE_MARGIN_SECONDS,
     INITIALIZATION_RUN_ID,
+    LAST_CALL_SECONDS,
     LAUNCH_RULE,
+    MAX_IDLE_SECONDS,
     MAX_REPORT_BYTES,
     REHEARSAL_GATES,
     ROLLING_SKIP_SECONDS,
@@ -133,6 +135,7 @@ def make_worker(
     name: str | None = None,
     secrets: tuple[str, ...] = (),
     upload_retry_seconds: float = 15.0,
+    extra: dict[str, Any] | None = None,
 ) -> Worker:
     spec = spec or tiny_spec(data, run)
     return Worker(
@@ -147,6 +150,7 @@ def make_worker(
         clock=clock or Clock(),
         secrets=secrets,
         upload_retry_seconds=upload_retry_seconds,
+        extra=extra,
     )
 
 
@@ -960,8 +964,12 @@ def test_heartbeat_runs_across_the_stage_boundary_and_ends_after_r2_verification
         assert record["unverified_milestones"] == [] and record["status"] == "completed"
         assert record["settle_rounds"][0]["drained"] is True
         assert record["drain_budget_seconds"] == pytest.approx(
-            worker.spec.max_transfer_seconds - FINALIZE_MARGIN_SECONDS, abs=1
-        )  # The whole window: the last GPU work was the stage-end validation.
+            worker.spec.max_transfer_seconds - PULL_RESERVE_SECONDS - FINALIZE_MARGIN_SECONDS,
+            abs=1,
+        )  # The whole drain: the last GPU work was the stage-end validation.
+        assert record["handover_due_unix"] == pytest.approx(
+            record["transfer_window_end_unix"] - PULL_RESERVE_SECONDS
+        )
     a = completed.beats["A"]
     stages = [beat["stage"] for beat in a]
     boundary = stages.index("stage2")
@@ -1055,19 +1063,58 @@ def test_speed_check_counts_planned_saves_before_the_first_save(data: Authored) 
     assert check["projected_seconds"]["checkpoint_seconds"] == 14.0
 
 
-def test_final_drain_uses_the_whole_watchdog_transfer_window_left(data: Authored) -> None:
+def test_final_drain_ends_before_the_handover_that_leaves_the_ssh_pull_reserve(
+    data: Authored,
+) -> None:
     clock = Clock()
     spec = tiny_spec(data, "B", finalization_reserve_seconds=900)
     worker = make_worker(data, "B", spec=spec, clock=clock)
-    window = spec.max_transfer_seconds - FINALIZE_MARGIN_SECONDS  # 780 s after GPU work.
-    assert window == 780
-    for idle, budget in ((0, 780), (500, 280), (window, 0), (2_000, 0)):
+    # 900 s window: a 360 s drain, 120 s of checks, then 420 s for the Mac's SSH pull.
+    assert worker.handover_due() == pytest.approx(worker.last_activity + 480)
+    assert 480 < MAX_IDLE_SECONDS  # Handed over before the watchdog's idle limit.
+    for idle, budget in ((0, 360), (300, 60), (360, 0), (2_000, 0)):
         clock.now = worker.last_activity + idle
         assert worker.drain_budget() == pytest.approx(budget)
-    clock.now = worker.pod_end - 100  # Never past the Pod end, less a minute.
+    clock.now = worker.pod_end - 300  # Never past the Pod end, less a minute.
     worker.last_activity = clock.now
-    assert worker.drain_budget() == pytest.approx(40)
+    assert worker.handover_due() == pytest.approx(worker.pod_end - 60)
+    assert worker.drain_budget() == pytest.approx(120)
     worker.uploader.close()
+
+
+def test_checks_after_the_drain_stop_in_time_for_the_handover(data: Authored) -> None:
+    clock = Clock()
+    bucket = MemoryBucket()
+    worker = make_worker(data, "A", spec=short_window(data), clock=clock, bucket=bucket)
+    worker.check_store = bucket.store(CREDENTIALS)  # The uploader keeps its own store.
+    stepping(worker, clock)
+    checked: list[tuple[str, float]] = []
+    original = worker.check_store.stored_sha256
+
+    def slow(key: str) -> str | None:
+        # An R2 that answers after 50 s: only two checks fit before the last-call time.
+        checked.append((key, clock.now))
+        clock.now += 50.0
+        return original(key)
+
+    worker.check_store.stored_sha256 = slow  # type: ignore[method-assign]
+    result = worker.execute()
+    record = json.loads((worker.root / "finalization.json").read_text())
+    # The newest milestone is checked first; nothing starts within 45 s of the handover.
+    assert "/stage2-final/" in checked[0][0]
+    assert checked and all(
+        start < record["handover_due_unix"] - LAST_CALL_SECONDS for _, start in checked
+    )
+    assert result["status"] == "failed" and result["failure"] == "r2_milestones_unverified"
+    unchecked = [
+        label for label, error in record["verification_errors"].items() if "handover" in error
+    ]
+    assert "stage1-final" in unchecked
+    assert {row["label"] for row in record["unverified_milestones"]} >= {"stage1-final"}
+    assert record["error"].startswith("TimeoutError") and "report.json" in record["error"]
+    # The final heartbeat lands before the handover, still inside the watchdog's idle limit.
+    assert heartbeat(worker)["updated_at_unix"] <= record["handover_due_unix"]
+    assert heartbeat(worker)["status"] == "failed"
 
 
 def test_speed_check_stops_a_run_projected_to_pass_the_deadline(data: Authored) -> None:
@@ -1197,8 +1244,12 @@ def refuse_put(part: str) -> Callable[[str, str], tuple[int, bytes] | None]:
 
 
 def short_window(data: Authored, run: str = "A") -> Specification:
-    """A one-second transfer window after the finalize margin: a failing drain ends fast."""
-    return replace(tiny_spec(data, run), max_transfer_seconds=FINALIZE_MARGIN_SECONDS + 1)
+    """A one-second drain before the finalize margin and pull reserve: a failing drain ends
+    fast."""
+    return replace(
+        tiny_spec(data, run),
+        max_transfer_seconds=FINALIZE_MARGIN_SECONDS + PULL_RESERVE_SECONDS + 1,
+    )
 
 
 @pytest.mark.parametrize("broken", ["stage2-final", "stage1-final", "report"])
@@ -1816,6 +1867,15 @@ def test_run_command_requires_the_receipts_code_revision_and_records_it(
     assert main(arguments) == 0
     assert started["extra"]["code_revision"] == REVISION  # report.json's code_revision.
     assert DEFAULT_REVISION == Path("/workspace/rehearsal/revision.json")
+    # The checks after the final drain use a bounded store: 2 attempts of 20 s each.
+    assert started["check_store"].attempts == 2
+
+
+def test_the_report_names_the_shipped_commit_not_the_pods_missing_git(data: Authored) -> None:
+    worker = make_worker(data, "B", extra={"code_revision": REVISION})
+    assert worker.report["git_commit"] == REVISION["git_commit"]
+    assert worker.report["dirty"] is False
+    worker.uploader.close()
 
 
 def test_cli_smoke_runs_both_runs_offline(

@@ -338,9 +338,9 @@ def test_receipt_records_the_code_revision_cost_and_upload_rate(tmp_path: Path) 
     assert receipt["pod_cost_usd_per_hour"] == 0.6
     for name in ("connection", "revision", "round_trip"):
         assert receipt["evidence_sha256"][name] == file_sha256(values[name])
-    # 2 x 1.65 GB inside the 780 s drain with a factor-2 margin.
+    # 1.65 GB inside the 360 s drain with a factor-2 margin.
     required = rehearsal_ops.REQUIRED_UPLOAD_BYTES_PER_SECOND
-    assert required == pytest.approx(2 * 1.65e9 / (900 - 120) * 2)
+    assert required == pytest.approx(1.65e9 / (900 - 120 - 420) * 2)
     assert PROBE / 10.0 >= required  # The fixture's 13.4 MB/s passes.
     # The receipt is checked again before it is written, and wherever it is read.
     for change, message in (
@@ -470,7 +470,7 @@ def test_run_b_receipt_covers_the_mixed_stage(tmp_path: Path) -> None:
                     "upload_bytes_per_second": PROBE / 20.0,
                 }
             },
-            "upload rate of 6.71 MB/s is below the 8.46 MB/s",
+            "upload rate of 6.71 MB/s is below the 9.17 MB/s",
         ),
         ({"round_trip": {"upload_bytes_per_second": None}}, "no upload_bytes_per_second"),
         ({"round_trip": {"download_bytes_per_second": 0}}, "no download_bytes_per_second"),

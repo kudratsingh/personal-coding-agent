@@ -393,6 +393,28 @@ def test_a_milestone_drops_waiting_rolling_labels_but_not_the_one_in_flight(
     assert uploader.status()["verified"] == ["step-1", "best-1", "step-3"]
 
 
+def test_resubmitting_an_older_milestone_keeps_newer_rolling_labels(
+    tmp_path: Path, make: Make
+) -> None:
+    uploader, fake, _ = make(retry_seconds=60.0, retry_max_seconds=60.0)
+    fake.faults = {"PUT": [403]}
+    uploader.submit("stage1-final", checkpoint(tmp_path, "stage1-final"), milestone=True)
+    wait_for(lambda: bool(uploader.status()["retrying"]))  # Waiting out its backoff.
+    fake.hold.clear()
+    uploader.submit("stage2-step8", checkpoint(tmp_path, "stage2-step8"), milestone=False)
+    assert fake.putting.wait(5)
+    uploader.submit("stage2-step9", checkpoint(tmp_path, "stage2-step9"), milestone=False)
+    # Finalization resubmits the older milestone: due at once, the newer weights kept.
+    uploader.submit("stage1-final", checkpoint(tmp_path, "stage1-final"), milestone=True)
+    status = uploader.status()
+    assert status["in_flight"] == "stage2-step8"
+    assert status["pending"] == ["stage1-final", "stage2-step9"]
+    assert status["superseded"] == []
+    fake.hold.set()
+    assert uploader.drain(5)
+    assert uploader.status()["verified"] == ["stage2-step8", "stage1-final", "stage2-step9"]
+
+
 def test_close_cancels_a_milestone_waiting_to_retry(tmp_path: Path, make: Make) -> None:
     uploader, fake, _ = make(retry_seconds=60.0, retry_max_seconds=60.0)
     fake.faults = {"PUT": [403]}

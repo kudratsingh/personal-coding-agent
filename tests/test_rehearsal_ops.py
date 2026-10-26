@@ -14,6 +14,8 @@ from tools import rehearsal_ops
 from tools.pilot_feasibility import MEASURED_UNTRAINED_CHECKPOINT_BYTES
 from tools.pilot_readiness_receipt import round_trip_passed
 from tools.rehearsal_ops import (
+    IDLE_SECONDS,
+    PULL_RESERVE_SECONDS,
     REQUIRED_UPLOAD_BYTES_PER_SECOND,
     check_r2_final,
     check_revision,
@@ -25,7 +27,7 @@ from tools.rehearsal_ops import (
     run_summary,
     verify_final,
 )
-from tools.rehearsal_run import FINALIZE_MARGIN_SECONDS
+from tools.rehearsal_run import FINALIZE_MARGIN_SECONDS, ROLLING_SKIP_SECONDS
 
 POD = "podfixture01"
 ENVIRONMENT = {
@@ -389,7 +391,7 @@ def test_the_default_probe_measures_throughput_the_receipt_checks(
     assert record["bytes"] == rehearsal_ops.ROUND_TRIP_PROBE_BYTES == 128 * 1024 * 1024
     assert record["upload_bytes_per_second"] == record["bytes"] / step
     assert record["status"] == "passed" and not bucket.meta
-    # 134 MB/s passes; 6.7 MB/s is below the 8.46 MB/s the 780 s drain needs.
+    # 134 MB/s passes; 6.7 MB/s is below the 9.17 MB/s the 360 s drain needs.
     if fast_enough:
         assert round_trip_passed(record, run="A", pod_id=POD)
     else:
@@ -409,14 +411,30 @@ def test_round_trip_refuses_a_clock_that_never_moves_and_a_bad_size(tmp_path: Pa
             round_trip(Bucket(), run="A", pod_id=POD, receipt=tmp_path / "t.json", size=size)  # type: ignore[arg-type]
 
 
-def test_required_upload_rate_moves_two_labels_inside_the_drain_with_margin() -> None:
-    window = rehearsal_ops.MAX_TRANSFER_SECONDS - rehearsal_ops.TRANSFER_MARGIN_SECONDS
-    assert window == 780 and rehearsal_ops.TRANSFER_MARGIN_SECONDS == FINALIZE_MARGIN_SECONDS
+def test_transfer_window_splits_into_drain_checks_and_ssh_pull_reserve() -> None:
+    assert rehearsal_ops.TRANSFER_MARGIN_SECONDS == FINALIZE_MARGIN_SECONDS == 120
+    assert rehearsal_ops.PULL_RESERVE_SECONDS == PULL_RESERVE_SECONDS == 420
+    assert rehearsal_ops.DRAIN_SECONDS == 360 and (
+        rehearsal_ops.DRAIN_SECONDS
+        + rehearsal_ops.TRANSFER_MARGIN_SECONDS
+        + rehearsal_ops.PULL_RESERVE_SECONDS
+        == rehearsal_ops.MAX_TRANSFER_SECONDS
+    )
+    # The worker hands over before the watchdog's idle limit, so the pull can stamp progress.
+    assert rehearsal_ops.MAX_TRANSFER_SECONDS - rehearsal_ops.PULL_RESERVE_SECONDS < IDLE_SECONDS
+
+
+def test_required_upload_rate_moves_the_final_milestone_inside_the_drain_with_margin() -> None:
     assert rehearsal_ops.S_LABEL_CHECKPOINT_BYTES >= MEASURED_UNTRAINED_CHECKPOINT_BYTES
-    # Two 1.65 GB labels in 780 s need 4.23 MB/s; the factor-2 margin makes it 8.46 MB/s.
-    assert REQUIRED_UPLOAD_BYTES_PER_SECOND == pytest.approx(8_461_538.46, abs=0.01)
-    assert 2 * rehearsal_ops.S_LABEL_CHECKPOINT_BYTES / REQUIRED_UPLOAD_BYTES_PER_SECOND == (
-        pytest.approx(window / 2)
+    # One 1.65 GB label in 360 s needs 4.58 MB/s; the factor-2 margin makes it 9.17 MB/s.
+    assert REQUIRED_UPLOAD_BYTES_PER_SECOND == pytest.approx(9_166_666.67, abs=0.01)
+    assert rehearsal_ops.S_LABEL_CHECKPOINT_BYTES / REQUIRED_UPLOAD_BYTES_PER_SECOND == (
+        pytest.approx(rehearsal_ops.DRAIN_SECONDS / 2)
+    )
+    # At that rate a rolling label takes at most 180 s, far inside the 900 s before a stage
+    # end in which no rolling save starts: only the milestone can be in the final drain.
+    assert rehearsal_ops.S_LABEL_CHECKPOINT_BYTES / REQUIRED_UPLOAD_BYTES_PER_SECOND < (
+        ROLLING_SKIP_SECONDS
     )
 
 

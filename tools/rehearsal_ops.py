@@ -54,27 +54,37 @@ WATCHDOG_COST_STOP_USD = 7.54
 """The Mac watchdog's cost stop, one cent inside the worker's so it is never the weaker."""
 IDLE_SECONDS = 600
 MAX_TRANSFER_SECONDS = 900
-"""How long after its last GPU work an ``uploading`` worker may keep the Pod (watchdog policy).
+"""How long after its last GPU work an idle worker may keep the Pod (watchdog policy).
 
 The worker's last drain to R2 leaves the GPU idle. 900 s equals the finalization reserve, the
 time every run already plans for its final save, uploads and checks; it is half of the
-watchdog's 1,800 s ceiling and costs at most $0.15 more per Pod at $0.60/h. The worker drains
-for at most ``MAX_TRANSFER_SECONDS - TRANSFER_MARGIN_SECONDS`` (780 s) of it, so the upload
-rate it needs is ``REQUIRED_UPLOAD_BYTES_PER_SECOND``, which the readiness receipt checks
-against the Pod's measured round trip. The watchdog grants the window only while the Mac sees
-new objects in R2."""
+watchdog's 1,800 s ceiling and costs at most $0.15 more per Pod at $0.60/h. Past the 600 s idle
+limit the watchdog grants the window only while the Mac sees progress: new objects in R2, or
+an SSH pull's bytes growing. The window is split three ways: the worker's final drain
+(``DRAIN_SECONDS``), its bounded checks and final heartbeat (``TRANSFER_MARGIN_SECONDS``),
+then the Mac supervisor's SSH pull of any milestone still unverified
+(``PULL_RESERVE_SECONDS``)."""
 TRANSFER_MARGIN_SECONDS = 120
-"""The worker's drain ends this long before the transfer window does (its
-``FINALIZE_MARGIN_SECONDS``), leaving time for the HEAD checks and the report upload."""
+"""After the drain, the worker's HEAD checks, the ``report.json`` upload and its final
+heartbeat (its ``FINALIZE_MARGIN_SECONDS``). Every R2 call in it uses a bounded store, and
+none starts late, so the final heartbeat is written by 480 s after the last GPU work."""
+PULL_RESERVE_SECONDS = 420
+"""The end of the window, kept for the Mac's SSH pull of an unverified milestone. The worker
+hands over 480 s after its last GPU work, before the 600 s idle limit, so the pull's growing
+bytes stamp progress in time; 1.65 GB in the roughly 370 s left after the supervisor's
+bounded R2 check needs about 4.5 MB/s. The pilot's pulls bound one 1.62 GB pull at 150 s or
+less (about 10.7 MB/s or faster)."""
+DRAIN_SECONDS = MAX_TRANSFER_SECONDS - TRANSFER_MARGIN_SECONDS - PULL_RESERVE_SECONDS
+"""The worker's final drain to R2: at most 360 s after its last GPU work."""
 S_LABEL_CHECKPOINT_BYTES = 1_650_000_000
 """One S label's checkpoint, weights and AdamW state: the measured 1,623,502,465 bytes
 (``pilot_feasibility.MEASURED_UNTRAINED_CHECKPOINT_BYTES``) rounded up to 1.65 GB."""
-REQUIRED_UPLOAD_BYTES_PER_SECOND = (
-    2 * S_LABEL_CHECKPOINT_BYTES / (MAX_TRANSFER_SECONDS - TRANSFER_MARGIN_SECONDS) * 2
-)
-"""The Pod's measured R2 upload rate must reach this, about 8.46 MB/s: two labels (a rolling
-upload still in flight and the stage-final milestone) inside the 780 s drain, with a factor-2
-safety margin. The readiness receipt's ``r2_round_trip_tested`` gate requires it."""
+REQUIRED_UPLOAD_BYTES_PER_SECOND = S_LABEL_CHECKPOINT_BYTES / DRAIN_SECONDS * 2
+"""The Pod's measured R2 upload rate must reach this, about 9.17 MB/s: the stage-final
+milestone inside the 360 s drain, with a factor-2 safety margin. One label is the worst case
+at this rate: no rolling save starts within 900 s of a stage end (``ROLLING_SKIP_SECONDS``)
+and one uploads in at most 180 s, so none is still in flight when the final save is made.
+The readiness receipt's ``r2_round_trip_tested`` gate requires it."""
 ROUND_TRIP_PROBE_BYTES = 128 * 1024 * 1024
 """The round trip's probe: large enough (128 MiB) that its PUT and GET measure throughput
 rather than request latency. The readiness receipt refuses a smaller probe."""

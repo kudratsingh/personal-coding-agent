@@ -1137,8 +1137,9 @@ def build_rehearsal_report(
         "two_runs_wall_bound_usd": 2 * wall_cost,
         "r2_upload": {
             "checkpoint_bytes": d35.S_LABEL_CHECKPOINT_BYTES,
-            "labels_in_one_drain": 2,
-            "drain_seconds": d35.MAX_TRANSFER_SECONDS - d35.TRANSFER_MARGIN_SECONDS,
+            "labels_in_one_drain": 1,
+            "drain_seconds": d35.DRAIN_SECONDS,
+            "pull_reserve_seconds": d35.PULL_RESERVE_SECONDS,
             "safety_factor": 2,
             "required_upload_bytes_per_second": d35.REQUIRED_UPLOAD_BYTES_PER_SECOND,
             "gate": "the readiness receipt refuses a Pod whose measured R2 round-trip upload "
@@ -1197,10 +1198,12 @@ def render_rehearsal_markdown(report: Mapping[str, Any]) -> str:
     upload = report["r2_upload"]
     lines += [
         f"- Both runs at their walls: ${report['two_runs_wall_bound_usd']:.2f}.",
-        f"- R2 upload: {upload['labels_in_one_drain']} labels of "
+        f"- R2 upload: {upload['labels_in_one_drain']} label of "
         f"{upload['checkpoint_bytes'] / 1e9:.2f} GB in the {upload['drain_seconds']} s drain "
-        f"with a {upload['safety_factor']}x margin need "
-        f"{upload['required_upload_bytes_per_second'] / 1e6:.2f} MB/s; {upload['gate']}.",
+        f"with a {upload['safety_factor']}x margin needs "
+        f"{upload['required_upload_bytes_per_second'] / 1e6:.2f} MB/s; {upload['gate']}. "
+        f"The last {upload['pull_reserve_seconds']} s of the transfer window are kept for "
+        "the Mac's SSH pull of a milestone R2 could not take.",
         f"- R2 storage {storage['bytes'] / GB:,.1f} GB, ${storage['monthly_usd']:.2f}/month "
         f"({storage['assumption']}).",
         "",

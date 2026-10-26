@@ -522,6 +522,8 @@ class CheckpointUploader:
         self._milestones: set[str] = set()
         self._rolling: list[_Rolling] = []
         self._superseded: list[str] = []
+        self._submitted: dict[str, int] = {}
+        """Each label's first-submission order: a label supersedes only older rolling ones."""
         self._cancelled: list[str] = []
         self._deleted: list[str] = []
         self._failures: list[dict[str, str]] = []
@@ -537,8 +539,10 @@ class CheckpointUploader:
 
         The same label and files already waiting are replaced in place and due at once;
         the same label and files already uploading are left to finish (a milestone is
-        retried if that upload fails). Malformed arguments raise here; nothing else
-        does, and no I/O happens.
+        retried if that upload fails). A submission drops the rolling labels still waiting
+        that were first submitted before it, which hold older weights; a resubmitted older
+        milestone keeps the newer rolling labels. Malformed arguments raise here; nothing
+        else does, and no I/O happens.
         """
         if not LABEL.fullmatch(label):
             raise ValueError(f"invalid label {label!r}")
@@ -556,10 +560,14 @@ class CheckpointUploader:
         with self._condition:
             if self._closed:
                 raise RuntimeError("the uploader is closed")
-            self._superseded += [
-                older.label for older in self._pending if not older.milestone and older != job
+            order = self._submitted.setdefault(label, len(self._submitted))
+            dropped = [
+                older
+                for older in self._pending
+                if not older.milestone and older != job and self._submitted[older.label] < order
             ]
-            self._pending = [older for older in self._pending if older.milestone or older == job]
+            self._superseded += [older.label for older in dropped]
+            self._pending = [older for older in self._pending if older not in dropped]
             if self._in_flight != job:
                 waiting = [index for index, older in enumerate(self._pending) if older == job]
                 if waiting:

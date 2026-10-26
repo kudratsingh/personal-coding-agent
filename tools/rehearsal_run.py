@@ -82,6 +82,7 @@ from tools.r2_store import (
     CheckpointUploader,
     Credentials,
     Store,
+    bounded_store,
 )
 from tools.rehearsal_binding import (
     ORDER_SEED,
@@ -91,7 +92,13 @@ from tools.rehearsal_binding import (
     r2_credentials,
     verify_binding,
 )
-from tools.rehearsal_ops import READINESS_GATES, READINESS_KIND, UPLOADING_STATUS, run_prefix
+from tools.rehearsal_ops import (
+    PULL_RESERVE_SECONDS,
+    READINESS_GATES,
+    READINESS_KIND,
+    UPLOADING_STATUS,
+    run_prefix,
+)
 from tools.runpod_watchdog import MAX_TRANSFER_SECONDS, MODE_WALL_SECONDS, PodIdentity, Policy
 
 SCHEMA_VERSION = 1
@@ -107,8 +114,12 @@ MAX_APPROVED_COST_USD = 10.0
 HEARTBEAT_REFRESH_SECONDS = 5.0
 FULL_VALIDATION_SORT_WINDOWS = 512
 FINALIZE_MARGIN_SECONDS = 120.0
-"""Kept free at the end of the watchdog's transfer window after the drain: the HEAD checks,
-the ``report.json`` upload and the supervisor's own verification and archive."""
+"""After the final drain: the HEAD checks, the ``report.json`` upload and the final heartbeat.
+The heartbeat is due ``PULL_RESERVE_SECONDS`` before the watchdog's transfer window ends,
+which leaves the Mac supervisor that long to pull an unverified milestone over SSH."""
+LAST_CALL_SECONDS = 45.0
+"""No R2 call after the drain starts later than this before the handover: each uses the
+bounded store (2 attempts of 20 s plus backoff), so the final heartbeat is not late."""
 ROLLING_SKIP_SECONDS = 900.0
 """The D-35 minimum for ``rolling_skip_seconds``: no rolling save starts when the stage's
 remaining updates at the measured rate, or the training deadline, end within this long,
@@ -362,9 +373,9 @@ class Specification:
     """No rolling save starts when the stage's remaining updates at the measured rate, or
     the training deadline, end within this long (``ROLLING_SKIP_SECONDS`` for D-35)."""
     max_transfer_seconds: float
-    """The watchdog policy's transfer window: an ``uploading`` heartbeat may hold the Pod
-    this long after the last GPU work. The final drain uses all of it except the
-    ``FINALIZE_MARGIN_SECONDS`` the checks after it need."""
+    """The watchdog policy's transfer window: an idle Pod may be held this long after the
+    last GPU work. The final drain uses it except the ``FINALIZE_MARGIN_SECONDS`` the checks
+    after it need and the ``PULL_RESERVE_SECONDS`` kept for the Mac's SSH pull."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.run, str) or self.run not in RUNS:
@@ -420,10 +431,12 @@ class Specification:
             raise ValueError("keep_rolling must be a positive integer")
         if self.max_transfer_seconds > MAX_TRANSFER_SECONDS:
             raise ValueError(f"max_transfer_seconds exceeds the {MAX_TRANSFER_SECONDS} s ceiling")
-        if self.max_transfer_seconds <= FINALIZE_MARGIN_SECONDS:
-            # A final drain waits without GPU work: it and the checks after it must end
-            # inside the watchdog's transfer window.
-            raise ValueError("max_transfer_seconds must exceed the finalize margin")
+        if self.max_transfer_seconds <= FINALIZE_MARGIN_SECONDS + PULL_RESERVE_SECONDS:
+            # A final drain waits without GPU work: it, the checks after it and the Mac's
+            # SSH pull must all end inside the watchdog's transfer window.
+            raise ValueError(
+                "max_transfer_seconds must exceed the finalize margin and the pull reserve"
+            )
 
     @property
     def tokens_per_update(self) -> int:
@@ -1059,6 +1072,7 @@ class Worker:
         secrets: Iterable[str] = (),
         extra: Mapping[str, Any] | None = None,
         upload_retry_seconds: float = MILESTONE_RETRY_SECONDS,
+        check_store: Store | None = None,
     ) -> None:
         if len(data.stages) != len(spec.stages) or any(
             stage.plan != plan or stage.expected["planned_updates"] != plan.updates
@@ -1076,6 +1090,10 @@ class Worker:
         if root.exists() or root.is_symlink():
             raise FileExistsError("rehearsal output must be a new directory")
         self.spec, self.root, self.data, self.store = spec, root, data, store
+        # The R2 checks after the final drain; a bounded store on the Pod (``run``).
+        self.check_store = store if check_store is None else check_store
+        self.handover: float | None = None
+        """When finalization starts: the time its final heartbeat is due."""
         self.initialization, self.initialization_sha256 = initialization, initialization_sha256
         self.device = training_device(device)
         self.clock, self.pod_created = clock, pod_created
@@ -1145,6 +1163,10 @@ class Worker:
             }
         self.subset_tokens = sum(row["subset_target_tokens"] for row in identity.values())
         commit, dirty = git_state()
+        revision = (extra or {}).get("code_revision")
+        if isinstance(revision, Mapping):
+            # The Pod's copy of the code has no .git: the checked revision.json names it.
+            commit, dirty = revision["git_commit"], revision["clean"] is not True
         self.stage_records: list[dict[str, Any]] = [
             {
                 "name": stage.plan.name,
@@ -1911,24 +1933,36 @@ class Worker:
 
     # Finalization ----------------------------------------------------------------------
 
-    def drain_budget(self) -> float:
-        """Seconds the final drain may wait: the whole transfer window left, less the margin
-        for the checks after it, and never past the Pod end less a minute.
+    def handover_due(self) -> float:
+        """When the final heartbeat is due: ``PULL_RESERVE_SECONDS`` before the watchdog's
+        transfer window ends, and never past the Pod end less a minute.
 
         The window is the watchdog's: ``max_transfer_seconds`` after the last GPU work,
         which is the end of the final save or validation, so the start of finalization
-        for every ending that saves a milestone.
+        for every ending that saves a milestone. Handing over then, 480 s after the last
+        GPU work for D-35, is before the watchdog's 600 s idle limit: the Mac supervisor
+        can start an SSH pull, whose growing bytes keep the Pod, with the rest of the
+        window still to run.
         """
-        now = self.clock()
-        transfer_left = (
-            self.spec.max_transfer_seconds
-            - FINALIZE_MARGIN_SECONDS
-            - max(0.0, now - self.last_activity)
+        return min(
+            self.last_activity + self.spec.max_transfer_seconds - PULL_RESERVE_SECONDS,
+            self.pod_end - 60,
         )
-        return max(0.0, min(transfer_left, self.pod_end - now - 60))
+
+    def drain_budget(self) -> float:
+        """Seconds the final drain may wait: until ``FINALIZE_MARGIN_SECONDS`` before the
+        handover (360 s after the last GPU work for D-35)."""
+        return max(0.0, self.handover_due() - FINALIZE_MARGIN_SECONDS - self.clock())
 
     def _stored(self, key: str) -> str | None:
-        found, _ = self.store.retry(partial(self.store.stored_sha256, key))
+        """The SHA-256 R2 stores for ``key``, by the bounded check store.
+
+        During finalization no check starts within ``LAST_CALL_SECONDS`` of the handover;
+        one that would raises ``TimeoutError``, so its label counts as unverified.
+        """
+        if self.handover is not None and self.clock() >= self.handover - LAST_CALL_SECONDS:
+            raise TimeoutError(f"no time left before the handover to check {key}")
+        found, _ = self.check_store.retry(partial(self.check_store.stored_sha256, key))
         return found
 
     def kept_labels(self) -> set[str]:
@@ -1939,12 +1973,16 @@ class Worker:
     def verified_labels(self) -> dict[str, bool]:
         """Labels the uploader verified and kept, each file checked again by HEAD.
 
-        A HEAD that still fails after its retries counts as unverified; its error is
-        kept in ``verification_errors``.
+        The milestones go first, the newest first, then the rolling labels. A HEAD that
+        still fails after its retries, or one there is no time left for, counts as
+        unverified; its error is kept in ``verification_errors``.
         """
         kept = self.kept_labels()
+        order = [*reversed([label for label in self.milestones if label in self.label_files])]
+        order += [label for label in self.label_files if label not in order]
         result: dict[str, bool] = {}
-        for label, files in self.label_files.items():
+        for label in order:
+            files = self.label_files[label]
             try:
                 result[label] = label in kept and all(
                     self._stored(self.prefix + label + "/" + name) == digest
@@ -2039,10 +2077,12 @@ class Worker:
         self.phase = "finalizing"
         trained = self.report["status"]
         hurry = self.report.get("stop_reason") in NO_FINALIZATION_STOPS
+        self.handover = self.handover_due()
         receipt: dict[str, Any] = {
             "training_status": trained,
             "started_unix": self.clock(),
             "transfer_window_end_unix": self.last_activity + self.spec.max_transfer_seconds,
+            "handover_due_unix": self.handover,
         }
         report_key = self.prefix + "report.json"
         unverified: list[dict[str, Any]] | None = None
@@ -2077,7 +2117,9 @@ class Worker:
             if hurry:
                 return
             path = self.root / "report.json"
-            self.store.put_known(report_key, path, report_sha256, path.stat().st_size)
+            if self.clock() >= self.handover - LAST_CALL_SECONDS:
+                raise TimeoutError("no time left before the handover to upload report.json")
+            self.check_store.put_known(report_key, path, report_sha256, path.stat().st_size)
             if self._stored(report_key) != report_sha256:
                 raise RuntimeError("report.json differs in R2 after upload")
             receipt["report_sha256"] = report_sha256
@@ -2501,6 +2543,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         initialization=args.initialization,
         initialization_sha256=args.initialization_sha256,
         store=Store(credentials),
+        check_store=bounded_store(credentials),
         pod_id=pod_id,
         pod_created=launch.origin,
         device="cuda:0",

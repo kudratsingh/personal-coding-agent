@@ -285,7 +285,7 @@ def round_trip_passed(probe: dict[str, Any], *, run: str, pod_id: str) -> bool:
 
     The probe must hold at least ``ROUND_TRIP_PROBE_BYTES`` and its measured upload rate
     (the bytes over the PUT's seconds) must reach ``REQUIRED_UPLOAD_BYTES_PER_SECOND``:
-    slower, the final drain cannot move two labels inside the transfer window.
+    slower, the final drain cannot move the stage-final milestone inside its 360 s.
     """
     prefix = rehearsal_ops.run_prefix(run, pod_id)
     if (
