@@ -4,9 +4,11 @@ Each tree is a prompter message with nested replies. A message is eligible only 
 is English, not synthetic, not deleted, accepted by review, carries no nonzero PII label
 and has text. Labels, when present, must be the README's mapping form (each label name
 maps to an object with a numeric ``value``); any other shape is ``missing_metadata``.
-Eligible messages that carry no PII label at all are counted separately. From each exported tree the adapter follows the best-ranked eligible reply
-at every turn (rank 0 first, unranked replies last, message ID breaking ties), so the
-chosen path never contains an ineligible message. It then keeps the longest prefix
+Eligible messages that carry no PII label at all are counted separately.
+
+From each exported tree the adapter follows the best-ranked eligible reply at every
+turn (rank 0 first, unranked replies last, message ID breaking ties), so the chosen
+path never contains an ineligible message. It then keeps the longest prefix
 that ends on an assistant turn and renders to at most ``max_tokens`` chat-v1 tokens.
 Every drop is counted by reason. See ``docs/sft-data.md``.
 """
