@@ -29,6 +29,7 @@ import tarfile
 import textwrap
 import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -184,15 +185,20 @@ def commands() -> list[tuple[str, list[str], str]]:
 
 def parse(module_name: str, argv: list[str], monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace:
     module = importlib.import_module(module_name)
-    original = argparse.ArgumentParser.parse_args
 
-    def capture(
-        self: argparse.ArgumentParser, args: object = None, namespace: object = None
-    ) -> argparse.Namespace:
-        raise Parsed(original(self, args, namespace))  # type: ignore[call-overload]
+    def capturing(name: str) -> Callable[..., argparse.Namespace]:
+        original = getattr(argparse.ArgumentParser, name)
+
+        def capture(
+            self: argparse.ArgumentParser, args: object = None, namespace: object = None
+        ) -> argparse.Namespace:
+            raise Parsed(original(self, args, namespace))
+
+        return capture
 
     with monkeypatch.context() as patch:
-        patch.setattr(argparse.ArgumentParser, "parse_args", capture)
+        for name in ("parse_args", "parse_intermixed_args"):
+            patch.setattr(argparse.ArgumentParser, name, capturing(name))
         try:
             module.main(argv)
         except Parsed as parsed:

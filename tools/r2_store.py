@@ -802,7 +802,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, help="keys are paths relative to this directory")
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("files", nargs="*", type=Path)
-    args = parser.parse_args(argv)
+    # Intermixed: Python 3.12 before 3.12.7 (the Pod image's 3.12.3) leaves files given after
+    # the options unrecognized with plain parse_args.
+    args = parser.parse_intermixed_args(argv)
     store = Store(Credentials.from_environment())
     if args.command == "status":
         objects = store.objects()
