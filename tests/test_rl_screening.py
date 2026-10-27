@@ -12,6 +12,7 @@ from scratchcoder.rl.screening import (
     REASONS,
     hash_order,
     prescreen,
+    require_train_tasks,
     score_screening,
     screen,
 )
@@ -192,3 +193,22 @@ def test_prescreen_counts_parseable_and_high_baseline_tasks_by_source() -> None:
         "constant_baseline": 1,
         "eligible_before_equal_rewards": 1,
     }
+
+
+def test_require_train_tasks_names_every_kind_of_offender() -> None:
+    good = task("good", ELIGIBLE)
+    baselines = require_train_tasks([good, task("const", CONSTANT)])
+    assert baselines["good"].parseable and baselines["const"].reward == pytest.approx(2 / 3)
+    held_out = Task(**{**good.__dict__, "id": "sealed", "split": "test"})
+    bare = Task(**{**good.__dict__, "id": "bare", "solution": None})
+    messy = task("messy", UNPARSEABLE)
+    require_train_tasks([bare])  # a missing reference matters only to the control
+    with pytest.raises(ValueError, match="1 not train-split tasks, e.g. sealed"):
+        require_train_tasks([good, held_out])
+    with pytest.raises(ValueError, match="1 unparseable by the reward channel, e.g. messy"):
+        require_train_tasks([good, messy])
+    with pytest.raises(ValueError, match="without a reference solution, e.g. bare"):
+        require_train_tasks([good, bare], references=True)
+    with pytest.raises(ValueError) as combined:
+        require_train_tasks([held_out, messy, bare], references=True)
+    assert all(word in str(combined.value) for word in ("sealed", "messy", "bare"))

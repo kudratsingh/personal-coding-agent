@@ -68,6 +68,35 @@ def baseline_of(task: Task) -> Baseline:
     return Baseline(True, best.reward, best.answer)
 
 
+def require_train_tasks(tasks: Sequence[Task], *, references: bool = False) -> dict[str, Baseline]:
+    """Refuse a task list RL or the control must not train on; return each task's baseline.
+
+    Every task must be a train-split task (RL executes its hidden tests and the control
+    trains on its reference, so a dev, test or holdout task would leak it), and every hidden
+    test must be parseable by the reward channel (an unparseable task scores 0 for any
+    program, so its groups would be skipped silently). With ``references`` every task must
+    also carry a reference solution (the control's targets). Raises ``ValueError`` naming
+    the first offender of each kind.
+    """
+    problems: list[str] = []
+    baselines: dict[str, Baseline] = {}
+    for task in tasks:
+        baselines[task.id] = baseline_of(task)
+    for label, bad in (
+        ("not train-split tasks", [task for task in tasks if task.split != "train"]),
+        ("unparseable by the reward channel", [t for t in tasks if not baselines[t.id].parseable]),
+        (
+            "without a reference solution",
+            [task for task in tasks if references and task.solution is None],
+        ),
+    ):
+        if bad:
+            problems.append(f"{len(bad)} {label}, e.g. {bad[0].id}")
+    if problems:
+        raise ValueError("RL tasks must be parseable train tasks: " + "; ".join(problems))
+    return baselines
+
+
 @dataclass(frozen=True)
 class ScreenedTask:
     """One candidate's screening evidence and its drop reason (``None`` when kept)."""
