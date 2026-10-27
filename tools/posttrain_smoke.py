@@ -236,6 +236,8 @@ def fixtures(root: Path) -> Fixtures:
     return Fixtures(root, tokenizer, inputs, full)
 
 
+SMOKE_TASKS = {"pool": 3, "humaneval": 2, "humaneval-plus": 1, "mbpp-plus": 2}
+"""Each suite's scored fixture tasks: HumanEval+ always excludes ``humaneval/32``."""
 KINDS = {
     "tokenizer": "tokenizer",
     "a-stage1-final": "checkpoint",
@@ -275,7 +277,7 @@ def smoke_specification(found: Fixtures) -> dict[str, Any]:
     stages = run1_stages()
     for stage in stages:
         for entry in stage.get("files", []):
-            entry["planned_tasks"] = 3 if entry["suite"] == "pool" else 2
+            entry["planned_tasks"] = SMOKE_TASKS[entry["suite"]]
     return {
         "schema_version": 1,
         "kind": "posttrain-run-specification",

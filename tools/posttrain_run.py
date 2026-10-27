@@ -22,8 +22,10 @@
 ``smoke`` (CPU)
     Run 1 end to end on a tiny model, fixture tasks and an in-memory bucket.
 
-Every stage start checks the wall, cost and idle limits; every generation stage start also
-applies the projected-finish rule (``PROJECTED_FINISH_RULE``). The stage machinery is a
+Every stage start checks the wall, cost and idle limits and applies the projected-finish
+rule (``PROJECTED_FINISH_RULE``); during a stage the worker stops at the finalization reserve
+(``RESERVE_STOP``), ``finalization_reserve_seconds`` before the Pod lifetime ends, so the
+drain, ``report.json`` and the handover always have their time. The stage machinery is a
 registry of kinds (``STAGE_KINDS``): run 2 adds ``rl``, ``more-sft`` and their evaluation,
 and its reward waits report ``awaiting_rewards``. Hidden tests never reach the Pod: every pool
 task file it reads is a Pod export (``scratchcoder.eval.export``). R2 credentials come only
@@ -67,6 +69,7 @@ from scratchcoder.eval.protocols import (
     CHAT,
     POOL,
     POOL_SPLITS,
+    load_suite_tasks,
     protocol_for,
 )
 from scratchcoder.eval.tasks import load_tasks
@@ -104,14 +107,16 @@ DEFAULT_REVISION = Path("/workspace/posttrain/revision.json")
 STAGE_KINDS = ("probe", "arc", "eval", "sft", "screen")
 """Run 1's stage kinds, each run by ``PosttrainWorker.run_<kind>``. Run 2 adds ``rl``,
 ``more-sft`` and their ``eval`` stages on the same machinery."""
-GENERATION_KINDS = frozenset({"probe", "eval", "screen"})
-"""Stages that start with the projected-finish rule."""
 CHECKPOINT_KINDS = frozenset({"checkpoint"})
 SFT_REFERENCE = "sft"
 """A stage's checkpoint reference to the weights the ``sft`` stage selected."""
 PROBE_STOP = "generation_below_planning_speed"
 SPEED_STOP = "sft_throughput_below_limit"
 PROJECTED_STOP = "projected_finish_after_deadline"
+RESERVE_STOP = "finalization_reserve"
+"""A stage still running when only the finalization reserve is left stops here. Unlike the
+wall and cost stops it finalizes in full: the drain, the HEAD checks, ``report.json`` and the
+handover all fit the reserve, which is the watchdog's transfer window."""
 LAUNCH_RULE = (
     "at launch the Pod lifetime left, to the first of the wall, the armed in-Pod deadline, the "
     "watchdog's wall and either cost stop, must hold every stage at the planning rates "
@@ -120,11 +125,12 @@ LAUNCH_RULE = (
     "seconds) plus the finalization reserve"
 )
 PROJECTED_FINISH_RULE = (
-    "at the start of every generation stage the run stops before starting it if now plus the "
-    "work remaining (this and every later stage, generation at the probe's measured rate at "
-    "the generation batch size with pool attempts priced at their token cap, SFT at its "
-    "measured slot rate once measured, ARC at its measured seconds per checkpoint once "
-    "measured) plus the finalization reserve passes the end of the Pod lifetime"
+    "at the start of every stage the run stops before starting it if now plus the work "
+    "remaining (this and every later stage, generation at the probe's measured rate at the "
+    "generation batch size, or the evaluation files' observed rate once lower, with pool "
+    "attempts priced at their token cap, SFT at its measured slot rate once measured, ARC at "
+    "its measured seconds per checkpoint once measured) plus the finalization reserve passes "
+    "the end of the Pod lifetime; a stage still running at the reserve stops there"
 )
 SECRET_VARIABLES = (
     "R2_POD_ACCESS_KEY_ID",
@@ -921,6 +927,8 @@ class PosttrainWorker(Worker):
         self.pod_id, self.pod_created = pod_id, pod_created
         self.limits = RunLimits.of(spec) if limits is None else limits
         self.pod_end = pod_created + self.limits.pod_seconds
+        self.reserve_unix = self.pod_end - spec.finalization_reserve_seconds
+        """No stage runs past this: the rest of the lifetime is the finalization's."""
         self.device = training_device(device)
         self.tokenizer_path = tokenizer or next(
             path for name, path in self.inputs.items() if spec.inputs[name]["kind"] == "tokenizer"
@@ -950,6 +958,10 @@ class PosttrainWorker(Worker):
         self.rates = Rates.planning(spec)
         self.sft_weights: Path | None = None
         self.probe_rates: dict[int, float] = {}
+        self.current: StagePlan | None = None
+        self.observed: dict[str, float] = {"cap_tokens": 0.0, "generation_seconds": 0.0}
+        """The completed evaluation files' generation: tokens priced at their caps, and the
+        seconds they took. Their ratio re-bases the projections when below the probe's rate."""
         commit, dirty = git_state()
         revision = (extra or {}).get("code_revision")
         if isinstance(revision, Mapping):
@@ -990,15 +1002,17 @@ class PosttrainWorker(Worker):
                 "idle_seconds": self.limits.idle_seconds,
                 "pod_end_unix": self.pod_end,
                 "finalization_reserve_seconds": spec.finalization_reserve_seconds,
+                "finalization_reserve_unix": self.reserve_unix,
             },
             "cost": None,
             "r2": {"prefix": self.prefix, "bucket": store.credentials.bucket},
             "timings": {"pod_created_unix": pod_created, "worker_started_unix": clock()},
             "semantics": (
                 "stages run in order; every artifact is uploaded as soon as it exists; the "
-                "probe stops the run below the planning speeds; each generation stage starts "
-                "only if the projected finish fits the Pod lifetime; SFT stops below the "
-                "speed floor; wall, cost and idle limits are never extended"
+                "probe stops the run below the planning speeds; each stage starts only if the "
+                "projected finish fits the Pod lifetime, and a stage still running at the "
+                "finalization reserve stops there; SFT stops below the speed floor; wall, cost "
+                "and idle limits are never extended"
             ),
             "limitations": [
                 "worker time checks cannot terminate a provider resource during an API outage",
@@ -1095,15 +1109,20 @@ class PosttrainWorker(Worker):
         )
         if reason:
             self.stop_reason = reason
+        elif self.stop_reason is None and now >= self.reserve_unix:
+            self.stop_reason = RESERVE_STOP
         return self.stop_reason is not None
 
     def tick(self, tokens: int = 0) -> None:
-        """GPU work in progress: refresh activity and the heartbeat, keep wall and cost."""
+        """GPU work in progress: refresh activity and the heartbeat, keep wall and cost, and
+        stop at the finalization reserve (``RESERVE_STOP``), which finalizes in full."""
         now = self.clock()
         self.last_activity = now
         self.progress += 1
         self.generated_tokens += tokens
         reason = self.limits.stop_reason(pod_elapsed=max(0.0, now - self.pod_created))
+        if reason is None and now >= self.reserve_unix:
+            reason = RESERVE_STOP
         if reason:
             self.stop_reason = reason
             raise PilotStop(reason)
@@ -1149,6 +1168,10 @@ class PosttrainWorker(Worker):
             }
             self.artifacts.append(artifact)
             outputs.append({key: artifact[key] for key in ("label", "name", "sha256", "bytes")})
+        if self.current is not None:
+            # The stage's record lists each output as it is made, so a stage that stops or
+            # fails later still names what it left in R2.
+            self.stage_by_name[self.current.name]["outputs"].extend(outputs)
         self.uploader.submit(label, rows, milestone=True)
         self.publish()
         return outputs
@@ -1185,7 +1208,7 @@ class PosttrainWorker(Worker):
         return list(self.plan.stages[index:])
 
     def projected_finish(self, stage: StagePlan) -> None:
-        """The projected-finish rule (``PROJECTED_FINISH_RULE``) before a generation stage."""
+        """The projected-finish rule (``PROJECTED_FINISH_RULE``) before every stage."""
         now = self.clock()
         plan = planned_seconds(self.plan, self.rates, stages=self.remaining_stages(stage))
         finish = now + plan["total_seconds"]
@@ -1334,6 +1357,11 @@ class PosttrainWorker(Worker):
                 generate=ticking_generate(self.tick),
             )
             self.last_activity = self.clock()
+            if header.task_count != entry.planned_tasks:
+                raise ValueError(
+                    f"{entry.name}: {header.task_count} tasks, the specification plans "
+                    f"{entry.planned_tasks}"
+                )
             files.append(
                 {
                     "name": entry.name,
@@ -1352,8 +1380,39 @@ class PosttrainWorker(Worker):
             outputs += self.export_label(
                 f"{stage.name}-{entry.name}", [("completions.jsonl", path)]
             )
+            self.observe_generation(entry, header.generation_seconds)
             self.release()
         return outputs
+
+    def observe_generation(self, entry: EvalFile, seconds: float) -> None:
+        """Re-base the projections on the evaluation files generated so far.
+
+        Their rate is priced as the projections price them, every attempt at its token cap,
+        so it predicts a like file's seconds exactly. The probe measures random prompts at
+        256 new tokens; real files with longer contexts may be slower. The projection rate
+        becomes the lower of the probe's and the files' so far, so it only grows stricter.
+        """
+        if not math.isfinite(seconds) or seconds <= 0:
+            return
+        self.observed["cap_tokens"] += entry.planned_tokens
+        self.observed["generation_seconds"] += seconds
+        observed = self.observed["cap_tokens"] / self.observed["generation_seconds"]
+        probe = self.probe_rates.get(self.plan.generation_batch, observed)
+        rate = min(probe, observed)
+        self.rates = replace(
+            self.rates,
+            generation_tokens_per_second=rate,
+            basis={
+                **self.rates.basis,
+                "generation": "measured" if rate == probe else "observed-evaluation",
+            },
+        )
+        self.report["generation_observed"] = {
+            **self.observed,
+            "cap_tokens_per_second": observed,
+            "probe_tokens_per_second": probe,
+            "projection_tokens_per_second": rate,
+        }
 
     def run_sft(self, stage: StagePlan) -> list[dict[str, Any]]:
         settings = self.plan.sft
@@ -1648,38 +1707,74 @@ class PosttrainWorker(Worker):
 
     def run_stage(self, stage: StagePlan) -> None:
         record = self.stage_by_name[stage.name]
+        self.current = stage  # A stop from here on, even before the stage starts, is its own.
         if self.stopped():
             raise PilotStop(str(self.stop_reason))
         self.stage_name, self.phase = stage.name, stage.name
-        if stage.kind in GENERATION_KINDS:
-            self.projected_finish(stage)
+        self.projected_finish(stage)
         started = self.clock()
         record.update(status="running", started_unix=started)
         self.publish()
         self.heartbeat()
         runner: Callable[[StagePlan], list[dict[str, Any]]] = getattr(self, f"run_{stage.kind}")
-        record["outputs"] = runner(stage)
+        outputs = runner(stage)
+        if outputs != record["outputs"]:
+            raise RuntimeError(f"stage {stage.name}'s outputs differ from its exported labels")
+        self.current = None
         record.update(status="completed", ended_unix=self.clock(), seconds=self.clock() - started)
         self.publish()
 
+    def check_planned_tasks(self) -> None:
+        """Every evaluation file and the screening hold the tasks the specification prices.
+
+        The projections price each file at its planned tasks, so a task file of another size
+        would misprice every time rule; checked before any stage starts.
+        """
+        counts: dict[tuple[str, str, Path], int] = {}
+        for stage in self.plan.stages:
+            for entry in stage.files:
+                key = (entry.suite, entry.split, self.inputs[entry.tasks])
+                if key not in counts:
+                    counts[key] = len(load_suite_tasks(*key)[0])
+                if counts[key] != entry.planned_tasks:
+                    raise ValueError(
+                        f"{stage.name} {entry.name}: the task file holds {counts[key]} tasks, "
+                        f"the specification plans {entry.planned_tasks}"
+                    )
+            if stage.kind == "screen":
+                listed = len(candidate_ids(self.inputs[stage.settings["candidates"]]))
+                if listed != int(self.plan.screening["planned_tasks"]):
+                    raise ValueError(
+                        f"{stage.name}: {listed} candidates, the specification plans "
+                        f"{self.plan.screening['planned_tasks']}"
+                    )
+
+    def close_stage(self, status: str, **fields: Any) -> None:
+        """Record a stopped or failed stage's status, end and seconds; its outputs are listed."""
+        if self.current is None:
+            return
+        record = self.stage_by_name[self.current.name]
+        ended = self.clock()
+        record.update(status=status, ended_unix=ended, **fields)
+        started = record.get("started_unix")
+        if isinstance(started, int | float):
+            record["seconds"] = ended - started
+        self.current = None
+
     def execute(self) -> dict[str, Any]:
-        current: StagePlan | None = None
         try:
             self.report["timings"]["stages_started_unix"] = self.clock()
+            self.check_planned_tasks()
             for stage in self.plan.stages:
-                current = stage
                 self.run_stage(stage)
-            current = None
             self.report["status"] = "completed"
         except PilotStop as error:
             self.report.update(status="stopped", stop_reason=str(error))
-            if current is not None:
-                self.stage_by_name[current.name].update(status="stopped", stop_reason=str(error))
+            self.close_stage("stopped", stop_reason=str(error))
         except BaseException as error:
             self.report.update(status="failed", error_type=type(error).__name__)
             self.report["error"] = str(sanitize(str(error)))[:500]
-            if current is not None:
-                self.stage_by_name[current.name].update(status="failed")
+            self.close_stage("failed")
             raise
         finally:
             for record in self.stage_by_name.values():

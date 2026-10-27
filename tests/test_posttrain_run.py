@@ -23,11 +23,14 @@ from scratchcoder.model.gpt import GPT
 from scratchcoder.rl.attempts import read_attempts_file
 from scratchcoder.rl.command import check_attempts_header, read_candidates
 from scratchcoder.tokenizer.bpe import ByteBPE
+from scratchcoder.train.pilot import PilotStop
 from tools import posttrain_approved, posttrain_ops
 from tools.posttrain_run import (
     PROBE_STOP,
     PROJECTED_STOP,
+    RESERVE_STOP,
     SPEED_STOP,
+    PosttrainWorker,
     Rates,
     RunLimits,
     Specification,
@@ -307,13 +310,13 @@ def test_records_stay_within_their_bounds(completed: Ran) -> None:
     assert completed.report["projections"] and all(
         row["fits"] for row in completed.report["projections"]
     )
-    assert [row["stage"] for row in completed.report["projections"]] == [
-        "probe",
-        "eval-base",
-        "eval-sft",
-        "screen",
-    ]
+    # The projected-finish rule runs at every stage's start, generation or not.
+    assert [row["stage"] for row in completed.report["projections"]] == STAGES
     assert completed.report["projections"][1]["basis"]["generation"] == "measured"
+    observed = completed.report["generation_observed"]
+    assert observed["projection_tokens_per_second"] == min(
+        observed["probe_tokens_per_second"], observed["cap_tokens_per_second"]
+    )
 
 
 # Stops ----------------------------------------------------------------------------------------
@@ -330,6 +333,11 @@ def test_a_probe_below_the_planning_speed_stops_the_run_after_uploading(
     assert statuses(ran.report) == {"probe": "stopped", **dict.fromkeys(STAGES[1:], "skipped")}
     assert ran.report["probe"]["passed"] is False
     assert ran.report["probe"]["measured_tokens_per_second"]["4"] > 0
+    probe = ran.report["stages"][0]  # A stopped stage still names its seconds and outputs.
+    assert probe["seconds"] is not None and {row["name"] for row in probe["outputs"]} == {
+        "generation-benchmark.json",
+        "record.json",
+    }
     prefix = posttrain_ops.run_prefix("1", SMOKE_POD_ID)
     assert prefix + "probe/generation-benchmark.json" in ran.bucket.objects
     assert prefix + "report.json" in ran.bucket.objects
@@ -349,8 +357,8 @@ def test_sft_below_the_speed_floor_stops_the_run(found: Fixtures, tmp_path: Path
     assert prefix + "eval-base-pool-dev-greedy/completions.jsonl" in ran.bucket.objects
 
 
-def test_a_generation_stage_that_cannot_finish_never_starts(
-    found: Fixtures, tmp_path: Path
+def test_a_stage_that_cannot_finish_never_starts(
+    found: Fixtures, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def huge(raw: dict[str, Any]) -> None:
         # At the planning rate the whole run fits, so the probe starts; at the probe's
@@ -359,17 +367,138 @@ def test_a_generation_stage_that_cannot_finish_never_starts(
         for entry in raw["stages"][5]["files"]:  # eval-sft
             entry["planned_tasks"] = 10**6
 
+    # Only this test prices files at more tasks than they hold; the count check would
+    # otherwise refuse the specification before any stage.
+    monkeypatch.setattr(PosttrainWorker, "check_planned_tasks", lambda self: None)
     ran = execute(found, tmp_path / "run", changes=huge)
     assert (ran.report["status"], ran.report["stop_reason"]) == ("stopped", PROJECTED_STOP)
-    # With the measured rate the work remaining from eval-base on cannot finish, so eval-base
-    # never starts, though eval-base itself would fit.
+    # With the measured rate the work remaining from arc-base on cannot finish, so arc-base
+    # never starts, though arc-base itself would fit.
     assert statuses(ran.report)["probe"] == "completed"
-    assert statuses(ran.report)["arc-base"] == "completed"
-    assert statuses(ran.report)["eval-base"] == "stopped"
+    assert statuses(ran.report)["arc-base"] == "stopped"
     projection = ran.report["projections"][-1]
-    assert projection["stage"] == "eval-base" and projection["fits"] is False
+    assert projection["stage"] == "arc-base" and projection["fits"] is False
     assert projection["projected_finish_unix"] > projection["pod_end_unix"]
-    assert not any(key.split("/")[3].startswith("eval-") for key in ran.bucket.objects)
+    assert projection["basis"]["generation"] == "measured"
+    assert not any(key.split("/")[3].startswith(("arc-", "eval-")) for key in ran.bucket.objects)
+
+
+class ShiftedClock:
+    """Real time plus an offset a test moves, so a stage can be made to run late."""
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+
+    def __call__(self) -> float:
+        return time.time() + self.offset
+
+
+def test_a_stage_still_running_at_the_reserve_stops_and_finalizes_in_full(
+    found: Fixtures, tmp_path: Path
+) -> None:
+    """The worker's in-stage stop is the finalization reserve, not the in-Pod deadline: the
+    stop leaves the drain, report.json and r2_final their time."""
+    clock = ShiftedClock()
+    bucket = MemoryBucket()
+    spec = Specification.load(SPEC)
+    worker = make_worker(
+        found,
+        tmp_path / "run",
+        bucket=bucket,
+        clock=clock,
+        pod_created=clock(),
+        limits=RunLimits.of(spec, pod_seconds=spec.ceiling.self_destruct_seconds),
+    )
+    assert worker.reserve_unix == worker.pod_end - 900
+    original = worker.run_eval
+
+    def late(stage: Any) -> Any:
+        # The stage was allowed to start; now generation runs slower than projected.
+        clock.offset = worker.reserve_unix - time.time() + 1
+        return original(stage)
+
+    worker.run_eval = late  # type: ignore[method-assign]
+    with patched_benchmarks():
+        report = worker.execute()
+    assert (report["status"], report["stop_reason"]) == ("stopped", RESERVE_STOP)
+    assert statuses(report)["eval-base"] == "stopped"
+    assert statuses(report)["sft"] == "skipped"
+    finalization = json.loads((tmp_path / "run" / "finalization.json").read_text())
+    assert finalization["drain_budget_seconds"] > 0  # Not the wall or cost stop's hurry.
+    assert finalization["r2_final"] is not None  # Every label made so far verified.
+    heartbeat = json.loads((tmp_path / "run" / "heartbeat.json").read_text())
+    assert heartbeat["r2_final"]["artifact_count"] == len(report["artifacts"])
+    assert posttrain_ops.run_prefix("1", SMOKE_POD_ID) + "report.json" in bucket.objects
+    with pytest.raises(PilotStop, match=RESERVE_STOP):
+        worker.tick()
+    worker.stop_reason = None
+    assert worker.stopped() and worker.stop_reason == RESERVE_STOP
+
+
+def test_a_late_stage_that_is_not_generation_never_starts(found: Fixtures, tmp_path: Path) -> None:
+    """The projected-finish rule runs before every stage: SFT after a slow eval-base."""
+    clock = ShiftedClock()
+    worker = make_worker(found, tmp_path / "run", bucket=MemoryBucket(), clock=clock)
+    original = worker.run_eval
+
+    def slow(stage: Any) -> Any:
+        outputs = original(stage)
+        if stage.name == "eval-base":
+            # The stage ran long: it ends, its GPU work just done, a second before the reserve.
+            clock.offset = worker.reserve_unix - time.time() - 1
+            worker.last_activity = clock()
+        return outputs
+
+    worker.run_eval = slow  # type: ignore[method-assign]
+    with patched_benchmarks():
+        report = worker.execute()
+    assert (report["status"], report["stop_reason"]) == ("stopped", PROJECTED_STOP)
+    assert statuses(report)["eval-base"] == "completed"
+    assert statuses(report)["sft"] == "stopped"
+    assert report["projections"][-1]["stage"] == "sft"
+    assert report["projections"][-1]["fits"] is False
+
+
+def test_slow_evaluation_files_re_base_the_projection(found: Fixtures, tmp_path: Path) -> None:
+    worker = make_worker(found, tmp_path / "run", bucket=MemoryBucket())
+    worker.probe_rates = {4: 1_000.0}
+    entry = worker.plan.stage("eval-base").files[0]
+    worker.observe_generation(entry, entry.planned_tokens / 10.0)  # 10 cap tokens a second.
+    assert worker.rates.generation_tokens_per_second == pytest.approx(10.0)
+    assert worker.rates.basis["generation"] == "observed-evaluation"
+    worker.observe_generation(entry, entry.planned_tokens / 100_000.0)  # A fast file.
+    # The rate over both files (about 20 a second) stays below the probe's 1,000.
+    assert worker.rates.generation_tokens_per_second == pytest.approx(
+        2 * entry.planned_tokens / (entry.planned_tokens / 10.0 + entry.planned_tokens / 1e5)
+    )
+    worker.uploader.close(timeout=5)
+
+
+def test_a_task_file_of_another_size_than_planned_is_refused_before_any_stage(
+    found: Fixtures, tmp_path: Path
+) -> None:
+    def misplanned(raw: dict[str, Any]) -> None:
+        raw["stages"][2]["files"][0]["planned_tasks"] = 2_000
+
+    worker = make_worker(found, tmp_path / "run", bucket=MemoryBucket(), changes=misplanned)
+    with patched_benchmarks(), pytest.raises(ValueError, match="plans 2000"):
+        worker.execute()
+    assert statuses(worker.report) == dict.fromkeys(STAGES, "skipped")
+    assert worker.report["status"] == "failed"
+
+
+def test_a_stopped_stage_records_its_seconds_and_outputs(found: Fixtures, tmp_path: Path) -> None:
+    def slow(raw: dict[str, Any]) -> None:
+        raw["sft"]["reference_slots_per_second"] = 1e12
+
+    ran = execute(found, tmp_path / "run", changes=slow)
+    stopped = next(stage for stage in ran.report["stages"] if stage["name"] == "sft")
+    assert stopped["status"] == "stopped" and stopped["seconds"] is not None
+    probe = next(stage for stage in ran.report["stages"] if stage["name"] == "probe")
+    assert [output["name"] for output in probe["outputs"]] == [
+        "generation-benchmark.json",
+        "record.json",
+    ]
 
 
 class SteppingClock:

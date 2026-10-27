@@ -49,7 +49,7 @@ Every time and cost limit is derived from the ceiling and the quoted rate in one
 | Mac watchdog idle limit | 600 s |
 | Transfer window after the last GPU work | 900 s |
 
-The **launch rule** (worker and readiness receipt): the lifetime left must hold every stage at the planning rates, generation priced at every attempt's token cap, plus the 900 s finalization reserve: 10,003 s, which leaves about 130 minutes for setup. The **projected-finish rule**: at the start of every generation stage the remaining stages at the measured rates plus the reserve must end before the lifetime does, or the run stops with `projected_finish_after_deadline` before starting the stage.
+The **launch rule** (worker and readiness receipt): the lifetime left must hold every stage at the planning rates, generation priced at every attempt's token cap, plus the 900 s finalization reserve: 10,003 s, which leaves about 130 minutes for setup. The **projected-finish rule**: at the start of every stage the remaining stages at the measured rates plus the reserve must end before the lifetime does, or the run stops with `projected_finish_after_deadline` before starting the stage. The generation rate is the probe's, or the completed evaluation files' observed rate (priced at their token caps, as the projections price them) once that is lower. The **finalization reserve**: a stage still running 900 s before the end of the lifetime stops there with `finalization_reserve`; unlike the wall and cost stops it finalizes in full, so the drain, `report.json` and `r2_final` fit before the in-Pod timer fires. Before any stage the worker checks that every evaluation file and the screening hold the tasks the specification prices.
 
 ## Safeguards
 
@@ -59,7 +59,8 @@ The **launch rule** (worker and readiness receipt): the lifetime left must hold 
 | In-Pod idle self-destruct after 900 s | `pod_self_destruct.py --idle-seconds --activity` (the worker's heartbeat, the bootstrap's progress stamps); `progress_unix` is the hook for run 2's reward waits | `test_posttrain_guards.py`, `test_posttrain_integration.py` |
 | Probe stop below the planning speeds | `PosttrainWorker.run_probe` | `test_posttrain_run.py`, `test_posttrain_integration.py` |
 | SFT speed check after 50 updates | `PosttrainWorker.sft_speed_check` | `test_posttrain_run.py` |
-| Projected finish before each generation stage | `PosttrainWorker.projected_finish` | `test_posttrain_run.py` |
+| Projected finish before every stage, re-based on slow evaluation files | `PosttrainWorker.projected_finish`, `observe_generation` | `test_posttrain_run.py` |
+| Finalization reserve: no stage runs into the last 900 s | `PosttrainWorker.tick`, `stopped` (`finalization_reserve`) | `test_posttrain_run.py` |
 | Wall, cost and idle stops during GPU work | `PosttrainWorker.tick`, `stopped` | `test_posttrain_run.py` |
 | R2 prefix guard | `posttrain_ops.GuardedStore`, the worker's only store | `test_posttrain_run.py`, `test_posttrain_guards.py` |
 | Weights-only upload rate, 3.06 MB/s | `posttrain_ops.REQUIRED_UPLOAD_BYTES_PER_SECOND`; the receipt's `r2_round_trip_tested` | `test_posttrain_guards.py`, `test_posttrain_readiness.py` |
