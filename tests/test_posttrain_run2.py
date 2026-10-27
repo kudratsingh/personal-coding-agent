@@ -4,7 +4,7 @@ reward bridge, the stops that end the run, the liveness rules during a wait, and
 Every run uses the run-2 smoke's fixtures (a tiny model, withheld fixture tasks with the
 Mac's facts, scripted programs) with the Mac's ``BridgeServer`` in a thread over the
 directory transport, and an in-memory bucket. Nothing touches a network, no generated code
-runs (the Mac scores with fakes; ``test_posttrain_run2_sandbox.py`` runs Docker), and the
+runs (the Mac scores with fakes; ``test_posttrain_run2_sandbox.py`` runs the sandbox), and the
 reference BPE encoder is disabled so every prompt goes through the cached encoder.
 """
 

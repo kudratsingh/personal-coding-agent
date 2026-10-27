@@ -616,17 +616,19 @@ class Run2Worker(PosttrainWorker):
             )
         if result.updates:
             changes["reward_wait_seconds_per_update"] = seconds["reward_wait"] / result.updates
+        basis = {name: "measured" for name in ("rollout", "dev", "mac")}
         if checks and seconds["dev_generation"] > 0:
-            changes["dev_generation_tokens_per_second"] = (
-                checks * programs * DEV_TOKENS / seconds["dev_generation"]
-            )
+            rate = checks * programs * DEV_TOKENS / seconds["dev_generation"]
+            changes["dev_generation_tokens_per_second"] = rate
+            if int(rl["dev_batch_size"]) == self.plan.generation_batch:
+                # The dev checks generate at the evaluation batch and the same 512-token cap:
+                # the evaluation stages are projected at their measured rate, not the
+                # planning speed (run 2 has no probe of its own).
+                changes["generation_tokens_per_second"] = rate
+                basis["generation"] = "measured-dev-checks"
         if checks:
             changes["dev_wait_seconds_per_check"] = seconds["dev_wait"] / checks
-        self.rates = replace(
-            self.rates,
-            **changes,
-            basis={**self.rates.basis, **{name: "measured" for name in ("rollout", "dev", "mac")}},
-        )
+        self.rates = replace(self.rates, **changes, basis={**self.rates.basis, **basis})
 
     def end_reason(self, stop: str, detail: str) -> str:
         """The run's stop reason when an arm's stop ends it: ``bridge_lost``, ``wait_margin``
