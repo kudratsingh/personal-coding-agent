@@ -59,11 +59,24 @@ class Result:
 
 
 def command(
-    name: str, limits: Limits, *, docker: str = "docker", runtime: Runtime | None = None
+    name: str,
+    limits: Limits,
+    *,
+    docker: str = "docker",
+    runtime: Runtime | None = None,
+    supervisor: str | None = None,
 ) -> list[str]:
+    """Build the fixed hardened ``docker run`` argument vector.
+
+    ``supervisor`` is the trusted supervisor source executed as PID 1 inside the
+    container; the default is ``program.py`` (the evaluation path of record). The
+    reward channel passes its own supervisor here. Every isolation flag is identical
+    regardless of which supervisor runs.
+    """
     runtime = runtime or Runtime()
     file_bytes = max(1048576, limits.input_bytes + 4096)
-    supervisor = Path(__file__).with_name("program.py").read_text(encoding="utf-8")
+    if supervisor is None:
+        supervisor = Path(__file__).with_name("program.py").read_text(encoding="utf-8")
     return [
         docker,
         "--host",
