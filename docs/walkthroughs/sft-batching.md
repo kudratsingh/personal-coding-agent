@@ -35,6 +35,16 @@ The last row shows the mistake the update-wide divisor avoids: averaging each mi
 
 ## Data flow and shapes
 
+**Where the rows come from.** `tools/sft_data.py` writes the training rows; see [SFT data](../sft-data.md). Every code task with a verified reference whose row fits becomes a row, so code is never subsampled. Language is sized to the code by a cap on its share of the training tokens, counting every token of a row. If all the language conversations keep that share at or below 30%, all are used. Otherwise they are taken in a fixed hash order until the next one would pass 30%, and the rest are dropped. For example, take code rows of 700 tokens in all and conversations of 100, 150 and 80 tokens in hash order:
+
+| Conversation | Language tokens if taken | Share if taken | Taken |
+| --- | ---: | ---: | --- |
+| 1 | 100 | 100 / 800 = 12.5% | yes |
+| 2 | 250 | 250 / 950 = 26.3% | yes |
+| 3 | 330 | 330 / 1,030 = 32.0% | no: past 30%, so it and every later one are dropped |
+
+The measured share is 26.3%. The build record reports it, the share of assistant (loss-target) tokens alone, and how many conversations the cap dropped (here one).
+
 **Rows.** An `SFTRow` holds an `id`, a `source` label, `ids` and `mask` (tuples of length `n`). On disk each row is one JSON line with `id`, `source`, `ids` and `spans`. `spans` is the list of half-open `[start, end)` ranges where the mask is true. `read_rows` rejects duplicate IDs and malformed spans.
 
 **Order.** Pass `p` sorts the kept rows by the first eight bytes of `sha256(f"{seed}|{p}|{row id}")`, read as a big-endian integer, with the ID breaking ties. Anyone can recompute it without a library shuffle. The rehearsal uses seed 0 and one pass. With several passes each pass has its own order.
@@ -53,6 +63,7 @@ The last row shows the mistake the update-wide divisor avoids: averaging each mi
 - **Rows over `L` pairs are dropped, not truncated.** A truncated row would teach the model an answer cut off mid-way, or with no `<|assistant_end|>`.
 - **Why read the whole update first.** The divisor must be known before the first backward pass, because the gradients of all microbatches are summed. Reading `A` small microbatches of token lists costs nothing next to the forward passes.
 - **Why a new mode instead of changing the masked branch.** Pretraining divides a padded final update by capacity, so each pretraining target keeps one fixed weight. Changing that would change pretraining. A test checks that a default-configuration pretraining run equals the written-out update bit for bit, and that the new branch never runs there.
+- **The cap bounds language, not code.** The code rows are the point of the rehearsal's SFT, so all of them are kept and the language share is fitted around them. Taking a hash-order prefix, rather than the conversations that pack closest to 30%, keeps the choice independent of conversation lengths, so a reader can recompute it from the IDs alone. `tests/test_sft_data.py` checks the prefix, the cap at its exact boundary, and that nothing is dropped when all the language fits.
 - **Unsupported combinations raise.** z-loss is rejected with `update_targets` at configuration time. More than one process is rejected by the masked branch. An update with no assistant targets raises instead of dividing by zero.
 
 ## Verification
@@ -74,8 +85,10 @@ The last row shows the mistake the update-wide divisor avoids: averaging each mi
 - the default pretraining update, bit for bit, against the written-out reference;
 - `assistant_loss` against the direct per-row mean for batch sizes 1, 2 and 5, in float32 and bf16.
 
+`tests/test_sft_data.py` covers the rows' source: the hash-order prefix under the 30% cap, the cap at its exact boundary, language kept whole when it fits, and the default of no count cap.
+
 ```sh
-uv run --locked pytest tests/test_sft_loader.py tests/test_sft_training.py
+uv run --locked pytest tests/test_sft_loader.py tests/test_sft_training.py tests/test_sft_data.py
 ```
 
 These are CPU tests on authored rows. They do not measure GPU throughput.

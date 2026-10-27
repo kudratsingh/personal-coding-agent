@@ -20,7 +20,7 @@ Start with the [project README](../README.md), [current status](status.md), and 
 | [Frozen tokenizer](tokenizer-freeze.md) | Identify the immutable table and held-out compression measurements. |
 | [S rehearsal data build](rehearsal-data.md) | How the S pretraining shards were built, verified and credited, with the 2026-10-25 results. |
 | [Rehearsal task pool](task-pool.md) | How the capped SFT/RL pool and its dev/test holdouts were built and verified, with the 2026-10-25 counts. |
-| [Rehearsal SFT data](sft-data.md) | How the hash-bound chat-v1 SFT rows, RL-candidate holdout and dev sets are built; the language intake and its stopped terms check. |
+| [Rehearsal SFT data](sft-data.md) | How the hash-bound chat-v1 SFT rows, RL-candidate holdout and dev sets are built; the OASST2 language intake under its terms of record, and the 30% language share cap. |
 | [Full-build plan status](full-build-plan.md) | Understand the estimate's scope, source-capacity limits and outstanding owner decision; no build authorization. |
 | [Rehearsal run operations](rehearsal-runs.md) | Supervise the two concurrent D-35 rehearsal Pods: limits, R2 layout, credentials, the teardown rule and the projected fit; commands are in the [rehearsal runbook](../REHEARSAL_RUNBOOK.md). |
 | [Rehearsal work-order outline](rehearsal-plan.md) | Review the plan-only Phase 4 sequence and unresolved execution prerequisites. |

@@ -40,6 +40,19 @@ REQUIRED = (
     "deleted",
     "review_result",
 )
+REASONS = (
+    "missing_metadata",
+    "unknown_role",
+    "not_english",
+    "synthetic",
+    "model_written",
+    "deleted",
+    "failed_review",
+    "pii_label",
+    "empty_text",
+)
+"""Every reason ``message_reason`` can give, in the order it checks them. Each is
+counted, zero included, so a record shows that every check ran."""
 
 
 @dataclass(frozen=True)
@@ -163,7 +176,7 @@ def adapt_trees(
     """One conversation per exported tree whose best eligible path fits ``max_tokens``."""
     if type(max_tokens) is not int or max_tokens < 7:
         raise ValueError("max_tokens must fit at least one exchange")
-    counts: Counter[str] = Counter()
+    counts: Counter[str] = Counter({f"message:{name}": 0 for name in ("eligible", *REASONS)})
     kept: list[Conversation] = []
     seen: set[str] = set()
     for raw in trees:

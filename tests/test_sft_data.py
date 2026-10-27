@@ -69,21 +69,38 @@ def pool(tmp_path: Path) -> Path:
     return tmp_path / "train.jsonl"
 
 
-def conversations(tmp_path: Path, count: int = 10) -> Path:
+PROVENANCE = {"dataset": "OpenAssistant/oasst2", "revision": "a" * 40, "owner_ruling": "approved"}
+
+
+def language_record(path: Path, **changes: Any) -> Path:
+    """A minimal completed language-stage record beside ``path``."""
+    record: dict[str, Any] = {
+        "schema_version": sft_data.SCHEMA_VERSION,
+        "status": "completed",
+        "provenance": dict(PROVENANCE),
+        "files": {"conversations.jsonl": {"sha256": file_sha256(path)}},
+    }
+    record.update(changes)
+    (path.parent / "record.json").write_text(json.dumps(record))
+    return path.parent / "record.json"
+
+
+def conversations(
+    tmp_path: Path, count: int = 10, *, texts: list[tuple[str, str]] | None = None
+) -> Path:
     path = tmp_path / "conversations.jsonl"
+    pairs = texts or [(f"Question {i}?", "An answer. " * (i + 3)) for i in range(count)]
     with path.open("w") as stream:
-        for index in range(count):
+        for index, (question, answer) in enumerate(pairs):
             item = Conversation(
                 id=f"tree-{index}",
                 source="OpenAssistant/oasst2",
-                messages=(
-                    Message("user", f"Question {index}?"),
-                    Message("assistant", "An answer. " * (index + 3)),
-                ),
+                messages=(Message("user", question), Message("assistant", answer)),
                 message_ids=(f"m{index}a", f"m{index}b"),
                 tokens=0,
             )
             stream.write(json.dumps(conversation_json(item)) + "\n")
+    language_record(path)
     return path
 
 
@@ -178,18 +195,32 @@ def test_language_dev_is_held_out_by_hash_and_train_is_capped_at_the_share(tmp_p
     assert [row.id for row in dev] == ordered[:3]
     assert {row.id for row in train} <= set(ordered[3:])
     tokens = record["tokens"]
-    budget = tokens["code"]["tokens"] * 0.3 / 0.7
-    assert tokens["language"]["tokens"] <= budget
+    code_tokens, language_tokens = tokens["code"]["tokens"], tokens["language"]["tokens"]
+    assert language_tokens / (language_tokens + code_tokens) <= 0.3
     accepted = [name for name in ordered[3:] if name in {row.id for row in train}]
     assert accepted == ordered[3 : 3 + len(accepted)]  # A prefix of the hash order.
+    # The first conversation left out would have taken the share past 30%.
+    index = int(ordered[3 + len(accepted)].split("-")[1])
+    rendered = render_conversation(
+        TOKENIZER,
+        [Message("user", f"Question {index}?"), Message("assistant", "An answer. " * (index + 3))],
+    )
+    more = language_tokens + len(rendered.ids)
+    assert more / (more + code_tokens) > 0.3
     language = record["language"]
     assert language["dev"] == 3 and language["train"] == len(train)
-    assert language["train"] + language.get("over_share", 0) == 7
+    assert language["train_available"] == 7 and "over_train_max" not in language
+    assert language["train"] + language["over_share"] == 7
     shares = record["shares"]
-    assert shares["language"] == pytest.approx(
-        tokens["language"]["tokens"] / (tokens["language"]["tokens"] + tokens["code"]["tokens"])
+    assert shares["language"] == pytest.approx(language_tokens / (language_tokens + code_tokens))
+    assert shares["language_assistant_only"] == pytest.approx(
+        tokens["language"]["assistant_tokens"]
+        / (tokens["language"]["assistant_tokens"] + tokens["code"]["assistant_tokens"])
     )
-    assert language["over_share"] > 0 and shares["language_target_met"]
+    assert shares["language_cap"] == 0.3 and shares["cap_bound"]
+    assert shares["cap_dropped"] == language["over_share"] > 0
+    # Code is never subsampled: every non-candidate task that fits is a row.
+    assert record["code"]["sft_rows"] == sum(record["code"]["sft_rows_by_source"].values())
     first = next(row for row in train if row.id == accepted[0])
     index = int(accepted[0].split("-")[1])
     assert first == SFTRow.of(
@@ -205,10 +236,47 @@ def test_language_dev_is_held_out_by_hash_and_train_is_capped_at_the_share(tmp_p
     )
 
 
+def test_language_under_the_cap_is_kept_whole(tmp_path: Path) -> None:
+    # At a 90% cap all seven training conversations fit: nothing is subsampled.
+    record = run_build(tmp_path, language_share=0.9)
+    language, shares = record["language"], record["shares"]
+    assert language["train"] == language["train_available"] == 7
+    assert "over_share" not in language and "over_train_max" not in language
+    assert not shares["cap_bound"] and shares["cap_dropped"] == 0
+    assert 0 < shares["language"] < 0.9
+
+
+@pytest.mark.parametrize(("extra", "kept"), [(0, True), (1, False)])
+def test_the_share_cap_is_exact_at_its_boundary(tmp_path: Path, extra: int, kept: bool) -> None:
+    # A 50% cap lets language equal the code's tokens exactly, and not one token more.
+    tasks = [task(OCI, index) for index in range(3)]
+    save_tasks(tmp_path / "train.jsonl", tasks)
+    code_tokens = sum(len(render_code_task(TOKENIZER, item).ids) for item in tasks)
+    # A one-exchange chat-v1 row costs five marker tokens plus its text bytes.
+    answer = "x" * (code_tokens - 5 - 1 + extra)
+    record = build(
+        pool_train=tmp_path / "train.jsonl",
+        language=conversations(tmp_path, texts=[("Q", answer)]),
+        output=tmp_path / "sft",
+        encoder=TOKENIZER,
+        tokenizer_identity=IDENTITY,
+        config=BuildConfig(rl_candidates=0, language_dev=0, language_share=0.5),
+    )
+    assert record["tokens"]["code"]["tokens"] == code_tokens
+    assert record["language"]["train"] == int(kept)
+    assert record["shares"]["cap_bound"] is not kept
+    if kept:
+        assert record["tokens"]["language"]["tokens"] == code_tokens
+        assert record["shares"]["language"] == 0.5
+
+
 def test_language_train_max_and_without_language(tmp_path: Path) -> None:
+    assert BuildConfig().language_train_max is None  # No count cap by default.
+    with pytest.raises(ValueError):
+        BuildConfig(language_train_max=0)
     record = run_build(tmp_path / "a", language_train_max=2, language_share=0.9)
     assert record["language"]["train"] == 2 and record["language"]["over_train_max"] == 5
-    assert not record["shares"]["language_target_met"]
+    assert not record["shares"]["cap_bound"]
     alone = build(
         pool_train=pool(tmp_path / "b"),
         output=tmp_path / "b" / "sft",
@@ -253,6 +321,54 @@ def test_code_dev_rows_and_input_validation(tmp_path: Path) -> None:
         )
     with pytest.raises(ValueError):
         BuildConfig(language_share=1.0)
+
+
+def test_build_record_carries_the_language_records_provenance(tmp_path: Path) -> None:
+    record = run_build(tmp_path)
+    entry = record["inputs"]["language"]
+    assert entry["provenance"] == PROVENANCE
+    assert entry["record"] == {
+        "path": str(tmp_path / "record.json"),
+        "sha256": file_sha256(tmp_path / "record.json"),
+    }
+    assert entry["sha256"] == file_sha256(tmp_path / "conversations.jsonl")
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        ({"schema_version": 1}, ValueError),
+        ({"status": "partial"}, ValueError),
+        ({"provenance": None}, ValueError),
+        ({"files": {"conversations.jsonl": {"sha256": "0" * 64}}}, ValueError),
+        ({"files": {}}, ValueError),
+        ({"provenance": {**PROVENANCE, "owner_ruling": "rejected"}}, PermissionError),
+        ({"provenance": {"dataset": "OpenAssistant/oasst2"}}, PermissionError),
+    ],
+)
+def test_build_refuses_language_without_a_matching_approved_record(
+    tmp_path: Path, changes: dict[str, Any], error: type[Exception]
+) -> None:
+    path = conversations(tmp_path)
+    language_record(path, **changes)
+    train = pool(tmp_path)
+
+    def attempt() -> None:
+        build(
+            pool_train=train,
+            language=path,
+            output=tmp_path / "sft",
+            encoder=TOKENIZER,
+            tokenizer_identity=IDENTITY,
+            config=BuildConfig(sequence_length=400, rl_candidates=5, language_dev=3),
+        )
+
+    with pytest.raises(error):
+        attempt()
+    (tmp_path / "record.json").unlink()
+    with pytest.raises(FileNotFoundError, match="language stage record"):
+        attempt()
+    assert not (tmp_path / "sft").exists()
 
 
 # ----------------------------------------------------------------- OpenAssistant
@@ -389,10 +505,14 @@ def test_adapter_follows_the_best_eligible_path_and_counts_every_filter() -> Non
     assert counts == {
         "message:deleted": 1,
         "message:eligible": 16,
+        "message:empty_text": 0,  # Every message reason is listed, zero included.
         "message:failed_review": 1,
+        "message:missing_metadata": 0,
+        "message:model_written": 0,
         "message:not_english": 1,
         "message:pii_label": 1,
         "message:synthetic": 1,
+        "message:unknown_role": 0,
         "messages_seen": 21,
         "tree:kept": 3,
         "tree:no_eligible_reply": 2,
@@ -611,20 +731,44 @@ def test_screens_keep_one_conversation_per_repeated_opening_prompt() -> None:
 
 # ------------------------------------------------------------------ language spec
 
+SPEC = ROOT / "configs" / "sft-language-oasst2.json"
+TREES = "2023-11-05_oasst2_ready.trees.jsonl.gz"
+DELETE = object()
+
 
 def spec_file(tmp_path: Path, **changes: Any) -> Path:
-    raw = json.loads((ROOT / "configs" / "sft-language-oasst2.json").read_text())
+    raw = json.loads(SPEC.read_text())
     raw.update(changes)
     path = tmp_path / "spec.json"
     path.write_text(json.dumps(raw))
     return path
 
 
+def terms_file(tmp_path: Path, section: str | None, key: str, value: Any) -> Path:
+    """The committed spec with one terms-of-record field changed (or deleted)."""
+    raw = json.loads(SPEC.read_text())
+    target = raw["terms_of_record"] if section is None else raw["terms_of_record"][section]
+    if value is DELETE:
+        del target[key]
+    else:
+        target[key] = value
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw))
+    return path
+
+
+def card_listing() -> dict[str, Any]:
+    card = json.loads(SPEC.read_text())["terms_of_record"]["card"]
+    return {"rfilename": card["file"], "size": card["size_bytes"], "blobId": card["git_blob_id"]}
+
+
 class FakeHub(Hub):
-    def __init__(self, files: Mapping[str, bytes]) -> None:
+    def __init__(self, files: Mapping[str, bytes], card: Mapping[str, Any] | None = None) -> None:
         super().__init__(None, sleep=lambda _: None)
         self.files = files
+        self.card = card_listing() if card is None else card
         self.calls = 0
+        self.downloads = 0
 
     def json(self, url: str) -> Any:
         self.calls += 1
@@ -632,16 +776,20 @@ class FakeHub(Hub):
         return {
             "sha": revision,
             "siblings": [
-                {
-                    "rfilename": name,
-                    "size": len(data),
-                    "lfs": {"sha256": hashlib.sha256(data).hexdigest()},
-                }
-                for name, data in self.files.items()
+                dict(self.card),
+                *(
+                    {
+                        "rfilename": name,
+                        "size": len(data),
+                        "lfs": {"sha256": hashlib.sha256(data).hexdigest()},
+                    }
+                    for name, data in self.files.items()
+                ),
             ],
         }
 
     def download(self, url: str, destination: Path, size: int, sha256: str) -> int:
+        self.downloads += 1
         data = self.files[url.rsplit("/", 1)[1]]
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(data)
@@ -652,35 +800,69 @@ def gz_trees(trees: list[dict[str, Any]]) -> bytes:
     return gzip.compress("".join(json.dumps(item) + "\n" for item in trees).encode())
 
 
-def test_committed_spec_records_the_terms_finding_and_blocks_the_download(tmp_path: Path) -> None:
-    spec = sft_data.load_language_spec(ROOT / "configs" / "sft-language-oasst2.json")
-    assert spec["owner_ruling"] is None and spec["owner_ruling_on"] is None
-    assert spec["dataset"] == "OpenAssistant/oasst2"
-    assert "no LICENSE file" in spec["terms_finding"]
+def test_committed_spec_records_the_ruling_and_the_terms_of_record() -> None:
+    spec = sft_data.load_language_spec(SPEC)
+    assert spec["schema_version"] == 2 and spec["dataset"] == "OpenAssistant/oasst2"
+    assert spec["owner_ruling"] == "approved" and spec["owner_ruling_on"] == "2026-10-26"
+    revision = "179dd21fc55192153d94adb0e0ce8f69e222bf75"
+    assert spec["revision"] == revision and spec["license_label"] == "Apache-2.0"
+    terms = spec["terms_of_record"]
+    assert terms["card"] == {
+        "file": "README.md",
+        "revision": revision,
+        "size_bytes": 10606,
+        "sha256": "52bd472cf3cae04a4b21ecd5316f929741c47d991d4763b041c3a94de072dc31",
+        "git_blob_id": "ce94775b146d09acf5c5ea31992a9f322e12de76",
+        "license": "apache-2.0",
+        "license_line": 2,
+    }
+    paper = terms["paper"]
+    assert (paper["arxiv_id"], paper["version"], paper["date"]) == (
+        "2304.07327",
+        "v2",
+        "2023-10-31",
+    )
+    assert paper["statement"] == "We release our code and data under a fully permissive licence."
+    assert "human-written" in terms["scope"] and "model_name" in terms["scope"]
+    finding = spec["terms_finding"]
+    for fact in ("no LICENSE file", "only as a metadata label", "grant no license", "accepted"):
+        assert fact in finding
+    assert spec["files"] == [TREES] and spec["max_download_bytes"] == 54370156
+
+
+def test_an_unruled_spec_blocks_the_download(tmp_path: Path) -> None:
+    spec = sft_data.load_language_spec(spec_file(tmp_path, owner_ruling=None, owner_ruling_on=None))
     hub = FakeHub({})
     with pytest.raises(PermissionError, match="owner"):
         sft_data.fetch(spec, tmp_path / "intake", hub_factory=lambda _: hub)
     assert hub.calls == 0 and not (tmp_path / "intake").exists()
+    with pytest.raises(PermissionError, match="owner"):
+        sft_data.adapt_language(
+            spec,
+            tmp_path / "intake",
+            encoder=TOKENIZER,
+            benchmarks=[],
+            choices=[],
+            holdouts=[],
+            min_alpha_tokens=3,
+        )
 
 
-def test_fetch_and_adapt_after_a_recorded_ruling(tmp_path: Path) -> None:
-    name = "2023-11-05_oasst2_ready.trees.jsonl.gz"
+def test_fetch_adapt_and_build_carry_the_provenance(tmp_path: Path) -> None:
     data = gz_trees(authored_trees())
     spec = sft_data.load_language_spec(
-        spec_file(
-            tmp_path,
-            owner_ruling="approved",
-            owner_ruling_on="2026-10-01",
-            max_tokens=60,
-            max_download_bytes=len(data),
-        )
+        spec_file(tmp_path, max_tokens=60, max_download_bytes=len(data))
     )
     directory = tmp_path / "intake"
-    receipt = sft_data.fetch(spec, directory, hub_factory=lambda _: FakeHub({name: data}))
+    receipt = sft_data.fetch(spec, directory, hub_factory=lambda _: FakeHub({TREES: data}))
     assert receipt["files"][0]["sha256"] == hashlib.sha256(data).hexdigest()
-    assert file_sha256(directory / "raw" / name) == receipt["files"][0]["sha256"]
+    assert receipt["files"][0]["size_bytes"] == len(data)
+    assert file_sha256(directory / "raw" / TREES) == receipt["files"][0]["sha256"]
+    assert receipt["owner_ruling"] == "approved" and receipt["revision"] == spec["revision"]
+    assert receipt["terms_of_record"] == spec["terms_of_record"]
+    assert receipt["card"]["git_blob_id"] == spec["terms_of_record"]["card"]["git_blob_id"]
     with pytest.raises(FileExistsError):
-        sft_data.fetch(spec, directory, hub_factory=lambda _: FakeHub({name: data}))
+        sft_data.fetch(spec, directory, hub_factory=lambda _: FakeHub({TREES: data}))
     record = sft_data.adapt_language(
         spec,
         directory,
@@ -690,7 +872,7 @@ def test_fetch_and_adapt_after_a_recorded_ruling(tmp_path: Path) -> None:
         holdouts=[task(OCI, 2, prompt="Pick? an option", split="dev")],
         min_alpha_tokens=3,
     )
-    assert record["intake"][name]["tree:kept"] == 3
+    assert record["intake"][TREES]["tree:kept"] == 3
     assert record["screens"] == {"kept": 3, "seen": 3}
     path = directory / "language" / "conversations.jsonl"
     assert record["files"]["conversations.jsonl"]["sha256"] == file_sha256(path)
@@ -700,6 +882,22 @@ def test_fetch_and_adapt_after_a_recorded_ruling(tmp_path: Path) -> None:
         "t8",
     ]
     assert record["exchanges_per_conversation"] == {"1": 2, "2": 1}
+    provenance = record["provenance"]
+    assert provenance["revision"] == spec["revision"]
+    assert provenance["owner_ruling"] == "approved"
+    assert provenance["owner_ruling_on"] == spec["owner_ruling_on"]
+    assert provenance["terms_of_record"] == spec["terms_of_record"]
+    assert provenance["license_label"] == "Apache-2.0"
+    assert provenance["spec_sha256"] == spec["sha256"]
+    assert provenance["receipts_sha256"] == file_sha256(directory / "download-receipts.json")
+    assert provenance["files"] == [
+        {
+            "filename": TREES,
+            "url": receipt["files"][0]["url"],
+            "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+    ]
     with pytest.raises(FileExistsError):
         sft_data.adapt_language(
             spec,
@@ -710,21 +908,44 @@ def test_fetch_and_adapt_after_a_recorded_ruling(tmp_path: Path) -> None:
             holdouts=[],
             min_alpha_tokens=3,
         )
+    built = build(
+        pool_train=pool(tmp_path),
+        language=path,
+        output=tmp_path / "sft",
+        encoder=TOKENIZER,
+        tokenizer_identity=IDENTITY,
+        config=BuildConfig(sequence_length=400, rl_candidates=5, language_dev=1),
+    )
+    assert built["inputs"]["language"]["provenance"] == provenance
+    assert built["inputs"]["language"]["record"]["sha256"] == file_sha256(
+        directory / "language" / "record.json"
+    )
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        {**card_listing(), "blobId": "0" * 40},
+        {**card_listing(), "size": 10607},
+        {"rfilename": "LICENSE", "size": 10606, "blobId": card_listing()["blobId"]},
+    ],
+)
+def test_fetch_refuses_a_card_that_differs_from_the_terms_of_record(
+    tmp_path: Path, card: dict[str, Any]
+) -> None:
+    data = gz_trees(authored_trees())
+    spec = sft_data.load_language_spec(spec_file(tmp_path, max_download_bytes=len(data)))
+    hub = FakeHub({TREES: data}, card=card)
+    with pytest.raises(ValueError, match="terms of record"):
+        sft_data.fetch(spec, tmp_path / "intake", hub_factory=lambda _: hub)
+    assert hub.downloads == 0 and not (tmp_path / "intake").exists()
 
 
 def test_fetch_refuses_oversized_plans_and_bad_specs(tmp_path: Path) -> None:
-    name = "2023-11-05_oasst2_ready.trees.jsonl.gz"
     data = gz_trees(authored_trees())
-    spec = sft_data.load_language_spec(
-        spec_file(
-            tmp_path,
-            owner_ruling="approved",
-            owner_ruling_on="2026-10-01",
-            max_download_bytes=len(data) - 1,
-        )
-    )
+    spec = sft_data.load_language_spec(spec_file(tmp_path, max_download_bytes=len(data) - 1))
     with pytest.raises(RuntimeError, match="approved maximum"):
-        sft_data.fetch(spec, tmp_path / "x", hub_factory=lambda _: FakeHub({name: data}))
+        sft_data.fetch(spec, tmp_path / "x", hub_factory=lambda _: FakeHub({TREES: data}))
     with pytest.raises(ValueError, match="allowlist"):
         sft_data.load_language_spec(spec_file(tmp_path, license_label="CC-BY-NC-4.0"))
     with pytest.raises(ValueError):
@@ -733,6 +954,47 @@ def test_fetch_refuses_oversized_plans_and_bad_specs(tmp_path: Path) -> None:
         sft_data.load_language_spec(
             spec_file(tmp_path, owner_ruling="approved", owner_ruling_on="2999-01-01")
         )
+    with pytest.raises(ValueError, match="schema"):
+        sft_data.load_language_spec(spec_file(tmp_path, schema_version=1))
+    raw = json.loads(SPEC.read_text())
+    del raw["terms_of_record"]
+    (tmp_path / "old.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="exactly the keys"):
+        sft_data.load_language_spec(tmp_path / "old.json")
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        (None, "scope", " "),
+        (None, "extra", "x"),
+        (None, "card", DELETE),
+        ("card", "extra", "x"),
+        ("card", "sha256", DELETE),
+        ("card", "revision", "0" * 40),  # Read at another revision than the pinned one.
+        ("card", "sha256", "52BD" + "0" * 60),
+        ("card", "git_blob_id", "ce94"),
+        ("card", "size_bytes", 0),
+        ("card", "license_line", "2"),
+        ("card", "license", "mit"),  # Not the spec's license label.
+        ("card", "file", ""),
+        ("paper", "extra", "x"),
+        ("paper", "statement", DELETE),
+        ("paper", "statement", ""),
+        ("paper", "arxiv_id", "arXiv:2304.07327"),
+        ("paper", "arxiv_id", 2304.07327),
+        ("paper", "version", "2"),
+        ("paper", "version", "v0"),
+        ("paper", "date", "2023-10-31T00:00"),
+        ("paper", "date", "2999-01-01"),
+        ("paper", "title", None),
+    ],
+)
+def test_spec_validates_every_terms_of_record_field(
+    tmp_path: Path, section: str | None, key: str, value: Any
+) -> None:
+    with pytest.raises(ValueError):
+        sft_data.load_language_spec(terms_file(tmp_path, section, key, value))
 
 
 @pytest.mark.parametrize(
@@ -753,12 +1015,11 @@ def test_spec_rejects_an_incomplete_or_unknown_ruling(
 
 
 def test_a_rejected_ruling_never_downloads(tmp_path: Path) -> None:
-    name = "2023-11-05_oasst2_ready.trees.jsonl.gz"
     data = gz_trees(authored_trees())
     spec = sft_data.load_language_spec(
         spec_file(tmp_path, owner_ruling="rejected", owner_ruling_on="2026-10-01")
     )
-    hub = FakeHub({name: data})
+    hub = FakeHub({TREES: data})
     with pytest.raises(PermissionError, match="did not approve"):
         sft_data.fetch(spec, tmp_path / "intake", hub_factory=lambda _: hub)
     assert hub.calls == 0 and not (tmp_path / "intake").exists()
