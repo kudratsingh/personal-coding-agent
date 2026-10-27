@@ -15,6 +15,9 @@ from uuid import uuid4
 
 IMAGE = "python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe"
 ENDPOINT = "unix:///var/run/docker.sock"
+HOST_WATCHDOG_SECONDS = 10.0
+"""How long past the candidate deadline the host waits for the container before giving up.
+The supervisor enforces the candidate deadline itself, so reaching this is a host stall."""
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,11 @@ class Result:
     stdout: str = ""
     exit_code: int | None = None
     elapsed_seconds: float = 0.0
+    host_stalled: bool = False
+    """True when the host watchdog, not the supervisor, ended the call. The status stays
+    ``timeout`` so the status vocabulary is unchanged, but such a result is not a verdict on
+    the candidate: callers must retry it and never score it (as a pass, a failure or a
+    timeout)."""
 
     @property
     def passed(self) -> bool:
@@ -59,11 +67,24 @@ class Result:
 
 
 def command(
-    name: str, limits: Limits, *, docker: str = "docker", runtime: Runtime | None = None
+    name: str,
+    limits: Limits,
+    *,
+    docker: str = "docker",
+    runtime: Runtime | None = None,
+    supervisor: str | None = None,
 ) -> list[str]:
+    """Build the fixed hardened ``docker run`` argument vector.
+
+    ``supervisor`` is the trusted supervisor source executed as PID 1 inside the
+    container; the default is ``program.py`` (the evaluation path of record). The
+    reward channel passes its own supervisor here. Every isolation flag is identical
+    regardless of which supervisor runs.
+    """
     runtime = runtime or Runtime()
     file_bytes = max(1048576, limits.input_bytes + 4096)
-    supervisor = Path(__file__).with_name("program.py").read_text(encoding="utf-8")
+    if supervisor is None:
+        supervisor = Path(__file__).with_name("program.py").read_text(encoding="utf-8")
     return [
         docker,
         "--host",
@@ -157,6 +178,7 @@ def run(
     status = "infrastructure_error"
     captured = bytearray()
     process: subprocess.Popen[bytes] | None = None
+    host_stalled = False
     try:
         with TemporaryFile() as input_stream:
             input_stream.write(payload)
@@ -173,8 +195,9 @@ def run(
             selector.register(process.stdout, selectors.EVENT_READ)
             try:
                 while selector.get_map():
-                    if time.monotonic() - started > limits.timeout_seconds + 10:
+                    if time.monotonic() - started > limits.timeout_seconds + HOST_WATCHDOG_SECONDS:
                         status = "timeout"
+                        host_stalled = True
                         break
                     for key, _ in selector.select(timeout=0.05):
                         chunk = os.read(key.fd, 4096)
@@ -207,7 +230,10 @@ def run(
             elif process.returncode == 137:
                 status = "resource_limit"
             return Result(
-                status, exit_code=process.returncode, elapsed_seconds=time.monotonic() - started
+                status,
+                exit_code=process.returncode,
+                elapsed_seconds=time.monotonic() - started,
+                host_stalled=host_stalled,
             )
     except (OSError, ValueError, subprocess.SubprocessError):
         return Result("infrastructure_error", elapsed_seconds=time.monotonic() - started)

@@ -61,8 +61,16 @@ from scratchcoder.data.mbpp import mbpp_release, read_mbpp
 from scratchcoder.data.pool import SimilarityIndex, build_pool, shingles, split_summary
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.tasks import Task, save_tasks
+from scratchcoder.sandbox.budget import io_seconds
 from scratchcoder.sandbox.diagnostics import failure_category
-from scratchcoder.sandbox.runner import IMAGE, Limits, Result, Runtime, run
+from scratchcoder.sandbox.runner import (
+    HOST_WATCHDOG_SECONDS,
+    IMAGE,
+    Limits,
+    Result,
+    Runtime,
+    run,
+)
 from scratchcoder.tokenizer.bulk import FastEncoder
 from tools.pilot_data import _load_tokenizer
 from tools.real_samples import HUMANEVAL_SHA256
@@ -95,8 +103,10 @@ COLUMNS = {
 # if it persists, the build stops rather than guessing.
 RETRY_STATUSES = frozenset({"infrastructure_error", "unavailable"})
 RETRY_DELAY_SECONDS = 2.0
-HOST_DEADLINE_SLACK = 10.0
-"""runner.run gives up this long after the candidate deadline: an infrastructure stall."""
+HOST_DEADLINE_SLACK = HOST_WATCHDOG_SECONDS
+"""runner.run gives up this long after the candidate deadline: an infrastructure stall. A
+fresh result says so itself (``Result.host_stalled``); this elapsed-time signature also
+recognises stalls in cache rows written before that flag existed."""
 LIMITS_FORMULA_VERSION = 1
 """Bump when limits_for changes; cached verdicts are bound to it."""
 ACECODE_ATTEMPTS = 3
@@ -461,10 +471,17 @@ def _kind(task: Task) -> str:
 
 
 def limits_for(verification: Mapping[str, Any], tests: str, mode: str) -> Limits:
-    """The sandbox deadline covers every I/O case in one call, so it grows with the cases."""
+    """The sandbox deadline covers every I/O case in one call, so it grows with the cases.
+
+    The I/O rule is :func:`scratchcoder.sandbox.budget.io_seconds`, which the reward channel
+    also uses, so both give a task the same deadline."""
     timeout = verification["timeout_seconds"]
     if mode == "io":
-        timeout += verification["io_seconds_per_case"] * len(json.loads(tests))
+        timeout = io_seconds(
+            len(json.loads(tests)),
+            base_seconds=timeout,
+            seconds_per_case=verification["io_seconds_per_case"],
+        )
     return Limits(timeout_seconds=min(60.0, timeout), memory_mb=verification["memory_mb"])
 
 
@@ -526,18 +543,19 @@ def verify(
 ) -> tuple[dict[str, Result], dict[str, int]]:
     """Run every distinct (code, tests, mode) once, persisting verdicts for resume.
 
-    ``deadline(tests, mode)`` is the candidate deadline of that call. A ``timeout``
-    reported ``HOST_DEADLINE_SLACK`` or more past it is the runner giving up on a stalled
-    container, not a verdict, and is retried like an unavailable sandbox. A
-    ``resource_limit`` is accepted only when a second attempt repeats it. Cached rows with
-    those signatures from before this rule are re-run.
+    ``deadline(tests, mode)`` is the candidate deadline of that call. A result the runner
+    marks ``host_stalled``, or a ``timeout`` reported ``HOST_DEADLINE_SLACK`` or more past the
+    deadline, is the runner giving up on a stalled container, not a verdict, and is retried
+    like an unavailable sandbox. A ``resource_limit`` is accepted only when a second attempt
+    repeats it. Cached rows with those signatures from before this rule are re-run.
     """
     results: dict[str, Result] = {}
     counters: Counter[str] = Counter()
 
     def stalled(result: Result, tests: str, mode: str) -> bool:
-        return result.status == "timeout" and result.elapsed_seconds >= (
-            deadline(tests, mode) + HOST_DEADLINE_SLACK
+        return result.host_stalled or (
+            result.status == "timeout"
+            and result.elapsed_seconds >= deadline(tests, mode) + HOST_DEADLINE_SLACK
         )
 
     calls_by_key = {call_key(*call): call for call in calls}
