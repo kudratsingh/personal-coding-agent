@@ -191,6 +191,7 @@ def _rewrite(path: Path, edit: object) -> Path:
         (lambda lines: lines[1].update(task_id="other"), "task IDs"),
         (lambda lines: lines[0].update(sampler_version="x"), "sampler"),
         (lambda lines: lines.reverse(), "header"),
+        (lambda lines: lines[0].update(excluded_tasks=[["humaneval/32"]]), "excluded"),
     ],
 )
 def test_reading_refuses_inconsistent_files(tmp_path: Path, edit: object, message: str) -> None:

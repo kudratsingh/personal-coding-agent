@@ -178,8 +178,10 @@ class CompletionsHeader:
         if not math.isfinite(self.generation_seconds) or self.generation_seconds < 0:
             raise ValueError("generation_seconds must be finite and nonnegative")
         for item in self.excluded_tasks:
-            if set(item) != {"task_id", "reason"} or not all(
-                isinstance(value, str) and value for value in item.values()
+            if (
+                not isinstance(item, Mapping)
+                or set(item) != {"task_id", "reason"}
+                or not all(isinstance(value, str) and value for value in item.values())
             ):
                 raise ValueError("an excluded task names task_id and reason")
 
