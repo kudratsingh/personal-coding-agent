@@ -91,6 +91,7 @@ A reward may be `NaN`, which reaches the RL loop and stops it with `non_finite`.
 | Failure | Handling | Test |
 | --- | --- | --- |
 | No reply in time (Mac down, slow, SSH lost) | The Pod withdraws the request to `withdrawn/` and raises `RewardTimeout`; `run_rl` stops with `reward_wait` and saves the weights | `test_a_timeout_withdraws_the_request_and_raises_reward_timeout`, `test_a_mac_that_never_answers_ends_in_reward_timeout` |
+| The wait ends by an error the injected sleep raises (run 2's worker giving up on a lost bridge, or a limit) | The request is withdrawn too, so the Mac never scores a request nobody waits for | `test_an_error_raised_while_waiting_withdraws_the_request` |
 | Reply with another ID, kind, index, count or SHA-256, a wrong schema, partial, corrupt, oversized or a symlink | The Pod moves it to `rejected/` and keeps waiting; the Mac re-pushes its stored reply on the next poll. More than `max_rejected` (3) raise `BridgeReplyError` | `test_the_pod_rejects_wrong_replies_and_accepts_the_right_one`, `test_too_many_rejected_replies_raise_a_bridge_reply_error` |
 | Host failure the Mac's retries cannot resolve | `host_failure` reply (stored); the Pod raises `RewardHostFailure`, never a reward of 0 | `test_mac_host_failures_and_timeouts_become_stored_replies`, `test_failure_replies_map_to_the_rl_loop_errors` |
 | Docker down during a dev check | After 16 unresolved calls in a row, no further program starts; the check is a host failure | `test_a_dead_sandbox_fails_a_dev_check_without_running_every_program` |
@@ -138,6 +139,8 @@ The bridge never sends a hidden test to the Pod, but the code that runs there us
 1. `facts = task_facts(tasks)` runs the real hidden tests through the reward channel's parser: per task, `parseable` and the constant answer's `reward`. The answer itself is not included, because it can be a hidden test's expected value.
 2. `facts_bytes(facts)` is the facts file: canonical JSON (sorted keys, no spaces), so its SHA-256 depends on the facts alone. `withheld_task(task)` makes the Pod's copy of each task, with a fixed placeholder for the hidden tests.
 3. On the Pod, `load_facts(raw, sha256=...)` checks the file against the SHA-256 it was configured with and against the exact schema and canonical form. `run_rl(..., facts=facts)` and `run_more_sft(..., facts=facts)` use the facts in place of the tests; for the dev check, `BridgeDevEvaluator(..., baseline=constant_baseline_from_facts(dev_facts, ids))` uses the rebuilt baseline.
+
+For run 2, `scratchcoder rl-pod-export` does steps 1 and 2 on the Mac from the pool's train and dev splits and the screening record, and writes the three files with a record of their SHA-256s: `rl-tasks.jsonl` (the kept tasks, withheld, references kept), `rl-dev.jsonl` (the 200-task dev subset, withheld) and `rl-facts.json` (one facts file for both). The run-2 binding pins those bytes and the Pod's worker checks them; `rl-bridge` is given the two task files' SHA-256s ([post-training runs](../posttrain-runs.md#run-2)).
 
 `constant_baseline_from_facts` does the same sums in the same order as `constant_baseline`, so a Pod run and a Mac run record the same baselines. Without the facts, a withheld task is refused with an error that says why; the placeholder would otherwise give a baseline of 0 and every task unparseable, silently.
 
