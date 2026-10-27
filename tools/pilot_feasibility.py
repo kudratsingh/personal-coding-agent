@@ -13,7 +13,7 @@ import argparse
 import json
 import math
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -1286,9 +1286,10 @@ def rehearsal_main(argv: Sequence[str]) -> int:
 # Post-training run 1: hours and dollars per stage against the run's ceiling
 
 POSTTRAIN_DISCLAIMER = (
-    "Post-training figures are projections: generation at the planning speeds (no generation "
-    "rate has been measured), pool attempts priced at their token caps, SFT at run B's "
-    "measured 56,765 slots/s; run 1's probe measures generation before anything else runs"
+    "Post-training figures are projections: generation at the planning speeds (the probe's "
+    "floors, 5% under the rates run 1's first launch measured), pool attempts priced at their "
+    "token caps, SFT at run B's measured 56,765 slots/s; run 1's probe measures generation "
+    "again before anything else runs"
 )
 POSTTRAIN_STORAGE_BYTES = 1_500_000_000
 """Run 1's artifacts in R2: the selected SFT weights (0.55 GB), 14 completions files and the
@@ -1461,7 +1462,11 @@ def posttrain_main(argv: Sequence[str]) -> int:
                 if args.run1_report is None or args.screening is None:
                     raise ValueError("measured rates need both --run1-report and --screening")
                 measured = run1_measured_rates(
-                    args.run1_report, args.screening, dev_results=args.dev_results
+                    args.run1_report,
+                    args.screening,
+                    generation_batch=raw["generation"]["batch_size"],
+                    rl_batches=(raw["rl"]["generation_batch"], raw["rl"]["dev_batch_size"]),
+                    dev_results=args.dev_results,
                 )
             report = posttrain2_report(
                 args.specification,
@@ -1556,28 +1561,43 @@ def run1_measured_rates(
     report_path: Path,
     screening_path: Path,
     *,
+    generation_batch: int,
+    rl_batches: Collection[int],
     dev_results: Sequence[Path] = (),
     workers: int = 8,
     attempts_per_update: int = 256,
     dev_programs: int = 1_800,
 ) -> dict[str, Any]:
-    """Run 2's rates from run 1's records: generation (the probe's, slowed by the evaluation
-    files' observed rate when lower), SFT's slot rate and ARC's seconds from the verified
-    report; the Mac's time per reward request (``attempts_per_update`` attempts on
-    ``workers``) from the screening record's per-attempt scoring seconds, and per dev check
-    from the SFT dev results' per-attempt seconds (the screening's when none are given), each
-    with one normal bridge round trip."""
+    """Run 2's rates from run 1's records: generation at run 2's evaluation batch
+    (``generation_batch``, which must be run 1's: the evaluation files' observed rate, or the
+    probe's when they ran no slower) and at RL's rollout and dev-check batches (``rl_batches``:
+    the probe's rate, slowed as the evaluation files were slowed against the probe at their
+    batch), SFT's slot rate and ARC's seconds from the verified report; the Mac's time per
+    reward request (``attempts_per_update`` attempts on ``workers``) from the screening
+    record's per-attempt scoring seconds, and per dev check from the SFT dev results'
+    per-attempt seconds (the screening's when none are given), each with one normal bridge
+    round trip."""
     report = json.loads(report_path.read_text(encoding="utf-8"))
     if not isinstance(report, dict) or report.get("kind") != "posttrain-run-report":
         raise ValueError(f"{report_path} is not a post-training run report")
     if report.get("run") != "1":
         raise ValueError("the measured rates come from run 1's report")
+    batch = ((report.get("specification") or {}).get("generation") or {}).get("batch_size")
+    if batch != generation_batch:
+        raise ValueError(
+            f"run 1 generated its evaluation at batch {batch!r}, run 2's specification at batch "
+            f"{generation_batch}: every endpoint's evaluation must share one generation batch"
+        )
     probe = (report.get("probe") or {}).get("measured_tokens_per_second") or {}
     rates = report.get("rates") or {}
-    if "64" not in probe or "256" not in probe:
-        raise ValueError("run 1's report has no probe rates at batch 64 and 256")
-    observed64 = float(rates.get("generation_tokens_per_second") or probe["64"])
-    slowdown = min(1.0, observed64 / float(probe["64"]))
+    batches = sorted({generation_batch, *rl_batches})
+    missing = [size for size in batches if str(size) not in probe]
+    if missing:
+        named = ", ".join(str(size) for size in missing)
+        raise ValueError(f"run 1's report has no probe rate at batch {named}")
+    key = str(generation_batch)
+    observed = float(rates.get("generation_tokens_per_second") or probe[key])
+    slowdown = min(1.0, observed / float(probe[key]))
     screening = json.loads(screening_path.read_text(encoding="utf-8"))
     rows = screening.get("rewards") if isinstance(screening, dict) else None
     if not isinstance(rows, list) or not rows:
@@ -1593,8 +1613,8 @@ def run1_measured_rates(
     sft = report.get("sft") or {}
     return {
         "generation_tokens_per_second": {
-            "64": observed64,
-            "256": float(probe["256"]) * slowdown,
+            str(size): observed if size == generation_batch else float(probe[str(size)]) * slowdown
+            for size in batches
         },
         "training_slots_per_second": float(sft.get("slots_per_second") or 56_765.0),
         "arc_seconds_per_checkpoint": float(rates.get("arc_seconds_per_checkpoint") or 54),

@@ -26,7 +26,14 @@ import pytest
 from test_rehearsal_runbook import comment_lines
 
 from tools import posttrain_ops
-from tools.posttrain_run import PROBE_STOP, PROJECTED_STOP, SPEED_STOP
+from tools.pilot_feasibility import posttrain_report
+from tools.posttrain_run import (
+    PROBE_STOP,
+    PROJECTED_STOP,
+    SPEED_STOP,
+    Specification,
+    launch_fit,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "POSTTRAIN_RUNBOOK.md"
@@ -241,6 +248,28 @@ def test_the_derived_limits_in_the_runbook_are_the_specifications() -> None:
     for reason in (PROBE_STOP, SPEED_STOP, PROJECTED_STOP):
         assert reason in text, reason
     assert "60,000 s of the pretraining rehearsal is never used" in text
+
+
+def test_the_runbooks_time_figures_are_the_specifications_at_the_planning_rates() -> None:
+    """The probe's floors, the launch rule's need and what it leaves for setup, and the
+    projection at the planning speeds, as the runbook quotes them, are the code's."""
+    spec = Specification.load(SPEC)
+    lifetime = spec.ceiling.self_destruct_seconds
+    needed = launch_fit(spec, remaining_seconds=lifetime)["planning_seconds_needed"]
+    planned = posttrain_report(SPEC)["scenarios"]["1x generation"]
+    floors = spec.probe["minimum_tokens_per_second"]
+    text = RUNBOOK.read_text()
+    assert (
+        f"Below {floors['128']:,.0f} generated tok/s at batch 128 or {floors['256']:,.0f}" in text
+    )
+    assert (
+        f"generation at {planned['generation_tokens_per_second']:,.0f} tok/s at batch 128" in text
+    )
+    assert (
+        f"{needed:,.0f} s, so setup may take up to about {(lifetime - needed) / 60:.0f} min" in text
+    )
+    projection = f"about {planned['total_hours']:.1f} hours and ${planned['total_usd']:.2f}"
+    assert text.count(projection) == 2, projection
 
 
 def test_the_pod_commands_name_the_post_training_paths(monkeypatch: pytest.MonkeyPatch) -> None:

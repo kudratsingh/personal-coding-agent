@@ -19,8 +19,9 @@ post-training proposal as approved on 2026-10-26 and the owner's later rulings:
 - **Ceiling:** $3.00 at the quoted $0.59/h GPU and $0.60/h total, so the worker stops at
   $3.00, the watchdog at $2.99 and the in-Pod timer at 17,820 s (``posttrain_ops``).
 - **Probe:** batch 1, 64, 128 and 256 on 256 real chat-v1 prompt lengths around the pool dev
-  median, top-p 0.95 at temperature 0.8, bf16; it stops the run below 5,000 generated tok/s
-  at batch 64 or 10,000 at batch 256.
+  median, top-p 0.95 at temperature 0.8, bf16; it stops the run below 8,279 generated tok/s
+  at batch 128 or 9,268 at batch 256 (``GENERATION_FLOORS``).
+- **Generation:** evaluation and screening at batch 128, in bf16; run 2's evaluation shares it.
 - **ARC-Easy:** label log-likelihood, float32, on run A's ``stage1-final`` and
   ``stage2-final`` and run B's ``mixed-final``, then on the selected SFT weights.
 - **Evaluation:** pool dev and test greedy plus n = 8 at temperature 0.8, top-p 0.95, seed 0;
@@ -69,8 +70,12 @@ LIMITS = {
     "finalization_reserve_seconds": 900,
     "startup_seconds": 1_080,
 }
+GENERATION_FLOORS = {"128": 8_279.0, "256": 9_268.0}
+"""The probe's floors and the planning generation speeds of both runs: 5% under the rates run
+1's first launch measured, rounded down (8,714.9 tok/s at batch 128 and 9,756.7 at batch 256;
+it measured 4,607 at batch 64, below that launch's 5,000 floor, and nothing generates at 64)."""
 PLANNING = {
-    "generation_tokens_per_second": {"64": 5_000.0, "256": 10_000.0},
+    "generation_tokens_per_second": dict(GENERATION_FLOORS),
     "training_slots_per_second": 56_765.0,
     "forward_tokens_per_second": 94_862.0,
     "probe_seconds": 360,
@@ -79,8 +84,8 @@ PLANNING = {
     "compile_seconds": 120,
     "weights_save_seconds": 5,
 }
-"""Planning rates: the proposal's planning speeds and run B's measured training and forward
-rates; the stage seconds are estimates for the launch rule and the projection only."""
+"""Planning rates: the probe's floors as the generation speeds and run B's measured training and
+forward rates; the stage seconds are estimates for the launch rule and the projection only."""
 PROBE = {
     "batch_sizes": [1, 64, 128, 256],
     "prompt_lengths": 256,
@@ -90,9 +95,11 @@ PROBE = {
     "precision": "bfloat16",
     "seed": 0,
     "repeats": 1,
-    "minimum_tokens_per_second": {"64": 5_000.0, "256": 10_000.0},
+    "minimum_tokens_per_second": dict(GENERATION_FLOORS),
 }
-GENERATION = {"batch_size": 64, "precision": "bfloat16"}
+GENERATION = {"batch_size": 128, "precision": "bfloat16"}
+"""Evaluation and screening generation. Each row samples with its own seed, so the batch
+changes only how rows are grouped, not which seed a row uses."""
 SFT = {
     "train_rows": 3_390,
     "planned_dev_tokens": 827_850,
@@ -380,7 +387,7 @@ from run 1's measured rates, and the cost limit every other limit derives from i
 the ceiling and 120% of the estimate (the owner's run 2 gate rulings); setup fetches only the
 541 MB SFT weights, so its allowance is 900 s."""
 RUN2_PLANNING = {
-    "generation_tokens_per_second": {"64": 5_000.0, "256": 10_000.0},
+    "generation_tokens_per_second": dict(GENERATION_FLOORS),
     "training_slots_per_second": 56_765.0,
     "arc_seconds_per_checkpoint": 54,
     "checkpoint_load_seconds": 20,
@@ -388,9 +395,10 @@ RUN2_PLANNING = {
     "reward_wait_seconds_per_update": 48,
     "dev_wait_seconds_per_check": 300,
 }
-"""The proposal's planning speeds and run B's measured training rate, and the Mac's time: about
-48 s of rewards per update (256 attempts on 8 workers) and 300 s per 1,800-program dev check.
-The gate's projection re-prices them from run 1's measured rates."""
+"""Run 1's probe floors at the batches run 2 generates at (128 for the evaluation, 256 for the
+rollouts and the dev checks), run B's measured training rate, and the Mac's time: about 48 s
+of rewards per update (256 attempts on 8 workers) and 300 s per 1,800-program dev check. The
+gate's projection re-prices them from run 1's measured rates."""
 RUN2_RL: dict[str, Any] = {
     "updates": 100,
     "tasks_per_update": 32,

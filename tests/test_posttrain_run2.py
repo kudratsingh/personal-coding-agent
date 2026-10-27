@@ -282,6 +282,23 @@ def test_the_tracked_template_is_the_approved_run_two_with_its_gate_values_null(
     assert "private/" not in text and "D-3" not in text
 
 
+def test_run_two_generates_as_run_one_and_plans_at_run_ones_floors() -> None:
+    """The base, SFT, RL and more-SFT evaluations share one generation protocol, so run 2
+    evaluates at run 1's batch, 128; it plans each batch it generates at (128 for the
+    evaluation, 256 for the rollouts and the dev checks) at run 1's probe floor there."""
+    run1 = posttrain_approved.run1_specification()
+    run2 = posttrain_approved.run2_specification()
+    assert run2["generation"] == run1["generation"]
+    assert run2["generation"]["batch_size"] == 128
+    rl = run2["rl"]
+    batches = {str(run2["generation"]["batch_size"]), str(rl["generation_batch"])}
+    assert batches | {str(rl["dev_batch_size"])} == {"128", "256"}
+    planning = run2["planning"]["generation_tokens_per_second"]
+    floors = run1["probe"]["minimum_tokens_per_second"]
+    assert set(planning) == set(floors) == batches
+    assert planning == floors == {"128": 8_279.0, "256": 9_268.0}
+
+
 def test_the_gate_fills_every_null_and_the_approved_check_refuses_any_other_change() -> None:
     filled = posttrain_approved.run2_specification(gate_values())
     posttrain_approved.check_run2(filled)
@@ -353,7 +370,7 @@ def test_the_cost_limit_is_the_lower_of_the_ceiling_and_120_percent_of_the_estim
         with pytest.raises(ValueError, match="differs from its derivation"):
             Specification.from_dict(changed)
     # The launch rule still refuses a plan that does not fit at the planning rates: at a $2.00
-    # estimate the limit is $2.40, a 14,220 s timer, short of the 20,288 s the plan needs.
+    # estimate the limit is $2.40, a 14,220 s timer, short of the 17,495 s the plan needs.
     low = posttrain_approved.run2_specification(gate_values())
     low["limits"].update(gate_estimate_usd=2.00, cost_limit_usd=2.40)
     low_spec = Specification.from_dict(low)
@@ -367,22 +384,22 @@ def test_the_cost_limit_is_the_lower_of_the_ceiling_and_120_percent_of_the_estim
 
 def test_the_gate_refuses_limits_that_leave_no_room_for_the_planned_setup() -> None:
     """A fast run 1 gives a low estimate, and 120% of it may not hold the planned 900 s setup
-    plus the 20,288 s the launch rule needs at the planning rates: the readiness receipt would
+    plus the 17,495 s the launch rule needs at the planning rates: the readiness receipt would
     then refuse only after the Pod had billed its setup. The gate refuses it first, and says
     what the limits leave for setup."""
     accepted = posttrain_approved.run2_specification({**gate_values(), "gate_estimate_usd": 3.20})
     fit = posttrain_approved.gate_launch_fit(accepted)
     assert fit["fits"] and fit["limit_usd"] == 3.84
     assert fit["lifetime_seconds"] == 22_860 and fit["startup_seconds"] == 900
-    assert fit["planning_seconds_needed"] == pytest.approx(20_288, abs=1)
-    assert fit["setup_allowance_seconds"] == pytest.approx(2_572, abs=1)
-    for estimate, left in ((2.97, "892"), (2.86, "112"), (2.00, "-6,068")):
+    assert fit["planning_seconds_needed"] == pytest.approx(17_495, abs=1)
+    assert fit["setup_allowance_seconds"] == pytest.approx(5_365, abs=1)
+    for estimate, left in ((2.58, "865"), (2.50, "325"), (2.00, "-3,275")):
         with pytest.raises(ValueError, match=f"leaves {left} s for setup") as caught:
             posttrain_approved.run2_specification({**gate_values(), "gate_estimate_usd": estimate})
         assert "planned 900 s" in str(caught.value)
     # A ceiling below the estimate binds the same way.
     with pytest.raises(ValueError, match="for setup"):
-        posttrain_approved.run2_specification({**gate_values(), "ceiling_usd": 3.40})
+        posttrain_approved.run2_specification({**gate_values(), "ceiling_usd": 3.00})
 
 
 def test_the_gate_command_takes_its_values_from_the_gates_own_files(
@@ -398,8 +415,9 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
         "run": "1",
         "pod_id": "podpost01",
         "status": "completed",
-        "probe": {"measured_tokens_per_second": {"64": 6_000.0, "256": 12_000.0}},
-        "rates": {"generation_tokens_per_second": 6_000.0, "arc_seconds_per_checkpoint": 40.0},
+        "specification": {"generation": {"batch_size": 128}},
+        "probe": {"measured_tokens_per_second": {"128": 8_500.0, "256": 9_500.0}},
+        "rates": {"generation_tokens_per_second": 8_500.0, "arc_seconds_per_checkpoint": 40.0},
         "sft": {"slots_per_second": 60_000.0},
         "artifacts": [
             {
@@ -537,23 +555,20 @@ def test_run_two_fits_its_ceiling_at_the_planning_rates() -> None:
     stages = plan["stages"]
     assert stages["rl"] == pytest.approx(
         20
-        + 100 * 256 * 256 / 10_000
+        + 100 * 256 * 256 / 9_268
         + 100 * 256 * 1_024 / 56_765
         + 100 * 48
-        + 6 * (1_800 * 512 / 10_000 + 300 + 5)
+        + 6 * (1_800 * 512 / 9_268 + 300 + 5)
     )
     assert stages["more-sft"] == pytest.approx(
-        20
-        + 100 * 256 * 256 / 10_000
-        + 100 * 256 * 1_024 / 56_765
-        + 5 * (1_800 * 512 / 10_000 + 305)
+        20 + 100 * 256 * 256 / 9_268 + 100 * 256 * 1_024 / 56_765 + 5 * (1_800 * 512 / 9_268 + 305)
     )
-    assert stages["eval-rl"] == pytest.approx(7 * 20 + 18_792_960 / 5_000)
+    assert stages["eval-rl"] == pytest.approx(7 * 20 + 18_792_960 / 8_279)
     assert stages["arc-post"] == pytest.approx(2 * (20 + 54))
     lifetime = spec.ceiling.self_destruct_seconds
     fit = launch_fit(spec, remaining_seconds=lifetime - spec.limits["startup_seconds"])
     assert fit["fits_at_planning"] and fit["planning_seconds_needed"] == pytest.approx(
-        20_288, abs=1
+        17_495, abs=1
     )
 
 
@@ -697,7 +712,7 @@ def test_the_waits_heartbeat_awaiting_rewards_and_a_fresh_lease_is_progress(comp
 def test_a_dev_checks_generation_keeps_the_gpu_stamp_and_the_heartbeat_live(
     found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A dev check generates 1,800 programs between two waits (about 92 s at batch 256 at the
+    """A dev check generates 1,800 programs between two waits (about 99 s at batch 256 at the
     planning speed): every batch stamps the GPU activity and refreshes the heartbeat, in both
     arms, so neither idle rule nor the heartbeat's staleness reads it as a hung worker. (The refresh
     interval is zeroed so the check does not depend on how fast this machine generates.)"""

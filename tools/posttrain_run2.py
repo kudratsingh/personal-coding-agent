@@ -518,7 +518,7 @@ class Run2Worker(PosttrainWorker):
 
     def dev_tick(self, tokens: int) -> None:
         """A dev check's generation batch ended: GPU work. Stamp it and keep the heartbeat
-        live, so a check's generation (1,800 programs at batch 256, about 92 s at the planning
+        live, so a check's generation (1,800 programs at batch 256, about 99 s at the planning
         speed) is never read as a hung worker by the idle rules or the heartbeat's staleness. No
         limit is enforced here: ``should_stop`` kept a full wait free before the update, and
         the check's own wait is refused by ``before_wait`` if it cannot fit."""
@@ -729,7 +729,7 @@ class Run2Worker(PosttrainWorker):
                 # measure the evaluation's speed: the evaluation stages are then projected at
                 # the lower of the planning speed and that rate (run 2 has no probe of its
                 # own), so, as in run 1, a measurement only makes the projected-finish rule
-                # stricter. Run 2's dev checks generate at batch 256 and its evaluation at 64,
+                # stricter. Run 2's dev checks generate at batch 256 and its evaluation at 128,
                 # so there the evaluation stays at its batch's planning speed until its own
                 # files are observed.
                 changes["generation_tokens_per_second"] = rate

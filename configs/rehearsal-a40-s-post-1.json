@@ -24,8 +24,8 @@
   },
   "planning": {
     "generation_tokens_per_second": {
-      "64": 5000.0,
-      "256": 10000.0
+      "128": 8279.0,
+      "256": 9268.0
     },
     "training_slots_per_second": 56765.0,
     "forward_tokens_per_second": 94862.0,
@@ -50,12 +50,12 @@
     "seed": 0,
     "repeats": 1,
     "minimum_tokens_per_second": {
-      "64": 5000.0,
-      "256": 10000.0
+      "128": 8279.0,
+      "256": 9268.0
     }
   },
   "generation": {
-    "batch_size": 64,
+    "batch_size": 128,
     "precision": "bfloat16"
   },
   "sft": {

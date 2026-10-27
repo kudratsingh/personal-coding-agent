@@ -26,8 +26,8 @@
   },
   "planning": {
     "generation_tokens_per_second": {
-      "64": 5000.0,
-      "256": 10000.0
+      "128": 8279.0,
+      "256": 9268.0
     },
     "training_slots_per_second": 56765.0,
     "arc_seconds_per_checkpoint": 54,
@@ -37,7 +37,7 @@
     "dev_wait_seconds_per_check": 300
   },
   "generation": {
-    "batch_size": 64,
+    "batch_size": 128,
     "precision": "bfloat16"
   },
   "rl": {
