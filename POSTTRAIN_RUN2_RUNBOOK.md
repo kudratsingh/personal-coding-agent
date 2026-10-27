@@ -11,7 +11,7 @@ Then run 1's finalization, with the bridge directories uploaded as one label (`b
 
 Commands marked **Mac** run on the owner's Mac inside the repository checkout; **Pod** commands run inside the rented Pod over SSH. One terminal drives the run, a second runs the supervisor (step 13), and a third, prepared in step 6 before the Pod exists, runs the reward bridge (step 11) in a terminal where `.env` has never been sourced. Nothing in steps 1 to 6 starts a Pod; step 5 stores inputs in R2 (cents a month). Step 7 creates the Pod and starts billing: do not execute it without the owner's explicit go for run 2 at the gate. Runpod offers no provider-enforced Pod lifetime: termination is layered best effort.
 
-**Limits, all derived from the ceiling the owner fixes at the gate** (`tools/posttrain_ops.py` `ceiling_limits`; `limits` prints them): at the planned **$5.80** and the quoted $0.60/h the worker stops at **$5.80**, the Mac watchdog at **$5.79**, the Pod wall is **34,800 s** and the in-Pod timer fires at **34,620 s**, 180 s inside it. The fixed 60,000 s of the pretraining rehearsal is never used: it stays only as the in-Pod timer's absolute cap. The watchdog's idle limit is 600 s; the in-Pod timer also deletes the Pod after **900 s** with no GPU work and no progress.
+**Limits, all derived from one cost limit fixed at the gate** (`tools/posttrain_ops.py` `ceiling_limits`; `limits` prints them). The owner fixes the ceiling. The gate's estimate is the run 2 projection's total at run 1's measured rates and the gate's quoted price; step 4 reads it from the projection's own output, never from memory. The cost limit is the lower of the ceiling and 120% of the estimate, rounded down to the cent, and every other limit derives from it. At an estimate of $3.53 (the projection at the planning speeds) and the planned $5.80 ceiling the cost limit is **$4.23**: the worker stops at **$4.23**, the Mac watchdog at **$4.22**, the Pod wall is **25,380 s** and the in-Pod timer fires at **25,200 s**, 180 s inside it. Only an estimate of $4.84 or more lets the $5.80 ceiling bind. The launch specification writes the estimate and the cost limit down; the gate, the readiness receipt and the worker refuse a missing, non-finite or non-positive estimate and a written limit other than its derivation. The fixed 60,000 s of the pretraining rehearsal is never used: it stays only as the in-Pod timer's absolute cap. The watchdog's idle limit is 600 s; the in-Pod timer also deletes the Pod after **900 s** with no GPU work and no progress.
 
 **The bridge's bounds, derived in one place** (`posttrain_ops.bridge_timeouts`; the specification writes them down and must equal the derivation; `limits --field` prints each):
 
@@ -31,7 +31,7 @@ Commands marked **Mac** run on the owner's Mac inside the repository checkout; *
 
 **Liveness while the Pod waits on the Mac.** While the bridge client waits, the worker heartbeats `awaiting_rewards` with the request it waits on (`awaiting`: request ID, kind, index, count, start and age). The Mac watchdog, under run 2's policy, then lets the GPU idle for that kind's extension and never more, so a worker that hangs while claiming to wait is still deleted. The Mac's bridge server renews its lease, `server.lease` in the Pod's bridge root and dated by the Pod's own clock, with every poll and every few seconds while it reads, scores or answers a request; the worker stamps the heartbeat's `progress_unix` from a lease renewed within its 60 s, which the in-Pod idle rule counts as progress, and a stale lease counts as nothing. A dead Mac therefore lets the Pod go: the worker gives the wait up 600 s after the last renewal (`bridge_lost`), uploads its weights and finalizes, and if it could not, the in-Pod timer deletes the Pod 900 s after that renewal. `should_stop` is not read during a wait, so before every update and every request the worker stops (`wait_margin`) unless one full wait fits before the cost stop, the wall and the finalization reserve; unlike the cost and wall stops it finalizes in full.
 
-**The time rules.** The readiness receipt (step 10) and the worker at launch (step 12) apply the launch rule: the lifetime left must hold every stage at the planning rates (generation at 5,000 tok/s at batch 64 and 10,000 at batch 256, every attempt priced at its token cap, training at 56,765 slots/s, the Mac at 48 s per reward request and 300 s per dev check) plus the 900 s finalization reserve: 21,302 s, so setup may take up to about 3.6 hours of the 34,620 s at $5.80. Then the projected-finish rule before every stage, at the rates RL has measured once it has run; a stage still running 900 s before the end of the lifetime stops there and finalizes in full. The projection at the planning speeds (step 4) is about 6.2 hours and $3.70.
+**The time rules.** The readiness receipt (step 10) and the worker at launch (step 12) apply the launch rule: the lifetime left must hold every stage at the planning rates (generation at 5,000 tok/s at batch 64 and 10,000 at batch 256, every attempt priced at its token cap, training at 56,765 slots/s, the Mac at 48 s per reward request and 300 s per dev check) plus the 900 s finalization reserve: 20,288 s, so setup may take up to about 4,912 s (1.4 hours) of the 25,200 s at a $4.23 limit. Then the projected-finish rule before every stage, at the rates RL has measured once it has run; a stage still running 900 s before the end of the lifetime stops there and finalizes in full. The projection at the planning speeds (step 4) is about 5.9 hours and $3.53.
 
 **Hidden tests never leave the Mac.** The Pod receives the withheld RL task file and the withheld dev subset (every hidden test replaced by a fixed placeholder), the facts file (each task's parseability and best constant answer's reward, computed on the Mac; the answer itself is left out) and run 1's Pod exports. `scratchcoder rl-pod-export` writes the three run-2 files on the Mac from the full train and dev splits and the screening record; the binding, the Pod's verification and the worker refuse any file in which a task carries its hidden tests, and the worker checks the facts file against its pinned SHA-256. The sealed test split is not read again for run 2: its Pod export is run 1's.
 
@@ -106,7 +106,7 @@ uv run --locked python -m tools.pilot_feasibility posttrain --specification "$SP
   --output "$SHARED/feasibility.json"
 ```
 
-Replace `0.59` with the console's price; above $0.59, stop and ask the owner. The owner fixes the ceiling (about $5.80, about 1.6 times the estimate re-priced at run 1's rates) and gives the go or not. Record the ceiling:
+Replace `0.59` with the console's price; above $0.59, stop and ask the owner (the gate step refuses such a projection). The projection prints **the gate's estimate**, its total at run 1's measured rates, and the stop 120% of it gives; the gate step reads both from `$SHARED/feasibility.json`. The owner fixes the ceiling (about $5.80, about 1.6 times the estimate) and gives the go or not. Record the ceiling:
 
 ```sh
 export CEILING=<the owner's ceiling in dollars>
@@ -120,16 +120,17 @@ uv run --locked scratchcoder rl-pod-export --train-tasks "$POOL/train.jsonl" --k
 
 It prints each file's name, SHA-256 and size; the same inputs always give the same bytes.
 
-**The launch specification.** Fill the template's gate values from the gate's own files: the ceiling, run 1's selected SFT weights (key, size and SHA-256 of the `sft-weights` label in run 1's verified report), the three files just written (hashed from their bytes, cross-checked with their record) and run 1's pool test export:
+**The launch specification.** Fill the template's gate values from the gate's own files: the ceiling, the projection's estimate and the cost limit they give, run 1's selected SFT weights (key, size and SHA-256 of the `sft-weights` label in run 1's verified report), the three files just written (hashed from their bytes, cross-checked with their record) and run 1's pool test export:
 
 ```sh
-uv run --locked python -m tools.posttrain_approved run2-gate --ceiling-usd "$CEILING" --run1-report "$RUN1_REPORT" --rl-pod-export "$RL_EXPORT" --pool-test-export "$RUN1_SHARED/exports/test-export.jsonl" --output "$SPEC"
+uv run --locked python -m tools.posttrain_approved run2-gate --ceiling-usd "$CEILING" --feasibility "$SHARED/feasibility.json" --run1-report "$RUN1_REPORT" --rl-pod-export "$RL_EXPORT" --pool-test-export "$RUN1_SHARED/exports/test-export.jsonl" --output "$SPEC"
 uv run --locked python -m tools.posttrain_binding check-exports --specification "$SPEC" --input pool-dev="$RUN1_SHARED/exports/dev-export.jsonl" --input pool-test="$RUN1_SHARED/exports/test-export.jsonl"
 ```
 
-The first prints the launch specification's SHA-256; the owner reviews the file. `check-exports` must print `{"exports": {"pool-dev": 2000, "pool-test": 2000}, "hidden_tests": 0}`. Then read the limits and the bridge's bounds off it:
+The first prints the launch specification's SHA-256, the ceiling, the estimate and the cost limit; the owner reviews the file. It refuses a projection of another template, of another run 1 report or above the $0.59 quote. `check-exports` must print `{"exports": {"pool-dev": 2000, "pool-test": 2000}, "hidden_tests": 0}`. Then read the limits and the bridge's bounds off it:
 
 ```sh
+export COST_LIMIT=$(uv run --locked python -m tools.posttrain_ops limits --specification "$SPEC" --field limit_usd)
 export WALL=$(uv run --locked python -m tools.posttrain_ops limits --specification "$SPEC" --field wall_seconds)
 export WATCHDOG_COST=$(uv run --locked python -m tools.posttrain_ops limits --specification "$SPEC" --field watchdog_cost_stop_usd)
 export TIMER=$(uv run --locked python -m tools.posttrain_ops limits --specification "$SPEC" --field self_destruct_seconds)
@@ -139,10 +140,10 @@ export MAC_REWARD_TIMEOUT=$(uv run --locked python -m tools.posttrain_ops limits
 export MAC_DEV_TIMEOUT=$(uv run --locked python -m tools.posttrain_ops limits --specification "$SPEC" --field mac_dev_timeout_seconds)
 export POD_REWARD_SHA256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["inputs"]["rl-tasks"]["sha256"])' "$SPEC")
 export POD_DEV_SHA256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["inputs"]["rl-dev"]["sha256"])' "$SPEC")
-echo "run $RUN: wall $WALL s, timer $TIMER s, watchdog cost stop $WATCHDOG_COST USD, Mac bounds $MAC_REWARD_TIMEOUT / $MAC_DEV_TIMEOUT s"
+echo "run $RUN: cost limit $COST_LIMIT USD, wall $WALL s, timer $TIMER s, watchdog cost stop $WATCHDOG_COST USD, Mac bounds $MAC_REWARD_TIMEOUT / $MAC_DEV_TIMEOUT s"
 ```
 
-At $5.80 the last line must print `wall 34800 s, timer 34620 s, watchdog cost stop 5.79 USD, Mac bounds 5600.0 / 9492.0 s`.
+The last line prints the limits derived from the cost limit the gate wrote. At a $5.80 ceiling and a $3.53 estimate it must print `cost limit 4.23 USD, wall 25380 s, timer 25200 s, watchdog cost stop 4.22 USD, Mac bounds 5600.0 / 9492.0 s`; at another estimate the numbers follow from `ceiling_limits`.
 
 ## 5. Binding and staging (Mac, at the go; R2 storage only)
 
@@ -360,7 +361,7 @@ The `stat` line should print `600 root` and a nonzero size, and both SHA-256 lin
 
 ## 9. Bootstrap (Pod, billable)
 
-Run 1's step 9 with `--run 2` and run 2's timer lifetime (`$TIMER`, 34,620 s at $5.80):
+Run 1's step 9 with `--run 2` and run 2's timer lifetime (`$TIMER`, 25,200 s at a $4.23 limit):
 
 ```sh
 if podssh 'test -e /workspace/posttrain/bootstrap.log'; then
@@ -672,15 +673,15 @@ The scorecard reports every row beside its constant-answer baseline, the paired 
 
 ## 19. Final billing verification (Mac)
 
-Run 1's step 18 block with run 2's ceiling: record the total only once two reads at least 30 minutes apart agree:
+Run 1's step 18 block with run 2's cost limit (`$COST_LIMIT`, the lower of the ceiling and 120% of the estimate): record the total only once two reads at least 30 minutes apart agree:
 
 ```sh
 export BUCKETS=$(( ($(date +%s) - ORIGIN) / 3600 + 2 ))
 uv run --locked python -m tools.runpod_pod_identity billing --pod-id "$POD_ID" --last-buckets "$BUCKETS" --output "$CTRL/billing-$(date +%s).json"
-python3 - "$CTRL" "$POD_ID" "$CEILING" <<'PY'
+python3 - "$CTRL" "$POD_ID" "$COST_LIMIT" <<'PY'
 import glob, json, sys
 
-control, pod_id, ceiling = sys.argv[1], sys.argv[2], float(sys.argv[3])
+control, pod_id, limit = sys.argv[1], sys.argv[2], float(sys.argv[3])
 reads = []
 total = 0.0
 for path in sorted(glob.glob(f"{control}/billing-*.json")):
@@ -694,11 +695,11 @@ for path in sorted(glob.glob(f"{control}/billing-*.json")):
         sys.exit(f"{path}: the records sum to {total} but the provider totals say {provider}")
     reads.append((path, round(total, 4)))
 print(json.dumps(reads))
-if total >= ceiling:
-    sys.exit(f"the Pod cost {total:.4f} USD, at or above its {ceiling:.2f} USD ceiling")
+if total >= limit:
+    sys.exit(f"the Pod cost {total:.4f} USD, at or above its {limit:.2f} USD cost limit")
 if len(reads) < 2 or reads[-1][1] != reads[-2][1]:
     sys.exit("the last two reads differ (or there is one read): wait and fetch again")
-print(f"billing settled at {reads[-1][1]} USD over two reads, under the {ceiling:.2f} USD ceiling")
+print(f"billing settled at {reads[-1][1]} USD over two reads, under the {limit:.2f} USD cost limit")
 PY
 ```
 

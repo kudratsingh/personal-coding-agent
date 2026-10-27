@@ -289,6 +289,8 @@ def smoke_specification2(
         "model": asdict(smoke_model(found.tokenizer)),
         "limits": {
             "ceiling_usd": 3.0,
+            "gate_estimate_usd": 2.5,
+            "cost_limit_usd": 3.0,
             "quoted_gpu_hourly": 0.59,
             "quoted_total_hourly": 0.6,
             "self_destruct_margin_seconds": 180,

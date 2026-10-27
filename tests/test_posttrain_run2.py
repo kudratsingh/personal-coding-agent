@@ -10,6 +10,7 @@ reference BPE encoder is disabled so every prompt goes through the cached encode
 
 import copy
 import json
+import math
 import os
 import tarfile
 import time
@@ -216,6 +217,7 @@ def gate_values() -> dict[str, Any]:
     pin = {"size_bytes": 10, "sha256": "a" * 64}
     return {
         "ceiling_usd": 5.80,
+        "gate_estimate_usd": 3.53,
         "sft-weights": {"key": "posttrain-runs/1/podpost01/sft-weights/checkpoint.pt", **pin},
         "rl-tasks": dict(pin),
         "rl-dev": dict(pin),
@@ -234,6 +236,7 @@ def test_the_tracked_template_is_the_approved_run_two_with_its_gate_values_null(
     spec = Specification.from_dict(raw, allow_gate_nulls=True)
     assert [stage.name for stage in spec.stages] == STAGES
     assert raw["limits"]["ceiling_usd"] is None
+    assert raw["limits"]["gate_estimate_usd"] is None and raw["limits"]["cost_limit_usd"] is None
     for name in ("sft-weights", "rl-tasks", "rl-dev", "rl-facts", "pool-test"):
         assert raw["inputs"][name]["sha256"] is None, name
     assert raw["inputs"]["sft-weights"]["key"] is None
@@ -277,7 +280,10 @@ def test_the_gate_fills_every_null_and_the_approved_check_refuses_any_other_chan
     filled = posttrain_approved.run2_specification(gate_values())
     posttrain_approved.check_run2(filled)
     spec = Specification.from_dict(filled)
-    assert spec.ceiling.wall_seconds == 34_800 and spec.ceiling.self_destruct_seconds == 34_620
+    # The stop at 120% of the $3.53 estimate, $4.236 rounded down to $4.23, is below the $5.80
+    # ceiling: every limit derives from it.
+    assert filled["limits"]["cost_limit_usd"] == 4.23
+    assert spec.ceiling.wall_seconds == 25_380 and spec.ceiling.self_destruct_seconds == 25_200
     for path, value in (
         (("rl", "learning_rate"), 1e-5),
         (("rl", "dev_checks"), [0, 50, 100]),
@@ -303,7 +309,46 @@ def test_the_gate_fills_every_null_and_the_approved_check_refuses_any_other_chan
             {**gate_values(), "rl-dev": {"size_bytes": 10, "sha256": "A" * 64}}
         )
     with pytest.raises(ValueError, match="absolute"):
-        posttrain_approved.run2_specification({**gate_values(), "ceiling_usd": 11.0})
+        posttrain_approved.run2_specification(
+            {**gate_values(), "ceiling_usd": 11.0, "gate_estimate_usd": 11.0}
+        )
+
+
+def test_the_cost_limit_is_the_lower_of_the_ceiling_and_120_percent_of_the_estimate() -> None:
+    """The owner's run 2 gate rulings: run 2 stops at min(ceiling, 1.2 x estimate), rounded
+    down to the cent, and every limit derives from that one value in ``ceiling_limits``. The
+    gate, the approval check, the worker's specification and the receipt refuse a null,
+    non-finite or non-positive estimate and a written limit that differs from the derived
+    one. Run 1's limits are unchanged."""
+    assert posttrain_ops.estimate_limit_usd(5.80, 3.53) == 4.23  # 4.236
+    assert posttrain_ops.estimate_limit_usd(5.80, 3.25) == 3.90  # 3.9 exactly, not 3.89
+    assert posttrain_ops.estimate_limit_usd(5.80, 5.00) == 5.80  # 6.00: the ceiling binds
+    derived = posttrain_ops.ceiling_limits(5.80, 0.60, gate_estimate_usd=3.53)
+    assert isinstance(derived, posttrain_ops.EstimateLimits)
+    assert (derived.ceiling_usd, derived.gate_estimate_usd, derived.limit_usd) == (5.8, 3.53, 4.23)
+    assert (derived.worker_cost_stop_usd, derived.watchdog_cost_stop_usd) == (4.23, 4.22)
+    assert (derived.wall_seconds, derived.self_destruct_seconds) == (25_380, 25_200)
+    assert derived.wall_seconds == posttrain_ops.ceiling_limits(4.23, 0.60).wall_seconds
+    filled = posttrain_approved.run2_specification(gate_values())
+    for estimate in (None, 0, -1.0, math.inf, math.nan, True, "3.53"):
+        with pytest.raises(ValueError, match="estimate"):
+            posttrain_approved.run2_specification({**gate_values(), "gate_estimate_usd": estimate})
+        changed = copy.deepcopy(filled)
+        changed["limits"]["gate_estimate_usd"] = estimate
+        with pytest.raises(ValueError):
+            posttrain_approved.check_run2(changed)
+        with pytest.raises(ValueError):
+            Specification.from_dict(changed)
+    for written in (5.80, 4.24, 4.22, 4.236):
+        changed = copy.deepcopy(filled)
+        changed["limits"]["cost_limit_usd"] = written
+        with pytest.raises(ValueError, match="differs from its derivation"):
+            posttrain_approved.check_run2(changed)
+        with pytest.raises(ValueError, match="differs from its derivation"):
+            Specification.from_dict(changed)
+    run1 = Specification.load(posttrain_approved.SPECIFICATION_PATH)
+    assert type(run1.ceiling) is posttrain_ops.CeilingLimits
+    assert run1.ceiling == posttrain_ops.ceiling_limits(3.0, 0.60)
 
 
 def test_the_gate_command_takes_its_values_from_the_gates_own_files(
@@ -319,6 +364,9 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
         "run": "1",
         "pod_id": "podpost01",
         "status": "completed",
+        "probe": {"measured_tokens_per_second": {"64": 6_000.0, "256": 12_000.0}},
+        "rates": {"generation_tokens_per_second": 6_000.0, "arc_seconds_per_checkpoint": 40.0},
+        "sft": {"slots_per_second": 60_000.0},
         "artifacts": [
             {
                 "label": "sft-weights",
@@ -337,11 +385,26 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
     write_export(
         "pool", tasks_path=tmp_path / "test.jsonl", output=pool_test, record=tmp_path / "r"
     )
+    screening = tmp_path / "screening.json"
+    rows = [{"task_id": "t", "sample": index, "seconds": 1.5} for index in range(8)]
+    screening.write_text(json.dumps({"format": "rl-screening-v1", "rewards": rows}))
+    from tools.pilot_feasibility import main as feasibility_main
+
+    projection = tmp_path / "feasibility.json"
+    priced = ["posttrain", "--specification", str(TEMPLATE), "--ceiling-usd", "5.80"]
+    priced += ["--quoted-gpu-hourly", "0.59", "--run1-report", str(run1)]
+    assert (
+        feasibility_main([*priced, "--screening", str(screening), "--output", str(projection)]) == 0
+    )
+    capsys.readouterr()
+    estimate = json.loads(projection.read_text())["scenarios"]["run 1's measured rates"]
     output = tmp_path / "spec-2.json"
     argv = [
         "run2-gate",
         "--ceiling-usd",
         "5.80",
+        "--feasibility",
+        str(projection),
         "--run1-report",
         str(run1),
         "--rl-pod-export",
@@ -355,6 +418,15 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
     printed = json.loads(capsys.readouterr().out)
     filled = json.loads(output.read_text())
     assert filled["limits"]["ceiling_usd"] == 5.8
+    # The estimate is the projection's own total at run 1's measured rates, never typed.
+    assert (
+        filled["limits"]["gate_estimate_usd"]
+        == estimate["total_usd"]
+        == printed["gate_estimate_usd"]
+    )
+    assert filled["limits"]["cost_limit_usd"] == posttrain_ops.estimate_limit_usd(
+        5.8, estimate["total_usd"]
+    )
     assert filled["inputs"]["sft-weights"] == {
         "kind": "checkpoint",
         "key": "posttrain-runs/1/podpost01/sft-weights/checkpoint.pt",
@@ -369,9 +441,22 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
 
     assert printed["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
     assert posttrain_approved.main(argv) == 1  # A launch specification is never rewritten.
+    other = [*argv[:-1], str(tmp_path / "other.json")]
+    # A projection of another run 1 report, at another price or of another template is refused.
+    for change in (
+        {"gate_estimate_usd": None},
+        {"quoted_gpu_hourly": 0.65},
+        {"quoted_total_hourly": 0.70},
+        {"specification_sha256": "0" * 64},
+        {"measured": {"sources": {"report_sha256": "0" * 64}}},
+    ):
+        edited = tmp_path / "edited-feasibility.json"
+        edited.write_text(json.dumps({**json.loads(projection.read_text()), **change}))
+        index = other.index("--feasibility") + 1
+        assert posttrain_approved.main([*other[:index], str(edited), *other[index + 1 :]]) == 1
     report["status"] = "stopped"
     run1.write_text(json.dumps(report))
-    assert posttrain_approved.main([*argv[:-1], str(tmp_path / "other.json")]) == 1
+    assert posttrain_approved.main(other) == 1
     assert weights.exists()
 
 

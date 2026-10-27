@@ -1,8 +1,9 @@
 """The owner-approved definitions of post-training runs 1 and 2, in one place.
 
 Run 2 (below run 1's values): ``run2_specification()`` is the tracked template
-``configs/rehearsal-a40-s-post-2.json``, every gate value ``null`` (the ceiling, run 1's
-selected SFT weights, the three ``rl-pod-export`` files and the pool test export);
+``configs/rehearsal-a40-s-post-2.json``, every gate value ``null`` (the ceiling, the gate's
+estimate and the cost limit it derives, run 1's selected SFT weights, the three
+``rl-pod-export`` files and the pool test export);
 ``python -m tools.posttrain_approved run2-gate`` fills them from the gate's own files and writes
 the launch specification, and ``check_run2`` is what the readiness receipt applies to it. Its
 protocol is the proposal's, frozen at approval (RL, the more-SFT control, ARC-Easy and the
@@ -38,7 +39,9 @@ post-training proposal as approved on 2026-10-26 and the owner's later rulings:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -365,9 +368,17 @@ def write_specification(path: Path = SPECIFICATION_PATH) -> None:
 # Run 2 --------------------------------------------------------------------------------------
 
 SPECIFICATION_PATH_2 = SPECIFICATION_PATH.with_name("rehearsal-a40-s-post-2.json")
-RUN2_LIMITS: dict[str, Any] = {**LIMITS, "ceiling_usd": None, "startup_seconds": 900}
-"""Run 2's limits: the ceiling (about $5.80) is fixed at the owner's gate from run 1's
-measured rates; setup fetches only the 541 MB SFT weights, so its allowance is 900 s."""
+RUN2_LIMITS: dict[str, Any] = {
+    **LIMITS,
+    "ceiling_usd": None,
+    "gate_estimate_usd": None,
+    "cost_limit_usd": None,
+    "startup_seconds": 900,
+}
+"""Run 2's limits: the ceiling (about $5.80) and the estimate are fixed at the owner's gate
+from run 1's measured rates, and the cost limit every other limit derives from is the lower of
+the ceiling and 120% of the estimate (the owner's run 2 gate rulings); setup fetches only the
+541 MB SFT weights, so its allowance is 900 s."""
 RUN2_PLANNING = {
     "generation_tokens_per_second": {"64": 5_000.0, "256": 10_000.0},
     "training_slots_per_second": 56_765.0,
@@ -543,16 +554,33 @@ def _sha256_hex(value: object, name: str) -> str:
     return value
 
 
+GATE_KEYS = ("ceiling_usd", "gate_estimate_usd", *GATED_INPUTS)
+"""What the gate gives: the owner's ceiling, the projection's estimate and each gated pin."""
+
+
 def fill_gate(raw: Mapping[str, Any], gate: Mapping[str, Any]) -> dict[str, Any]:
-    """The template with the gate's values: ``ceiling_usd`` and, for each gated input, its
-    pin (``sft-weights``: key, size_bytes, sha256; the others: size_bytes, sha256)."""
-    if set(gate) != {"ceiling_usd", *GATED_INPUTS}:
-        raise ValueError(f"the gate gives exactly ceiling_usd and {list(GATED_INPUTS)}")
+    """The template with the gate's values: ``ceiling_usd``, ``gate_estimate_usd`` and the
+    cost limit they derive (``posttrain_ops.estimate_limit_usd``), and for each gated input
+    its pin (``sft-weights``: key, size_bytes, sha256; the others: size_bytes, sha256)."""
+    from tools.posttrain_ops import estimate_limit_usd
+
+    if set(gate) != set(GATE_KEYS):
+        raise ValueError(f"the gate gives exactly {list(GATE_KEYS)}")
     filled: dict[str, Any] = json.loads(json.dumps(raw))
     ceiling = gate["ceiling_usd"]
     if isinstance(ceiling, bool) or not isinstance(ceiling, int | float) or not 0 < ceiling:
         raise ValueError("the gate's ceiling must be a positive number of dollars")
     filled["limits"]["ceiling_usd"] = float(ceiling)
+    estimate = gate["gate_estimate_usd"]
+    if (
+        isinstance(estimate, bool)
+        or not isinstance(estimate, int | float)
+        or not math.isfinite(estimate)
+        or not 0 < estimate
+    ):
+        raise ValueError("the gate's estimate must be a positive, finite number of dollars")
+    filled["limits"]["gate_estimate_usd"] = float(estimate)
+    filled["limits"]["cost_limit_usd"] = estimate_limit_usd(float(ceiling), float(estimate))
     for name in GATED_INPUTS:
         pin = gate[name]
         fields = (
@@ -564,9 +592,9 @@ def fill_gate(raw: Mapping[str, Any], gate: Mapping[str, Any]) -> dict[str, Any]
             raise ValueError(f"the gate's {name} size must be a positive integer")
         _sha256_hex(pin["sha256"], f"the gate's {name} SHA-256")
         filled["inputs"][name].update(pin)
-    from tools.posttrain_ops import ceiling_limits
+    from tools.posttrain_ops import specification_limits
 
-    ceiling_limits(float(ceiling), float(filled["limits"]["quoted_total_hourly"]))
+    specification_limits(filled)  # The limits the cost limit derives must exist.
     return filled
 
 
@@ -586,7 +614,10 @@ RUN2_APPROVED_SECTIONS = (
 def check_run2(raw: Mapping[str, Any]) -> None:
     """Refuse a run-2 launch specification that differs from the approved one, or in which any
     gate value is still ``null``: every approved section equal, the limits equal but for the
-    gate's ceiling, every input pin equal but for the gate's."""
+    gate's ceiling, estimate and cost limit, every input pin equal but for the gate's. The
+    estimate must be a positive, finite number of dollars and the written cost limit exactly
+    the lower of the ceiling and 120% of it (``posttrain_ops.specification_limits``)."""
+    from tools.posttrain_ops import RUN2_GATE_LIMITS, specification_limits
     from tools.posttrain_run import gate_nulls
 
     approved = run2_specification()
@@ -598,8 +629,8 @@ def check_run2(raw: Mapping[str, Any]) -> None:
     differ = [name for name in RUN2_APPROVED_SECTIONS if raw.get(name) != approved[name]]
     limits = raw.get("limits", {})
     if not isinstance(limits, Mapping) or {
-        key: value for key, value in limits.items() if key != "ceiling_usd"
-    } != {key: value for key, value in approved["limits"].items() if key != "ceiling_usd"}:
+        key: value for key, value in limits.items() if key not in RUN2_GATE_LIMITS
+    } != {key: value for key, value in approved["limits"].items() if key not in RUN2_GATE_LIMITS}:
         differ.append("limits")
     inputs = raw.get("inputs", {})
     if not isinstance(inputs, Mapping) or set(inputs) != set(approved["inputs"]):
@@ -611,6 +642,7 @@ def check_run2(raw: Mapping[str, Any]) -> None:
                     differ.append(f"inputs.{name}.{field}")
     if differ:
         raise ValueError(f"the specification differs from the approved run 2 in {differ}")
+    specification_limits(raw)
 
 
 def write_specification_2(path: Path = SPECIFICATION_PATH_2) -> None:
@@ -665,11 +697,59 @@ def pod_export_pins(directory: Path) -> dict[str, dict[str, Any]]:
     return pins
 
 
+MEASURED_SCENARIO = "run 1's measured rates"
+"""The run 2 projection's scenario whose total is the gate's estimate."""
+
+
+def gate_estimate(feasibility: Path, *, run1_report: Path) -> float:
+    """The gate's estimate, read from the run 2 projection's own output
+    (``python -m tools.pilot_feasibility posttrain ... --output``), never typed: the total in
+    dollars of its scenario at run 1's measured rates. The projection must be of the approved
+    template, from this run 1 report, at the approved quoted price or below it."""
+    from scratchcoder.data.shards import file_sha256
+
+    report = json.loads(feasibility.read_text(encoding="utf-8"))
+    template = (json.dumps(run2_specification(), indent=2) + "\n").encode()
+    if (
+        not isinstance(report, dict)
+        or report.get("kind") != "posttrain-feasibility"
+        or report.get("run") != "2"
+    ):
+        raise ValueError(f"{feasibility} is not run 2's cost projection")
+    if report.get("specification_sha256") != hashlib.sha256(template).hexdigest():
+        raise ValueError("the projection priced another specification than the run-2 template")
+    sources = (report.get("measured") or {}).get("sources") or {}
+    if sources.get("report_sha256") != file_sha256(run1_report):
+        raise ValueError("the projection's measured rates are not from this run 1 report")
+    limits = RUN2_LIMITS
+    if report.get("quoted_total_hourly") != limits["quoted_total_hourly"]:
+        raise ValueError("the projection is not priced at the specification's quoted rate")
+    gpu = report.get("quoted_gpu_hourly")
+    if not isinstance(gpu, int | float) or gpu > limits["quoted_gpu_hourly"]:
+        raise ValueError("the projection's GPU price is above the approved quote: ask the owner")
+    estimate = (report.get("scenarios") or {}).get(MEASURED_SCENARIO, {}).get("total_usd")
+    if (
+        isinstance(estimate, bool)
+        or not isinstance(estimate, int | float)
+        or not math.isfinite(estimate)
+        or estimate <= 0
+        or report.get("gate_estimate_usd") != estimate
+    ):
+        raise ValueError("the projection gives no estimate at run 1's measured rates")
+    return float(estimate)
+
+
 def gate_values(
-    *, ceiling_usd: float, run1_report: Path, rl_pod_export: Path, pool_test_export: Path
+    *,
+    ceiling_usd: float,
+    feasibility: Path,
+    run1_report: Path,
+    rl_pod_export: Path,
+    pool_test_export: Path,
 ) -> dict[str, Any]:
-    """Every run-2 gate value from the gate's own files: the owner's ceiling, run 1's verified
-    report, the ``rl-pod-export`` directory and the pool test export."""
+    """Every run-2 gate value from the gate's own files: the owner's ceiling, the run 2
+    projection's estimate, run 1's verified report, the ``rl-pod-export`` directory and the
+    pool test export."""
     from scratchcoder.data.shards import file_sha256
     from tools.posttrain_binding import require_export
 
@@ -678,6 +758,7 @@ def gate_values(
         raise ValueError(f"the pool test export holds {count} tasks, not {POOL_TASKS}")
     return {
         "ceiling_usd": ceiling_usd,
+        "gate_estimate_usd": gate_estimate(feasibility, run1_report=run1_report),
         "sft-weights": run1_sft_weights(run1_report),
         **pod_export_pins(rl_pod_export),
         "pool-test": {
@@ -691,13 +772,18 @@ def main(argv: list[str] | None = None) -> int:
     """``run2-gate``: write run 2's launch specification from the gate's values (Mac);
     ``write-template``: rewrite the tracked run-2 template."""
     import argparse
-    import hashlib
     import sys
 
     parser = argparse.ArgumentParser(description=main.__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     gate = commands.add_parser("run2-gate", help="fill run 2's gate values (Mac, at the gate)")
     gate.add_argument("--ceiling-usd", type=float, required=True, help="the owner's ceiling")
+    gate.add_argument(
+        "--feasibility",
+        type=Path,
+        required=True,
+        help="the run 2 projection's --output at run 1's measured rates (its estimate)",
+    )
     gate.add_argument("--run1-report", type=Path, required=True, help="run 1's verified report")
     gate.add_argument("--rl-pod-export", type=Path, required=True, help="the rl-pod-export dir")
     gate.add_argument("--pool-test-export", type=Path, required=True)
@@ -713,6 +799,7 @@ def main(argv: list[str] | None = None) -> int:
             raise FileExistsError(f"{args.output} already exists; a launch spec is never rewritten")
         values = gate_values(
             ceiling_usd=args.ceiling_usd,
+            feasibility=args.feasibility,
             run1_report=args.run1_report,
             rl_pod_export=args.rl_pod_export,
             pool_test_export=args.pool_test_export,
@@ -728,9 +815,13 @@ def main(argv: list[str] | None = None) -> int:
     data = (json.dumps(filled, indent=2) + "\n").encode()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(data)
-    print(
-        json.dumps({"specification": str(args.output), "sha256": hashlib.sha256(data).hexdigest()})
-    )
+    limits = filled["limits"]
+    printed = {
+        "specification": str(args.output),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        **{key: limits[key] for key in ("ceiling_usd", "gate_estimate_usd", "cost_limit_usd")},
+    }
+    print(json.dumps(printed))
     return 0
 
 

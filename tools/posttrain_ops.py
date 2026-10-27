@@ -14,6 +14,14 @@ For run 1 at $0.60/h: $3.00, $2.99, 18,000 s and 17,820 s. The worker, the readi
 receipt, the runbook's watchdog policy and the bootstrap's timer limit all take them from
 here (``limits`` prints them), and the receipt and the worker refuse anything weaker.
 
+Run 2 adds a stop at 120% of the gate's estimate (the owner's run 2 gate rulings). Its gate
+writes the estimate (``limits.gate_estimate_usd``, the run 2 projection at run 1's measured
+rates and the gate's quoted price) and the limit it gives (``limits.cost_limit_usd``): the
+lower of the ceiling and 120% of the estimate, rounded down to the cent
+(``estimate_limit_usd``). Every limit above then derives from that limit in place of the
+ceiling, in the same place (``ceiling_limits`` with ``gate_estimate_usd``), and a run-2
+specification whose written limit differs from its derivation is refused.
+
 Run 2 waits on the Mac's RL rewards and dev verdicts through the reward bridge. Its bounds
 on one wait are derived here too, in one place (``bridge_timeouts``): the Pod's reward and
 dev timeouts, the Mac's ``--reward-timeout`` and ``--dev-timeout``, the Mac's checks before it
@@ -125,6 +133,10 @@ LIMIT_KEYS = frozenset(
         "startup_seconds",
     }
 )
+RUN2_LIMIT_KEYS = LIMIT_KEYS | {"gate_estimate_usd", "cost_limit_usd"}
+"""Run 2's ``limits``: run 1's keys, the gate's estimate and the limit it derives."""
+ESTIMATE_STOP_FRACTION = 1.2
+"""Run 2 stops at 120% of the gate's estimate when that is below the ceiling."""
 _SAFE_POD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
@@ -154,19 +166,59 @@ class CeilingLimits:
         return float(origin) + self.self_destruct_seconds
 
 
+@dataclass(frozen=True)
+class EstimateLimits(CeilingLimits):
+    """Run 2's limits: ``CeilingLimits`` derived from ``limit_usd``, the lower of the
+    ceiling and 120% of the gate's estimate; ``ceiling_usd`` stays the owner's ceiling."""
+
+    gate_estimate_usd: float
+    estimate_stop_fraction: float
+    limit_usd: float
+
+
+def estimate_limit_usd(ceiling_usd: float, gate_estimate_usd: object) -> float:
+    """The lower of the ceiling and 120% of the gate's estimate, rounded down to the cent so
+    it never exceeds either. A null, non-finite or non-positive estimate is refused."""
+    if gate_estimate_usd is None:
+        raise ValueError(
+            "limits.gate_estimate_usd is null: the estimate is fixed at the owner's gate "
+            "(python -m tools.posttrain_approved run2-gate)"
+        )
+    estimate = _positive(gate_estimate_usd, "the gate's estimate")
+    ceiling = _positive(ceiling_usd, "the ceiling")
+    cents = math.floor(round(ESTIMATE_STOP_FRACTION * estimate * 100, 6))
+    return min(ceiling, cents / 100)
+
+
 def ceiling_limits(
     ceiling_usd: float,
     quoted_total_hourly: float,
     *,
     self_destruct_margin_seconds: float = SELF_DESTRUCT_MARGIN_SECONDS,
     watchdog_margin_usd: float = WATCHDOG_MARGIN_USD,
+    gate_estimate_usd: float | None = None,
 ) -> CeilingLimits:
     """The run's limits from its dollar ceiling: the one place they are derived.
 
     The wall is the ceiling's worth of whole seconds at the quoted rate, rounded down, so
     the wall's quoted cost never exceeds the ceiling. It must fit the in-Pod timer's
-    absolute 60,000 s cap.
+    absolute 60,000 s cap. With ``gate_estimate_usd`` (run 2) every limit derives from
+    ``estimate_limit_usd`` instead, and the record is an ``EstimateLimits``.
     """
+    if gate_estimate_usd is not None:
+        limit = estimate_limit_usd(ceiling_usd, gate_estimate_usd)
+        derived = ceiling_limits(
+            limit,
+            quoted_total_hourly,
+            self_destruct_margin_seconds=self_destruct_margin_seconds,
+            watchdog_margin_usd=watchdog_margin_usd,
+        )
+        return EstimateLimits(
+            **{**asdict(derived), "ceiling_usd": _positive(ceiling_usd, "the ceiling")},
+            gate_estimate_usd=float(gate_estimate_usd),
+            estimate_stop_fraction=ESTIMATE_STOP_FRACTION,
+            limit_usd=limit,
+        )
     ceiling = _positive(ceiling_usd, "the ceiling")
     hourly = _positive(quoted_total_hourly, "the quoted total hourly rate")
     margin = _positive(self_destruct_margin_seconds, "the self-destruct margin")
@@ -192,17 +244,32 @@ def ceiling_limits(
     )
 
 
-def read_limits(raw: Mapping[str, Any], *, allow_null: Sequence[str] = ()) -> dict[str, Any]:
-    """A specification's ``limits`` object, exactly ``LIMIT_KEYS``, each a positive number;
-    ``allow_null`` names keys that may still be ``null`` (run 2's ceiling before the gate)."""
-    if not isinstance(raw, Mapping) or set(raw) != LIMIT_KEYS:
-        raise ValueError(f"limits must have exactly the keys {sorted(LIMIT_KEYS)}")
-    for key in LIMIT_KEYS:
+RUN2_GATE_LIMITS = ("ceiling_usd", "gate_estimate_usd", "cost_limit_usd")
+"""Run 2's limits fixed at the owner's gate, ``null`` in the tracked template."""
+
+
+def limit_keys(specification: Mapping[str, Any]) -> frozenset[str]:
+    """The keys a specification's ``limits`` must have: run 2's include the gate estimate."""
+    return RUN2_LIMIT_KEYS if specification.get("run") == "2" else LIMIT_KEYS
+
+
+def read_limits(
+    raw: Mapping[str, Any],
+    *,
+    allow_null: Sequence[str] = (),
+    keys: frozenset[str] = LIMIT_KEYS,
+) -> dict[str, Any]:
+    """A specification's ``limits`` object, exactly ``keys`` (``LIMIT_KEYS``; run 2's
+    ``RUN2_LIMIT_KEYS``), each a positive number; ``allow_null`` names keys that may still be
+    ``null`` (run 2's gate values before the gate)."""
+    if not isinstance(raw, Mapping) or set(raw) != keys:
+        raise ValueError(f"limits must have exactly the keys {sorted(keys)}")
+    for key in sorted(keys):
         if raw[key] is None and key in allow_null:
             continue
-        if raw[key] is None and key == "ceiling_usd":
+        if raw[key] is None and key in RUN2_GATE_LIMITS:
             raise ValueError(
-                "limits.ceiling_usd is null: the ceiling is fixed at the owner's gate "
+                f"limits.{key} is null: it is fixed at the owner's gate "
                 "(python -m tools.posttrain_approved run2-gate)"
             )
         _positive(raw[key], f"limits.{key}")
@@ -210,14 +277,24 @@ def read_limits(raw: Mapping[str, Any], *, allow_null: Sequence[str] = ()) -> di
 
 
 def specification_limits(specification: Mapping[str, Any]) -> CeilingLimits:
-    """``ceiling_limits`` for a specification file's ``limits`` object."""
-    limits = read_limits(specification.get("limits", {}))
-    return ceiling_limits(
+    """``ceiling_limits`` for a specification file's ``limits`` object. Run 2's derive from
+    the lower of the ceiling and 120% of the gate's estimate, and its written
+    ``cost_limit_usd`` must be exactly that limit."""
+    limits = read_limits(specification.get("limits", {}), keys=limit_keys(specification))
+    derived = ceiling_limits(
         limits["ceiling_usd"],
         limits["quoted_total_hourly"],
         self_destruct_margin_seconds=limits["self_destruct_margin_seconds"],
         watchdog_margin_usd=limits["watchdog_margin_usd"],
+        gate_estimate_usd=limits.get("gate_estimate_usd"),
     )
+    if isinstance(derived, EstimateLimits) and limits["cost_limit_usd"] != derived.limit_usd:
+        raise ValueError(
+            f"limits.cost_limit_usd ({limits['cost_limit_usd']}) differs from its derivation, "
+            f"the lower of the ${derived.ceiling_usd:.2f} ceiling and 120% of the "
+            f"${derived.gate_estimate_usd:.2f} estimate: {derived.limit_usd}"
+        )
+    return derived
 
 
 # Run 2's reward bridge: every bound on one wait, derived in one place -----------------------
@@ -454,7 +531,11 @@ def specification_bridge_timeouts(specification: Mapping[str, Any]) -> BridgeTim
     rl = specification.get("rl")
     if not isinstance(rl, Mapping):
         raise ValueError("a specification with a bridge needs its rl section")
-    limits = read_limits(specification.get("limits", {}), allow_null=("ceiling_usd",))
+    limits = read_limits(
+        specification.get("limits", {}),
+        allow_null=RUN2_GATE_LIMITS,
+        keys=limit_keys(specification),
+    )
     derived = bridge_timeouts(
         attempts_per_request=rl["tasks_per_update"] * rl["group_size"],
         dev_programs=rl["dev_tasks"] * (rl["dev_samples"] + 1),

@@ -20,7 +20,9 @@
     "pod_idle_seconds": 900,
     "max_transfer_seconds": 900,
     "finalization_reserve_seconds": 900,
-    "startup_seconds": 900
+    "startup_seconds": 900,
+    "gate_estimate_usd": null,
+    "cost_limit_usd": null
   },
   "planning": {
     "generation_tokens_per_second": {

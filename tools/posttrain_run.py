@@ -312,6 +312,8 @@ RUN2_STAGE_KEYS = {
 }
 RUN2_GATE_FIELDS: tuple[tuple[str, ...], ...] = (
     ("limits", "ceiling_usd"),
+    ("limits", "gate_estimate_usd"),
+    ("limits", "cost_limit_usd"),
     ("inputs", "sft-weights", "key"),
     ("inputs", "sft-weights", "size_bytes"),
     ("inputs", "sft-weights", "sha256"),
@@ -325,9 +327,11 @@ RUN2_GATE_FIELDS: tuple[tuple[str, ...], ...] = (
     ("inputs", "pool-test", "sha256"),
 )
 """Run 2's values fixed at the owner's gate, ``null`` in the tracked specification: the ceiling
-(re-priced from run 1's measured rates), run 1's selected SFT weights (key, size, SHA-256),
-the three ``rl-pod-export`` files and the pool test export. The worker and the readiness
-receipt refuse a specification in which any is still ``null``."""
+(re-priced from run 1's measured rates), the gate's estimate (the run 2 projection at run 1's
+measured rates) and the cost limit it derives (the lower of the ceiling and 120% of the
+estimate, ``posttrain_ops.estimate_limit_usd``), run 1's selected SFT weights (key, size,
+SHA-256), the three ``rl-pod-export`` files and the pool test export. The worker and the
+readiness receipt refuse a specification in which any is still ``null``."""
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,47}\Z")
 
 
@@ -648,9 +652,15 @@ class Specification:
                 "gate (python -m tools.posttrain_approved run2-gate)"
             )
         model = ModelConfig(**_exact(top["model"], set(ModelConfig.__dataclass_fields__), "model"))
-        limits = posttrain_ops.read_limits(top["limits"], allow_null=("ceiling_usd",))
-        if top["limits"]["ceiling_usd"] is not None:
-            posttrain_ops.specification_limits(top)  # The derived limits must exist.
+        limits = posttrain_ops.read_limits(
+            top["limits"],
+            allow_null=posttrain_ops.RUN2_GATE_LIMITS,
+            keys=posttrain_ops.RUN2_LIMIT_KEYS,
+        )
+        if all(limits[key] is not None for key in posttrain_ops.RUN2_GATE_LIMITS):
+            # The limits exist, and the written cost limit is the lower of the ceiling and
+            # 120% of the gate's estimate.
+            posttrain_ops.specification_limits(top)
         planning = _exact(top["planning"], RUN2_PLANNING_KEYS, "planning")
         rates = _rates(planning["generation_tokens_per_second"], "planning rates")
         for name in RUN2_PLANNING_KEYS - {"generation_tokens_per_second"}:
@@ -1004,7 +1014,8 @@ class Launch:
 
 
 def check_policy(policy: Policy, spec: Specification) -> None:
-    """The watchdog policy carries the limits ``ceiling_limits`` derives, or stricter ones."""
+    """The watchdog policy carries the limits ``ceiling_limits`` derives, or stricter ones;
+    run 2's wall and cost stop are exactly the ones derived from its cost limit."""
     derived = spec.ceiling
     if (
         policy.mode != "posttrain"
@@ -1014,6 +1025,14 @@ def check_policy(policy: Policy, spec: Specification) -> None:
         or policy.quoted_total_hourly < derived.quoted_total_hourly
     ):
         raise ValueError("the watchdog policy is weaker than the ceiling-derived limits")
+    if spec.run == "2" and (
+        policy.max_wall_seconds != derived.wall_seconds
+        or policy.max_cost_usd != derived.watchdog_cost_stop_usd
+    ):
+        raise ValueError(
+            "the watchdog policy's wall or cost stop differs from the limits derived from run "
+            "2's cost limit (posttrain_ops limits --policy-output writes them)"
+        )
     if policy.max_transfer_seconds != spec.max_transfer_seconds:
         raise ValueError("the watchdog's transfer window differs from the specification's")
     # Run 2's bounded idle extension while the Pod awaits the Mac is exactly the derived

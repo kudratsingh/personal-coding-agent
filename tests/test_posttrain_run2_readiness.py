@@ -34,6 +34,7 @@ def gated() -> dict[str, Any]:
     return posttrain_approved.run2_specification(
         {
             "ceiling_usd": 5.80,
+            "gate_estimate_usd": 3.53,
             "sft-weights": {"key": f"posttrain-runs/1/{POD}/sft-weights/checkpoint.pt", **PIN},
             "rl-tasks": dict(PIN),
             "rl-dev": dict(PIN),
@@ -185,9 +186,11 @@ def test_the_run_two_receipt_is_exactly_what_the_worker_accepts(tmp_path: Path) 
     arguments = evidence(tmp_path)
     receipt = build_receipt(**arguments, now=NOW)
     assert receipt["run"] == "2" and receipt["r2_run_prefix"] == f"posttrain-runs/2/{POD}/"
-    assert receipt["limits"]["wall_seconds"] == 34_800
-    assert receipt["limits"]["self_destruct_seconds"] == 34_620
-    assert receipt["limits"]["watchdog_cost_stop_usd"] == 5.79
+    # Every limit from the $4.23 cost limit, 120% of the $3.53 estimate.
+    assert receipt["limits"]["limit_usd"] == 4.23 and receipt["limits"]["ceiling_usd"] == 5.8
+    assert receipt["limits"]["wall_seconds"] == 25_380
+    assert receipt["limits"]["self_destruct_seconds"] == 25_200
+    assert receipt["limits"]["watchdog_cost_stop_usd"] == 4.22
     assert receipt["watchdog_policy"]["awaiting_dev_extension_seconds"] == 11_806.5
     assert receipt["bridge_timeouts"]["reward_timeout_seconds"] == 7_854.5
     assert receipt["time_fit"]["fits_at_planning"]
@@ -200,7 +203,7 @@ def test_the_run_two_receipt_is_exactly_what_the_worker_accepts(tmp_path: Path) 
         preflight_sha256=receipt["preflight_sha256"],
         heartbeat=DEFAULT_HEARTBEAT,
     )
-    assert launch.end == arguments["billing_origin_unix"] + 34_620
+    assert launch.end == arguments["billing_origin_unix"] + 25_200
 
 
 def no_extension(policy: dict[str, Any]) -> None:
@@ -215,11 +218,21 @@ def parents_copied(copy: dict[str, Any]) -> None:
     copy["inputs"] = []
 
 
+def the_ceilings_wall(policy: dict[str, Any]) -> None:
+    policy["max_wall_seconds"] = 34_800  # The $5.80 ceiling's wall, not the $4.23 limit's.
+
+
+def a_stricter_cost_stop(policy: dict[str, Any]) -> None:
+    policy["max_cost_usd"] = 4.00  # Written by hand: not the derived $4.22.
+
+
 @pytest.mark.parametrize(
     "name, change, message",
     [
         ("policy", no_extension, "not the derived bound"),
         ("policy", longer_extension, "not the derived bound"),
+        ("policy", the_ceilings_wall, "weaker than the ceiling-derived limits"),
+        ("policy", a_stricter_cost_stop, "differs from the limits derived from run 2's"),
         ("mac-copy", parents_copied, "exactly"),
     ],
 )
@@ -239,3 +252,21 @@ def test_the_template_and_unapproved_values_are_refused(tmp_path: Path) -> None:
     changed["rl"]["learning_rate"] = 1e-5
     with pytest.raises(ValueError, match="approved run 2"):
         build_receipt(**evidence(tmp_path / "b", raw=changed), now=NOW)
+
+
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("cost_limit_usd", 5.80, "differs from its derivation"),
+        ("gate_estimate_usd", None, "still null"),
+        ("gate_estimate_usd", -3.53, "positive"),
+        ("gate_estimate_usd", 0, "positive"),
+    ],
+)
+def test_the_receipt_refuses_a_bad_estimate_or_a_written_limit_off_its_derivation(
+    tmp_path: Path, field: str, value: Any, message: str
+) -> None:
+    raw = gated()
+    raw["limits"][field] = value
+    with pytest.raises(ValueError, match=message):
+        build_receipt(**evidence(tmp_path, raw=raw), now=NOW)

@@ -13,6 +13,7 @@ from tools.pilot_feasibility import (
     render_posttrain2_markdown,
     run1_measured_rates,
 )
+from tools.posttrain_ops import estimate_limit_usd
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "configs" / "rehearsal-a40-s-post-2.json"
 
@@ -93,6 +94,27 @@ def test_run_ones_records_give_the_measured_rates(tmp_path: Path) -> None:
     assert measured["total_usd"] < projected["scenarios"]["planning speeds"]["total_usd"] + 1
     text = render_posttrain2_markdown(projected)
     assert "## run 1's measured rates" in text and "| **Total** |" in text
+    # The gate's estimate is this scenario's total, and the stop it gives is derived as the
+    # worker derives it: the lower of the ceiling and 120% of the estimate.
+    assert projected["gate_estimate_usd"] == measured["total_usd"]
+    assert f"**The gate's estimate: ${measured['total_usd']:.4f}**" in text
+    stopped = measured["limits_at_this_estimate"]
+    assert stopped["limit_usd"] == estimate_limit_usd(5.80, measured["total_usd"])
+    assert stopped["ceiling_usd"] == 5.80 and stopped["gate_estimate_usd"] == measured["total_usd"]
+    assert measured["fits_lifetime_at_this_estimate"]
+    assert posttrain2_report(TEMPLATE, ceiling_usd=5.80)["gate_estimate_usd"] is None
+
+
+def test_the_projection_names_the_template_it_priced() -> None:
+    import hashlib
+
+    report = posttrain2_report(TEMPLATE, ceiling_usd=5.80)
+    assert report["specification_sha256"] == hashlib.sha256(TEMPLATE.read_bytes()).hexdigest()
+    planned = report["scenarios"]["planning speeds"]
+    # At the planning speeds the estimate would be $3.53 and the stop $4.23, a 25,380 s wall.
+    assert planned["limits_at_this_estimate"]["limit_usd"] == 4.23
+    assert planned["limits_at_this_estimate"]["wall_seconds"] == 25_380
+    assert report["limits"]["ceiling_usd"] == 5.80 and report["limits"]["wall_seconds"] == 34_800
 
 
 def test_the_cli_prints_the_proposals_table_for_run_two(
