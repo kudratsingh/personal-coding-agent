@@ -8,14 +8,31 @@ the reward bridge:
   kept tasks, with the Mac's facts in place of their hidden tests; rewards through
   ``BridgeRewardSource`` and dev checks through ``BridgeDevEvaluator`` (one ``BridgeClient``
   for the run). ``on_check`` uploads each dev check's weights at once as its own weights-only
-  label (``rl-check-<update>``). A reward-wait timeout, a lost bridge, a margin stop or a
-  limit ends the run (the control needs the bridge too) after the latest weights are uploaded;
-  any other stop is a result and the control runs.
+  label (``rl-check-<update>``).
 - ``more-sft``: ``scratchcoder.rl.control.run_more_sft`` from the same SFT weights on the kept
   tasks' references, its GPU-busy budget RL's measured busy seconds, RL's attention kernel,
   its checks' weights uploaded at once (``more-sft-check-<step>``), its dev checks through
   the bridge.
 - ``arc`` and ``eval`` stages read ``rl`` and ``more-sft``: each arm's selected checkpoint.
+
+How an arm's stop is handled (the owner's run 2 gate rulings, ``ARM_STOP_RULE``): a wall or
+cost stop ends the run, as in run 1. A stop of the Mac's side (``reward_wait`` on either side,
+``reward_host_failure``, ``bridge_lost``) or a margin stop (``wait_margin``) ends only that
+arm's training, after its latest weights are uploaded: the arm's endpoint is selected from
+the dev checks already scored, the stages that need no Mac wait continue under the
+projected-finish rule, the reserve and every limit, and the run then finalizes as
+``stopped`` with that arm's reason. A channel stop in either arm and a margin stop in RL
+leave the control unevaluated (it needs the Mac for its dev checks); a margin stop in the
+control evaluates both arms as the projected-finish rule admits them (when both do not fit
+but RL's alone does, the control is left unevaluated and RL's is evaluated). With no RL dev
+check scored there is nothing to select and the run ends at once. Any other stop is a result
+and the run goes on.
+
+Same weights (``SAME_WEIGHTS_RULE``): when an arm's selected checkpoint holds the SFT weights
+the run loaded, compared tensor by tensor and bit for bit, the arm is not evaluated again on
+the Pod (no ARC entry, no ``eval-<arm>`` files). ``report.json``'s
+``selection.endpoints.<arm>`` records the comparison and that run 1's SFT results, pinned in
+the specification's ``sft_results``, stand for it: not an independent measurement.
 
 Liveness while the Pod waits on the Mac (``RUN2_LIVENESS``): the client's sleep is the
 worker's ``wait_sleep``, so a wait heartbeats ``awaiting_rewards`` with the client's
@@ -54,7 +71,7 @@ from scratchcoder.rl.bridge import (
     read_bounded,
 )
 from scratchcoder.rl.bridge_mac import LEASE_FILE, LEASE_FORMAT
-from scratchcoder.rl.checkpoint import load_weights
+from scratchcoder.rl.checkpoint import compare_to_loaded, load_weights
 from scratchcoder.rl.control import ControlResult, run_more_sft
 from scratchcoder.rl.dev import ConstantBaseline, dev_subset
 from scratchcoder.rl.facts import constant_baseline_from_facts, load_facts
@@ -70,6 +87,8 @@ from tools.posttrain_run import (
     CONTROL_REFERENCE,
     RESERVE_STOP,
     RL_REFERENCE,
+    SFT_ARC,
+    SFT_RESULT_FILES,
     WAIT_MARGIN_STOP,
     EvalFile,
     PosttrainWorker,
@@ -87,20 +106,38 @@ RUN2_LIVENESS = (
     "and every exchange the worker stops (wait_margin) unless one full wait fits before the "
     "cost stop, the wall and the finalization reserve"
 )
-RL_STOPS_ENDING_THE_RUN = frozenset({*CHANNEL_STOPS, EXTERNAL})
-"""Stops of either arm after which the run ends: the execution side failed or was lost
-(``reward_wait``, ``reward_host_failure``) or a limit asked to stop (``external``). Any other
-RL stop (completed, collapse, dev patience, leakage, non-finite) is a result: the control
-runs. The control's budget, passes-exhausted or non-finite stop is a result too."""
+ARM_STOPS = frozenset({*CHANNEL_STOPS, EXTERNAL})
+"""The stops of either arm that are not a result: the execution side failed or was lost
+(``reward_wait``, ``reward_host_failure``; ``bridge_lost`` and ``wait_margin`` reach the arm as
+one of these) or ``should_stop`` asked (``external``: a limit or the margin). Any other RL stop
+(completed, collapse, dev patience, leakage, non-finite) is a result: the control runs. The
+control's budget, passes-exhausted or non-finite stop is a result too."""
+CHANNEL = "channel"
+MARGIN = "margin"
+LIMIT = "limit"
+ARM_STOP_RULE = (
+    "a wall or cost stop ends the run; a stop of the Mac's side (reward_wait, "
+    "reward_host_failure, bridge_lost) or a wait_margin stop ends only that arm's training: "
+    "its latest weights are uploaded, its endpoint is selected from the dev checks already "
+    "scored, and the stages that need no Mac wait run under the projected-finish rule, the "
+    "finalization reserve and every limit; the control is skipped after any such stop in RL, "
+    "and not evaluated after a stop of the Mac's side in the control; after a margin stop in "
+    "the control each arm is evaluated as the projected-finish rule admits it, RL's first; "
+    "with no RL dev check scored the run ends"
+)
 SELECTION_RULE = (
     "the selectable check with the highest dev-subset greedy pass@1; ties to the higher "
     "8-sample mean pass rate, then to the later check"
 )
-IDENTICAL_ENDPOINTS_RULE = (
-    "both arms selected the same weights (the control's start is RL's update-0 check); the "
-    "unseal record and the scorecard need a different checkpoint for each endpoint, so the "
-    "owner rules on how to report them before the endpoints are frozen"
+SAME_WEIGHTS_RULE = (
+    "an arm whose selected checkpoint holds the SFT weights this run loaded, every tensor "
+    "compared bit for bit (not a file's SHA-256, which differs), is not evaluated again: run "
+    "1's SFT results, pinned in sft_results, stand for it and are not an independent "
+    "measurement"
 )
+POD = "pod"
+REUSES_SFT = "reuses-run-1-sft"
+NOT_EVALUATED = "not-evaluated"
 BRIDGE_FILES = ("server.lease", "server.lease.lock", "client.lock")
 BRIDGE_BOXES = ("outbox", "inbox", "done", "withdrawn", "rejected")
 MAX_BRIDGE_TAR_BYTES = 512 * 1024 * 1024
@@ -217,12 +254,19 @@ class Run2Worker(PosttrainWorker):
         self.uploaded: set[Path] = set()
         self.ending: str | None = None
         """Why the run ends early, if it does: the stop reason the worker reports."""
+        self.arm_stop: dict[str, Any] | None = None
+        """The stop that ended an arm's training but not the run (``ARM_STOP_RULE``)."""
+        self.not_on_pod: dict[str, str] = {}
+        """Arms that are not evaluated on this Pod, each with the reason."""
+        self.stopped_stages: dict[str, str] = {}
+        """Stages whose arm stopped early although the run went on, with the reason."""
         self.generation_floor_basis = "planning"
         super().__init__(spec, root, **options)
         self.report.update(
             rl=None,
             more_sft=None,
-            selection={},
+            arm_stop=None,
+            selection={"endpoints": {"rule": SAME_WEIGHTS_RULE}},
             bridge={
                 "root": str(self.bridge_root),
                 "timeouts": asdict(timeouts),
@@ -474,10 +518,10 @@ class Run2Worker(PosttrainWorker):
 
     def dev_tick(self, tokens: int) -> None:
         """A dev check's generation batch ended: GPU work. Stamp it and keep the heartbeat
-        live, so a check's generation (1,800 programs, about 184 s at the planning speed) is
-        never read as a hung worker by the idle rules or the heartbeat's staleness. No limit
-        is enforced here: ``should_stop`` kept a full wait free before the update, and the
-        check's own wait is refused by ``before_wait`` if it cannot fit."""
+        live, so a check's generation (1,800 programs at batch 256, about 92 s at the planning
+        speed) is never read as a hung worker by the idle rules or the heartbeat's staleness. No
+        limit is enforced here: ``should_stop`` kept a full wait free before the update, and
+        the check's own wait is refused by ``before_wait`` if it cannot fit."""
         now = self.clock()
         self.last_activity = now
         self.progress += 1
@@ -614,10 +658,17 @@ class Run2Worker(PosttrainWorker):
             [("result.json", output / "result.json"), ("events.jsonl", output / "events.jsonl")],
         )
         self.measure_rl(result)
-        ending = result.stop_reason in RL_STOPS_ENDING_THE_RUN or self.ending is not None
-        if ending or result.selected is None:
+        kind = self.stop_kind(result.stop_reason)
+        if kind == LIMIT or result.selected is None:
+            # A wall or cost stop ends the run; so does an RL that scored no check to select.
             raise PilotStop(self.end_reason(result.stop_reason, result.stop_detail))
-        self.produced[RL_REFERENCE] = Path(result.selected.checkpoint)
+        if kind is not None:
+            self.stop_arm(stage, RL_REFERENCE, kind, result.stop_reason, result.stop_detail)
+            self.not_on_pod[CONTROL_REFERENCE] = (
+                f"the control did not run: RL ended with {self.arm_stop_reason()}, and the "
+                "control's dev checks need the Mac"
+            )
+        self.choose_endpoint(RL_REFERENCE, result.selected, labels)
         return outputs
 
     def rl_record(self, result: RLResult) -> dict[str, Any]:
@@ -674,10 +725,13 @@ class Run2Worker(PosttrainWorker):
             changes["dev_generation_tokens_per_second"] = rate
             current = self.rates.generation_tokens_per_second
             if int(rl["dev_batch_size"]) == self.plan.generation_batch and rate < current:
-                # The dev checks generate at the evaluation batch and the same 512-token cap:
-                # the evaluation stages are projected at the lower of the planning speed and
-                # the checks' measured rate (run 2 has no probe of its own), so, as in run 1,
-                # a measurement only makes the projected-finish rule stricter.
+                # Dev checks generated at the evaluation batch and the same 512-token cap
+                # measure the evaluation's speed: the evaluation stages are then projected at
+                # the lower of the planning speed and that rate (run 2 has no probe of its
+                # own), so, as in run 1, a measurement only makes the projected-finish rule
+                # stricter. Run 2's dev checks generate at batch 256 and its evaluation at 64,
+                # so there the evaluation stays at its batch's planning speed until its own
+                # files are observed.
                 changes["generation_tokens_per_second"] = rate
                 basis["generation"] = "measured-dev-checks"
         if checks:
@@ -723,24 +777,236 @@ class Run2Worker(PosttrainWorker):
             chosen = check_summary(selected, labels.get(selected.dev.check, ""))
         return {"rule": SELECTION_RULE, "selected": chosen, "checks": rows}
 
-    def identical_endpoints(self) -> dict[str, Any]:
-        """Whether both arms selected the same weights. The control's start is RL's
-        update-0 check, so when neither arm beats it both select that one file; the
-        evaluation stages still run for both (the owner's rule decides how they are
-        reported), and the flag says so before anything is frozen."""
-        chosen = {
-            arm: (self.report["selection"].get(arm) or {}).get("selected")
-            for arm in ("rl", "more-sft")
+    # Arm stops, endpoints and the stages that follow ------------------------------------
+
+    def stop_kind(self, stop: str) -> str | None:
+        """How an arm's stop is handled (``ARM_STOP_RULE``): ``limit`` for a wall or cost stop
+        (it ends the run), ``margin`` for ``wait_margin``, ``channel`` for a stop of the Mac's
+        side (a reward-wait timeout on either side, a host failure, a lost bridge), ``None``
+        for a result."""
+        if self.stop_reason is not None:
+            return LIMIT  # should_stop or a wait reached the wall or the cost stop.
+        if self.ending == WAIT_MARGIN_STOP:
+            return MARGIN
+        if self.ending == BRIDGE_LOST_STOP or stop in CHANNEL_STOPS:
+            return CHANNEL
+        if stop in ARM_STOPS or self.ending is not None:
+            return LIMIT  # Defensive: an external stop with no limit recorded ends the run.
+        return None
+
+    def arm_stop_reason(self) -> str:
+        assert self.arm_stop is not None
+        return str(self.arm_stop["reason"])
+
+    def stop_arm(self, stage: StagePlan, arm: str, kind: str, stop: str, detail: str) -> None:
+        """Record that ``arm``'s training ended early but the run goes on."""
+        reason = self.end_reason(stop, detail)
+        self.arm_stop = {
+            "arm": arm,
+            "kind": kind,
+            "reason": reason,
+            "arm_stop_reason": stop,
+            "detail": detail,
+            "at_unix": self.clock(),
+            "rule": ARM_STOP_RULE,
         }
-        rl, control = chosen["rl"], chosen["more-sft"]
-        identical = rl is not None and control is not None and rl["sha256"] == control["sha256"]
-        return {
-            "identical": identical,
-            "rl": None if rl is None else rl["label"],
-            "more-sft": None if control is None else control["label"],
-            "sha256": rl["sha256"] if identical and rl is not None else None,
-            "rule": IDENTICAL_ENDPOINTS_RULE if identical else None,
+        self.report["arm_stop"] = self.arm_stop
+        self.stopped_stages[stage.name] = reason
+        self.ending = None  # The run goes on: the stages that need no Mac wait follow.
+        self.publish()
+
+    def after_stages(self) -> None:
+        """An arm that stopped early leaves the run ``stopped`` with its reason, after the
+        stages that could still run."""
+        if self.arm_stop is not None:
+            raise PilotStop(self.arm_stop_reason())
+
+    def choose_endpoint(
+        self, arm: str, selected: CheckRecord | None, labels: Mapping[int, str]
+    ) -> None:
+        """Record ``arm``'s endpoint: whether its selected weights are the SFT weights the run
+        loaded (bit for bit), and so whether it is evaluated here or reuses run 1's SFT
+        results. An arm that is not evaluated at all is not compared."""
+        endpoints = self.report["selection"]["endpoints"]
+        assert selected is not None
+        label = labels.get(selected.dev.check, "")
+        entry: dict[str, Any] = {
+            "selected": label,
+            "checkpoint_sha256": selected.sha256,
+            "same_weights_as_sft": None,
+            "comparison": None,
+            "evaluation": POD,
+            "independent": True,
+            "reason": None,
+            "reuses": None,
         }
+        if arm in self.not_on_pod:
+            entry.update(evaluation=NOT_EVALUATED, independent=None, reason=self.not_on_pod[arm])
+        else:
+            started = self.clock()
+            self.phase = f"{arm}-same-weights"
+            sft = self.inputs["sft-weights"]
+            found = compare_to_loaded(Path(selected.checkpoint), sft)
+            self.last_activity = self.clock()
+            entry["same_weights_as_sft"] = found.same
+            entry["comparison"] = {
+                "method": (
+                    "every tensor's name, dtype, shape and bytes against the SFT weights as "
+                    "the run loaded them, on the CPU"
+                ),
+                "sft_weights_sha256": file_sha256(sft),
+                "tensors": found.tensors,
+                "first_difference": found.first_difference,
+                "seconds": self.clock() - started,
+            }
+            if found.same:
+                reason = (
+                    f"{label} holds the SFT weights bit for bit: run 1's SFT results stand for "
+                    "it, not an independent measurement"
+                )
+                self.not_on_pod[arm] = reason
+                entry.update(
+                    evaluation=REUSES_SFT,
+                    independent=False,
+                    reason=reason,
+                    reuses={"endpoint": "sft", "results": self.reused_results(arm)},
+                )
+            else:
+                self.produced[arm] = Path(selected.checkpoint)
+        endpoints[arm] = entry
+        self.publish()
+
+    def reused_results(self, arm: str) -> dict[str, dict[str, Any]]:
+        """Each artifact ``arm`` would have produced here, mapped to run 1's pinned artifact
+        that stands for it (``Specification.sft_results``)."""
+        pins = self.plan.sft_results
+        mapped = {f"arc-post-{arm}/arc.json": {"run_1": SFT_ARC, **pins[SFT_ARC]}}
+        for name in SFT_RESULT_FILES:
+            source = f"eval-sft-{name}/completions.jsonl"
+            mapped[f"eval-{arm}-{name}/completions.jsonl"] = {"run_1": source, **pins[source]}
+        return mapped
+
+    def skip_reason(self, stage: StagePlan) -> str | None:
+        """Why ``stage`` does not run on this Pod, or ``None``: the control after RL's early
+        stop; an evaluation stage of an arm not evaluated here; an ARC stage none of whose
+        checkpoints is. (Asked only of stages that have not run.)"""
+        if stage.kind == "more-sft":
+            return self.not_on_pod.get(CONTROL_REFERENCE)
+        if stage.kind == "eval":
+            return self.not_on_pod.get(str(stage.settings["checkpoint"]))
+        if stage.kind == "arc":
+            references = list(stage.settings["checkpoints"])
+            skipped = [self.not_on_pod.get(reference) for reference in references]
+            if all(skipped):
+                return "; ".join(
+                    f"{ref}: {why}" for ref, why in zip(references, skipped, strict=True)
+                )
+        return None
+
+    def evaluated_stage(self, stage: StagePlan) -> StagePlan:
+        """``stage`` as it runs here: an ARC stage keeps only the checkpoints evaluated here."""
+        if stage.kind != "arc":
+            return stage
+        kept = [ref for ref in stage.settings["checkpoints"] if ref not in self.not_on_pod]
+        return replace(stage, settings={**stage.settings, "checkpoints": kept})
+
+    def remaining_stages(self, stage: StagePlan) -> list[StagePlan]:
+        """The projected-finish rule prices only what will run: no skipped stage, and no ARC
+        entry of an arm not evaluated here."""
+        return [
+            self.evaluated_stage(later)
+            for later in super().remaining_stages(stage)
+            if self.skip_reason(later) is None
+        ]
+
+    def projected_finish(self, stage: StagePlan) -> None:
+        """The projected-finish rule, admitting each arm: after a margin stop in the control
+        both arms are evaluable, and when the evaluation of both does not fit but RL's alone
+        might, the control is left unevaluated (``not-evaluated``, the reason recorded) and
+        RL's evaluation is projected again on its own. That is decided only before any of the
+        control's evaluation has begun (at ``arc-post``); a later refusal stops the run as in
+        run 1, so no stage refused here runs. Otherwise as in run 1."""
+        try:
+            super().projected_finish(stage)
+        except PilotStop:
+            if not self.drop_control_for_rl(stage):
+                raise
+            self.stop_reason = None
+            super().projected_finish(stage)  # RL alone; raises if that does not fit either.
+
+    def evaluates_control(self, stage: StagePlan) -> bool:
+        """Whether ``stage`` evaluates the control's checkpoint here (its ARC entry or its
+        generation files)."""
+        if stage.kind == "eval":
+            return str(stage.settings["checkpoint"]) == CONTROL_REFERENCE
+        if stage.kind == "arc":
+            return CONTROL_REFERENCE in list(stage.settings["checkpoints"])
+        return False
+
+    def drop_control_for_rl(self, stage: StagePlan) -> bool:
+        """Leave the control unevaluated so RL's evaluation may run alone; ``True`` when that
+        changed what remains (only after the control's margin stop, while both arms were
+        still to be evaluated here, before any of the control's evaluation has begun, and at
+        a stage that still runs without the control)."""
+        stop = self.arm_stop
+        if (
+            stop is None
+            or (stop["arm"], stop["kind"]) != (CONTROL_REFERENCE, MARGIN)
+            or CONTROL_REFERENCE in self.not_on_pod
+            or RL_REFERENCE in self.not_on_pod
+            or stage.kind not in {"arc", "eval"}
+            or (stage.kind == "eval" and self.evaluates_control(stage))
+        ):
+            return False
+        begun = [
+            earlier.name
+            for earlier in self.plan.stages[: self.plan.stages.index(stage)]
+            if self.evaluates_control(earlier)
+            and self.stage_by_name[earlier.name]["status"] != "pending"
+        ]
+        if begun:
+            return False  # The control's evaluation has begun: the run stops as in run 1.
+        before = [later.name for later in self.remaining_stages(stage)]
+        reason = (
+            "not evaluated: after the control's margin stop the projected-finish rule did "
+            "not admit both arms' evaluation; RL's alone was projected again"
+        )
+        self.not_on_pod[CONTROL_REFERENCE] = reason
+        entry = self.report["selection"]["endpoints"].get(CONTROL_REFERENCE)
+        if isinstance(entry, dict):
+            entry.update(evaluation=NOT_EVALUATED, independent=None, reason=reason)
+        self.report["arm_stop"]["control_not_admitted"] = {
+            "at_stage": stage.name,
+            "remaining_before": before,
+            "remaining_after": [later.name for later in self.remaining_stages(stage)],
+        }
+        self.publish()
+        return True
+
+    def run_stage(self, stage: StagePlan) -> None:
+        """Skip a stage that does not run here (recording why); mark an arm that stopped
+        early as stopped, though the run goes on."""
+        reason = self.skip_reason(stage)
+        record = self.stage_by_name[stage.name]
+        if reason is not None:
+            record.update(status="skipped", skip_reason=reason)
+            self.publish()
+            return
+        super().run_stage(stage)
+        if stage.name in self.stopped_stages:
+            record.update(status="stopped", stop_reason=self.stopped_stages[stage.name])
+            self.publish()
+
+    def run_arc(self, stage: StagePlan) -> list[dict[str, Any]]:
+        evaluated = self.evaluated_stage(stage)
+        left_out = {
+            ref: self.not_on_pod[ref]
+            for ref in stage.settings["checkpoints"]
+            if ref in self.not_on_pod
+        }
+        if left_out:
+            self.stage_by_name[stage.name]["checkpoints_not_evaluated"] = left_out
+        return super().run_arc(evaluated)
 
     # The control stage ------------------------------------------------------------------
 
@@ -840,7 +1106,6 @@ class Run2Worker(PosttrainWorker):
         self.report["selection"]["more-sft"] = self.selection(
             result.checks, result.selected, labels
         )
-        self.report["selection"]["identical_endpoints"] = self.identical_endpoints()
         outputs += self.export_label(
             stage.name,
             [
@@ -848,9 +1113,17 @@ class Run2Worker(PosttrainWorker):
                 ("control-events.jsonl", run_dir / "control-events.jsonl"),
             ],
         )
-        if result.stop_reason in RL_STOPS_ENDING_THE_RUN or self.ending is not None:
+        kind = self.stop_kind(result.stop_reason)
+        if kind == LIMIT:
             raise PilotStop(self.end_reason(result.stop_reason, result.stop_detail))
-        self.produced[CONTROL_REFERENCE] = Path(result.selected.checkpoint)
+        if kind is not None:
+            self.stop_arm(stage, CONTROL_REFERENCE, kind, result.stop_reason, result.stop_detail)
+            if kind == CHANNEL:
+                self.not_on_pod[CONTROL_REFERENCE] = (
+                    f"not evaluated: the control ended with {self.arm_stop_reason()}, a stop of "
+                    "the Mac's side"
+                )
+        self.choose_endpoint(CONTROL_REFERENCE, result.selected, labels)
         return outputs
 
     # Finalization -----------------------------------------------------------------------

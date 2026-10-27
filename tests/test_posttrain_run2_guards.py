@@ -17,7 +17,7 @@ from scratchcoder.rl.rewards import DEFAULT_HOST_RETRIES, DEFAULT_WORKERS
 from scratchcoder.sandbox.budget import io_seconds
 from scratchcoder.sandbox.reward import HOST_SLACK_SECONDS, MAX_IO_CASES
 from tools import posttrain_approved, posttrain_ops, runpod_watchdog
-from tools.posttrain_run import Specification, check_policy
+from tools.posttrain_run import SFT_RESULTS, Specification, check_policy
 from tools.runpod_watchdog import Policy, check_once, read_heartbeat
 
 TEMPLATE = posttrain_approved.SPECIFICATION_PATH_2
@@ -30,11 +30,15 @@ def gated() -> dict[str, Any]:
     return posttrain_approved.run2_specification(
         {
             "ceiling_usd": 5.80,
+            "gate_estimate_usd": 3.53,
             "sft-weights": {"key": "posttrain-runs/1/podpost01/sft-weights/checkpoint.pt", **pin},
             "rl-tasks": dict(pin),
             "rl-dev": dict(pin),
             "rl-facts": dict(pin),
             "pool-test": dict(pin),
+            "sft-results": {
+                name: {"key": f"posttrain-runs/1/podpost01/{name}", **pin} for name in SFT_RESULTS
+            },
         }
     )
 
@@ -56,18 +60,29 @@ def test_every_wait_bound_derives_from_the_budgets_the_workers_and_the_tries() -
     # The bridge: one Mac poll, list/read/write each 5 tries to its timeout, the backoff, a
     # Pod poll.
     assert bounds.bridge_allowance_seconds == 2 + 5 * (30 + 120 + 120) + 3 * 15 + 0.5 == 1_397.5
-    assert bounds.reward_timeout_seconds == 5_600 + 1_397.5 == 6_997.5
-    assert bounds.dev_timeout_seconds == 9_492 + 1_397.5 == 10_889.5
-    # The Mac's --reward-timeout and --dev-timeout are the Pod's less the allowance.
+    # The Mac's checks before it scores a request: one window pass, every call to its bound
+    # (11 container-engine calls of 60 s, two ssh-add of 30 s, one launchctl of 10 s), and the
+    # image check (4 tries of 30 s and the 1, 2 and 4 s waits). test_rl_bridge_window.py ties
+    # each term to the bridge's own call bounds.
+    assert bounds.window_check_seconds == 11 * 60 + 2 * 30 + 10 == 730
+    assert bounds.image_check_seconds == 4 * 30 + 1 + 2 + 4 == 127.0
+    assert bounds.mac_check_seconds == 857.0
+    assert bounds.reward_timeout_seconds == 5_600 + 1_397.5 + 857 == 7_854.5
+    assert bounds.dev_timeout_seconds == 9_492 + 1_397.5 + 857 == 11_746.5
+    # The Mac's --reward-timeout and --dev-timeout are the Pod's less the allowance and the
+    # checks: the Mac's bound starts when the checks have passed.
     for kind, mac in (("reward", 5_600.0), ("dev", 9_492.0)):
-        assert bounds.timeout(kind) - bounds.bridge_allowance_seconds == mac
-    assert bounds.awaiting_reward_extension_seconds == 6_997.5 + 60 == 7_057.5
-    assert bounds.awaiting_dev_extension_seconds == 10_889.5 + 60 == 10_949.5
-    assert bounds.wait_margin_seconds == 10_889.5
+        assert bounds.timeout(kind) - bounds.bridge_allowance_seconds - 857 == mac
+        assert bounds.mac_timeout(kind) == mac
+    assert bounds.awaiting_reward_extension_seconds == 7_854.5 + 60 == 7_914.5
+    assert bounds.awaiting_dev_extension_seconds == 11_746.5 + 60 == 11_806.5
+    assert bounds.wait_margin_seconds == 11_746.5
     assert bounds.lease_seconds == LEASE_SECONDS == 60.0
     assert bounds.lost_bridge_seconds == 900 - 300 == 600.0
     with pytest.raises(ValueError):
         bounds.timeout("other")
+    with pytest.raises(ValueError):
+        bounds.mac_timeout("other")
 
 
 def test_the_mac_reward_bound_is_run_ones_screening_timeout() -> None:
@@ -92,7 +107,7 @@ def test_the_derivation_refuses_impossible_inputs() -> None:
 def test_the_specification_writes_the_derivation_down_and_refuses_another_value() -> None:
     raw = json.loads(TEMPLATE.read_text())
     bridge = raw["bridge"]
-    assert (bridge["reward_timeout_seconds"], bridge["dev_timeout_seconds"]) == (6_997.5, 10_889.5)
+    assert (bridge["reward_timeout_seconds"], bridge["dev_timeout_seconds"]) == (7_854.5, 11_746.5)
     assert (bridge["mac_reward_timeout_seconds"], bridge["mac_dev_timeout_seconds"]) == (
         5_600.0,
         9_492.0,
@@ -245,18 +260,30 @@ def test_the_policy_file_carries_the_derived_extensions_and_the_receipt_checks_t
     arguments = ["limits", "--specification", str(spec_path), "--origin", "1000"]
     assert posttrain_ops.main([*arguments, "--policy-output", str(policy_path)]) == 0
     record = json.loads(capsys.readouterr().out)
-    assert record["wall_seconds"] == 34_800 and record["self_destruct_seconds"] == 34_620
-    assert record["watchdog_cost_stop_usd"] == 5.79
+    # At the $3.53 estimate the cost limit is $4.23 (120%, below the $5.80 ceiling).
+    assert record["wall_seconds"] == 25_380 and record["self_destruct_seconds"] == 25_200
+    assert record["watchdog_cost_stop_usd"] == 4.22 and record["limit_usd"] == 4.23
+    assert (record["ceiling_usd"], record["gate_estimate_usd"]) == (5.8, 3.53)
     assert record["mac_reward_timeout_seconds"] == 5_600.0
     written = json.loads(policy_path.read_text())
-    assert written["awaiting_reward_extension_seconds"] == 7_057.5
-    assert written["awaiting_dev_extension_seconds"] == 10_949.5
+    assert written["awaiting_reward_extension_seconds"] == 7_914.5
+    assert written["awaiting_dev_extension_seconds"] == 11_806.5
     spec = Specification.from_dict(gated())
     check_policy(Policy(**written), spec)
     for field in ("awaiting_reward_extension_seconds", "awaiting_dev_extension_seconds"):
         for value in (0.0, written[field] + 1):
             with pytest.raises(ValueError, match="not the derived bound"):
                 check_policy(Policy(**{**written, field: value}), spec)
+    # Run 2's wall and cost stop are exactly the derived ones: the ceiling's would be weaker,
+    # and a stricter value written by hand differs from the cost limit's too.
+    for field, value in (
+        ("max_wall_seconds", 34_800),
+        ("max_cost_usd", 5.79),
+        ("max_wall_seconds", 25_379),
+        ("max_cost_usd", 4.21),
+    ):
+        with pytest.raises(ValueError, match="policy"):
+            check_policy(Policy(**{**written, field: value}), spec)
     # Run 1's policy file is unchanged: no extension key, and none may be granted.
     run1 = Specification.load(posttrain_approved.SPECIFICATION_PATH)
     policy1 = posttrain_ops.watchdog_policy(run1.ceiling, origin=1.0, idle_baseline=1.0)
@@ -296,20 +323,20 @@ def test_the_watchdog_refuses_extension_flags_other_than_its_policy_file(tmp_pat
         "--receipt",
         "r.json",
         "--max-wall-seconds",
-        "34800",
+        "25380",
         "--max-cost-usd",
-        "5.79",
+        "4.22",
         "--quoted-total-hourly",
         "0.60",
         "--awaiting-reward-extension-seconds",
-        "7057.5",
+        "7914.5",
         "--awaiting-dev-extension-seconds",
-        "10949.5",
+        "11806.5",
     ]
     parsed = runpod_watchdog.policy_from_args(parser.parse_args(argv))
     assert (parsed.awaiting_reward_extension_seconds, parsed.awaiting_dev_extension_seconds) == (
-        7_057.5,
-        10_949.5,
+        7_914.5,
+        11_806.5,
     )
 
 
@@ -322,19 +349,20 @@ def test_the_cost_stop_keeps_one_full_wait_at_the_quoted_rate() -> None:
     assert bounds is not None
     derived = spec.ceiling
     margin_usd = bounds.wait_margin_seconds / 3600 * derived.quoted_total_hourly
-    assert margin_usd == pytest.approx(1.81492, abs=1e-5)  # 10,889.5 s at $0.60/h.
+    assert margin_usd == pytest.approx(1.95775, abs=1e-5)  # 11,746.5 s at $0.60/h.
     # A wait may start only while it ends before every stop. At launch the worker's lifetime
-    # is the in-Pod timer's, 34,620 s, and the finalization reserve takes its last 900 s, so
-    # the reserve binds first: no wait starts after 22,830.5 s, $3.805 of quoted spend (the
-    # lifetime's end alone would allow $3.955, the $5.80 cost stop $3.985).
+    # is the in-Pod timer's, 25,200 s at the $4.23 cost limit, and the finalization reserve
+    # takes its last 900 s, so the reserve binds first: no wait starts after 12,553.5 s, $2.092
+    # of quoted spend (the lifetime's end alone would allow $2.242, the $4.23 cost stop
+    # $2.272).
     lifetime = derived.self_destruct_seconds
     rate = derived.quoted_total_hourly / 3600
     reserve = lifetime - spec.finalization_reserve_seconds - bounds.wait_margin_seconds
     end = lifetime - bounds.wait_margin_seconds
     cost = derived.worker_cost_stop_usd / rate - bounds.wait_margin_seconds
-    assert (lifetime, reserve, end) == (34_620, 22_830.5, 23_730.5)
-    assert cost == pytest.approx(23_910.5)
-    assert [round(seconds * rate, 3) for seconds in (reserve, end, cost)] == [3.805, 3.955, 3.985]
+    assert (lifetime, reserve, end) == (25_200, 12_553.5, 13_453.5)
+    assert cost == pytest.approx(13_633.5)
+    assert [round(seconds * rate, 3) for seconds in (reserve, end, cost)] == [2.092, 2.242, 2.272]
     # The margin is the longer wait's: a reward wait alone needs less.
     assert bounds.reward_timeout_seconds < bounds.wait_margin_seconds == bounds.dev_timeout_seconds
 

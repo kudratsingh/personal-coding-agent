@@ -8,6 +8,23 @@ from pathlib import Path
 from scratchcoder.common.smoke import run_smoke
 
 
+def _window_interval(text: str) -> float:
+    """``--window-check-interval``: positive, finite and at most the justified bound."""
+    import math
+
+    from scratchcoder.rl.bridge_mac import WINDOW_CHECK_INTERVAL_SECONDS
+
+    try:
+        value = float(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from error
+    if not math.isfinite(value) or not 0 < value <= WINDOW_CHECK_INTERVAL_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must be positive and at most {WINDOW_CHECK_INTERVAL_SECONDS:.0f} s"
+        )
+    return value
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch only implemented commands and return a process exit status."""
     parser = argparse.ArgumentParser(prog="scratchcoder")
@@ -160,7 +177,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     rl_bridge.add_argument(
         "--no-dotenv", action="store_true", help="skip the .env check: there is no .env file"
     )
-    rl_bridge.add_argument("--image-id", help="the pinned sandbox image's local ID, checked")
+    rl_bridge.add_argument(
+        "--image-id",
+        required=True,
+        help="the pinned sandbox image's local ID, checked before each request and in every "
+        "window pass",
+    )
+    rl_bridge.add_argument(
+        "--window-check-interval",
+        type=_window_interval,
+        default=900.0,
+        help="repeat the Mac execution-window checks before scoring a request once the last "
+        "pass is this many seconds old (default and maximum 900)",
+    )
     rl_bridge.add_argument("--max-polls", type=int)
     from scratchcoder.eval import pipeline_cli
 
@@ -229,7 +258,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             resolve_dotenv,
             serve_command,
         )
-        from scratchcoder.rl.bridge_mac import BridgeLeaseHeld
+        from scratchcoder.rl.bridge_mac import BridgeLeaseHeld, WindowCheckFailed
 
         try:
             dotenv = resolve_dotenv(args.dotenv, disabled=args.no_dotenv)
@@ -254,6 +283,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dotenv=dotenv,
                 image_id=args.image_id,
                 max_polls=args.max_polls,
+                window_check_seconds=args.window_check_interval,
             )
         except BridgeEnvironmentError as error:
             sys.stderr.write(f"rl-bridge: {error}\n")
@@ -261,6 +291,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         except BridgeLeaseHeld as error:
             sys.stderr.write(f"rl-bridge: {error}\n")
             return 3
+        except WindowCheckFailed as error:
+            sys.stderr.write(f"rl-bridge: {error}\n")
+            return 4
     if args.command == "generation-benchmark":
         import json
 

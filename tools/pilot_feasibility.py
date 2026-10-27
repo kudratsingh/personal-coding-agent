@@ -1628,8 +1628,11 @@ def posttrain2_report(
     measured: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run 2 in the proposal's table form at the planning speeds, with the Mac twice as slow,
-    and (with ``measured``) at run 1's measured rates, each against the ceiling."""
-    from tools.posttrain_run import Rates, Specification
+    and (with ``measured``) at run 1's measured rates, each against the ceiling and against the
+    stop at 120% of its own total. The total at run 1's measured rates is the gate's estimate
+    (``gate_estimate_usd``), which ``posttrain_approved run2-gate`` reads from this report."""
+    from tools import posttrain_ops
+    from tools.posttrain_run import Rates, Specification, planned_seconds
 
     raw = json.loads(specification.read_text(encoding="utf-8"))
     if ceiling_usd is not None:
@@ -1637,12 +1640,20 @@ def posttrain2_report(
     elif raw["limits"]["ceiling_usd"] is None:
         raise ValueError("the run-2 template has no ceiling yet: give --ceiling-usd")
     spec = Specification.from_dict(raw, allow_gate_nulls=True)
-    derived = spec.ceiling
+    margins = {
+        "self_destruct_margin_seconds": spec.limits["self_destruct_margin_seconds"],
+        "watchdog_margin_usd": spec.limits["watchdog_margin_usd"],
+    }
+    derived = posttrain_ops.ceiling_limits(
+        spec.limits["ceiling_usd"], spec.limits["quoted_total_hourly"], **margins
+    )
     gpu = (
         float(spec.limits["quoted_gpu_hourly"]) if quoted_gpu_hourly is None else quoted_gpu_hourly
     )
     hourly = max(derived.quoted_total_hourly, rehearsal_total_hourly(gpu, d35.CONTAINER_DISK_GB))
     planning = Rates.planning(spec)
+    launch_need = float(planned_seconds(spec, planning)["total_seconds"])
+    startup = float(spec.limits["startup_seconds"])
     scenarios: dict[str, Any] = {
         "planning speeds": planning,
         "planning speeds, Mac twice as slow": replace(
@@ -1673,6 +1684,9 @@ def posttrain2_report(
         }
         total = math.fsum(seconds.values())
         usd = total / 3600 * hourly
+        stopped = posttrain_ops.ceiling_limits(
+            derived.ceiling_usd, derived.quoted_total_hourly, gate_estimate_usd=usd, **margins
+        )
         rendered[name] = {
             "rows": {
                 key: (
@@ -1696,14 +1710,33 @@ def posttrain2_report(
             "fits_lifetime": total <= derived.self_destruct_seconds,
             "fits_ceiling": usd < derived.worker_cost_stop_usd,
             "ceiling_over_estimate": derived.ceiling_usd / usd,
+            "limits_at_this_estimate": asdict(stopped),
+            "fits_lifetime_at_this_estimate": total <= stopped.self_destruct_seconds,
+            # The launch rule prices the planning rates whatever this scenario's rates: what
+            # the gate (``posttrain_approved.gate_launch_fit``) checks at this estimate.
+            "launch_at_this_estimate": {
+                "lifetime_seconds": posttrain_ops.lifetime_seconds(stopped),
+                "planning_seconds_needed": launch_need,
+                "startup_seconds": startup,
+                "setup_allowance_seconds": posttrain_ops.lifetime_seconds(stopped) - launch_need,
+                "fits": posttrain_ops.lifetime_seconds(stopped) - startup >= launch_need,
+            },
         }
     bridge = spec.bridge_timeouts
     assert bridge is not None
+    estimate = rendered["run 1's measured rates"]["total_usd"] if measured is not None else None
     return {
         "schema_version": 1,
         "kind": "posttrain-feasibility",
         "run": "2",
         "source": str(specification),
+        "specification_sha256": _sha256_file(specification),
+        "gate_estimate_usd": estimate,
+        "gate_estimate_rule": (
+            "the total at run 1's measured rates and this report's quoted price; the gate "
+            "writes it into the launch specification, and run 2 stops at the lower of the "
+            "ceiling and 120% of it"
+        ),
         "quoted_gpu_hourly": gpu,
         "quoted_total_hourly": hourly,
         "limits": asdict(derived),
@@ -1743,6 +1776,8 @@ def render_posttrain2_markdown(report: Mapping[str, Any]) -> str:
     labels = dict(RUN2_ROWS)
     for name, scenario in report["scenarios"].items():
         tokens = scenario["evaluation_tokens"]
+        launch = scenario["launch_at_this_estimate"]
+        verdict = "the gate accepts it" if launch["fits"] else "**the gate refuses it**"
         lines += [f"## {name}", "", "| Stage | Hours | Dollars |", "| --- | ---: | ---: |"]
         for key, row in scenario["rows"].items():
             label = labels[key]
@@ -1761,7 +1796,19 @@ def render_posttrain2_markdown(report: Mapping[str, Any]) -> str:
             f"below the ${limits['ceiling_usd']:.2f} ceiling: "
             f"{'yes' if scenario['fits_ceiling'] else '**no**'} "
             f"({scenario['ceiling_over_estimate']:.2f}x the estimate); 120% of the estimate: "
-            f"${scenario['stop_at_120_percent_usd']:.2f}.",
+            f"${scenario['stop_at_120_percent_usd']:.2f}, so a run with this estimate stops at "
+            f"${scenario['limits_at_this_estimate']['limit_usd']:.2f} with a "
+            f"{scenario['limits_at_this_estimate']['wall_seconds']:,} s wall. At that stop the "
+            f"launch rule (the planning rates, {launch['planning_seconds_needed']:,.0f} s) "
+            f"leaves {launch['setup_allowance_seconds']:,.0f} s for the "
+            f"{launch['startup_seconds']:,.0f} s setup: {verdict}.",
+            "",
+        ]
+    if report.get("gate_estimate_usd") is not None:
+        lines += [
+            f"**The gate's estimate: ${report['gate_estimate_usd']:.4f}** (the total at run 1's "
+            "measured rates); `posttrain_approved run2-gate --feasibility` reads it from this "
+            "report's JSON output.",
             "",
         ]
     lines += [

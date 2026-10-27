@@ -13,6 +13,7 @@ from tools.pilot_feasibility import (
     render_posttrain2_markdown,
     run1_measured_rates,
 )
+from tools.posttrain_ops import estimate_limit_usd
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "configs" / "rehearsal-a40-s-post-2.json"
 
@@ -27,20 +28,20 @@ def test_run_two_fits_its_ceiling_at_the_planning_speeds() -> None:
     assert hours["rl_training"] == pytest.approx(100 * 256 * 1_024 / 56_765 / 3600)  # 0.13
     assert hours["rl_reward_waits"] == pytest.approx(100 * 48 / 3600)  # 1.33
     generation, wait = hours["rl_dev_checks"]
-    assert generation == pytest.approx(6 * 1_800 * 512 / 5_000 / 3600)  # 0.31
+    assert generation == pytest.approx(6 * 1_800 * 512 / 10_000 / 3600)  # 0.15 at batch 256
     assert wait == pytest.approx(6 * 300 / 3600)  # 0.50
     assert hours["control_training"] == pytest.approx(hours["rl_rollouts"] + hours["rl_training"])
     assert hours["control_dev_checks"] == pytest.approx(
-        [5 * 1_800 * 512 / 5_000 / 3600, 5 * 300 / 3600]
+        [5 * 1_800 * 512 / 10_000 / 3600, 5 * 300 / 3600]
     )
     assert planned["evaluation_tokens"] == 2 * 18_792_960  # 37.6M tokens at cap.
     assert hours["evaluation"] == pytest.approx((14 * 20 + 2 * 18_792_960 / 5_000) / 3600)
-    assert planned["total_hours"] == pytest.approx(6.17, abs=0.01)
-    assert planned["total_usd"] == pytest.approx(3.70, abs=0.01)
+    assert planned["total_hours"] == pytest.approx(5.89, abs=0.01)
+    assert planned["total_usd"] == pytest.approx(3.53, abs=0.01)
     assert planned["fits_lifetime"] and planned["fits_ceiling"]
-    assert report["wait_margin_usd"] == pytest.approx(10_889.5 / 3600 * 0.6)
+    assert report["wait_margin_usd"] == pytest.approx(11_746.5 / 3600 * 0.6)
     slow = report["scenarios"]["planning speeds, Mac twice as slow"]
-    assert slow["total_usd"] == pytest.approx(5.05, abs=0.01) and slow["fits_ceiling"]
+    assert slow["total_usd"] == pytest.approx(4.88, abs=0.01) and slow["fits_ceiling"]
     assert report["limits"]["watchdog_cost_stop_usd"] == 5.79
 
 
@@ -93,6 +94,39 @@ def test_run_ones_records_give_the_measured_rates(tmp_path: Path) -> None:
     assert measured["total_usd"] < projected["scenarios"]["planning speeds"]["total_usd"] + 1
     text = render_posttrain2_markdown(projected)
     assert "## run 1's measured rates" in text and "| **Total** |" in text
+    # The gate's estimate is this scenario's total, and the stop it gives is derived as the
+    # worker derives it: the lower of the ceiling and 120% of the estimate.
+    assert projected["gate_estimate_usd"] == measured["total_usd"]
+    assert f"**The gate's estimate: ${measured['total_usd']:.4f}**" in text
+    stopped = measured["limits_at_this_estimate"]
+    assert stopped["limit_usd"] == estimate_limit_usd(5.80, measured["total_usd"])
+    assert stopped["ceiling_usd"] == 5.80 and stopped["gate_estimate_usd"] == measured["total_usd"]
+    assert measured["fits_lifetime_at_this_estimate"]
+    assert posttrain2_report(TEMPLATE, ceiling_usd=5.80)["gate_estimate_usd"] is None
+    # The launch rule prices the planning rates whatever run 1 measured: a fast Mac lowers the
+    # estimate, and so the stop, below what the planning-rate need and the setup fit in.
+    fast = dict(rates, reward_wait_seconds_per_update=24.0, dev_wait_seconds_per_check=150.0)
+    quick = posttrain2_report(TEMPLATE, ceiling_usd=5.80, measured=fast)
+    launch = quick["scenarios"]["run 1's measured rates"]["launch_at_this_estimate"]
+    assert launch["planning_seconds_needed"] == pytest.approx(20_288, abs=1)
+    assert launch["setup_allowance_seconds"] < launch["startup_seconds"] == 900
+    assert launch["fits"] is False
+    assert "**the gate refuses it**" in render_posttrain2_markdown(quick)
+
+
+def test_the_projection_names_the_template_it_priced() -> None:
+    import hashlib
+
+    report = posttrain2_report(TEMPLATE, ceiling_usd=5.80)
+    assert report["specification_sha256"] == hashlib.sha256(TEMPLATE.read_bytes()).hexdigest()
+    planned = report["scenarios"]["planning speeds"]
+    # At the planning speeds the estimate would be $3.53 and the stop $4.23, a 25,380 s wall.
+    assert planned["limits_at_this_estimate"]["limit_usd"] == 4.23
+    assert planned["limits_at_this_estimate"]["wall_seconds"] == 25_380
+    launch = planned["launch_at_this_estimate"]
+    assert launch["lifetime_seconds"] == 25_200 and launch["fits"] is True
+    assert launch["setup_allowance_seconds"] == pytest.approx(25_200 - 20_288, abs=1)
+    assert report["limits"]["ceiling_usd"] == 5.80 and report["limits"]["wall_seconds"] == 34_800
 
 
 def test_the_cli_prints_the_proposals_table_for_run_two(
@@ -102,8 +136,8 @@ def test_the_cli_prints_the_proposals_table_for_run_two(
     argv = ["posttrain", "--specification", str(TEMPLATE), "--ceiling-usd", "5.80"]
     assert main([*argv, "--quoted-gpu-hourly", "0.59", "--output", str(output)]) == 0
     text = capsys.readouterr().out
-    assert "| **Total** | **6.17** | **$3.70** |" in text
-    assert "| RL dev checks: generation / Mac wait | 0.31 / 0.50 |" in text
+    assert "| **Total** | **5.89** | **$3.53** |" in text
+    assert "| RL dev checks: generation / Mac wait | 0.15 / 0.50 |" in text
     assert json.loads(output.read_text())["run"] == "2"
     report, screening, _ = run1_records(tmp_path)
     assert main([*argv, "--run1-report", str(report), "--screening", str(screening)]) == 0

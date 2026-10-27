@@ -205,6 +205,33 @@ def test_exec_runs_the_executor_without_any_credential(
     assert "MY_OWN_TOKEN" not in names and "R2_SECRET_ACCESS_KEY" not in names
 
 
+def test_exec_hands_the_child_the_shells_agent_socket_path_never_the_agent(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """The child (run 2's bridge) repeats the agent check while it runs; it gets the parent
+    shell's socket path under a name no SSH client reads, and no SSH agent variable."""
+    script = (
+        "import json, os; print('CHILD', json.dumps({k: os.environ.get(k) for k in "
+        "('SSH_AUTH_SOCK', 'SSH_AGENT_PID', 'SCRATCHCODER_SHELL_AGENT_SOCKET')}))"
+    )
+    for parent, forwarded in (({"SSH_AUTH_SOCK": "/shell/agent"}, "/shell/agent"), ({}, None)):
+        status = mac_window_check.main(
+            ["exec", "--image-id", IMAGE_ID, "--", sys.executable, "-c", script],
+            run=FakeDocker(),
+            environ={"PATH": "/usr/bin:/bin", **parent},
+            run_agent=FakeAgent(),
+            session_socket=lambda: "/session/Listeners",
+        )
+        assert status == 0
+        out = capfd.readouterr().out
+        child = json.loads(next(line for line in out.splitlines() if line.startswith("CHILD"))[6:])
+        assert child == {
+            "SSH_AUTH_SOCK": None,
+            "SSH_AGENT_PID": None,
+            "SCRATCHCODER_SHELL_AGENT_SOCKET": forwarded,
+        }
+
+
 def test_exec_runs_nothing_when_a_check_fails(
     tmp_path: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:

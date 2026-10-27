@@ -25,12 +25,17 @@
     1. ``rl``: ``run_rl`` from run 1's selected SFT weights on the withheld kept tasks, its
        rewards and dev verdicts from the Mac through the reward bridge
        (``BridgeRewardSource``, ``BridgeDevEvaluator``), each dev check's weights uploaded
-       at once. A reward-wait timeout, a lost bridge or a margin stop ends the run (the
-       control needs the bridge too); collapse, patience, leakage or completion is a result.
+       at once. A reward-wait timeout, a host failure, a lost bridge or a margin stop ends
+       RL's training, not the run: the stages that need no Mac wait follow
+       (``tools/posttrain_run2.py``, ``ARM_STOP_RULE``); collapse, patience, leakage or
+       completion is a result.
     2. ``more-sft``: ``run_more_sft`` from the same SFT weights on the kept tasks' references,
        its GPU-busy budget RL's measured busy seconds, its dev checks through the bridge.
     3. ``arc-post``: ARC-Easy on the RL-selected and the control-selected checkpoints.
     4. ``eval-rl``, ``eval-more-sft``: the seven completions files of each (chat-v1).
+
+    An arm whose selected weights are the SFT weights, bit for bit, is not evaluated again:
+    run 1's SFT results, pinned in ``sft_results``, stand for it (``SAME_WEIGHTS_RULE``).
 
     While the bridge client waits the heartbeat reads ``awaiting_rewards``, and a Mac lease
     renewed on the Pod counts as progress for the in-Pod idle rule (``RUN2_LIVENESS``).
@@ -277,6 +282,7 @@ RUN2_TOP_KEYS = {
     "bridge",
     "stages",
     "inputs",
+    "sft_results",
     "r2",
 }
 RUN2_PLANNING_KEYS = {
@@ -312,6 +318,8 @@ RUN2_STAGE_KEYS = {
 }
 RUN2_GATE_FIELDS: tuple[tuple[str, ...], ...] = (
     ("limits", "ceiling_usd"),
+    ("limits", "gate_estimate_usd"),
+    ("limits", "cost_limit_usd"),
     ("inputs", "sft-weights", "key"),
     ("inputs", "sft-weights", "size_bytes"),
     ("inputs", "sft-weights", "sha256"),
@@ -325,22 +333,80 @@ RUN2_GATE_FIELDS: tuple[tuple[str, ...], ...] = (
     ("inputs", "pool-test", "sha256"),
 )
 """Run 2's values fixed at the owner's gate, ``null`` in the tracked specification: the ceiling
-(re-priced from run 1's measured rates), run 1's selected SFT weights (key, size, SHA-256),
-the three ``rl-pod-export`` files and the pool test export. The worker and the readiness
-receipt refuse a specification in which any is still ``null``."""
+(re-priced from run 1's measured rates), the gate's estimate (the run 2 projection at run 1's
+measured rates) and the cost limit it derives (the lower of the ceiling and 120% of the
+estimate, ``posttrain_ops.estimate_limit_usd``), run 1's selected SFT weights (key, size,
+SHA-256), the three ``rl-pod-export`` files and the pool test export, and every pin of
+``sft_results`` (``SFT_RESULTS``). The worker and the readiness receipt refuse a
+specification in which any is still ``null``."""
+SFT_RESULT_FILES = (
+    "pool-dev-greedy",
+    "pool-dev-n8",
+    "pool-test-greedy",
+    "pool-test-n8",
+    "humaneval-greedy",
+    "humaneval-plus-greedy",
+    "mbpp-plus-greedy",
+)
+"""The seven completions files of every chat-v1 evaluation stage, run 1's ``eval-sft`` and run
+2's ``eval-rl`` and ``eval-more-sft`` alike."""
+SFT_ARC = "arc-sft-sft/arc.json"
+SFT_RESULTS = (SFT_ARC, *(f"eval-sft-{name}/completions.jsonl" for name in SFT_RESULT_FILES))
+"""Run 2's ``sft_results``: run 1's artifacts of the SFT weights' evaluation (its ARC report and
+its seven completions files, ``<label>/<name>`` in run 1's prefix), each pinned at the gate by
+R2 key, size and SHA-256 like an input. An arm whose selected weights are the SFT weights
+reuses them instead of a duplicate evaluation (the owner's run 2 gate rulings); the pins make
+that reuse verifiable. They never reach the Pod."""
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,47}\Z")
 
 
 def gate_nulls(raw: Mapping[str, Any]) -> list[str]:
-    """The run-2 gate fields (``RUN2_GATE_FIELDS``) still ``null`` in ``raw``, dotted."""
+    """The run-2 gate fields (``RUN2_GATE_FIELDS`` and every ``sft_results`` pin) still
+    ``null`` in ``raw``, dotted."""
     missing = []
-    for path in RUN2_GATE_FIELDS:
+    fields = [
+        *RUN2_GATE_FIELDS,
+        *(("sft_results", name, key) for name in SFT_RESULTS for key in sorted(INPUT_PIN_KEYS)),
+    ]
+    for path in fields:
+        if path[-1] == "kind":
+            continue
         value: Any = raw
         for key in path:
             value = value.get(key) if isinstance(value, Mapping) else None
         if value is None:
             missing.append(".".join(path))
     return missing
+
+
+def check_sft_results(raw: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Run 2's ``sft_results``: exactly ``SFT_RESULTS``, each pin ``key``, ``size_bytes`` and
+    ``sha256`` (``null`` before the gate); once filled, each key the artifact's own under run 1's
+    prefix, the prefix of the ``sft-weights`` input."""
+    pins = raw.get("sft_results")
+    if not isinstance(pins, Mapping) or set(pins) != set(SFT_RESULTS):
+        raise ValueError(f"sft_results must pin exactly {list(SFT_RESULTS)}")
+    weights = ((raw.get("inputs") or {}).get("sft-weights") or {}).get("key")
+    prefix = None
+    if isinstance(weights, str) and weights.endswith("/sft-weights/checkpoint.pt"):
+        prefix = weights.removesuffix("sft-weights/checkpoint.pt")
+    checked = {}
+    for name in SFT_RESULTS:
+        pin = pins[name]
+        if not isinstance(pin, Mapping) or set(pin) != {"key", "size_bytes", "sha256"}:
+            raise ValueError(f"sft_results {name} gives exactly key, size_bytes and sha256")
+        if all(pin[field] is None for field in pin):
+            checked[name] = dict(pin)
+            continue
+        if prefix is None or pin["key"] != prefix + name:
+            raise ValueError(f"sft_results {name} is not run 1's artifact beside its SFT weights")
+        if type(pin["size_bytes"]) is not int or pin["size_bytes"] < 1:
+            raise ValueError(f"sft_results {name} needs a positive size")
+        digest = pin["sha256"]
+        if not isinstance(digest, str) or len(digest) != 64 or digest.strip("0123456789abcdef"):
+            raise ValueError(f"sft_results {name} needs a SHA-256")
+        checked[name] = dict(pin)
+    return checked
 
 
 def rl_config_of(rl: Mapping[str, Any]) -> RLConfig:
@@ -479,6 +545,8 @@ class Specification:
     """Run 2's more-SFT control settings (``CONTROL_KEYS``); empty for run 1."""
     bridge: Mapping[str, Any] = field(default_factory=dict)
     """Run 2's reward bridge (``posttrain_ops.BRIDGE_KEYS``); empty for run 1."""
+    sft_results: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    """Run 2's pins of run 1's SFT evaluation artifacts (``SFT_RESULTS``); empty for run 1."""
 
     @property
     def ceiling(self) -> posttrain_ops.CeilingLimits:
@@ -648,9 +716,15 @@ class Specification:
                 "gate (python -m tools.posttrain_approved run2-gate)"
             )
         model = ModelConfig(**_exact(top["model"], set(ModelConfig.__dataclass_fields__), "model"))
-        limits = posttrain_ops.read_limits(top["limits"], allow_null=("ceiling_usd",))
-        if top["limits"]["ceiling_usd"] is not None:
-            posttrain_ops.specification_limits(top)  # The derived limits must exist.
+        limits = posttrain_ops.read_limits(
+            top["limits"],
+            allow_null=posttrain_ops.RUN2_GATE_LIMITS,
+            keys=posttrain_ops.RUN2_LIMIT_KEYS,
+        )
+        if all(limits[key] is not None for key in posttrain_ops.RUN2_GATE_LIMITS):
+            # The limits exist, and the written cost limit is the lower of the ceiling and
+            # 120% of the gate's estimate.
+            posttrain_ops.specification_limits(top)
         planning = _exact(top["planning"], RUN2_PLANNING_KEYS, "planning")
         rates = _rates(planning["generation_tokens_per_second"], "planning rates")
         for name in RUN2_PLANNING_KEYS - {"generation_tokens_per_second"}:
@@ -707,6 +781,14 @@ class Specification:
                     )
             if stage.kind in PRODUCED_REFERENCES:
                 produced.add(PRODUCED_REFERENCES[stage.kind])
+            if stage.kind == "eval" and tuple(entry.name for entry in stage.files) != (
+                SFT_RESULT_FILES
+            ):
+                raise ValueError(
+                    f"{stage.name}: run 2 evaluates the seven files of run 1's eval-sft, "
+                    "whose results an arm with the SFT weights reuses"
+                )
+        sft_results = check_sft_results(top)
         r2 = _exact(top["r2"], {"storage_cap_usd_per_month"}, "r2")
         _positive(r2["storage_cap_usd_per_month"], "r2.storage_cap_usd_per_month")
         return cls(
@@ -725,6 +807,7 @@ class Specification:
             rl=rl,
             control=control,
             bridge=bridge,
+            sft_results=sft_results,
         )
 
     @staticmethod
@@ -1004,7 +1087,8 @@ class Launch:
 
 
 def check_policy(policy: Policy, spec: Specification) -> None:
-    """The watchdog policy carries the limits ``ceiling_limits`` derives, or stricter ones."""
+    """The watchdog policy carries the limits ``ceiling_limits`` derives, or stricter ones;
+    run 2's wall and cost stop are exactly the ones derived from its cost limit."""
     derived = spec.ceiling
     if (
         policy.mode != "posttrain"
@@ -1014,6 +1098,14 @@ def check_policy(policy: Policy, spec: Specification) -> None:
         or policy.quoted_total_hourly < derived.quoted_total_hourly
     ):
         raise ValueError("the watchdog policy is weaker than the ceiling-derived limits")
+    if spec.run == "2" and (
+        policy.max_wall_seconds != derived.wall_seconds
+        or policy.max_cost_usd != derived.watchdog_cost_stop_usd
+    ):
+        raise ValueError(
+            "the watchdog policy's wall or cost stop differs from the limits derived from run "
+            "2's cost limit (posttrain_ops limits --policy-output writes them)"
+        )
     if policy.max_transfer_seconds != spec.max_transfer_seconds:
         raise ValueError("the watchdog's transfer window differs from the specification's")
     # Run 2's bounded idle extension while the Pod awaits the Mac is exactly the derived
@@ -1471,6 +1563,10 @@ class PosttrainWorker(Worker):
     def before_finalize(self) -> None:
         """A hook for labels made just before the finalization (run 2's bridge directories);
         run 1 has none."""
+
+    def after_stages(self) -> None:
+        """A hook run after the last stage, before the run is recorded completed (run 2 raises
+        ``PilotStop`` there when an arm's training ended early); run 1 has none."""
 
     # Limits -----------------------------------------------------------------------------
 
@@ -2142,6 +2238,7 @@ class PosttrainWorker(Worker):
             self.check_planned_tasks()
             for stage in self.plan.stages:
                 self.run_stage(stage)
+            self.after_stages()
             self.report["status"] = "completed"
         except PilotStop as error:
             self.report.update(status="stopped", stop_reason=str(error))

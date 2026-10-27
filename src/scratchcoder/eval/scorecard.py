@@ -27,6 +27,15 @@ It has three values: ``True`` (above the threshold, even on a partial row), ``Fa
 complete greedy HumanEval row at or below it) and ``None`` (no complete greedy HumanEval
 row, so nothing can be said); a checkpoint never evaluated on HumanEval is listed under
 ``not_evaluated`` rather than reported as clean.
+
+**Reused results.** A checkpoint name may *reuse* another's results (``reuses``): run 2's
+arm whose selected weights equal the SFT weights bit for bit was not evaluated again, so its
+rows are the reused checkpoint's rows, copied under its name with ``reuses`` set,
+``independent: false`` and no GPU or sandbox minutes of their own. A pair of two names with
+one source is not compared (``same_weights: true``, no difference); a pair with one reusing
+name is computed on the source's results and says so (``reused``). The leak flag follows the
+source. ``load_inputs`` reads a scorecard-inputs file that lists every input with the names
+and the reuses, so the reuse is recorded where the inputs are.
 """
 
 import hashlib
@@ -395,6 +404,82 @@ def _compare(
     return entry
 
 
+INPUTS_KIND = "scorecard-inputs"
+REUSE_NOTE = (
+    "the same weights as {source}, compared bit for bit: {source}'s results, not an "
+    "independent measurement"
+)
+
+
+@dataclass(frozen=True)
+class ScorecardInputs:
+    """A scorecard-inputs file: the checkpoint names, the reuses and every input path."""
+
+    checkpoints: dict[str, str]
+    reuses: dict[str, str]
+    results: tuple[Path, ...]
+    benchmarks: tuple[Path, ...]
+    arc_reports: tuple[Path, ...]
+    reasons: dict[str, str] = field(default_factory=dict)
+    """Why each reusing name reuses (the record that showed the weights equal)."""
+
+
+def load_inputs(path: Path) -> ScorecardInputs:
+    """Read a scorecard-inputs file (``kind`` ``scorecard-inputs``, ``schema_version`` 1)::
+
+        {"checkpoints": {"base": "<sha256>", ...},
+         "reuses": {"rl": {"endpoint": "sft", "reason": "..."}},
+         "results": [...], "benchmarks": [...], "arc": [...]}
+
+    Relative paths are read from the current directory."""
+    value = json.loads(path.read_text(encoding="utf-8"))
+    keys = {"kind", "schema_version", "checkpoints", "reuses", "results", "benchmarks", "arc"}
+    if (
+        not isinstance(value, dict)
+        or value.get("kind") != INPUTS_KIND
+        or value.get("schema_version") != 1
+        or set(value) - {"created_at", "sources"} != keys
+    ):
+        raise ValueError(f"{path} is not a scorecard-inputs file")
+    checkpoints, reuses = value["checkpoints"], value["reuses"]
+    if not isinstance(checkpoints, dict) or not all(
+        isinstance(name, str) and isinstance(sha, str) for name, sha in checkpoints.items()
+    ):
+        raise ValueError(f"{path}: checkpoints map names to SHA-256s")
+    if not isinstance(reuses, dict) or not all(
+        isinstance(item, dict) and set(item) == {"endpoint", "reason"} for item in reuses.values()
+    ):
+        raise ValueError(f"{path}: each reuse names its endpoint and its reason")
+    lists = {}
+    for key in ("results", "benchmarks", "arc"):
+        rows = value[key]
+        if not isinstance(rows, list) or not all(isinstance(row, str) for row in rows):
+            raise ValueError(f"{path}: {key} lists paths")
+        lists[key] = tuple(Path(row) for row in rows)
+    return ScorecardInputs(
+        checkpoints=dict(checkpoints),
+        reuses={name: str(item["endpoint"]) for name, item in reuses.items()},
+        results=lists["results"],
+        benchmarks=lists["benchmarks"],
+        arc_reports=lists["arc"],
+        reasons={name: str(item["reason"]) for name, item in reuses.items()},
+    )
+
+
+def _reused_row(row: Mapping[str, Any], name: str, source: str, reason: str) -> dict[str, Any]:
+    copied = dict(row)
+    copied.update(
+        checkpoint=name,
+        reuses=source,
+        independent=False,
+        note=REUSE_NOTE.format(source=source),
+        reuse_reason=reason,
+        gpu_minutes=0.0 if row.get("gpu_minutes") is not None else None,
+        sandbox_minutes=0.0,
+    )
+    return copied
+
+
 def build_scorecard(
     *,
     checkpoints: Mapping[str, str],
@@ -406,11 +491,22 @@ def build_scorecard(
     pairs: Sequence[tuple[str, str]] | None = None,
     bootstrap_samples: int = BOOTSTRAP_SAMPLES,
     bootstrap_seed: int = BOOTSTRAP_SEED,
+    reuses: Mapping[str, str] | None = None,
+    reuse_reasons: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Build the scorecard. ``checkpoints`` maps names (``base``, ``sft``, ...) to SHA-256."""
+    """Build the scorecard. ``checkpoints`` maps names (``base``, ``sft``, ...) to SHA-256;
+    ``reuses`` maps a further name to the checkpoint name whose results stand for it."""
     by_sha = {sha: name for name, sha in checkpoints.items()}
     if len(by_sha) != len(checkpoints):
         raise ValueError("two checkpoint names share one SHA-256")
+    reused = dict(reuses or {})
+    for name, source in reused.items():
+        if name in checkpoints or source not in checkpoints:
+            raise ValueError(f"{name} reuses {source}: a reuse names a new name and a checkpoint")
+    reasons = dict(reuse_reasons or {})
+
+    def source_of(name: str) -> str:
+        return reused.get(name, name)
 
     def name_of(sha: str, source: object) -> str:
         if sha not in by_sha:
@@ -459,9 +555,31 @@ def build_scorecard(
         )
         arc_runs[name] = arc
         arc_rows.append(_arc_row(name, arc, arc_baseline))
+    reused_rows = [
+        _reused_row(row, name, source, reasons.get(name, ""))
+        for name, source in reused.items()
+        for row in [*(row for _, _, row in rows), *arc_rows]
+        if row["checkpoint"] == source
+    ]
     comparisons = []
     named_pairs = list(DEFAULT_PAIRS if pairs is None else pairs)
-    for first, second in named_pairs:
+    for first_name, second_name in named_pairs:
+        first, second = source_of(first_name), source_of(second_name)
+        if first == second:
+            comparisons.append(
+                {
+                    "pair": f"{first_name} vs {second_name}",
+                    "first": first_name,
+                    "second": second_name,
+                    "same_weights": True,
+                    "difference": None,
+                    "note": f"{first_name} and {second_name} are one checkpoint ({first}): no "
+                    "comparison",
+                }
+            )
+            continue
+        noted = {name: reused[name] for name in (first_name, second_name) if name in reused}
+        start = len(comparisons)
         for suite_key in sorted({(run.suite, run.split, run.decoding) for _, run, _ in rows}):
             left = [run for name, run, _ in rows if name == first and _key(run) == suite_key]
             right = [run for name, run, _ in rows if name == second and _key(run) == suite_key]
@@ -503,7 +621,12 @@ def build_scorecard(
                     seed=bootstrap_seed,
                 )
             )
-    all_rows = [row for _, _, row in rows] + arc_rows
+        for entry in comparisons[start:]:
+            entry.update(pair=f"{first_name} vs {second_name}", first=first_name)
+            entry["second"] = second_name
+            if noted:
+                entry["reused"] = noted
+    all_rows = [row for _, _, row in rows] + arc_rows + reused_rows
     costs: dict[tuple[str, str, str], dict[str, float]] = {}
     for item in all_rows:
         total = costs.setdefault(
@@ -513,7 +636,7 @@ def build_scorecard(
         total["gpu_minutes"] += item["gpu_minutes"] or 0.0
         total["sandbox_minutes"] += item["sandbox_minutes"] or 0.0
     leak: dict[str, bool | None] = {}
-    for name in checkpoints:
+    for name in [*checkpoints, *reused]:
         marks = [
             row["leak_flag"] for row in all_rows if row["checkpoint"] == name and "leak_flag" in row
         ]
@@ -529,6 +652,10 @@ def build_scorecard(
         "git_commit": commit,
         "dirty": dirty,
         "checkpoints": dict(checkpoints),
+        "reuses": {
+            name: {"endpoint": source, "reason": reasons.get(name, ""), "independent": False}
+            for name, source in reused.items()
+        },
         "rows": sorted(all_rows, key=lambda row: (row["suite"], row["split"], row["checkpoint"])),
         "comparisons": comparisons,
         "costs": [
@@ -571,6 +698,11 @@ def render_markdown(scorecard: Mapping[str, Any]) -> str:
     lines = ["# Evaluation scorecard", ""]
     leak = scorecard["leak"]
     lines.append(f"Leak rule: {leak['rule']}. Flagged: {leak['any']}.")
+    for name, reuse in scorecard.get("reuses", {}).items():
+        lines.append(
+            f"**{name} reuses {reuse['endpoint']}:** {REUSE_NOTE.format(source=reuse['endpoint'])}"
+            "; its rows repeat them and are not an independent measurement."
+        )
     if leak["not_evaluated"]:
         lines.append(
             "Leak check not possible (no complete greedy HumanEval row): "
@@ -627,6 +759,8 @@ def render_markdown(scorecard: Mapping[str, Any]) -> str:
             leak_mark = " (LEAK FLAG)" if row.get("leak_flag") is True else ""
             if "leak_flag" in row and row["leak_flag"] is None:
                 leak_mark = " (leak check inconclusive)"
+            if row.get("reuses"):
+                leak_mark += f" (reuses {row['reuses']}: not independent)"
             lines.append(
                 f"| {row['checkpoint']}{leak_mark} | {row['decoding']} | {row['protocol']} | "
                 f"{score} | {control} | {unresolved} | "
@@ -641,6 +775,9 @@ def render_markdown(scorecard: Mapping[str, Any]) -> str:
         )
         lines.append("| --- | --- | --- | ---: | --- | --- | ---: | --- |")
         for item in scorecard["comparisons"]:
+            if item.get("same_weights"):
+                lines.append(f"| {item['pair']} | all | n/a | n/a | n/a | {item['note']} | 0 | |")
+                continue
             if item.get("difference") is None:
                 interval, difference, direction = "n/a", "n/a", "no shared tasks"
             else:
@@ -648,6 +785,8 @@ def render_markdown(scorecard: Mapping[str, Any]) -> str:
                 interval = f"[{100 * item['lower']:+.2f}, {100 * item['upper']:+.2f}]"
                 direction = item["direction"]
             note = "cross-protocol" if item["cross_protocol"] else ""
+            for name, source in item.get("reused", {}).items():
+                note = f"{note}; {name} is {source}'s results".lstrip("; ")
             lines.append(
                 f"| {item['pair']} | {item['suite']} {item['split']} | {item['metric']} | "
                 f"{difference} | {interval} | {direction} | {item['tasks']} | {note} |"

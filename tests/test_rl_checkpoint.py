@@ -9,7 +9,14 @@ from scratchcoder.common.config import ModelConfig, RunConfig, TrainConfig
 from scratchcoder.data.sft import SFTLoader, SFTRow
 from scratchcoder.eval.checkpoint import load_checkpoint
 from scratchcoder.model.gpt import GPT
-from scratchcoder.rl.checkpoint import file_sha256, load_weights, read_weights, save_weights
+from scratchcoder.rl.checkpoint import (
+    compare_to_loaded,
+    compare_weights,
+    file_sha256,
+    load_weights,
+    read_weights,
+    save_weights,
+)
 from scratchcoder.tokenizer.bpe import ByteBPE
 from scratchcoder.train.trainer import Trainer
 
@@ -43,6 +50,84 @@ def test_saving_and_loading_reproduces_the_weights_bit_for_bit(
         assert torch.equal(restored[name].view(torch.uint8), value.view(torch.uint8)), name
     state = read_weights(path)
     assert state["format"] == "weights-v1" and state["step"] == 12 and state["run_id"] == "rl-run"
+
+
+def test_the_same_weights_saved_twice_compare_equal_though_their_files_differ(
+    tmp_path: Path,
+) -> None:
+    """The run 2 rule: an endpoint is the SFT weights when its tensors equal them bit for bit,
+    whatever its file's SHA-256 (two saves of one model record another run ID and step)."""
+    model = trained_model()
+    first, second = tmp_path / "sft.pt", tmp_path / "rl-check-0000.pt"
+    save_weights(first, model, tokenizer_hash="tok", run_id="posttrain-1-sft", step=106)
+    save_weights(second, load_weights(first), tokenizer_hash="tok", run_id="posttrain-2-rl", step=0)
+    assert file_sha256(first) != file_sha256(second)
+    same = compare_weights(first, second)
+    assert same.same and same.first_difference is None
+    assert same.tensors == len(model.state_dict())
+    # One bit of one weight differs: not the same weights.
+    with torch.no_grad():
+        weight = model.embedding.weight
+        weight.view(torch.int32)[0, 0] ^= 1
+    changed = tmp_path / "changed.pt"
+    save_weights(changed, model, tokenizer_hash="tok", run_id="posttrain-2-rl", step=12)
+    found = compare_weights(first, changed)
+    assert not found.same and found.first_difference == "embedding.weight"
+    # Another dtype with equal values is another model file: not the same weights either.
+    halved = tmp_path / "bf16.pt"
+    save_weights(
+        halved, load_weights(first).to(torch.bfloat16), tokenizer_hash="t", run_id="r", step=0
+    )
+    assert not compare_weights(first, halved).same
+    # NaN and -0.0 compare as stored, bit for bit.
+    with torch.no_grad():
+        weight.view(torch.int32)[0, 0] ^= 1
+        weight[0, 1] = float("nan")
+        weight[0, 2] = -0.0
+    odd = tmp_path / "odd.pt"
+    save_weights(odd, model, tokenizer_hash="tok", run_id="a", step=1)
+    again = tmp_path / "odd-again.pt"
+    save_weights(again, load_weights(odd), tokenizer_hash="tok", run_id="b", step=2)
+    assert compare_weights(odd, again).same
+    with torch.no_grad():
+        weight[0, 2] = 0.0
+    zero = tmp_path / "zero.pt"
+    save_weights(zero, model, tokenizer_hash="tok", run_id="c", step=3)
+    assert not compare_weights(odd, zero).same
+
+
+def test_same_weights_compare_against_the_weights_the_run_loaded_not_the_file(
+    tmp_path: Path,
+) -> None:
+    """An SFT file with two floating dtypes loads into the model's own float32, so RL's
+    update-0 check (saved from the loaded model) differs from the file in dtype; it still
+    holds the weights the run started from, which is what the run 2 rule compares against.
+    One flipped bit in the check is still another model."""
+    model = trained_model()
+    with torch.no_grad():
+        model.embedding.weight.data = model.embedding.weight.data.to(torch.bfloat16)
+    sft = tmp_path / "sft-mixed.pt"
+    save_weights(sft, model, tokenizer_hash="tok", run_id="posttrain-1-sft", step=106)
+    dtypes = {value.dtype for value in read_weights(sft)["model"].values()}
+    assert dtypes == {torch.float32, torch.bfloat16}
+    check = tmp_path / "rl-check-0000.pt"
+    save_weights(check, load_weights(sft), tokenizer_hash="tok", run_id="posttrain-2-rl", step=0)
+    assert not compare_weights(check, sft).same  # The file: another dtype.
+    found = compare_to_loaded(check, sft)
+    assert found.same and found.first_difference is None
+    assert found.tensors == len(model.state_dict())
+    loaded = load_weights(sft)
+    with torch.no_grad():
+        loaded.embedding.weight.view(torch.int32)[0, 0] ^= 1
+    changed = tmp_path / "changed.pt"
+    save_weights(changed, loaded, tokenizer_hash="tok", run_id="posttrain-2-rl", step=12)
+    assert compare_to_loaded(changed, sft).first_difference == "embedding.weight"
+    # A uniform-dtype file loads as itself: the two comparisons agree.
+    uniform = tmp_path / "sft.pt"
+    save_weights(uniform, trained_model(), tokenizer_hash="tok", run_id="s", step=1)
+    again = tmp_path / "again.pt"
+    save_weights(again, load_weights(uniform), tokenizer_hash="tok", run_id="r", step=0)
+    assert compare_weights(again, uniform).same and compare_to_loaded(again, uniform).same
 
 
 def test_altered_bytes_and_identities_are_rejected(tmp_path: Path) -> None:

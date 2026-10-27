@@ -351,3 +351,85 @@ def test_scorecard_cli_writes_json_and_markdown(
     assert markdown.read_text().startswith("# Evaluation scorecard")
     with pytest.raises(SystemExit):
         main(arguments)  # The outputs exist now.
+
+
+def test_an_arm_with_the_sft_weights_repeats_sfts_rows_marked_not_independent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run 2: an arm whose selected weights equal the SFT weights bit for bit was not evaluated
+    again. Its rows are SFT's, copied under its name and marked; it is never compared with SFT
+    (one checkpoint), and a comparison with another arm is computed on SFT's results and says
+    so. It costs no minutes of its own."""
+    reason = "rl-check-0000 equals the SFT weights, compared bit for bit on the Pod"
+    card = build(
+        tmp_path,
+        monkeypatch,
+        checkpoints={"base": BASE, "sft": SFT, "more-sft": RL},
+        reuses={"rl": "sft"},
+        reuse_reasons={"rl": reason},
+    )
+    for suite, decoding in (
+        ("pool", "greedy"),
+        ("pool", "sampled"),
+        ("arc-easy", "label-likelihood"),
+    ):
+        copied, source = row(card, "rl", suite, decoding), row(card, "sft", suite, decoding)
+        assert copied["metrics"] == source["metrics"]
+        assert copied["reuses"] == "sft" and copied["independent"] is False
+        assert copied["reuse_reason"] == reason and "not an independent" in copied["note"]
+        assert copied["sandbox_minutes"] == 0.0
+    assert card["reuses"] == {"rl": {"endpoint": "sft", "reason": reason, "independent": False}}
+    by_pair: dict[str, list[dict[str, Any]]] = {}
+    for item in card["comparisons"]:
+        by_pair.setdefault(item["pair"], []).append(item)
+    (same,) = by_pair["rl vs sft"]
+    assert same["same_weights"] is True and same["difference"] is None
+    against = by_pair["rl vs more-sft"]
+    assert against and all(item["reused"] == {"rl": "sft"} for item in against)
+    direct = {(item["suite"], item["metric"]): item for item in by_pair["more-sft vs sft"]}
+    for item in against:
+        assert item["difference"] == pytest.approx(
+            -direct[(item["suite"], item["metric"])]["difference"]
+        )
+    assert card["leak"]["flags"]["rl"] == card["leak"]["flags"]["sft"]
+    costs = {(item["checkpoint"], item["suite"]): item for item in card["costs"]}
+    assert costs[("rl", "pool")]["sandbox_minutes"] == 0.0
+    rendered = render_markdown(card)
+    assert "**rl reuses sft:**" in rendered
+    assert "| rl (reuses sft: not independent) |" in rendered
+    with pytest.raises(ValueError, match="a reuse names a new name and a checkpoint"):
+        build(tmp_path / "x", monkeypatch, reuses={"rl": "nobody"})
+
+
+def test_the_cli_reads_the_names_reuses_and_inputs_from_a_scorecard_inputs_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    results, baseline = pool_results(tmp_path)
+    kept = [path for path in results if not path.name.startswith("rl-")]
+    inputs = tmp_path / "scorecard-inputs.json"
+    inputs.write_text(
+        json.dumps(
+            {
+                "kind": "scorecard-inputs",
+                "schema_version": 1,
+                "checkpoints": {"base": BASE, "sft": SFT},
+                "reuses": {"rl": {"endpoint": "sft", "reason": "same weights"}},
+                "results": [str(path) for path in kept],
+                "benchmarks": [],
+                "arc": [],
+            }
+        )
+    )
+    output = tmp_path / "card.json"
+    arguments = ["scorecard", "--inputs", str(inputs), f"--pool-baseline={baseline}"]
+    assert main([*arguments, "--output", str(output)]) == 0
+    card = json.loads(output.read_text())
+    assert card["reuses"]["rl"]["endpoint"] == "sft"
+    assert {item["checkpoint"] for item in card["rows"]} == {"base", "sft", "rl"}
+    capsys.readouterr()
+    with pytest.raises(SystemExit):  # Names come from somewhere.
+        main(["scorecard", "--output", str(tmp_path / "none.json")])
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"kind": "scorecard-inputs", "schema_version": 1}))
+    with pytest.raises(ValueError, match="not a scorecard-inputs file"):
+        main(["scorecard", "--inputs", str(bad), "--output", str(tmp_path / "bad-card.json")])

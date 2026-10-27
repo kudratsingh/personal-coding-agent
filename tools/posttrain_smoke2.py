@@ -24,6 +24,7 @@ program with the task's reference); with ``docker`` the real ``LocalRewardSource
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
@@ -53,7 +54,7 @@ from scratchcoder.rl.rollout import ROLLOUT_SEED
 from scratchcoder.tokenizer.bpe import ByteBPE
 from scratchcoder.tokenizer.bulk import FastEncoder
 from tools.posttrain_approved import bridge_section, run2_stages
-from tools.posttrain_run import RunLimits, Specification
+from tools.posttrain_run import SFT_RESULTS, RunLimits, Specification
 from tools.posttrain_run2 import Run2Worker
 from tools.posttrain_smoke import (
     SMOKE_TASKS,
@@ -282,6 +283,15 @@ def smoke_specification2(
     for stage in stages:
         for entry in stage.get("files", []):
             entry["planned_tasks"] = SMOKE_TASKS[entry["suite"]]
+    run1 = RUN1_SFT_KEY.removesuffix("sft-weights/checkpoint.pt")
+    sft_results = {  # Run 1's smoke artifacts are not on disk: authored pins.
+        name: {
+            "key": run1 + name,
+            "size_bytes": 1,
+            "sha256": hashlib.sha256(name.encode()).hexdigest(),
+        }
+        for name in SFT_RESULTS
+    }
     return {
         "schema_version": 1,
         "kind": "posttrain-run-specification",
@@ -289,6 +299,8 @@ def smoke_specification2(
         "model": asdict(smoke_model(found.tokenizer)),
         "limits": {
             "ceiling_usd": 3.0,
+            "gate_estimate_usd": 2.5,
+            "cost_limit_usd": 3.0,
             "quoted_gpu_hourly": 0.59,
             "quoted_total_hourly": 0.6,
             "self_destruct_margin_seconds": 180,
@@ -314,6 +326,7 @@ def smoke_specification2(
         "bridge": bridge_section(SMOKE_BRIDGE, rl_section),
         "stages": stages,
         "inputs": inputs,
+        "sft_results": sft_results,
         "r2": {"storage_cap_usd_per_month": 5.0},
     }
 
@@ -531,7 +544,11 @@ def summary2(report: Mapping[str, Any], bucket: MemoryBucket) -> dict[str, Any]:
             arm: ((selection.get(arm) or {}).get("selected") or {}).get("label")
             for arm in ("rl", "more-sft")
         },
-        identical_endpoints=(selection.get("identical_endpoints") or {}).get("identical"),
+        evaluation={
+            arm: (((selection.get("endpoints") or {}).get(arm)) or {}).get("evaluation")
+            for arm in ("rl", "more-sft")
+        },
+        arm_stop=(report.get("arm_stop") or {}).get("reason"),
         bridge_waits=len((report.get("bridge") or {}).get("waits", [])),
     )
     return value

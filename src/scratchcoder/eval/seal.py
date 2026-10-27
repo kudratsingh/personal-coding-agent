@@ -23,6 +23,18 @@ Execution is refused unless the file is sealed, every completions file the recor
 is sealed, the file is listed under the endpoint whose checkpoint generated it, and no
 other read of it was ever opened. A second execution of the same completions is refused.
 
+Run 2's arms (``rl``, ``more-sft``) may take two more forms (``REUSING_ENDPOINTS``), so one
+checkpoint is executed once and never under two names:
+
+- ``{"reuses": "sft", "selected_checkpoint_sha256": "..."}``: the arm selected weights equal
+  bit for bit to the SFT weights (checked on the Pod), so it was not evaluated again and the
+  ``sft`` endpoint's reads stand for it; the arm's own selected file is named for the record.
+  The endpoint it reuses must be one that executes.
+- ``{"not_evaluated": "<reason>"}``: the run ended before the arm was evaluated (a stop of
+  the Mac's side during the control); nothing of it is read.
+
+Every executing endpoint must still be a different checkpoint.
+
 A second read cannot be had by regenerating. One unseal record governs a ledger: once any
 read has opened, no file can be sealed and every later read must present the same record.
 The record may not list two files of one checkpoint, protocol and decoding kind (greedy or
@@ -53,6 +65,11 @@ from scratchcoder.common.records import utc_now
 from scratchcoder.eval.completions import SHA256, Completions, read_completions
 
 ENDPOINTS = ("base", "sft", "rl", "more-sft")
+REUSING_ENDPOINTS = ("rl", "more-sft")
+"""The endpoints that may reuse another's reads or be absent: run 2's arms."""
+REUSED_ENDPOINT = "sft"
+"""The one endpoint whose reads an arm may reuse: an arm whose selected weights are the SFT
+weights it started from (the owner's run 2 gate rulings), never base or the other arm."""
 UNSEAL_KIND = "unseal"
 LEDGER_FORMAT = "scratchcoder-seal-ledger"
 GENESIS = "0" * 64
@@ -78,10 +95,27 @@ class Endpoint:
 
 
 @dataclass(frozen=True)
+class Reuse:
+    """An arm whose weights equal another endpoint's: that endpoint's reads stand for it."""
+
+    name: str
+    reuses: str
+    selected_checkpoint_sha256: str
+
+
+@dataclass(frozen=True)
 class UnsealRecord:
     endpoints: tuple[Endpoint, ...]
+    """The endpoints whose test completions are read, each a different checkpoint."""
     frozen_at: str
     sha256: str
+    reuses: tuple[Reuse, ...] = ()
+    not_evaluated: tuple[tuple[str, str], ...] = ()
+    """``(endpoint, reason)`` for an arm the run never evaluated."""
+
+    def reused_by(self, name: str) -> list[str]:
+        """The arms whose reads are those of endpoint ``name``."""
+        return [reuse.name for reuse in self.reuses if reuse.reuses == name]
 
     @classmethod
     def load(cls, path: Path) -> "UnsealRecord":
@@ -103,8 +137,30 @@ class UnsealRecord:
         if not isinstance(endpoints, dict) or set(endpoints) != set(ENDPOINTS):
             raise SealError(f"the unseal record must name exactly the endpoints {ENDPOINTS}")
         parsed = []
+        reuses: list[Reuse] = []
+        absent: list[tuple[str, str]] = []
         for name in ENDPOINTS:
             item = endpoints[name]
+            if name in REUSING_ENDPOINTS and isinstance(item, dict) and "reuses" in item:
+                selected = item.get("selected_checkpoint_sha256")
+                if (
+                    set(item) != {"reuses", "selected_checkpoint_sha256"}
+                    or item["reuses"] != REUSED_ENDPOINT
+                    or not isinstance(selected, str)
+                    or not SHA256.fullmatch(selected)
+                ):
+                    raise SealError(
+                        f"endpoint {name}: a reuse names {REUSED_ENDPOINT} (only SFT's reads "
+                        "stand for an arm) and the arm's selected checkpoint SHA-256"
+                    )
+                reuses.append(Reuse(name, item["reuses"], selected))
+                continue
+            if name in REUSING_ENDPOINTS and isinstance(item, dict) and "not_evaluated" in item:
+                reason = item["not_evaluated"]
+                if set(item) != {"not_evaluated"} or not isinstance(reason, str) or not reason:
+                    raise SealError(f"endpoint {name}: not_evaluated gives only its reason")
+                absent.append((name, reason))
+                continue
             if not isinstance(item, dict) or set(item) != {
                 "checkpoint_sha256",
                 "completions_sha256",
@@ -124,10 +180,22 @@ class UnsealRecord:
             parsed.append(Endpoint(name, checkpoint, tuple(listed)))
         if len({endpoint.checkpoint_sha256 for endpoint in parsed}) != len(parsed):
             raise SealError("each endpoint must be a different checkpoint")
+        executing = {endpoint.name for endpoint in parsed}
+        for reuse in reuses:
+            if reuse.reuses not in executing:
+                raise SealError(
+                    f"endpoint {reuse.name} reuses {reuse.reuses}, which is not read itself"
+                )
         listed_all = [digest for endpoint in parsed for digest in endpoint.completions_sha256]
         if len(set(listed_all)) != len(listed_all):
             raise SealError("a completions file is listed twice")
-        return cls(tuple(parsed), value["frozen_at"], hashlib.sha256(raw).hexdigest())
+        return cls(
+            tuple(parsed),
+            value["frozen_at"],
+            hashlib.sha256(raw).hexdigest(),
+            tuple(reuses),
+            tuple(absent),
+        )
 
     def endpoint_for(self, completions_sha256: str) -> Endpoint | None:
         for endpoint in self.endpoints:
@@ -394,7 +462,7 @@ class SealLedger:
         digest = completions.sha256
         with self._locked() as (events, handle):
             endpoint, reads = self._check_read(events, completions, unseal)
-            fields = {
+            fields: dict[str, Any] = {
                 "completions_sha256": digest,
                 "checkpoint_sha256": endpoint.checkpoint_sha256,
                 "endpoint": endpoint.name,
@@ -402,6 +470,9 @@ class SealLedger:
                 "results_id": results_id,
                 "results_path": str(results_path),
             }
+            reused_by = unseal.reused_by(endpoint.name)
+            if reused_by:
+                fields["reused_by"] = reused_by  # This one read stands for these arms too.
             if not reads:
                 return self._append(events, handle, "opened", **fields)
             opened = [event for event in reads if event["event"] == "opened"]

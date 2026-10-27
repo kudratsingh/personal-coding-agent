@@ -14,12 +14,21 @@ For run 1 at $0.60/h: $3.00, $2.99, 18,000 s and 17,820 s. The worker, the readi
 receipt, the runbook's watchdog policy and the bootstrap's timer limit all take them from
 here (``limits`` prints them), and the receipt and the worker refuse anything weaker.
 
+Run 2 adds a stop at 120% of the gate's estimate (the owner's run 2 gate rulings). Its gate
+writes the estimate (``limits.gate_estimate_usd``, the run 2 projection at run 1's measured
+rates and the gate's quoted price) and the limit it gives (``limits.cost_limit_usd``): the
+lower of the ceiling and 120% of the estimate, rounded down to the cent
+(``estimate_limit_usd``). Every limit above then derives from that limit in place of the
+ceiling, in the same place (``ceiling_limits`` with ``gate_estimate_usd``), and a run-2
+specification whose written limit differs from its derivation is refused.
+
 Run 2 waits on the Mac's RL rewards and dev verdicts through the reward bridge. Its bounds
 on one wait are derived here too, in one place (``bridge_timeouts``): the Pod's reward and
-dev timeouts, the Mac's ``--reward-timeout`` and ``--dev-timeout``, the Mac watchdog's idle
-extension while the heartbeat reads ``awaiting_rewards``, the margin the worker's cost, wall
-and reserve stops keep for one full wait, and the lost-bridge bound that ends a wait whose
-Mac lease went stale before the in-Pod idle rule fires.
+dev timeouts, the Mac's ``--reward-timeout`` and ``--dev-timeout``, the Mac's checks before it
+scores a request (one window pass and the image check), the Mac watchdog's idle extension
+while the heartbeat reads ``awaiting_rewards``, the margin the worker's cost, wall and
+reserve stops keep for one full wait, and the lost-bridge bound that ends a wait whose Mac
+lease went stale before the in-Pod idle rule fires.
 
 ``limits`` (Mac)
     Print a specification's derived limits; with ``--origin`` also the timer deadline, and
@@ -48,7 +57,11 @@ from typing import IO, Any
 
 from scratchcoder.common.records import atomic_json, utc_now
 from scratchcoder.data.shards import file_sha256
-from scratchcoder.rl.bridge_mac import LEASE_SECONDS
+from scratchcoder.rl.bridge_mac import (
+    LEASE_SECONDS,
+    image_check_seconds_bound,
+    window_check_seconds_bound,
+)
 from scratchcoder.rl.rewards import DEFAULT_HOST_RETRIES, DEFAULT_WORKERS
 from scratchcoder.sandbox.budget import io_seconds
 from scratchcoder.sandbox.reward import FUNCTION_BUDGET_SECONDS, HOST_SLACK_SECONDS, MAX_IO_CASES
@@ -120,6 +133,10 @@ LIMIT_KEYS = frozenset(
         "startup_seconds",
     }
 )
+RUN2_LIMIT_KEYS = LIMIT_KEYS | {"gate_estimate_usd", "cost_limit_usd"}
+"""Run 2's ``limits``: run 1's keys, the gate's estimate and the limit it derives."""
+ESTIMATE_STOP_FRACTION = 1.2
+"""Run 2 stops at 120% of the gate's estimate when that is below the ceiling."""
 _SAFE_POD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
@@ -149,19 +166,59 @@ class CeilingLimits:
         return float(origin) + self.self_destruct_seconds
 
 
+@dataclass(frozen=True)
+class EstimateLimits(CeilingLimits):
+    """Run 2's limits: ``CeilingLimits`` derived from ``limit_usd``, the lower of the
+    ceiling and 120% of the gate's estimate; ``ceiling_usd`` stays the owner's ceiling."""
+
+    gate_estimate_usd: float
+    estimate_stop_fraction: float
+    limit_usd: float
+
+
+def estimate_limit_usd(ceiling_usd: float, gate_estimate_usd: object) -> float:
+    """The lower of the ceiling and 120% of the gate's estimate, rounded down to the cent so
+    it never exceeds either. A null, non-finite or non-positive estimate is refused."""
+    if gate_estimate_usd is None:
+        raise ValueError(
+            "limits.gate_estimate_usd is null: the estimate is fixed at the owner's gate "
+            "(python -m tools.posttrain_approved run2-gate)"
+        )
+    estimate = _positive(gate_estimate_usd, "the gate's estimate")
+    ceiling = _positive(ceiling_usd, "the ceiling")
+    cents = math.floor(round(ESTIMATE_STOP_FRACTION * estimate * 100, 6))
+    return min(ceiling, cents / 100)
+
+
 def ceiling_limits(
     ceiling_usd: float,
     quoted_total_hourly: float,
     *,
     self_destruct_margin_seconds: float = SELF_DESTRUCT_MARGIN_SECONDS,
     watchdog_margin_usd: float = WATCHDOG_MARGIN_USD,
+    gate_estimate_usd: float | None = None,
 ) -> CeilingLimits:
     """The run's limits from its dollar ceiling: the one place they are derived.
 
     The wall is the ceiling's worth of whole seconds at the quoted rate, rounded down, so
     the wall's quoted cost never exceeds the ceiling. It must fit the in-Pod timer's
-    absolute 60,000 s cap.
+    absolute 60,000 s cap. With ``gate_estimate_usd`` (run 2) every limit derives from
+    ``estimate_limit_usd`` instead, and the record is an ``EstimateLimits``.
     """
+    if gate_estimate_usd is not None:
+        limit = estimate_limit_usd(ceiling_usd, gate_estimate_usd)
+        derived = ceiling_limits(
+            limit,
+            quoted_total_hourly,
+            self_destruct_margin_seconds=self_destruct_margin_seconds,
+            watchdog_margin_usd=watchdog_margin_usd,
+        )
+        return EstimateLimits(
+            **{**asdict(derived), "ceiling_usd": _positive(ceiling_usd, "the ceiling")},
+            gate_estimate_usd=float(gate_estimate_usd),
+            estimate_stop_fraction=ESTIMATE_STOP_FRACTION,
+            limit_usd=limit,
+        )
     ceiling = _positive(ceiling_usd, "the ceiling")
     hourly = _positive(quoted_total_hourly, "the quoted total hourly rate")
     margin = _positive(self_destruct_margin_seconds, "the self-destruct margin")
@@ -187,17 +244,45 @@ def ceiling_limits(
     )
 
 
-def read_limits(raw: Mapping[str, Any], *, allow_null: Sequence[str] = ()) -> dict[str, Any]:
-    """A specification's ``limits`` object, exactly ``LIMIT_KEYS``, each a positive number;
-    ``allow_null`` names keys that may still be ``null`` (run 2's ceiling before the gate)."""
-    if not isinstance(raw, Mapping) or set(raw) != LIMIT_KEYS:
-        raise ValueError(f"limits must have exactly the keys {sorted(LIMIT_KEYS)}")
-    for key in LIMIT_KEYS:
+def lifetime_seconds(limits: CeilingLimits) -> float:
+    """The longest a Pod under ``limits`` can live from its billing origin: the first of the
+    wall, the in-Pod timer and the worker's and the watchdog's cost stops at the quoted rate
+    (``rehearsal_run.lifetime_end`` with nothing yet spent)."""
+    hourly = limits.quoted_total_hourly
+    return min(
+        float(limits.wall_seconds),
+        float(limits.self_destruct_seconds),
+        limits.worker_cost_stop_usd / hourly * 3600,
+        limits.watchdog_cost_stop_usd / hourly * 3600,
+    )
+
+
+RUN2_GATE_LIMITS = ("ceiling_usd", "gate_estimate_usd", "cost_limit_usd")
+"""Run 2's limits fixed at the owner's gate, ``null`` in the tracked template."""
+
+
+def limit_keys(specification: Mapping[str, Any]) -> frozenset[str]:
+    """The keys a specification's ``limits`` must have: run 2's include the gate estimate."""
+    return RUN2_LIMIT_KEYS if specification.get("run") == "2" else LIMIT_KEYS
+
+
+def read_limits(
+    raw: Mapping[str, Any],
+    *,
+    allow_null: Sequence[str] = (),
+    keys: frozenset[str] = LIMIT_KEYS,
+) -> dict[str, Any]:
+    """A specification's ``limits`` object, exactly ``keys`` (``LIMIT_KEYS``; run 2's
+    ``RUN2_LIMIT_KEYS``), each a positive number; ``allow_null`` names keys that may still be
+    ``null`` (run 2's gate values before the gate)."""
+    if not isinstance(raw, Mapping) or set(raw) != keys:
+        raise ValueError(f"limits must have exactly the keys {sorted(keys)}")
+    for key in sorted(keys):
         if raw[key] is None and key in allow_null:
             continue
-        if raw[key] is None and key == "ceiling_usd":
+        if raw[key] is None and key in RUN2_GATE_LIMITS:
             raise ValueError(
-                "limits.ceiling_usd is null: the ceiling is fixed at the owner's gate "
+                f"limits.{key} is null: it is fixed at the owner's gate "
                 "(python -m tools.posttrain_approved run2-gate)"
             )
         _positive(raw[key], f"limits.{key}")
@@ -205,14 +290,24 @@ def read_limits(raw: Mapping[str, Any], *, allow_null: Sequence[str] = ()) -> di
 
 
 def specification_limits(specification: Mapping[str, Any]) -> CeilingLimits:
-    """``ceiling_limits`` for a specification file's ``limits`` object."""
-    limits = read_limits(specification.get("limits", {}))
-    return ceiling_limits(
+    """``ceiling_limits`` for a specification file's ``limits`` object. Run 2's derive from
+    the lower of the ceiling and 120% of the gate's estimate, and its written
+    ``cost_limit_usd`` must be exactly that limit."""
+    limits = read_limits(specification.get("limits", {}), keys=limit_keys(specification))
+    derived = ceiling_limits(
         limits["ceiling_usd"],
         limits["quoted_total_hourly"],
         self_destruct_margin_seconds=limits["self_destruct_margin_seconds"],
         watchdog_margin_usd=limits["watchdog_margin_usd"],
+        gate_estimate_usd=limits.get("gate_estimate_usd"),
     )
+    if isinstance(derived, EstimateLimits) and limits["cost_limit_usd"] != derived.limit_usd:
+        raise ValueError(
+            f"limits.cost_limit_usd ({limits['cost_limit_usd']}) differs from its derivation, "
+            f"the lower of the ${derived.ceiling_usd:.2f} ceiling and 120% of the "
+            f"${derived.gate_estimate_usd:.2f} estimate: {derived.limit_usd}"
+        )
+    return derived
 
 
 # Run 2's reward bridge: every bound on one wait, derived in one place -----------------------
@@ -254,8 +349,14 @@ class BridgeTimeouts:
     - ``bridge_allowance_seconds``: the bridge's own time on top of the Mac's: one Mac poll,
       one listing, one read and one write over SSH, each tried 5 times to its timeout with
       the backoff waits between, and one Pod poll.
+    - ``window_check_seconds``: one of the Mac's execution-window passes at its worst, run
+      before a request is scored when the last pass is old (every call to its bound,
+      ``scratchcoder.rl.bridge_mac.window_check_seconds_bound``).
+    - ``image_check_seconds``: the Mac's pinned-image check before every request at its
+      worst (every try to its bound and every backoff wait).
     - ``reward_timeout_seconds`` and ``dev_timeout_seconds``: the Pod's, the Mac's plus the
-      allowance, so a Mac-side ``timeout`` reply always reaches a Pod that still waits.
+      allowance and both checks, so a Mac-side ``timeout`` reply always reaches a Pod that
+      still waits, whatever the checks before it took.
     - ``awaiting_*_extension_seconds``: the Mac watchdog's idle limit while the heartbeat
       reads ``awaiting_rewards`` for that kind of request: the Pod's timeout plus the slack.
     - ``wait_margin_seconds``: one full wait (the longer kind); the worker's cost, wall and
@@ -272,6 +373,8 @@ class BridgeTimeouts:
     mac_reward_timeout_seconds: float
     mac_dev_timeout_seconds: float
     bridge_allowance_seconds: float
+    window_check_seconds: float
+    image_check_seconds: float
     reward_timeout_seconds: float
     dev_timeout_seconds: float
     awaiting_slack_seconds: float
@@ -280,6 +383,19 @@ class BridgeTimeouts:
     wait_margin_seconds: float
     lease_seconds: float
     lost_bridge_seconds: float
+
+    @property
+    def mac_check_seconds(self) -> float:
+        """The Mac's checks before it scores one request, at their worst."""
+        return self.window_check_seconds + self.image_check_seconds
+
+    def mac_timeout(self, kind: str) -> float:
+        """The Mac's own bound for a ``reward`` or ``dev`` request (``rl-bridge``)."""
+        if kind == "reward":
+            return self.mac_reward_timeout_seconds
+        if kind == "dev":
+            return self.mac_dev_timeout_seconds
+        raise ValueError(f"unknown bridge request kind {kind!r}")
 
     def timeout(self, kind: str) -> float:
         """The Pod's timeout for a ``reward`` or ``dev`` request."""
@@ -316,7 +432,9 @@ def bridge_timeouts(
     For the rehearsal (256 attempts, 1,800 dev programs, 8 workers): a try is 27 + 15 = 42 s,
     an attempt 4 x 42 + 1 + 2 + 4 = 175 s, the Mac's reward bound 32 x 175 = 5,600 s and its
     dev bound 225 x 42 + 42 = 9,492 s; the allowance 2 + 5 x (30 + 120 + 120) + 3 x 15 + 0.5 =
-    1,397.5 s, so the Pod waits 6,997.5 s for rewards and 10,889.5 s for a dev check.
+    1,397.5 s; the Mac's checks before a request, one window pass of 11 x 60 + 2 x 30 + 10 =
+    730 s and the image check of 4 x 30 + 1 + 2 + 4 = 127 s, so the Pod waits 5,600 + 1,397.5 +
+    857 = 7,854.5 s for rewards and 11,746.5 s for a dev check.
     """
     for name, count in (
         ("attempts_per_request", attempts_per_request),
@@ -349,8 +467,10 @@ def bridge_timeouts(
         + 3 * backoff
         + pod_poll_seconds
     )
-    reward = mac_reward + allowance
-    dev = mac_dev + allowance
+    window_check = window_check_seconds_bound()
+    image_check = image_check_seconds_bound()
+    reward = mac_reward + allowance + window_check + image_check
+    dev = mac_dev + allowance + window_check + image_check
     lost = pod_idle_seconds - LOST_BRIDGE_MARGIN_SECONDS
     if lost <= LEASE_SECONDS:
         raise ValueError("the in-Pod idle limit leaves no room to detect a lost bridge")
@@ -363,6 +483,8 @@ def bridge_timeouts(
         mac_reward_timeout_seconds=mac_reward,
         mac_dev_timeout_seconds=mac_dev,
         bridge_allowance_seconds=allowance,
+        window_check_seconds=window_check,
+        image_check_seconds=image_check,
         reward_timeout_seconds=reward,
         dev_timeout_seconds=dev,
         awaiting_slack_seconds=float(awaiting_slack_seconds),
@@ -422,7 +544,11 @@ def specification_bridge_timeouts(specification: Mapping[str, Any]) -> BridgeTim
     rl = specification.get("rl")
     if not isinstance(rl, Mapping):
         raise ValueError("a specification with a bridge needs its rl section")
-    limits = read_limits(specification.get("limits", {}), allow_null=("ceiling_usd",))
+    limits = read_limits(
+        specification.get("limits", {}),
+        allow_null=RUN2_GATE_LIMITS,
+        keys=limit_keys(specification),
+    )
     derived = bridge_timeouts(
         attempts_per_request=rl["tasks_per_update"] * rl["group_size"],
         dev_programs=rl["dev_tasks"] * (rl["dev_samples"] + 1),
@@ -692,16 +818,22 @@ def run_summary(
 
 
 def run2_results(report: Mapping[str, Any]) -> dict[str, Any]:
-    """Run 2's results for its summary: the arms, the selection and the bridge."""
+    """Run 2's results for its summary: the arms, an arm's early stop, the selection with
+    each arm's endpoint (evaluated on the Pod, reusing run 1's SFT results because its weights
+    are the SFT weights, or not evaluated) and the bridge."""
     bridge = report.get("bridge")
     if isinstance(bridge, Mapping):
         waits = bridge.get("waits")
         bridge = {key: value for key, value in bridge.items() if key != "waits"}
         bridge["wait_count"] = len(waits) if isinstance(waits, list) else None
+    selection = report.get("selection")
+    endpoints = selection.get("endpoints") if isinstance(selection, Mapping) else None
     return {
         "rl": report.get("rl"),
         "more_sft": report.get("more_sft"),
-        "selection": report.get("selection"),
+        "arm_stop": report.get("arm_stop"),
+        "selection": selection,
+        "endpoints": endpoints,
         "bridge": bridge,
     }
 

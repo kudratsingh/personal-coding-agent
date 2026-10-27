@@ -24,6 +24,12 @@ reads a request or pushes a reply, so a slow SSH call never lets it lapse) and a
 server is refused with ``BridgeLeaseHeld``, so a request is never scored twice by two Macs
 to different rewards.
 
+With a ``window_check`` the server repeats the Mac execution-window checks
+(``scratchcoder.sandbox.window``) on its own process while it runs: at its start and before
+it scores a request once the last pass is ``window_check_seconds`` old. A failed or errored
+pass ends the server (``WindowCheckFailed``) before anything more is scored, its receipt in
+``window-checks/`` in the state directory.
+
 SSH calls are retried a bounded number of times with doubling backoff; a request read whose
 size differs from the listing is looked at again on the next poll, and an unreadable one is
 refused only when the second look finds it unchanged (a non-atomic writer may still be at
@@ -99,6 +105,7 @@ from scratchcoder.rl.rewards import (
     check_rewards,
 )
 from scratchcoder.sandbox.runner import Result
+from scratchcoder.sandbox.window import failed_checks, pass_seconds_bound
 
 PROGRESS_FORMAT = "rl-bridge-progress-v1"
 LEASE_FORMAT = "rl-bridge-lease-v1"
@@ -115,6 +122,49 @@ EXIT_MISSING = 4
 EXIT_REFUSED = 5
 MAX_LISTING_BYTES = 4 * 1024 * 1024
 PHASES = {REWARD: "kept screening list", DEV: "dev subset"}
+WINDOW_CHECK_INTERVAL_SECONDS = 900.0
+"""How old the bridge's last full execution-window pass may be when it scores a request: an
+older one is repeated first (``BridgeServer.window_check``). A pass is 11 ``docker`` calls (five
+container starts that fail to mount) and three local calls, seconds on an idle Docker
+Desktop. At the planning rates RL sends a reward request about every 80 s (26 s of rollouts,
+5 s of training, 48 s of scoring), so a pass runs before about one request in eleven and costs
+the Mac about 1% of its time; one before every request would add its seconds to each of RL's
+100 reward waits. A change to the Mac's sharing, agents, image or environment is caught before
+the first request scored more than 15 minutes after the last pass began. The Pod's timeouts
+hold one pass at its worst (``scratchcoder.sandbox.window.pass_seconds_bound``). It is also the
+longest interval a server accepts: a shorter one only repeats the passes more often, a longer
+one (a typed 9000 for 900) would quietly turn the repeat into a start-only check."""
+WINDOW_RECEIPTS = "window-checks"
+"""The state directory's folder of window-pass receipts, one ``pass-NNNNN.json`` per pass. A
+server restarted over the same state numbers its passes after the highest receipt there, so
+an earlier server's receipts (the failed pass that stopped it among them) are never
+overwritten."""
+WINDOW_RECEIPT = re.compile(r"pass-(\d{5,})\.json\Z")
+IMAGE_CHECK_RETRIES = 3
+"""Retries of the pinned image's ``docker image inspect`` before each request, after the first
+try (4 tries, waiting 1, 2 and 4 s)."""
+IMAGE_CHECK_TIMEOUT_SECONDS = 30.0
+"""The bound on one ``docker image inspect`` of the check before each request
+(``scratchcoder.rl.bridge_command.image_check``)."""
+WINDOW_DOCKER_TIMEOUT_SECONDS = 60.0
+"""The bound on one ``docker`` call of the bridge's window passes; one pass is at most
+``window.pass_seconds_bound(60)`` = 730 s."""
+
+
+def image_check_seconds_bound(
+    retries: int = IMAGE_CHECK_RETRIES,
+    *,
+    timeout: float = IMAGE_CHECK_TIMEOUT_SECONDS,
+    backoff_seconds: float = 1.0,
+) -> float:
+    """The longest the check before a request can take: every try to its bound and every
+    backoff wait, 4 x 30 + 1 + 2 + 4 = 127 s."""
+    return (retries + 1) * timeout + sum(backoff_seconds * 2.0**n for n in range(retries))
+
+
+def window_check_seconds_bound() -> float:
+    """The longest one of the bridge's window passes can take: 730 s."""
+    return pass_seconds_bound(WINDOW_DOCKER_TIMEOUT_SECONDS)
 
 
 class BridgeTransportError(RuntimeError):
@@ -140,6 +190,16 @@ class BridgeLeaseHeld(BridgeError):
         )
         self.holder = holder
         self.age_seconds = age_seconds
+
+
+class WindowCheckFailed(BridgeError):
+    """A Mac execution-window pass failed or could not be made (``BridgeServer.window_check``):
+    the server scores nothing more and stops, its receipt naming the failed checks."""
+
+
+WindowCheck = Callable[[], Mapping[str, Any]]
+"""One full pass of the execution-window checks (``scratchcoder.sandbox.window.check``): a
+record whose ``status`` is ``passed``, or anything else for a failed pass."""
 
 
 class BridgeRemoteError(BridgeError):
@@ -1039,8 +1099,16 @@ class BridgeServer:
     them to the Pod's timeout less the bridge's allowance (``docs/rl.md``). ``before_scoring``
     runs before each request is scored (for example a check of the sandbox image); if it
     raises, the request gets a ``host_failure`` reply and nothing runs. State lives under
-    ``state``: ``replies/``, ``progress.json``, ``events.jsonl`` and an exclusive
-    ``server.lock``.
+    ``state``: ``replies/``, ``progress.json``, ``events.jsonl``, ``window-checks/`` and an
+    exclusive ``server.lock``.
+
+    ``window_check`` is one full pass of the Mac execution-window checks (``None`` for none).
+    It runs when ``serve`` starts and again before a request is scored whenever the last pass
+    began ``window_check_seconds`` ago or more; each pass leaves a receipt in
+    ``window-checks/``. A pass that fails, or raises, ends the server with
+    ``WindowCheckFailed`` before anything more is scored: the request stays unanswered, the
+    lease lapses, and the Pod gives its wait up as a lost bridge. While a pass runs the ticker
+    renews the lease, so a slow pass never reads as a dead Mac.
     """
 
     def __init__(
@@ -1064,6 +1132,8 @@ class BridgeServer:
         server_id: str | None = None,
         lease_seconds: float | None = LEASE_SECONDS,
         inputs: Mapping[str, Any] | None = None,
+        window_check: WindowCheck | None = None,
+        window_check_seconds: float = WINDOW_CHECK_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
@@ -1094,6 +1164,22 @@ class BridgeServer:
             workers=workers, timeout=dev_timeout
         )
         self.before_scoring = before_scoring
+        if (
+            isinstance(window_check_seconds, bool)
+            or not isinstance(window_check_seconds, (int, float))
+            or not math.isfinite(window_check_seconds)
+            or window_check_seconds <= 0
+            or window_check_seconds > WINDOW_CHECK_INTERVAL_SECONDS
+        ):
+            raise ValueError(
+                "window_check_seconds must be positive and at most "
+                f"{WINDOW_CHECK_INTERVAL_SECONDS:.0f} (the justified bound)"
+            )
+        self.window_check = window_check
+        self.window_check_seconds = float(window_check_seconds)
+        self._window_passes = highest_window_pass(state)
+        self._window_started: float | None = None
+        """When the last passed window pass began (this server's monotonic clock)."""
         self.max_request_bytes = max_request_bytes
         self.transport_retries = transport_retries
         self.backoff_seconds = float(backoff_seconds)
@@ -1117,6 +1203,7 @@ class BridgeServer:
                 transport.claim(self.server_id, self.lease_seconds)
             self._scoring = threading.Event()
             self._transferring = threading.Event()
+            self._checking = threading.Event()
             self._lease_lost: BridgeLeaseHeld | None = None
             self.log = EventLogger(state / "events.jsonl", "rl-bridge")  # last: nothing to close
         except BaseException:
@@ -1133,6 +1220,15 @@ class BridgeServer:
                 "pod_task_sha256": dict(self.pod_task_sha256),
                 "allowed_tasks": {kind: len(ids) for kind, ids in self.allowed.items()},
                 "inputs": dict(inputs or {}),
+                "window_check": (
+                    None
+                    if window_check is None
+                    else {
+                        "interval_seconds": self.window_check_seconds,
+                        "passes": 0,
+                        "last": None,
+                    }
+                ),
             },
         )
         self.log.event(
@@ -1354,6 +1450,57 @@ class BridgeServer:
         except Exception as error:
             self.progress.update(last_error=_short(error))
 
+    def window_due(self) -> bool:
+        """Whether a window pass must run before the next request is scored."""
+        if self.window_check is None:
+            return False
+        started = self._window_started
+        return started is None or self._clock() - started >= self.window_check_seconds
+
+    def _window_pass(self, reason: str) -> None:
+        """One full pass of the execution-window checks, its receipt written first; a failed
+        or errored pass raises ``WindowCheckFailed``. Receipts and the log carry the checks'
+        own records (names, exit codes, image IDs), never a value of the environment."""
+        assert self.window_check is not None
+        self._window_passes += 1
+        number = self._window_passes
+        started, started_unix = self._clock(), self._wall()
+        try:
+            record: dict[str, Any] = dict(self.window_check())
+            passed = record.get("status") == "passed"
+            failed = [] if passed else failed_checks(record)
+        except Exception as error:
+            record = {"status": "error", "error": _short(error)}
+            passed, failed = False, ["error"]
+        receipt = self.state / WINDOW_RECEIPTS / f"pass-{number:05d}.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        if receipt.exists() or receipt.is_symlink():
+            raise WindowCheckFailed(f"{receipt} already exists; a receipt is never overwritten")
+        summary = {
+            "pass": number,
+            "reason": reason,
+            "status": "passed" if passed else str(record.get("status") or "failed"),
+            "failed": failed,
+            "started_unix": started_unix,
+            "seconds": self._clock() - started,
+            "receipt": str(receipt),
+        }
+        atomic_json(receipt, {**record, "bridge_pass": summary})
+        self.progress.update(
+            window_check={
+                "interval_seconds": self.window_check_seconds,
+                "passes": number,
+                "last": summary,
+            }
+        )
+        self.log.event("window_check", **summary)
+        if not passed:
+            raise WindowCheckFailed(
+                f"the Mac execution-window check failed ({', '.join(failed)}) at pass {number} "
+                f"({reason}); nothing more is scored: see {receipt}"
+            )
+        self._window_started = started
+
     def _score(self, request: BridgeRequest) -> BridgeReply:
         started = self._clock()
         self._scoring.set()
@@ -1362,6 +1509,9 @@ class BridgeServer:
             current={**_request_row(request.name, self._wall()), "count": request.count},
         )
         try:
+            if self.window_due():
+                # Before anything of this request runs; a failure ends the server unanswered.
+                self._window_pass(f"before scoring {request.request_id}")
             try:
                 if self.before_scoring is not None:
                     self.before_scoring(request)
@@ -1433,8 +1583,9 @@ class BridgeServer:
         last ``BridgeTransportError``. Any other error is recorded in ``progress.json``
         (state ``failed``) and raised; nothing unscored is stored, so a restarted server
         scores that request again. ``progress_seconds`` is the ticker that rewrites
-        ``progress.json`` and, while a request is read, scored or answered, renews the lease
-        (``None`` for no ticker).
+        ``progress.json`` and, while a request is read, scored or answered or a window pass
+        runs, renews the lease (``None`` for no ticker). With a ``window_check`` the first
+        pass runs before the first poll; a failed pass raises ``WindowCheckFailed``.
         """
         if type(max_consecutive_failures) is not int or max_consecutive_failures < 1:
             raise ValueError("max_consecutive_failures must be a positive integer")
@@ -1446,14 +1597,25 @@ class BridgeServer:
             def tick() -> None:
                 while not stop.wait(interval):
                     self.progress.write()
-                    if self._scoring.is_set() or self._transferring.is_set():
+                    if (
+                        self._scoring.is_set()
+                        or self._transferring.is_set()
+                        or self._checking.is_set()
+                    ):
                         self._renew_lease()
 
             ticker = threading.Thread(target=tick, name="rl-bridge-progress", daemon=True)
             ticker.start()
         failures = polls = 0
-        self.progress.update(state="polling")
         try:
+            if self.window_check is not None:
+                self.progress.update(state="checking")
+                self._checking.set()
+                try:
+                    self._window_pass("start")
+                finally:
+                    self._checking.clear()
+            self.progress.update(state="polling")
             while not (should_stop is not None and should_stop()):
                 if max_polls is not None and polls >= max_polls:
                     break
@@ -1480,6 +1642,19 @@ class BridgeServer:
             stop.set()
             if ticker is not None:
                 ticker.join(timeout=5)
+
+
+def highest_window_pass(state: Path) -> int:
+    """The highest pass number among the window receipts in ``state`` (0 for none)."""
+    directory = state / WINDOW_RECEIPTS
+    if not directory.is_dir():
+        return 0
+    numbers = [
+        int(match.group(1))
+        for path in directory.iterdir()
+        if (match := WINDOW_RECEIPT.fullmatch(path.name))
+    ]
+    return max(numbers, default=0)
 
 
 def _phase_tasks(tasks: Iterable[Task], split: str, kind: str) -> dict[str, Task]:
