@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -50,7 +50,7 @@ from scratchcoder.rl.checkpoint import read_weights, save_weights
 from scratchcoder.rl.dev import DevEvaluator, select_check
 from scratchcoder.rl.loop import CheckRecord, ShouldStop, stop_request
 from scratchcoder.rl.rewards import RewardError, RewardTimeout
-from scratchcoder.rl.screening import require_train_tasks
+from scratchcoder.rl.screening import Baseline, require_train_tasks
 from scratchcoder.train.trainer import Trainer, TrainingStop
 
 BUDGET = "budget"
@@ -229,6 +229,7 @@ def run_more_sft(
     config: ControlConfig | None = None,
     should_stop: ShouldStop | None = None,
     on_check: Callable[[CheckRecord], None] | None = None,
+    facts: Mapping[str, Baseline] | None = None,
 ) -> ControlResult:
     """Train the control from ``parent`` for ``budget_seconds`` of GPU-busy time.
 
@@ -236,14 +237,15 @@ def run_more_sft(
     record and events under ``output / run_id``; the control adds
     ``control-events.jsonl``, ``checkpoints/step-NNNNN.pt`` and ``control-result.json``
     there. ``should_stop`` is read once per update, as in RL. ``tasks`` must be parseable
-    train tasks with reference solutions (``require_train_tasks``).
+    train tasks with reference solutions (``require_train_tasks``); ``facts`` are the
+    Mac's facts about their hidden tests, for a Pod that holds none.
     """
     config = config or ControlConfig()
     if isinstance(budget_seconds, bool) or not math.isfinite(budget_seconds) or budget_seconds < 0:
         raise ValueError("the budget must be finite nonnegative seconds")
     if start.dev.check != 0:
         raise ValueError("the control's start is RL's update-0 check")
-    require_train_tasks(tasks, references=True)
+    require_train_tasks(tasks, references=True, baselines=facts)
     run_dir = output / run_id
     if (run_dir / "control-result.json").exists():
         raise ValueError(f"{run_dir} already holds a control result")

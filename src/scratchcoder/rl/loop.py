@@ -34,7 +34,7 @@ import json
 import math
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -58,7 +58,7 @@ from scratchcoder.rl.rewards import (
     check_rewards,
 )
 from scratchcoder.rl.rollout import ROLLOUT_SEED, ROLLOUT_TOKENS, generate_rollouts, rollout_seed
-from scratchcoder.rl.screening import require_train_tasks
+from scratchcoder.rl.screening import Baseline, require_train_tasks
 from scratchcoder.sandbox.reward import AuditTally
 from scratchcoder.train.trainer import synchronized_time
 
@@ -337,6 +337,7 @@ def run_rl(
     config: RLConfig | None = None,
     should_stop: ShouldStop | None = None,
     on_check: Callable[[CheckRecord], None] | None = None,
+    facts: Mapping[str, Baseline] | None = None,
 ) -> RLResult:
     """Run RL on ``model`` (the SFT parent, already on its device) over the kept tasks.
 
@@ -346,6 +347,8 @@ def run_rl(
     hold a result. Precision follows the device: bfloat16 autocast on CUDA, float32 on the CPU.
 
     ``tasks`` must be train-split tasks the reward channel can parse (``require_train_tasks``).
+    ``facts`` are the Mac's facts about their hidden tests, for a Pod that holds none
+    (``scratchcoder.rl.facts``); without them the tasks must carry their real hidden tests.
     ``on_check`` is called with each dev check's record once its checkpoint file exists, so
     a caller can upload it at once; an exception from it propagates like any other error,
     after the latest weights are saved. An unexpected error in the loop or in the stop-time
@@ -358,7 +361,7 @@ def run_rl(
     by_id = {task.id: task for task in tasks}
     if len(by_id) != len(tasks):
         raise ValueError("RL task IDs must be unique")
-    task_baselines = require_train_tasks(tasks)
+    task_baselines = require_train_tasks(tasks, baselines=facts)
     device = next(model.parameters()).device
     precision = "bfloat16" if device.type == "cuda" else "float32"
     schedule = task_schedule(

@@ -13,5 +13,7 @@
   the Mac, through files).
 - ``bridge_mac``: the bridge's Mac side: polling the Pod over SSH, scoring, replying.
 - ``bridge_command``: ``scratchcoder rl-bridge``.
+- ``withheld`` and ``facts``: tasks as the Pod may hold them (no hidden tests) and the Mac's
+  facts about the real tests that the Pod needs instead.
 - ``fakes``: deterministic stand-ins for tests and smokes.
 """

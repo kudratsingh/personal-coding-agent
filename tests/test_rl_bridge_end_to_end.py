@@ -14,11 +14,13 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -69,10 +71,12 @@ from scratchcoder.rl.bridge_mac import (
 from scratchcoder.rl.checkpoint import save_weights
 from scratchcoder.rl.control import ControlConfig, ControlResult, run_more_sft
 from scratchcoder.rl.dev import DevCheck, PoolDevEvaluator
+from scratchcoder.rl.facts import constant_baseline_from_facts, task_facts
 from scratchcoder.rl.fakes import FakeRewardSource
 from scratchcoder.rl.loop import CheckRecord, RLConfig, run_rl
 from scratchcoder.rl.rewards import NO_PROGRAM, Attempt, AttemptReward
 from scratchcoder.rl.rollout import Rollout
+from scratchcoder.rl.withheld import withheld_task
 from scratchcoder.tokenizer.bpe import ByteBPE
 from scratchcoder.train import trainer as trainer_module
 
@@ -436,6 +440,143 @@ def test_the_more_sft_control_takes_its_dev_checks_through_the_bridge(
         f"dev-{step:06d}.json" for step in steps[1:]
     ]
     assert len(dev.calls) == len(steps) - 1
+
+
+# ----------------------------------------------- a Pod that holds no hidden tests
+
+HIDDEN = {
+    "t0": "assert f(1) == 0\nassert f(2) == 0",  # a constant answer earns 1.0
+    "t1": "assert f(6) == 424242424\nassert f(2) == 0",  # 0.5
+    "t2": "assert f(6) == 434343434",
+    "t3": "assert f(1) == 0\nassert f(7) == 444444444\nassert f(2) == 0\nassert f(3) == 0",
+    "t4": "assert f(5) == 454545454",
+    "t5": "assert f(2) == 464646464\nassert f(3) == 464646464",
+    "d0": "assert f(1) == 0\nassert f(2) == 0",
+    "d1": "y = f(1)\nassert y == 474747474",  # not parseable by the reward channel
+    "d2": "assert f(6) == 484848484",
+    "d3": "assert f(9) == 494949494\nassert f(1) == 0",
+}
+
+
+def with_hidden(tasks: Sequence[Task]) -> list[Task]:
+    return [replace(task, hidden_tests=HIDDEN[task.id]) for task in tasks]
+
+
+def assert_no_hidden_test_in(*roots: Path) -> None:
+    """No file under ``roots`` holds any real hidden test (a marker unique to each)."""
+    markers = re.findall(r"\d{9}", " ".join(HIDDEN.values()))
+    assert len(set(markers)) == 8
+    for root in roots:
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix not in {".pt", ".lock"}:
+                content = path.read_text(errors="replace")
+                assert not [m for m in markers if m in content], path
+
+
+def test_the_hidden_test_scan_finds_a_planted_marker(tmp_path: Path) -> None:
+    assert_no_hidden_test_in(tmp_path)
+    (tmp_path / "leak.json").write_text('{"tests": "assert f(6) == 424242424"}')
+    with pytest.raises(AssertionError):
+        assert_no_hidden_test_in(tmp_path)
+
+
+def test_a_pod_without_hidden_tests_runs_rl_through_the_bridge_as_if_it_had_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(loop, "generate_rollouts", scripted_rollouts)
+    monkeypatch.setattr(dev_module, "generate_many", dev_completions)
+    real_train, real_dev = with_hidden(TRAIN), with_hidden(DEV_TASKS)
+    train_facts, dev_facts = task_facts(real_train), task_facts(real_dev)
+    held_train = [withheld_task(task) for task in real_train]
+    held_dev = [withheld_task(task) for task in real_dev]
+    baseline = constant_baseline_from_facts(dev_facts, [task.id for task in real_dev])
+    assert baseline.unparseable == 1 and 0 < baseline.mean < 1
+    common: dict[str, Any] = {
+        "encoder": TOKENIZER,
+        "decoder": TOKENIZER,
+        "run_id": "rl-withheld-test",
+        "tokenizer_hash": "authored",
+        "config": rl_config(),
+    }
+    local = run_rl(
+        tiny_model(),
+        real_train,
+        rewards=FakeRewardSource(),
+        evaluator=PoolDevEvaluator(real_dev, TOKENIZER, TOKENIZER, CountingDev(), batch_size=8),
+        output=tmp_path / "local",
+        **common,
+    )
+    pod = tmp_path / "pod"
+    with pod_client(pod, poll_seconds=0.01) as client:
+        executor = BridgeDevExecutor(client, task_file_sha256=DEV_SHA, timeout=60)
+        with mac_thread(mac_server(pod, tmp_path / "mac")):
+            bridged = run_rl(
+                tiny_model(),
+                held_train,
+                rewards=BridgeRewardSource(client, task_file_sha256=RL_SHA, timeout=60),
+                evaluator=BridgeDevEvaluator(
+                    held_dev, TOKENIZER, TOKENIZER, executor, batch_size=8, baseline=baseline
+                ),
+                output=tmp_path / "bridged",
+                facts=train_facts,
+                **common,
+            )
+    assert any(row["baseline_mean"] > 0 for row in local.monitoring)  # a real baseline
+    assert comparable(bridged.monitoring) == comparable(local.monitoring)
+    ours, theirs = bridged.checks[0].dev, local.checks[0].dev
+    assert (ours.constant_baseline, ours.baseline_unparseable, ours.constant_pass_rate) == (
+        theirs.constant_baseline,
+        theirs.baseline_unparseable,
+        theirs.constant_pass_rate,
+    )
+    assert ours.per_task == theirs.per_task and bridged.checks[0].sha256 == local.checks[0].sha256
+    # Without the facts the Pod's run refuses to start, rather than train against a
+    # baseline computed from placeholders.
+    with pytest.raises(ValueError, match="withhold them"):
+        run_rl(
+            tiny_model(),
+            held_train,
+            rewards=FakeRewardSource(),
+            evaluator=PoolDevEvaluator(real_dev, TOKENIZER, TOKENIZER, CountingDev()),
+            output=tmp_path / "refused",
+            **common,
+        )
+    assert_no_hidden_test_in(pod, tmp_path / "bridged", tmp_path / "mac")
+
+
+def test_the_control_runs_on_withheld_tasks_with_the_macs_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(dev_module, "generate_many", dev_completions)
+    torch.manual_seed(0)
+    parent = tmp_path / "parent.pt"
+    model = GPT(ModelConfig(vocab_size=272, width=32, layers=2, heads=2, context=96))
+    save_weights(parent, model, tokenizer_hash=TOKENIZER.sha256, run_id="sft", step=0)
+    start = CheckRecord(DevCheck(0, 0.1, 0.05, 0.2, 0.1, 200, 0.0, 0.0), 0, str(parent), "0" * 64)
+    real_train = with_hidden(TRAIN)
+    held_train = [withheld_task(task) for task in real_train]
+    options: dict[str, Any] = {
+        "parent": parent,
+        "encoder": TOKENIZER,
+        "tokenizer_hash": TOKENIZER.sha256,
+        "budget_seconds": 3.0,
+        "start": start,
+        "evaluator": PoolDevEvaluator(DEV_TASKS, TOKENIZER, TOKENIZER, CountingDev(), batch_size=8),
+        "config": ControlConfig(batch_size=2, accumulation_steps=2, warmup_updates=1),
+    }
+
+    def run(tasks: list[Task], name: str, **extra: Any) -> ControlResult:
+        readings = iter([value for step in range(20) for value in (101.0 * step, 101.0 * step + 1)])
+        monkeypatch.setattr(trainer_module, "synchronized_time", lambda device: next(readings))
+        return run_more_sft(
+            tasks=tasks, output=tmp_path / name, run_id="more-sft", **options, **extra
+        )
+
+    local = run(real_train, "local")
+    withheld = run(held_train, "withheld", facts=task_facts(real_train))
+    assert [check.sha256 for check in withheld.checks] == [check.sha256 for check in local.checks]
+    with pytest.raises(ValueError, match="withhold them"):
+        run(held_train, "refused")
 
 
 # --------------------------------------------------------------------- the command
