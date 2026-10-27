@@ -722,7 +722,9 @@ def check_readiness(
     origin = min(origin, created)
     derived = spec.ceiling
     deadline = finite_number(receipt.get("self_destruct_deadline_unix"), "self-destruct deadline")
-    if not now < deadline <= origin + derived.self_destruct_seconds + 1:
+    # The runbook arms the timer at the create request's time plus the derived timer lifetime;
+    # the provider's creation time may read a little earlier, so the bound is the wall itself.
+    if not now < deadline <= origin + derived.wall_seconds:
         raise ValueError("the armed in-Pod deadline lies outside the ceiling-derived lifetime")
     if receipt.get("r2_run_prefix") != posttrain_ops.run_prefix(spec.run, identity.pod_id):
         raise ValueError("the receipt's R2 prefix is not this run's Pod prefix")

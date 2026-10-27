@@ -489,6 +489,21 @@ def test_readiness_accepts_the_receipt_and_applies_the_launch_rule() -> None:
         ready(receipt(), now=CREATED + 9_000)  # Setup ran too long for the whole run.
 
 
+def test_a_mac_clock_ahead_of_the_provider_still_arms_within_the_wall() -> None:
+    """The runbook arms the timer at the Mac's create-request time plus 17,820 s; a provider
+    creation time 30 s earlier makes the conservative origin earlier, still inside the wall."""
+    spec = Specification.load(SPEC)
+    mac_origin = CREATED + 30
+    value = receipt(
+        watchdog_policy=posttrain_ops.watchdog_policy(
+            spec.ceiling, origin=mac_origin, idle_baseline=CREATED
+        ),
+        self_destruct_deadline_unix=spec.ceiling.deadline_unix(mac_origin),
+    )
+    launch = ready(value, now=CREATED + 600)
+    assert launch.origin == CREATED and launch.end == CREATED + 30 + 17_820
+
+
 @pytest.mark.parametrize(
     "change, message",
     [
