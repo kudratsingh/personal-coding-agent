@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from scratchcoder.rl.bridge_mac import WINDOW_CHECK_INTERVAL_SECONDS
 from tools.pilot_feasibility import (
     BRIDGE_ROUND_TRIP_SECONDS,
     main,
@@ -50,6 +51,27 @@ def test_run_two_fits_its_ceiling_at_the_planning_speeds() -> None:
     slow = report["scenarios"]["planning speeds, Mac twice as slow"]
     assert slow["total_usd"] == pytest.approx(4.42, abs=0.01) and slow["fits_ceiling"]
     assert report["limits"]["watchdog_cost_stop_usd"] == 5.79
+
+
+def test_the_window_pass_cadence_quoted_is_rls_update_at_the_planning_rates() -> None:
+    """The bridge's interval and the operations page price one RL update the way the
+    projection does: its rollouts, its training and its reward wait."""
+    rows = posttrain2_report(TEMPLATE, ceiling_usd=5.80)["scenarios"]["planning speeds"]["rows"]
+    parts = [
+        rows[key]["hours"] * 3600 / RAW["rl"]["updates"]
+        for key in ("rl_rollouts", "rl_training", "rl_reward_waits")
+    ]
+    update = sum(parts)
+    assert [round(part) for part in parts] == [7, 5, 48] and round(update) == 60
+    assert round(WINDOW_CHECK_INTERVAL_SECONDS / update) == 15
+    phrase = (
+        "a reward request about every 60 s (7 s of rollouts at batch 256, 5 s of training, 48 s "
+        "of scoring), so between its dev checks a pass runs before about one request in fifteen"
+    )
+    root = TEMPLATE.parents[1]
+    for path in (root / "src/scratchcoder/rl/bridge_mac.py", root / "docs/posttrain-runs.md"):
+        text = " ".join(path.read_text().split())
+        assert phrase in text and "every 80 s" not in text, path.name
 
 
 def test_the_template_needs_a_ceiling_to_price_against() -> None:

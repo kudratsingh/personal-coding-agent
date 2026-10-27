@@ -126,14 +126,15 @@ WINDOW_CHECK_INTERVAL_SECONDS = 900.0
 """How old the bridge's last full execution-window pass may be when it scores a request: an
 older one is repeated first (``BridgeServer.window_check``). A pass is 11 ``docker`` calls (five
 container starts that fail to mount) and three local calls, seconds on an idle Docker
-Desktop. At the planning rates RL sends a reward request about every 80 s (26 s of rollouts,
-5 s of training, 48 s of scoring), so a pass runs before about one request in eleven and costs
-the Mac about 1% of its time; one before every request would add its seconds to each of RL's
-100 reward waits. A change to the Mac's sharing, agents, image or environment is caught before
-the first request scored more than 15 minutes after the last pass began. The Pod's timeouts
-hold one pass at its worst (``scratchcoder.sandbox.window.pass_seconds_bound``). It is also the
-longest interval a server accepts: a shorter one only repeats the passes more often, a longer
-one (a typed 9000 for 900) would quietly turn the repeat into a start-only check."""
+Desktop. At the planning rates RL sends a reward request about every 60 s (7 s of rollouts at
+batch 256, 5 s of training, 48 s of scoring), so between its dev checks a pass runs before about
+one request in fifteen and costs the Mac about 1% of its time; one before every request would
+add its seconds to each of RL's 100 reward waits. A change to the Mac's sharing, agents, image
+or environment is caught before the first request scored more than 15 minutes after the last
+pass began. The Pod's timeouts hold one pass at its worst
+(``scratchcoder.sandbox.window.pass_seconds_bound``). It is also the longest interval a server
+accepts: a shorter one only repeats the passes more often, a longer one (a typed 9000 for 900)
+would quietly turn the repeat into a start-only check."""
 WINDOW_RECEIPTS = "window-checks"
 """The state directory's folder of window-pass receipts, one ``pass-NNNNN.json`` per pass. A
 server restarted over the same state numbers its passes after the highest receipt there, so
