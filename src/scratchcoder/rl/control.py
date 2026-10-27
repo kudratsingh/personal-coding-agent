@@ -14,20 +14,28 @@ seconds (``RLResult.busy_seconds``). Before each update the control stops if
 ``busy + mean step / 2 >= budget``: taking one more step of the mean length would then
 overshoot by more than stopping undershoots. Dev checks, checkpoints and execution waits
 are outside ``step_seconds`` and recorded separately, as in RL; neither arm compiles, so
-compile time is 0 in both. The result reports the actual mismatch and whether it lies
-within plus or minus 5%.
+compile time is 0 in both (the control therefore offers no ``compile`` setting: its compile
+time could not be separated from the budget). The attention kernel and the optimizer's
+foreach path are settings (``attention``, ``optimizer_foreach``): set them to what the RL
+model and the SFT stage use, or the control's seconds buy fewer updates than the same time
+would on that path. The result reports the actual mismatch and whether it lies within plus
+or minus 5%.
 
 **Checks.** The start is RL's update-0 check (the same weights), reused, not repeated.
 Further checks follow after 1, 2, 4 and 8 passes over the rows (after the first update
 whose rows complete that pass, ``ceil(p x rows / rows per update)``) and at the budget end.
-Selection is RL's rule. See ``docs/walkthroughs/more-sft-control.md``.
+Selection is RL's rule. A stop whose weights no check covers takes one more check at the
+end, except a reward-channel stop and, unless ``check_at_external_stop``, a ``should_stop``
+stop; unchecked weights are saved, and an unexpected error anywhere (the end check
+included) saves the latest weights before it propagates. ``on_check`` is called with each
+check's record once its checkpoint exists. See ``docs/walkthroughs/more-sft-control.md``.
 """
 
 from __future__ import annotations
 
 import math
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -42,6 +50,7 @@ from scratchcoder.rl.checkpoint import read_weights, save_weights
 from scratchcoder.rl.dev import DevEvaluator, select_check
 from scratchcoder.rl.loop import CheckRecord, ShouldStop, stop_request
 from scratchcoder.rl.rewards import RewardError, RewardTimeout
+from scratchcoder.rl.screening import require_train_tasks
 from scratchcoder.train.trainer import Trainer, TrainingStop
 
 BUDGET = "budget"
@@ -75,6 +84,15 @@ class ControlConfig:
     sequence_length: int | None = None
     """Row length; ``None`` uses the model's context."""
     optimizer_foreach: bool = False
+    attention: str = "reference"
+    """The attention kernel of the trained model (``"reference"`` or ``"fused"``); match the
+    RL model's ``set_fused_attention`` and the SFT stage."""
+    check_at_stop: bool = True
+    """Take an end check at a stop the control decides itself (budget, passes exhausted,
+    non-finite) when its weights changed since the last check."""
+    check_at_external_stop: bool = False
+    """The same at a ``should_stop`` stop; off by default so a cost, wall or idle stop spends
+    nothing more. The weights are saved either way."""
 
     def __post_init__(self) -> None:
         for name in ("batch_size", "accumulation_steps", "max_passes"):
@@ -98,6 +116,11 @@ class ControlConfig:
             type(self.sequence_length) is not int or self.sequence_length < 1
         ):
             raise ValueError("sequence_length must be a positive integer or None")
+        if self.attention not in {"reference", "fused"}:
+            raise ValueError("attention must be reference or fused")
+        for name in ("optimizer_foreach", "check_at_stop", "check_at_external_stop"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
 
     def to_json(self) -> dict[str, Any]:
         value = asdict(self)
@@ -205,19 +228,22 @@ def run_more_sft(
     device: str = "cpu",
     config: ControlConfig | None = None,
     should_stop: ShouldStop | None = None,
+    on_check: Callable[[CheckRecord], None] | None = None,
 ) -> ControlResult:
     """Train the control from ``parent`` for ``budget_seconds`` of GPU-busy time.
 
     ``start`` is RL's update-0 check of the same parent weights. The trainer writes its run
     record and events under ``output / run_id``; the control adds
     ``control-events.jsonl``, ``checkpoints/step-NNNNN.pt`` and ``control-result.json``
-    there. ``should_stop`` is read once per update, as in RL.
+    there. ``should_stop`` is read once per update, as in RL. ``tasks`` must be parseable
+    train tasks with reference solutions (``require_train_tasks``).
     """
     config = config or ControlConfig()
     if isinstance(budget_seconds, bool) or not math.isfinite(budget_seconds) or budget_seconds < 0:
         raise ValueError("the budget must be finite nonnegative seconds")
     if start.dev.check != 0:
         raise ValueError("the control's start is RL's update-0 check")
+    require_train_tasks(tasks, references=True)
     run_dir = output / run_id
     if (run_dir / "control-result.json").exists():
         raise ValueError(f"{run_dir} already holds a control result")
@@ -256,6 +282,7 @@ def run_more_sft(
             adam_epsilon=config.adam_epsilon,
             precision=precision,
             optimizer_foreach=config.optimizer_foreach,
+            attention=config.attention,
             schedule="cosine",
             loss_normalization="update_targets",
         ),
@@ -295,6 +322,18 @@ def run_more_sft(
             seconds["checkpoint"] += time.perf_counter() - started
             return str(path), digest
 
+        def record_failure(error: Exception) -> None:
+            """Log an unexpected error and keep the latest weights before it propagates."""
+            logger.event(
+                "control_failed",
+                error_type=type(error).__name__,
+                detail=str(error)[:500],
+                updates=trainer.step,
+            )
+            if trainer.step > (checks[-1].optimizer_steps if checks else 0):
+                save(trainer.step, checked=False)
+            trainer.finish(success=False)  # a no-op when the trainer already recorded failure
+
         def dev_check(step: int, label: str) -> None:
             result = evaluator.evaluate(trainer.model, step)
             if result.check != step:
@@ -302,7 +341,8 @@ def run_more_sft(
             seconds["dev_generation"] += result.generation_seconds
             seconds["dev_wait"] += result.wait_seconds
             path, digest = save(step, checked=True)
-            checks.append(CheckRecord(result, step, path, digest, label))
+            record = CheckRecord(result, step, path, digest, label)
+            checks.append(record)
             logger.event(
                 "control_dev_check",
                 step=step,
@@ -312,6 +352,8 @@ def run_more_sft(
                 sha256=digest,
                 **result.to_json(per_task=False),
             )
+            if on_check is not None:
+                on_check(record)
 
         def on_step(current: Trainer, metrics: dict[str, float]) -> None:
             step_seconds.append(metrics["step_seconds"])
@@ -362,26 +404,22 @@ def run_more_sft(
         except FloatingPointError as error:
             stop.update(reason=NON_FINITE, detail=f"step {trainer.step + 1}: {error}")
         except Exception as error:
-            # Keep the latest weights before the error propagates.
-            logger.event(
-                "control_failed",
-                error_type=type(error).__name__,
-                detail=str(error)[:500],
-                updates=trainer.step,
-            )
-            if trainer.step > (checks[-1].optimizer_steps if checks else 0):
-                save(trainer.step, checked=False)
+            record_failure(error)
             raise
         reason = stop.get("reason", PASSES_EXHAUSTED)
         detail = stop.get("detail", f"loader exhausted after {trainer.step} updates")
         last = checks[-1].optimizer_steps if checks else 0
         stop_checkpoint: dict[str, str] | None = None
-        if reason not in CHANNEL_STOPS and trainer.step > last:
+        wanted = config.check_at_external_stop if reason == EXTERNAL else config.check_at_stop
+        if reason not in CHANNEL_STOPS and wanted and trainer.step > last:
             try:
                 dev_check(trainer.step, "end")
                 last = trainer.step
             except RewardError as error:
                 detail = f"{detail}; end check failed: {error}"
+            except Exception as error:
+                record_failure(error)
+                raise
         if trainer.step > last:
             path, digest = save(trainer.step, checked=False)
             stop_checkpoint = {"checkpoint": path, "sha256": digest}

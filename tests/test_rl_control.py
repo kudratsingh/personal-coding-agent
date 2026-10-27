@@ -223,7 +223,16 @@ def test_control_config_validation_and_defaults(parent: Path, tmp_path: Path) ->
     assert (defaults.batch_size, defaults.accumulation_steps) == (16, 2)
     assert defaults.learning_rate == 6e-5 and defaults.warmup_updates == 10
     assert defaults.pass_checks == (1, 2, 4, 8) and defaults.tolerance == 0.05
-    for options in ({"pass_checks": (2, 1)}, {"tolerance": 0.0}, {"batch_size": 0}):
+    assert (defaults.attention, defaults.optimizer_foreach) == ("reference", False)
+    assert defaults.check_at_stop and not defaults.check_at_external_stop
+    for options in (
+        {"pass_checks": (2, 1)},
+        {"tolerance": 0.0},
+        {"batch_size": 0},
+        {"attention": "flash"},
+        {"check_at_stop": 1},
+        {"check_at_external_stop": "yes"},
+    ):
         with pytest.raises(ValueError):
             ControlConfig(**options)
     wrong_start = CheckRecord(DevCheck(5, 0.1, 0.1, 0.1, 0.1, 1, 0.0, 0.0), 5, "x", "0" * 64)
@@ -350,3 +359,118 @@ def test_an_unexpected_error_in_the_control_saves_its_weights(
     assert (run / "checkpoints" / "step-00003.pt").exists()
     assert not (run / "control-result.json").exists()
     assert json.loads((run / "record.json").read_text())["status"] == "failed"
+
+
+def test_an_error_in_the_end_check_saves_the_weights_and_fails_the_run(
+    tmp_path: Path, parent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The end check follows the trainer's own guard; an unexpected error there (a lost
+    bridge, an out-of-memory) must not lose the updates since the last check."""
+    use_clock(monkeypatch, [0.5] * 50)
+
+    def script(check: int) -> tuple[float, float]:
+        if check == 10:
+            raise ConnectionError("the Mac bridge dropped")
+        return 0.1, 0.0
+
+    with pytest.raises(ConnectionError):
+        control(tmp_path, parent, 5.0, evaluator=ScriptedDevEvaluator(script=script))
+    run = tmp_path / "control" / "more-sft"
+    saved = torch.load(run / "checkpoints" / "step-00010.pt", weights_only=True)
+    assert saved["metadata"]["checked"] is False and saved["metadata"]["step"] == 10
+    assert not (run / "control-result.json").exists()
+    assert json.loads((run / "record.json").read_text())["status"] == "failed"
+    events = [json.loads(line) for line in (run / "control-events.jsonl").read_text().splitlines()]
+    assert [e["fields"]["error_type"] for e in events if e["event"] == "control_failed"] == [
+        "ConnectionError"
+    ]
+
+
+def test_a_reward_error_in_the_end_check_still_returns_cleanly(
+    tmp_path: Path, parent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    use_clock(monkeypatch, [0.5] * 50)
+    result, _ = control(tmp_path, parent, 5.0, evaluator=ScriptedDevEvaluator(timeout_at=10))
+    assert result.stop_reason == "budget" and "end check failed" in result.stop_detail
+    assert result.stop_checkpoint is not None
+
+
+def test_an_external_stop_takes_no_end_check_unless_asked(
+    tmp_path: Path, parent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stopping at update 4 leaves its weights unchecked (the last check was at 3): a cost,
+    wall or idle stop saves them and spends nothing more, unless the caller opts in."""
+    use_clock(monkeypatch, [0.5] * 50)
+    answers = iter([None, None, None, None, "cost"])
+    result, evaluator = control(tmp_path / "a", parent, 100.0, should_stop=lambda: next(answers))
+    assert result.stop_reason == "external" and result.updates == 4
+    assert evaluator.calls == [2, 3]
+    assert result.stop_checkpoint is not None
+    assert Path(result.stop_checkpoint["checkpoint"]).name == "step-00004.pt"
+    use_clock(monkeypatch, [0.5] * 50)
+    answers = iter([None, None, None, None, "cost"])
+    result, evaluator = control(
+        tmp_path / "b",
+        parent,
+        100.0,
+        should_stop=lambda: next(answers),
+        config={"check_at_external_stop": True},
+    )
+    assert evaluator.calls == [2, 3, 4] and result.stop_checkpoint is None
+    assert result.checks[-1].label == "end"
+    # A stop the control decides itself is governed by check_at_stop alone.
+    use_clock(monkeypatch, [0.5] * 50)
+    result, evaluator = control(tmp_path / "c", parent, 5.0, config={"check_at_stop": False})
+    assert result.stop_reason == "budget" and evaluator.calls == [2, 3, 6]
+    assert result.stop_checkpoint is not None
+
+
+def test_on_check_sees_each_control_check_once_its_checkpoint_exists(
+    tmp_path: Path, parent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    use_clock(monkeypatch, [0.5] * 50)
+    seen: list[tuple[int, str, bool]] = []
+
+    def on_check(record: CheckRecord) -> None:
+        seen.append((record.dev.check, record.label, Path(record.checkpoint).exists()))
+
+    control(tmp_path, parent, 5.0, on_check=on_check)
+    assert seen == [
+        (2, "passes-1", True),
+        (3, "passes-2", True),
+        (6, "passes-4", True),
+        (10, "end", True),
+    ]  # the start check is RL's and is not reported again
+
+
+def test_the_control_trains_with_the_configured_attention_kernel(
+    tmp_path: Path, parent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    use_clock(monkeypatch, [1.0] * 20)
+    result, _ = control(tmp_path, parent, 2.0, config={"attention": "fused"})
+    run = tmp_path / "control" / "more-sft"
+    assert json.loads((run / "record.json").read_text())["config"]["train"]["attention"] == "fused"
+    saved = json.loads((run / "control-result.json").read_text())
+    assert saved["config"]["attention"] == "fused" and result.updates >= 1
+
+
+def test_the_control_refuses_tasks_it_must_not_train_on(tmp_path: Path, parent: Path) -> None:
+    template = TASKS[0].__dict__
+    for bad, match in (
+        (Task(**{**template, "id": "x-test", "split": "test"}), "x-test"),
+        (Task(**{**template, "id": "x-ref", "solution": None}), "x-ref"),
+        (Task(**{**template, "id": "x-bad", "hidden_tests": "y = f(1)\nassert y == 2"}), "x-bad"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            run_more_sft(
+                parent=parent,
+                tasks=[*TASKS, bad],
+                encoder=TOKENIZER,
+                tokenizer_hash=TOKENIZER.sha256,
+                budget_seconds=1.0,
+                start=start_check(parent),
+                evaluator=ScriptedDevEvaluator(),
+                output=tmp_path,
+                run_id="x",
+            )
+    assert not (tmp_path / "x").exists()
