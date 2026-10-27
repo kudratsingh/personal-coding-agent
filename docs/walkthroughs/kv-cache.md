@@ -75,7 +75,7 @@ Rotary embeddings use these positions, not the slot numbers. B's prompt token is
 ## Design choices and common mistakes
 
 - **Left, not right, padding.** With right padding, rows would write their new tokens into different slots and need per-row cache lengths.
-- **Positions per row.** Rotating by slot number instead of `slot − pad` gives a padded row the geometry of a longer prompt. The padded-logits test fails if positions ignore the padding.
+- **Positions per row.** Rotary attention depends only on the distance between positions, so shifting all of a row's slots by `pad` would leave its scores unchanged apart from rounding. Per-row positions matter because the cache can hold more slots than the context: `W + max(budget) − 1` exceeds it when a long prompt shares a batch with a short prompt and a long budget. Slot numbers would then reach the table's last position, `context − 1`, and the short row's newest tokens would all get that position, while its own positions `slot − pad` stay inside the context. A test runs such a batch and compares each short row's logits with the row run alone; the padded-logits test cannot detect slot-number positions.
 - **Padding queries.** If a padding query hid every key, its softmax would be `NaN`. That `NaN` reaches the padding slot's values, and `0 × NaN` then poisons real rows. Letting padding queries see their causal past keeps everything finite; the padding tokens themselves cannot change real logits (tested by swapping the filler token).
 - **No cache growth.** Appending with `torch.cat` copies the whole cache at every step. The preallocated buffer writes one slot per step and slices views. The older `forward_cached` path with growing tuples remains for existing callers and reference tests.
 - **Fixed tables.** The rotary angles and masks are built once per call. The previous loop rebuilt the rotary table and causal mask in every layer at every step.
@@ -95,6 +95,7 @@ uv run --locked pytest tests/test_generation.py tests/test_sampling_integrity.py
 - `tests/test_generation.py` keeps a frozen copy of the previous single-prompt greedy loop. In float32, batched greedy output over prompts of lengths 1–31 equals it token for token, as does the older `generate` with and without a stop token. It also checks that:
   - a seeded row equals its single-row run and its `generate_many` runs at batch sizes 1, 2 and 7;
   - padded rows match their unpadded logits, for several prefill chunk sizes;
+  - when the slots pass the context, short rows still match their unpadded logits, which fails if positions are slot numbers;
   - cache prefill plus decoding equals the full forward pass, with and without query/key normalization;
   - budgets are per row and unchanged by sorted batching;
   - stop sets end each row, and early exit happens at the first check after every row stopped;
@@ -125,7 +126,7 @@ For base-model code evaluation, prompt whitespace is part of the protocol: `rstr
 ## Questions and answers
 
 - Why cache keys and values but not queries? Later tokens attend to earlier keys and values; no later step uses an earlier query.
-- Why left padding with per-row positions? Every row's newest token is in the same slot, so one cache length serves all rows, while rotary angles still follow each row's own positions.
+- Why left padding with per-row positions? Every row's newest token is in the same slot, so one cache length serves all rows. Rotary angles follow each row's own positions, which stay inside the context while the row is active even when the slot numbers pass it.
 - Why may a padding query see padding keys? So its softmax row is never empty; a `NaN` there would reach real rows through `0 × NaN`.
 - Why a counter-based sampler? A row's uniform depends only on its seed and step, so seeded output does not change with batch size or neighbours, which `torch.multinomial` with one generator cannot give.
 - Why pin zero-probability entries in the running sum? A parallel scan can round a removed token's running sum upward; pinning keeps that token unselectable.

@@ -95,8 +95,10 @@ class KVCache:
             raise ValueError("prompt width must be positive and fit the capacity")
         self.batch, self.width, self.capacity, self.length = pad.numel(), width, capacity, 0
         slots = torch.arange(capacity, device=pad.device)
-        # Positions past the context occur only in rows that already finished; the
-        # clamp keeps their (discarded) work finite and the table index in range.
+        # The capacity can exceed the context (a long prompt beside a long budget), so
+        # slot numbers could pass the table; each row's own positions stay inside it
+        # while the row is active. Positions past the context occur only in rows that
+        # already finished; the clamp keeps their (discarded) work finite and in range.
         positions = (slots[None, :] - pad[:, None]).clamp(0, config.context - 1)
         cosine, sine = rotary_table(
             config.width // config.heads, 0, config.context, device=pad.device

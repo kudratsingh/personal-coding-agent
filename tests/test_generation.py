@@ -99,11 +99,36 @@ def test_left_padded_rows_match_their_unpadded_logits(chunk: int) -> None:
         for index in range(4):
             steps.append(model.decode(follow[:, index : index + 1], cache))
         for row, prompt in enumerate(prompts):
-            # Rotary uses the row's own positions 0..len-1, never its padded slots.
+            # The masks hide the padding. Rotary scores depend only on position
+            # differences, so this cannot tell slot numbers from positions; see below.
             full = model(torch.tensor([prompt + follow[row].tolist()]))[0]
             expected = full[len(prompt) - 1 : len(prompt) + 4]
             actual = torch.stack([step[row] for step in steps])
             torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+
+
+def test_rows_keep_their_own_positions_when_slots_pass_the_context() -> None:
+    # A long prompt and a long budget give more slots than the context. Slot
+    # numbers would then reach the last table position, but a short row's own
+    # positions stay small, so its logits must equal the row run alone.
+    model = model_fixture()
+    prompts = prompt_fixture([29, 3, 1])
+    width, steps = 29, 8
+    pad = torch.tensor([width - len(row) for row in prompts])
+    ids = torch.tensor([[0] * (width - len(row)) + row for row in prompts])
+    follow = torch.randint(0, 272, (3, steps), generator=torch.Generator().manual_seed(5))
+    cache = KVCache(model.config, pad, width=width, capacity=width + steps)
+    assert cache.capacity > model.config.context
+    with torch.no_grad():
+        outputs = [model.decode(ids, cache)]
+        for index in range(steps):
+            outputs.append(model.decode(follow[:, index : index + 1], cache))
+        for row in (1, 2):  # Row 0 passes its own budget here; only its clamped slots differ.
+            prompt = prompts[row]
+            full = model(torch.tensor([prompt + follow[row].tolist()]))[0]
+            expected = full[len(prompt) - 1 : len(prompt) + steps]
+            actual = torch.stack([output[row] for output in outputs])
+            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_padding_tokens_cannot_change_real_logits() -> None:
