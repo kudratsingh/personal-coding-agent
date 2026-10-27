@@ -76,7 +76,50 @@ def main(argv: Sequence[str] | None = None) -> int:
     benchmark.add_argument("--top-p", type=float, default=1.0)
     benchmark.add_argument("--seed", type=int, default=0)
     benchmark.add_argument("--repeats", type=int, default=1)
+    rl_prescreen = subparsers.add_parser(
+        "rl-prescreen",
+        help="count RL candidates by parseability and constant baseline; runs no code",
+    )
+    rl_prescreen.add_argument("--tasks", type=Path, required=True, help="the pool's train.jsonl")
+    rl_prescreen.add_argument("--candidates", type=Path, required=True)
+    rl_prescreen.add_argument("--threshold", type=float, default=0.5)
+    rl_screen = subparsers.add_parser(
+        "rl-screen",
+        help="score screening attempts in the Docker sandbox and write the keep-rule record",
+    )
+    rl_screen.add_argument("--tasks", type=Path, required=True, help="the pool's train.jsonl")
+    rl_screen.add_argument("--candidates", type=Path, required=True)
+    rl_screen.add_argument("--attempts", type=Path, required=True, help="Attempt JSON lines")
+    rl_screen.add_argument("--output", type=Path, required=True)
+    rl_screen.add_argument(
+        "--timeout", type=float, required=True, help="seconds per batch of 256 attempts"
+    )
+    rl_screen.add_argument("--workers", type=int, default=8)
+    rl_screen.add_argument("--threshold", type=float, default=0.5)
+    rl_screen.add_argument("--cap", type=int, default=1000)
+    rl_screen.add_argument("--floor", type=int, default=320)
     args = parser.parse_args(argv)
+    if args.command in {"rl-prescreen", "rl-screen"}:
+        import json
+
+        from scratchcoder.rl.command import prescreen_candidates, screen_attempts
+
+        if args.command == "rl-prescreen":
+            summary = prescreen_candidates(args.tasks, args.candidates, threshold=args.threshold)
+        else:
+            summary = screen_attempts(
+                tasks_path=args.tasks,
+                candidates_path=args.candidates,
+                attempts_path=args.attempts,
+                output=args.output,
+                timeout=args.timeout,
+                workers=args.workers,
+                threshold=args.threshold,
+                cap=args.cap,
+                floor=args.floor,
+            )
+        sys.stdout.write(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n")
+        return 0
     if args.command == "generation-benchmark":
         import json
 
