@@ -14,6 +14,13 @@ For run 1 at $0.60/h: $3.00, $2.99, 18,000 s and 17,820 s. The worker, the readi
 receipt, the runbook's watchdog policy and the bootstrap's timer limit all take them from
 here (``limits`` prints them), and the receipt and the worker refuse anything weaker.
 
+Run 2 waits on the Mac's RL rewards and dev verdicts through the reward bridge. Its bounds
+on one wait are derived here too, in one place (``bridge_timeouts``): the Pod's reward and
+dev timeouts, the Mac's ``--reward-timeout`` and ``--dev-timeout``, the Mac watchdog's idle
+extension while the heartbeat reads ``awaiting_rewards``, the margin the worker's cost, wall
+and reserve stops keep for one full wait, and the lost-bridge bound that ends a wait whose
+Mac lease went stale before the in-Pod idle rule fires.
+
 ``limits`` (Mac)
     Print a specification's derived limits; with ``--origin`` also the timer deadline, and
     with ``--policy-output`` write the watchdog policy file.
@@ -41,15 +48,19 @@ from typing import IO, Any
 
 from scratchcoder.common.records import atomic_json, utc_now
 from scratchcoder.data.shards import file_sha256
+from scratchcoder.rl.bridge_mac import LEASE_SECONDS
+from scratchcoder.rl.rewards import DEFAULT_HOST_RETRIES, DEFAULT_WORKERS
+from scratchcoder.sandbox.budget import io_seconds
+from scratchcoder.sandbox.reward import FUNCTION_BUDGET_SECONDS, HOST_SLACK_SECONDS, MAX_IO_CASES
 from tools import rehearsal_ops
 from tools.r2_store import SHA256_HEX, Store
 from tools.rehearsal_binding import r2_credentials
 from tools.rehearsal_ops import ObjectStore, head_sha256
 
 RUN_ROOT = "posttrain-runs"
-RUNS = ("1",)
-"""The post-training runs this code drives. Run 2 (RL, the more-SFT control and their
-evaluation, with the Mac in the loop) is added with its own stages and specification."""
+RUNS = ("1", "2")
+"""The post-training runs this code drives: run 1 (probe, ARC, evaluation, SFT, screening)
+and run 2 (RL with the Mac in the loop, the more-SFT control and their evaluation)."""
 ABSOLUTE_LIFETIME_SECONDS = 60_000
 """The in-Pod timer's absolute cap (``pod_self_destruct.ABSOLUTE_DEADLINE_SECONDS``)."""
 SELF_DESTRUCT_MARGIN_SECONDS = 180
@@ -77,8 +88,8 @@ hour before the final drain, and every other artifact is a small JSON or JSON Li
 ROUND_TRIP_PROBE_BYTES = rehearsal_ops.ROUND_TRIP_PROBE_BYTES
 UPLOADING_STATUS = rehearsal_ops.UPLOADING_STATUS
 AWAITING_REWARDS_STATUS = "awaiting_rewards"
-"""Run 2's heartbeat while the worker waits for the Mac's RL rewards (the hook for its
-Mac-stamped reward progress); run 1 never writes it."""
+"""Run 2's heartbeat while the worker waits for the Mac's RL rewards or dev verdicts; run 1
+never writes it. The Mac watchdog gives it a bounded idle extension (``bridge_timeouts``)."""
 IN_PROGRESS_STATUSES = ("running", UPLOADING_STATUS, AWAITING_REWARDS_STATUS)
 SUCCESS_STATUSES = rehearsal_ops.SUCCESS_STATUSES
 FAILURE_STATUSES = rehearsal_ops.FAILURE_STATUSES
@@ -176,11 +187,19 @@ def ceiling_limits(
     )
 
 
-def read_limits(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """A specification's ``limits`` object, exactly ``LIMIT_KEYS``, each a positive number."""
+def read_limits(raw: Mapping[str, Any], *, allow_null: Sequence[str] = ()) -> dict[str, Any]:
+    """A specification's ``limits`` object, exactly ``LIMIT_KEYS``, each a positive number;
+    ``allow_null`` names keys that may still be ``null`` (run 2's ceiling before the gate)."""
     if not isinstance(raw, Mapping) or set(raw) != LIMIT_KEYS:
         raise ValueError(f"limits must have exactly the keys {sorted(LIMIT_KEYS)}")
     for key in LIMIT_KEYS:
+        if raw[key] is None and key in allow_null:
+            continue
+        if raw[key] is None and key == "ceiling_usd":
+            raise ValueError(
+                "limits.ceiling_usd is null: the ceiling is fixed at the owner's gate "
+                "(python -m tools.posttrain_approved run2-gate)"
+            )
         _positive(raw[key], f"limits.{key}")
     return dict(raw)
 
@@ -196,6 +215,232 @@ def specification_limits(specification: Mapping[str, Any]) -> CeilingLimits:
     )
 
 
+# Run 2's reward bridge: every bound on one wait, derived in one place -----------------------
+
+REWARD_TRIES = 1 + DEFAULT_HOST_RETRIES
+"""``LocalRewardSource`` tries an attempt once and retries a host failure 3 times: 4 tries."""
+REWARD_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+"""Its waits before those retries: 1 s doubling, capped at 8 s (``LocalRewardSource.backoff``)."""
+MAC_POLL_SECONDS = 2.0
+"""The Mac server's wait between idle polls (``scratchcoder rl-bridge --poll-seconds``)."""
+POD_POLL_SECONDS = 0.5
+"""The Pod client's wait between looks at its inbox (``BridgeClient`` default)."""
+SSH_TIMEOUT_SECONDS = 120.0
+SSH_LIST_TIMEOUT_SECONDS = 30.0
+SSH_RETRIES = 4
+SSH_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0)
+"""``BridgeServer``'s SSH retries: 4 after the first try, waiting 1, 2, 4 and 8 s."""
+AWAITING_SLACK_SECONDS = 60.0
+"""Kept on top of a wait's timeout in the Mac watchdog's idle extension: the CPU work between
+the last GPU stamp and the request, the supervisor's 5 s mirror and the watchdog's poll."""
+LOST_BRIDGE_MARGIN_SECONDS = 300.0
+"""How long before the in-Pod idle rule a wait with a stale Mac lease is given up, so the
+worker saves and uploads its weights and finalizes before the timer deletes the Pod."""
+
+
+@dataclass(frozen=True)
+class BridgeTimeouts:
+    """Run 2's bounds on one bridge wait (seconds), all from ``bridge_timeouts``.
+
+    - ``attempt_try_seconds``: one program's longest try, the reward channel's longest budget
+      (27 s for a 100-case I/O task; 8 s for a function task) plus its 15 s host slack. It is
+      also the slack for "a program still running" when a Mac-side bound passes.
+    - ``reward_attempt_seconds``: one attempt through all its tries and backoff waits.
+    - ``mac_reward_timeout_seconds``: a reward request's worst-case scoring on the Mac,
+      ``ceil(attempts / workers)`` rounds of that attempt (``rl-bridge --reward-timeout``).
+    - ``mac_dev_timeout_seconds``: a dev check's worst case, ``ceil(programs / workers)``
+      rounds of one try plus one more try for a program still running
+      (``rl-bridge --dev-timeout``).
+    - ``bridge_allowance_seconds``: the bridge's own time on top of the Mac's: one Mac poll,
+      one listing, one read and one write over SSH, each tried 5 times to its timeout with
+      the backoff waits between, and one Pod poll.
+    - ``reward_timeout_seconds`` and ``dev_timeout_seconds``: the Pod's, the Mac's plus the
+      allowance, so a Mac-side ``timeout`` reply always reaches a Pod that still waits.
+    - ``awaiting_*_extension_seconds``: the Mac watchdog's idle limit while the heartbeat
+      reads ``awaiting_rewards`` for that kind of request: the Pod's timeout plus the slack.
+    - ``wait_margin_seconds``: one full wait (the longer kind); the worker's cost, wall and
+      reserve stops keep it free, since ``should_stop`` is not read during a wait.
+    - ``lost_bridge_seconds``: a wait with no Mac lease renewal for this long is given up
+      (``bridge_lost``), well before the in-Pod idle rule deletes the Pod.
+    """
+
+    attempts_per_request: int
+    dev_programs: int
+    workers: int
+    attempt_try_seconds: float
+    reward_attempt_seconds: float
+    mac_reward_timeout_seconds: float
+    mac_dev_timeout_seconds: float
+    bridge_allowance_seconds: float
+    reward_timeout_seconds: float
+    dev_timeout_seconds: float
+    awaiting_slack_seconds: float
+    awaiting_reward_extension_seconds: float
+    awaiting_dev_extension_seconds: float
+    wait_margin_seconds: float
+    lease_seconds: float
+    lost_bridge_seconds: float
+
+    def timeout(self, kind: str) -> float:
+        """The Pod's timeout for a ``reward`` or ``dev`` request."""
+        if kind == "reward":
+            return self.reward_timeout_seconds
+        if kind == "dev":
+            return self.dev_timeout_seconds
+        raise ValueError(f"unknown bridge request kind {kind!r}")
+
+    def extension(self, kind: str) -> float:
+        """The Mac watchdog's idle extension while the Pod waits on a request of ``kind``."""
+        if kind == "reward":
+            return self.awaiting_reward_extension_seconds
+        if kind == "dev":
+            return self.awaiting_dev_extension_seconds
+        raise ValueError(f"unknown bridge request kind {kind!r}")
+
+
+def bridge_timeouts(
+    *,
+    attempts_per_request: int,
+    dev_programs: int,
+    workers: int = DEFAULT_WORKERS,
+    mac_poll_seconds: float = MAC_POLL_SECONDS,
+    pod_poll_seconds: float = POD_POLL_SECONDS,
+    ssh_timeout_seconds: float = SSH_TIMEOUT_SECONDS,
+    ssh_list_timeout_seconds: float = SSH_LIST_TIMEOUT_SECONDS,
+    ssh_retries: int = SSH_RETRIES,
+    awaiting_slack_seconds: float = AWAITING_SLACK_SECONDS,
+    pod_idle_seconds: float = POD_IDLE_SECONDS,
+) -> BridgeTimeouts:
+    """Every bound on one run-2 bridge wait, from the channel's budgets and the bridge's rules.
+
+    For the rehearsal (256 attempts, 1,800 dev programs, 8 workers): a try is 27 + 15 = 42 s,
+    an attempt 4 x 42 + 1 + 2 + 4 = 175 s, the Mac's reward bound 32 x 175 = 5,600 s and its
+    dev bound 225 x 42 + 42 = 9,492 s; the allowance 2 + 5 x (30 + 120 + 120) + 3 x 15 + 0.5 =
+    1,397.5 s, so the Pod waits 6,997.5 s for rewards and 10,889.5 s for a dev check.
+    """
+    for name, count in (
+        ("attempts_per_request", attempts_per_request),
+        ("dev_programs", dev_programs),
+        ("workers", workers),
+    ):
+        if type(count) is not int or count < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    if type(ssh_retries) is not int or not 0 <= ssh_retries <= len(SSH_BACKOFF_SECONDS):
+        raise ValueError(f"ssh_retries must lie in [0, {len(SSH_BACKOFF_SECONDS)}]")
+    for name, value in (
+        ("mac_poll_seconds", mac_poll_seconds),
+        ("pod_poll_seconds", pod_poll_seconds),
+        ("ssh_timeout_seconds", ssh_timeout_seconds),
+        ("ssh_list_timeout_seconds", ssh_list_timeout_seconds),
+        ("awaiting_slack_seconds", awaiting_slack_seconds),
+        ("pod_idle_seconds", pod_idle_seconds),
+    ):
+        _positive(value, name)
+    budget = max(FUNCTION_BUDGET_SECONDS, io_seconds(MAX_IO_CASES))
+    try_seconds = budget + HOST_SLACK_SECONDS
+    attempt = REWARD_TRIES * try_seconds + math.fsum(REWARD_BACKOFF_SECONDS)
+    mac_reward = math.ceil(attempts_per_request / workers) * attempt
+    mac_dev = math.ceil(dev_programs / workers) * try_seconds + try_seconds
+    tries = 1 + ssh_retries
+    backoff = math.fsum(SSH_BACKOFF_SECONDS[:ssh_retries])
+    allowance = (
+        mac_poll_seconds
+        + tries * (ssh_list_timeout_seconds + 2 * ssh_timeout_seconds)
+        + 3 * backoff
+        + pod_poll_seconds
+    )
+    reward = mac_reward + allowance
+    dev = mac_dev + allowance
+    lost = pod_idle_seconds - LOST_BRIDGE_MARGIN_SECONDS
+    if lost <= LEASE_SECONDS:
+        raise ValueError("the in-Pod idle limit leaves no room to detect a lost bridge")
+    return BridgeTimeouts(
+        attempts_per_request=attempts_per_request,
+        dev_programs=dev_programs,
+        workers=workers,
+        attempt_try_seconds=try_seconds,
+        reward_attempt_seconds=attempt,
+        mac_reward_timeout_seconds=mac_reward,
+        mac_dev_timeout_seconds=mac_dev,
+        bridge_allowance_seconds=allowance,
+        reward_timeout_seconds=reward,
+        dev_timeout_seconds=dev,
+        awaiting_slack_seconds=float(awaiting_slack_seconds),
+        awaiting_reward_extension_seconds=reward + awaiting_slack_seconds,
+        awaiting_dev_extension_seconds=dev + awaiting_slack_seconds,
+        wait_margin_seconds=max(reward, dev),
+        lease_seconds=LEASE_SECONDS,
+        lost_bridge_seconds=lost,
+    )
+
+
+BRIDGE_KEYS = frozenset(
+    {
+        "root",
+        "workers",
+        "mac_poll_seconds",
+        "pod_poll_seconds",
+        "ssh_timeout_seconds",
+        "ssh_list_timeout_seconds",
+        "ssh_retries",
+        "awaiting_slack_seconds",
+        "reward_timeout_seconds",
+        "dev_timeout_seconds",
+        "mac_reward_timeout_seconds",
+        "mac_dev_timeout_seconds",
+        "awaiting_reward_extension_seconds",
+        "awaiting_dev_extension_seconds",
+        "wait_margin_seconds",
+        "lost_bridge_seconds",
+    }
+)
+"""A run-2 specification's ``bridge`` object: the inputs of ``bridge_timeouts`` and the bounds
+it derives, written out so the runbook and the policy can be read off it."""
+DERIVED_BRIDGE_KEYS = (
+    "reward_timeout_seconds",
+    "dev_timeout_seconds",
+    "mac_reward_timeout_seconds",
+    "mac_dev_timeout_seconds",
+    "awaiting_reward_extension_seconds",
+    "awaiting_dev_extension_seconds",
+    "wait_margin_seconds",
+    "lost_bridge_seconds",
+)
+
+
+def specification_bridge_timeouts(specification: Mapping[str, Any]) -> BridgeTimeouts | None:
+    """``bridge_timeouts`` for a run-2 specification (``None`` for a run without a bridge).
+
+    The attempts per request are the RL batch (tasks per update x group size), the dev
+    programs the dev subset's tasks x (samples + one greedy). Every derived value the
+    specification writes down must equal the derivation."""
+    bridge = specification.get("bridge")
+    if bridge is None:
+        return None
+    if not isinstance(bridge, Mapping) or set(bridge) != BRIDGE_KEYS:
+        raise ValueError(f"bridge must have exactly the keys {sorted(BRIDGE_KEYS)}")
+    rl = specification.get("rl")
+    if not isinstance(rl, Mapping):
+        raise ValueError("a specification with a bridge needs its rl section")
+    limits = read_limits(specification.get("limits", {}), allow_null=("ceiling_usd",))
+    derived = bridge_timeouts(
+        attempts_per_request=rl["tasks_per_update"] * rl["group_size"],
+        dev_programs=rl["dev_tasks"] * (rl["dev_samples"] + 1),
+        workers=bridge["workers"],
+        mac_poll_seconds=bridge["mac_poll_seconds"],
+        pod_poll_seconds=bridge["pod_poll_seconds"],
+        ssh_timeout_seconds=bridge["ssh_timeout_seconds"],
+        ssh_list_timeout_seconds=bridge["ssh_list_timeout_seconds"],
+        ssh_retries=bridge["ssh_retries"],
+        awaiting_slack_seconds=bridge["awaiting_slack_seconds"],
+        pod_idle_seconds=limits["pod_idle_seconds"],
+    )
+    differ = [key for key in DERIVED_BRIDGE_KEYS if bridge[key] != getattr(derived, key)]
+    if differ:
+        raise ValueError(f"the bridge values {differ} differ from their derivation")
+    return derived
+
+
 def watchdog_policy(
     limits: CeilingLimits,
     *,
@@ -203,9 +448,12 @@ def watchdog_policy(
     idle_baseline: float,
     idle_seconds: float = MAC_IDLE_SECONDS,
     transfer_seconds: float = MAX_TRANSFER_SECONDS,
+    bridge: BridgeTimeouts | None = None,
 ) -> dict[str, Any]:
-    """The Mac watchdog's policy file for a run: wall and cost stop from ``ceiling_limits``."""
-    return {
+    """The Mac watchdog's policy file for a run: wall and cost stop from ``ceiling_limits``,
+    and for run 2 the bounded idle extensions of an ``awaiting_rewards`` heartbeat (run 1's
+    policy has none, so the idle rule applies to every heartbeat unchanged)."""
+    policy: dict[str, Any] = {
         "mode": "posttrain",
         "max_wall_seconds": limits.wall_seconds,
         "max_cost_usd": limits.watchdog_cost_stop_usd,
@@ -215,6 +463,12 @@ def watchdog_policy(
         "billing_started_at_unix": origin,
         "idle_baseline_unix": idle_baseline,
     }
+    if bridge is not None:
+        policy.update(
+            awaiting_reward_extension_seconds=bridge.awaiting_reward_extension_seconds,
+            awaiting_dev_extension_seconds=bridge.awaiting_dev_extension_seconds,
+        )
+    return policy
 
 
 def run_prefix(run: str, pod_id: str) -> str:
@@ -512,11 +766,16 @@ def limits_record(args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(specification, dict):
         raise ValueError("the specification must be a JSON object")
     derived = specification_limits(specification)
+    bridge = specification_bridge_timeouts(specification)
     record: dict[str, Any] = {"run": specification.get("run"), **asdict(derived)}
+    if bridge is not None:
+        record.update(asdict(bridge))  # Run 2's wait bounds, by name (``--field``).
     if args.origin is not None:
         record["self_destruct_deadline_unix"] = int(derived.deadline_unix(args.origin))
         baseline = args.origin if args.idle_baseline is None else args.idle_baseline
-        record["policy"] = watchdog_policy(derived, origin=args.origin, idle_baseline=baseline)
+        record["policy"] = watchdog_policy(
+            derived, origin=args.origin, idle_baseline=baseline, bridge=bridge
+        )
         if args.policy_output is not None:
             atomic_json(args.policy_output, record["policy"])
     elif args.policy_output is not None or args.idle_baseline is not None:
