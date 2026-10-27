@@ -656,7 +656,10 @@ def run_summary(
     verification: Mapping[str, Any] | None,
     source: str,
 ) -> dict[str, Any]:
-    """A small record of a run for the private archive; the artifacts stay in R2."""
+    """A small record of a run for the private archive; the artifacts stay in R2.
+
+    Run 2's adds its results: RL's and the control's records, the selection and the bridge's
+    record with its waits counted rather than listed (``report.json`` beside it has them)."""
     stages = []
     for entry in report.get("stages") or []:
         if isinstance(entry, dict):
@@ -684,6 +687,22 @@ def run_summary(
         "r2_final_verified": verification is not None,
         "r2_verification": None if verification is None else dict(verification),
         "created_at": utc_now(),
+        **(run2_results(report) if run == "2" else {}),
+    }
+
+
+def run2_results(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Run 2's results for its summary: the arms, the selection and the bridge."""
+    bridge = report.get("bridge")
+    if isinstance(bridge, Mapping):
+        waits = bridge.get("waits")
+        bridge = {key: value for key, value in bridge.items() if key != "waits"}
+        bridge["wait_count"] = len(waits) if isinstance(waits, list) else None
+    return {
+        "rl": report.get("rl"),
+        "more_sft": report.get("more_sft"),
+        "selection": report.get("selection"),
+        "bridge": bridge,
     }
 
 

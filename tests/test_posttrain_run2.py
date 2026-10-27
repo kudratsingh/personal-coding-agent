@@ -549,6 +549,23 @@ def test_the_bridge_directories_are_kept_and_no_hidden_test_reaches_the_pod(
         assert all(is_withheld(task) for task in load_tasks(found.inputs[name]))
 
 
+def test_the_archived_summary_carries_run_twos_results(completed: Ran) -> None:
+    report = completed.report
+    summary = posttrain_ops.run_summary(
+        report, run="2", pod_id=SMOKE2_POD_ID, verification=None, source="test"
+    )
+    assert summary["rl"] == report["rl"] and summary["more_sft"] == report["more_sft"]
+    assert summary["selection"] == report["selection"]
+    bridge = summary["bridge"]
+    assert "waits" not in bridge and bridge["wait_count"] == len(report["bridge"]["waits"])
+    assert bridge["lost"] is None and bridge["timeouts"] == report["bridge"]["timeouts"]
+    first = posttrain_ops.run_summary(
+        report, run="1", pod_id=SMOKE2_POD_ID, verification=None, source="test"
+    )
+    assert not {"rl", "more_sft", "selection", "bridge"} & set(first)  # run 1's is unchanged
+    assert len(json.dumps(summary)) < 200_000
+
+
 def test_the_r2_report_passes_the_macs_final_verification(completed: Ran, tmp_path: Path) -> None:
     beat = json.loads((completed.worker.root / "heartbeat.json").read_text())
     store = completed.bucket.store(SMOKE_CREDENTIALS)
