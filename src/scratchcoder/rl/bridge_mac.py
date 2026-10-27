@@ -1110,13 +1110,13 @@ class BridgeServer:
             self.store = ReplyStore(state / "replies")
             self.highest = self.store.highest_seq()
             self._deferred: dict[str, int] = {}
-            self.log = EventLogger(state / "events.jsonl", "rl-bridge")
             self.server_id = server_identity(state, server_id)
             self.lease_seconds = None if lease_seconds is None else _lease_seconds(lease_seconds)
             if self.lease_seconds is not None:
                 transport.claim(self.server_id, self.lease_seconds)
             self._scoring = threading.Event()
             self._lease_lost: BridgeLeaseHeld | None = None
+            self.log = EventLogger(state / "events.jsonl", "rl-bridge")  # last: nothing to close
         except BaseException:
             fcntl.flock(self._lock, fcntl.LOCK_UN)
             os.close(self._lock)
