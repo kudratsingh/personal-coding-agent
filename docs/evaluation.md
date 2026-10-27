@@ -66,4 +66,4 @@ Generation and execution are separate steps joined by a hashed completions file;
 
   Named pairs (`--pair FIRST:SECOND`; by default SFT vs base, RL vs SFT, more-SFT vs SFT and RL vs more-SFT) get a paired task bootstrap with 2,000 resamples and seed 0, labelled cross-protocol when the protocols differ. Any checkpoint above 20% greedy pass@1 on HumanEval carries the leak flag. The flag is true, false or unknown: a checkpoint with no complete greedy HumanEval row is listed as not evaluated rather than clean.
 
-No completions file, results file or scorecard has been produced for a trained checkpoint yet. The pool dev constant-answer baseline is 0.276 mean reward and 4.3% of tasks fully passed (1,995 of 2,000 tasks covered); the walkthrough gives it by source.
+No completions file, results file or scorecard has been produced for a trained checkpoint yet. The pool dev constant-answer baseline is 0.297 mean reward and 4.5% of tasks fully passed (1,995 of 2,000 tasks covered); the walkthrough gives it by source.

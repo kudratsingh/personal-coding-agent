@@ -116,16 +116,16 @@ SCRATCHCODER_SANDBOX_TESTS=1 uv run --locked pytest tests/test_eval_pipeline_san
 
 The Docker-backed test runs reference and wrong programs through the real runner on authored dev-shaped tasks: a function task, a class task and a 40-case I/O task. It also runs an executed constant baseline. With `SCRATCHCODER_POOL_DEV` set to the pool's dev file, it also runs one short real dev task per source, including a 99-case TACO task. Every reference passed and every wrong program failed.
 
-**Pool dev constant-answer baseline (measured 2026-10-26).** Mean best-constant reward, with the share of tasks a constant answer fully passes:
+**Pool dev constant-answer baseline (measured 2026-10-27).** Mean best-constant reward, with the share of tasks a constant answer fully passes:
 
 | Source | Tasks | Covered | Mean reward | Fully passed |
 | --- | ---: | ---: | ---: | ---: |
-| OpenCodeInstruct | 1,850 | 1,845 | 0.282 | 4.0% (74) |
-| MBPP | 124 | 124 | 0.200 | 9.7% (12) |
-| TACO | 26 | 26 | 0.181 | 0.0% |
-| All | 2,000 | 1,995 | 0.276 | 4.3% (86) |
+| OpenCodeInstruct | 1,850 | 1,845 | 0.298 | 4.0% (74) |
+| MBPP | 124 | 124 | 0.296 | 12.9% (16) |
+| TACO | 26 | 26 | 0.216 | 0.0% |
+| All | 2,000 | 1,995 | 0.297 | 4.5% (90) |
 
-The reward channel scored 1,893 tasks on the host. Constant programs covered 102 more, in 1,257 sandbox calls. Five OpenCodeInstruct tasks are uncovered: their tests only inspect objects the candidate must create, and call no function a constant could stand in for.
+The reward channel scored 1,893 tasks on the host. Constant programs covered 102 more, in 2,880 sandbox calls. Five OpenCodeInstruct tasks are uncovered: their tests only inspect objects the candidate must create, and call no function a constant could stand in for.
 
 ## Questions and answers
 
