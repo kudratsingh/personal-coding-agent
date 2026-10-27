@@ -46,6 +46,7 @@ from scratchcoder.sandbox.reward import (
     audit_attempt,
     budget_for,
     check_passes,
+    degenerate_baseline,
     is_parseable,
     parse_function_checks,
     parse_io_cases,
@@ -850,6 +851,60 @@ def test_the_supervisors_own_overrun_stays_far_inside_the_host_slack() -> None:
     # to start and stop under emulation, is still short of the host's stall deadline.
     assert reward_program.OVERRUN_SECONDS == 7.0
     assert reward_program.OVERRUN_SECONDS + 5.0 <= reward.HOST_SLACK_SECONDS
+
+
+# --------------------------------------------------------------------------------------
+# Degenerate-answer baseline (host side; runs no code).
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "hidden,public,reward_value,answer",
+    [
+        ("assert f(1) is None\nassert f(2) is None\nassert f(3) == 4", "", 2 / 3, "constant None"),
+        ("assert not f(1)\nassert f(2) == 0\nassert f(3) == []", "", 2 / 3, "constant False"),
+        ("assert f(1) == 7\nassert f(2) == 8", "assert f(0) == 7", 0.5, "public example 7"),
+        ("assert f([1]) == [1]\nassert f([2, 1]) == [1, 2]", "", 0.5, "echo"),
+        ("assert f(1) == 2.0\nassert f(2) == 2", "assert f(5) == 2", 1.0, "public example 2"),
+        # Only direct calls of a candidate function take the answer: ``len(f(3))`` needs the
+        # candidate's value, and ``floor`` is the tests' own import.
+        ("assert len(f(3)) == 0\nassert f(1) == -1", "", 0.5, "constant -1"),
+        (
+            "from math import floor\nassert floor(0.5) == 0\nassert f() == ''",
+            "",
+            0.5,
+            "constant ''",
+        ),
+        ("assert Stack().pop() is None", "", 0.0, "none"),
+    ],
+)
+def test_degenerate_baseline_for_function_tasks(
+    hidden: str, public: str, reward_value: float, answer: str
+) -> None:
+    baseline = degenerate_baseline(function_task(hidden, public=public or "assert True"))
+    assert baseline is not None
+    assert baseline.reward == pytest.approx(reward_value) and baseline.answer == answer
+    assert baseline.total == hidden.count("assert")
+
+
+def test_degenerate_baseline_for_io_tasks() -> None:
+    cases = [{"input": "3\n", "output": "YES\n"}, {"input": "1\n", "output": "YES"}]
+    cases += [{"input": "2\n", "output": "NO"}]
+    yes = degenerate_baseline(io_task(cases))
+    assert yes is not None and (yes.passed, yes.total, yes.answer) == (2, 3, "constant 'YES'")
+    # The public example's output (the first case here) is known to the policy.
+    shown = [{"input": "9\n", "output": "42"}] * 3 + [{"input": "8\n", "output": "41"}]
+    copied = degenerate_baseline(io_task(shown))
+    assert copied is not None and copied.reward == 0.75 and copied.answer == "public example '42'"
+    echo = [{"input": "x\n", "output": "y"}, {"input": "abc\n", "output": "abc"}]
+    echo += [{"input": "q\n", "output": "q"}]
+    echoed = degenerate_baseline(io_task(echo))
+    assert echoed is not None and echoed.answer == "echo" and echoed.passed == 2
+    hidden = io_task([{"input": "1\n", "output": "424242"}])
+    unshown = dataclasses.replace(hidden, public_tests=json.dumps([{"input": "", "output": "7"}]))
+    solved = degenerate_baseline(unshown)
+    assert solved is not None and solved.reward == 0.0 and solved.answer == "none"
+    assert degenerate_baseline(function_task("assert f() != 1")) is None
 
 
 def test_the_payload_carries_no_expected_values() -> None:

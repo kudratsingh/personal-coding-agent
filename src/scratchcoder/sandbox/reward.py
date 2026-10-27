@@ -41,6 +41,7 @@ container, so it cannot exhaust the supervisor before ``started`` either.
 
 import ast
 import base64
+import builtins
 import math
 import os
 import re
@@ -438,6 +439,183 @@ def check_passes(check: Check, reported: object) -> bool:
         return False
     except Exception:
         return False
+
+
+# --------------------------------------------------------------------------------------
+# Degenerate-answer baseline (host side, pure; runs no candidate code).
+# --------------------------------------------------------------------------------------
+
+FUNCTION_DEGENERATE_ANSWERS: tuple[object, ...] = (
+    None,
+    True,
+    False,
+    0,
+    1,
+    -1,
+    0.0,
+    "",
+    [],
+    {},
+    (),
+)
+"""Return values a policy can give without reading a task: the singletons, small integers and
+empty values that many hidden assertions expect."""
+IO_DEGENERATE_ANSWERS: tuple[str, ...] = (
+    "",
+    "0",
+    "1",
+    "-1",
+    "2",
+    "YES",
+    "NO",
+    "Yes",
+    "No",
+    "yes",
+    "no",
+    "IMPOSSIBLE",
+    "Impossible",
+)
+"""Outputs a policy can print without reading a task's input."""
+
+
+@dataclass(frozen=True)
+class DegenerateBaseline:
+    """The best reward that one answer needing no solution earns on a task. ``answer`` names
+    it: ``constant <value>`` (one fixed return value or printed output), ``public example
+    <value>`` (a value copied from the task's public tests, which the policy sees), or
+    ``echo`` (return the first argument, or print the input)."""
+
+    reward: float
+    passed: int
+    total: int
+    answer: str
+
+
+def _imported_names(setup: str) -> set[str]:
+    names: set[str] = set()
+    for node in ast.parse(setup).body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                names.add((alias.asname or alias.name).split(".")[0])
+    return names
+
+
+def _direct_call(source: str, foreign: set[str]) -> ast.Call | None:
+    """The call node when ``source`` is a direct call of a function the candidate defines
+    (a plain name that is neither a builtin nor imported by the tests), else ``None``."""
+    try:
+        node = ast.parse(source, mode="eval").body
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return None
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        return None
+    return None if node.func.id in foreign else node
+
+
+def _always(value: object) -> Callable[[ast.Call], tuple[bool, object]]:
+    def answer(_call: ast.Call) -> tuple[bool, object]:
+        return True, value
+
+    return answer
+
+
+def _first_argument(call: ast.Call) -> tuple[bool, object]:
+    if not call.args or isinstance(call.args[0], ast.Starred):
+        return False, None
+    return _safe_literal(call.args[0])
+
+
+def _public_values(task: Task) -> list[object]:
+    """The expected values of the public tests' supported assertions (function mode)."""
+    try:
+        tree = ast.parse(task.public_tests)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return []
+    values: list[object] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assert):
+            check = _parse_predicate(node.test)
+            if check is not None and check.predicate == "eq":
+                values.append(check.expected)
+    return values
+
+
+def _public_outputs(task: Task) -> list[str]:
+    """The expected outputs of the public examples (I/O mode)."""
+    try:
+        cases = loads(task.public_tests)
+    except ValueError:
+        return []
+    if not isinstance(cases, list):
+        return []
+    return [
+        case["output"]
+        for case in cases
+        if isinstance(case, dict) and isinstance(case.get("output"), str)
+    ]
+
+
+def _function_baseline(task: Task, parsed: FunctionChecks) -> DegenerateBaseline:
+    foreign = set(dir(builtins)) | _imported_names(parsed.setup)
+    calls = [_direct_call(check.call, foreign) for check in parsed.checks]
+    answers = [(f"constant {value!r}", _always(value)) for value in FUNCTION_DEGENERATE_ANSWERS]
+    answers += [(f"public example {value!r:.60}", _always(value)) for value in _public_values(task)]
+    answers.append(("echo", _first_argument))
+    best = DegenerateBaseline(0.0, 0, parsed.total, "none")
+    for label, answer_for in answers:
+        passed = 0
+        for check, call in zip(parsed.checks, calls, strict=True):
+            if call is None:
+                continue  # not a direct call of a candidate function: counted as failed
+            known, value = answer_for(call)
+            if not known:
+                continue
+            try:
+                wire = _wire_from_value(value)
+            except TypeError:
+                continue
+            passed += check_passes(check, {"ok": True, "v": wire})
+        if passed > best.passed:
+            best = DegenerateBaseline(passed / parsed.total, passed, parsed.total, label)
+    return best
+
+
+def _io_baseline(task: Task, parsed: IoCases) -> DegenerateBaseline:
+    answers = [(f"constant {text!r}", text) for text in IO_DEGENERATE_ANSWERS]
+    answers += [(f"public example {text.strip()!r:.60}", text) for text in _public_outputs(task)]
+    best = DegenerateBaseline(0.0, 0, parsed.total, "none")
+    for label, text in answers:
+        passed = sum(text.strip() == expected.strip() for expected in parsed.expected)
+        if passed > best.passed:
+            best = DegenerateBaseline(passed / parsed.total, passed, parsed.total, label)
+    echoed = sum(
+        given.strip() == expected.strip()
+        for given, expected in zip(parsed.inputs, parsed.expected, strict=True)
+    )
+    if echoed > best.passed:
+        best = DegenerateBaseline(echoed / parsed.total, echoed, parsed.total, "echo")
+    return best
+
+
+def degenerate_baseline(task: Task, *, limits: Limits | None = None) -> DegenerateBaseline | None:
+    """The best reward the reward channel would give an answer that needs no solution: a
+    fixed return value or output (``FUNCTION_DEGENERATE_ANSWERS``,
+    ``IO_DEGENERATE_ANSWERS``), a value copied from the task's public tests, or echoing the
+    first argument or the input. ``None`` when the task is not parseable.
+
+    It is computed on the host from the parsed hidden tests with the channel's own
+    comparison, and runs no code. For a function task an answer is applied only to checks
+    whose call is a direct call of a function the candidate defines (``f(1, 2)``, not
+    ``len(f(1))`` or ``Stack().pop()``); other checks count as failed, so the value is a
+    lower bound. RL screening can record it per task and drop tasks it rewards too well:
+    because the advantage is a reward minus its group's mean, such a task pays a policy for
+    answering without solving."""
+    parsed = parse_task(task, limits=limits)
+    if parsed is None:
+        return None
+    if isinstance(parsed, IoCases):
+        return _io_baseline(task, parsed)
+    return _function_baseline(task, parsed)
 
 
 # --------------------------------------------------------------------------------------
