@@ -214,6 +214,28 @@ def candidate_names(tests: str) -> list[str]:
     return sorted(called - foreign)
 
 
+def solution_names(solution: str | None, tests: str) -> list[str]:
+    """Names the tests call as plain functions that the reference solution defines at its top
+    level, including a name that is also a builtin (MBPP+ ``mbpp/126`` defines ``sum``, which
+    :func:`candidate_names` cannot tell from a call to the builtin)."""
+    if not solution:
+        return []
+    try:
+        defined = {
+            node.name
+            for node in ast.parse(solution).body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        called = {
+            node.func.id
+            for node in ast.walk(ast.parse(tests))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+    except SyntaxError:
+        return []
+    return sorted(defined & called)
+
+
 def constant_function_program(names: Sequence[str], answer: Answer) -> str:
     """Every named function returns the answer (or its first argument, for echo)."""
     return "".join(
@@ -482,7 +504,10 @@ def benchmark_constant_programs(task: Task, suite: str) -> list[tuple[str, str]]
         imports = "\n".join(
             line for line in task.public_tests.splitlines() if line.startswith(("import ", "from "))
         )
-        names = candidate_names(task.public_tests)
+        names = sorted(
+            set(candidate_names(task.public_tests))
+            | set(solution_names(task.solution, task.public_tests))
+        )
         if not names:
             return []
         prefix = imports + "\n\n" if imports else ""

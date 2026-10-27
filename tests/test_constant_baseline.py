@@ -3,7 +3,7 @@
 import json
 import re
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -205,6 +205,21 @@ def test_benchmark_constant_programs() -> None:
         "import math\n\ndef shared(*args, **kwargs):\n    return args[0]\n\n\n"
     )
     assert benchmark_constant_programs(pool_task("he/1", split="eval"), "humaneval") == []
+
+
+def test_an_mbpp_function_named_like_a_builtin_is_still_covered() -> None:
+    # mbpp/126 defines `sum`; the tests' call looks like the builtin, so the name comes from
+    # the reference solution. Without a solution the task stays uncovered (and is reported).
+    public = "assert sum(10, 15) == 6"
+    covered = pool_task(
+        "mbpp/126", split="eval", public_tests=public, solution="def sum(a, b):\n    return 6"
+    )
+    programs = dict(benchmark_constant_programs(covered, "mbpp-plus"))
+    assert programs["echo"] == "def sum(*args, **kwargs):\n    return args[0]\n\n\n"
+    assert programs["public example 6"].endswith("def sum(*args, **kwargs):\n    return 6\n\n\n")
+    bare = pool_task("mbpp/126", split="eval", public_tests=public, solution="x = 1")
+    assert benchmark_constant_programs(bare, "mbpp-plus") == []
+    assert benchmark_constant_programs(replace(bare, solution="def sum(:"), "mbpp-plus") == []
 
 
 def test_arc_baseline_from_labels_alone() -> None:
