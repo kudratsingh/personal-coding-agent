@@ -23,6 +23,10 @@ Named checkpoint pairs on the same tasks get a paired task bootstrap
 (``scratchcoder.eval.metrics.paired_bootstrap``) with a fixed seed; a pair whose protocols
 differ (SFT versus base on the pool) is labelled cross-protocol. The leak flag marks any
 checkpoint above 20% greedy pass@1 on HumanEval, treated as a leak until shown otherwise.
+It has three values: ``True`` (above the threshold, even on a partial row), ``False`` (a
+complete greedy HumanEval row at or below it) and ``None`` (no complete greedy HumanEval
+row, so nothing can be said); a checkpoint never evaluated on HumanEval is listed under
+``not_evaluated`` rather than reported as clean.
 """
 
 import hashlib
@@ -272,7 +276,11 @@ def _row(name: str, run: Run, baselines: Sequence[dict[str, Any]]) -> dict[str, 
     if run.suite == "pool":
         row["slices"] = _slices(run, baselines)
     if run.suite == LEAK_SUITE and run.decoding == "greedy":
-        row["leak_flag"] = metrics.get("pass_at_1", 0.0) > LEAK_THRESHOLD
+        score = metrics.get("pass_at_1")
+        if score is not None and score > LEAK_THRESHOLD:
+            row["leak_flag"] = True
+        else:
+            row["leak_flag"] = False if score is not None and row["complete"] else None
     return row
 
 
@@ -500,10 +508,15 @@ def build_scorecard(
         )
         total["gpu_minutes"] += item["gpu_minutes"] or 0.0
         total["sandbox_minutes"] += item["sandbox_minutes"] or 0.0
-    leak = {
-        name: any(row.get("leak_flag", False) for row in all_rows if row["checkpoint"] == name)
-        for name in checkpoints
-    }
+    leak: dict[str, bool | None] = {}
+    for name in checkpoints:
+        marks = [
+            row["leak_flag"] for row in all_rows if row["checkpoint"] == name and "leak_flag" in row
+        ]
+        if any(mark is True for mark in marks):
+            leak[name] = True
+        else:
+            leak[name] = False if any(mark is False for mark in marks) else None
     commit, dirty = git_state()
     return {
         "kind": "scorecard",
@@ -522,7 +535,8 @@ def build_scorecard(
             "rule": f"greedy pass@1 above {LEAK_THRESHOLD:.0%} on {LEAK_SUITE} is a leak until "
             "shown otherwise",
             "flags": leak,
-            "any": any(leak.values()),
+            "any": any(flag is True for flag in leak.values()),
+            "not_evaluated": [name for name, flag in leak.items() if flag is None],
         },
         "bootstrap": {"samples": bootstrap_samples, "seed": bootstrap_seed, "confidence": 0.95},
         "inputs": [
@@ -553,6 +567,12 @@ def render_markdown(scorecard: Mapping[str, Any]) -> str:
     lines = ["# Evaluation scorecard", ""]
     leak = scorecard["leak"]
     lines.append(f"Leak rule: {leak['rule']}. Flagged: {leak['any']}.")
+    if leak["not_evaluated"]:
+        lines.append(
+            "Leak check not possible (no complete greedy HumanEval row): "
+            + ", ".join(leak["not_evaluated"])
+            + "."
+        )
     lines.append("")
     groups: dict[tuple[str, str], list[Mapping[str, Any]]] = defaultdict(list)
     for row in scorecard["rows"]:
@@ -591,6 +611,8 @@ def render_markdown(scorecard: Mapping[str, Any]) -> str:
                 control = (
                     f"{_percent(baseline['mean_reward'])} / {_percent(baseline['full_pass_share'])}"
                 )
+                if baseline.get("uncovered"):
+                    control += f" ({baseline['uncovered']} uncovered)"
             unresolved = row.get("unresolved_attempts", 0)
             gpu = row.get("gpu_minutes")
             hashes = " / ".join(
@@ -598,7 +620,9 @@ def render_markdown(scorecard: Mapping[str, Any]) -> str:
                 for key in ("checkpoint_sha256", "tokenizer_sha256", "task_file_sha256")
             )
             hashes += " / " + str(row.get("protocol_sha256", ""))[:12]
-            leak_mark = " (LEAK FLAG)" if row.get("leak_flag") else ""
+            leak_mark = " (LEAK FLAG)" if row.get("leak_flag") is True else ""
+            if "leak_flag" in row and row["leak_flag"] is None:
+                leak_mark = " (leak check inconclusive)"
             lines.append(
                 f"| {row['checkpoint']}{leak_mark} | {row['decoding']} | {row['protocol']} | "
                 f"{score} | {control} | {unresolved} | "

@@ -266,15 +266,49 @@ def test_leak_flag_benchmarks_and_arc_rows(tmp_path: Path, monkeypatch: pytest.M
     base = row(card, "base", "humaneval", "greedy")
     assert base["metrics"]["pass_at_1"] == pytest.approx(1 / 3) and base["leak_flag"] is True
     assert row(card, "sft", "humaneval", "greedy")["leak_flag"] is False
-    assert card["leak"]["flags"] == {"base": True, "sft": False, "rl": False}
-    assert card["leak"]["any"] is True
+    # rl has no HumanEval row at all: it is not evaluated, which is not the same as clean.
+    assert card["leak"]["flags"] == {"base": True, "sft": False, "rl": None}
+    assert card["leak"]["any"] is True and card["leak"]["not_evaluated"] == ["rl"]
     assert base["constant_baseline"]["available"] is True
     assert base["constant_baseline"]["full_pass_share"] == pytest.approx(0.0)
     arc = row(card, "base", "arc-easy", "label-likelihood")
     assert arc["metrics"]["accuracy"] == 0.5
     assert arc["constant_baseline"]["best_position_accuracy"] == 0.5
     assert arc["constant_baseline"]["chance"] == 0.25
-    assert "LEAK FLAG" in render_markdown(card)
+    rendered = render_markdown(card)
+    assert "LEAK FLAG" in rendered
+    assert "Leak check not possible (no complete greedy HumanEval row): rl." in rendered
+
+
+def test_an_incomplete_humaneval_row_is_inconclusive_unless_already_above_the_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    benchmarks = benchmark_artifacts(tmp_path, monkeypatch)
+    for path, failing_index in zip(benchmarks, (1, 2), strict=True):
+        report = json.loads(path.read_text())
+        report["attempts"][failing_index].update(resolved=False, passed=False)
+        path.write_text(json.dumps(report))
+    card = build(tmp_path / "x", monkeypatch, benchmarks=benchmarks)
+    base = row(card, "base", "humaneval", "greedy")
+    sft = row(card, "sft", "humaneval", "greedy")
+    # base passes 1 of the 2 resolved tasks (0.5 > 0.2): flagged even though incomplete.
+    assert base["complete"] is False and base["leak_flag"] is True
+    # sft passes 0 of its 2 resolved tasks, but a task is unresolved: no clean bill of health.
+    assert sft["complete"] is False and sft["leak_flag"] is None
+    assert card["leak"]["flags"] == {"base": True, "sft": None, "rl": None}
+    assert card["leak"]["not_evaluated"] == ["sft", "rl"]
+    assert "(leak check inconclusive)" in render_markdown(card)
+
+
+def test_the_markdown_shows_how_many_tasks_the_constant_baseline_left_uncovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    card = build(tmp_path, monkeypatch)
+    sft = row(card, "sft", "pool", "greedy")
+    assert sft["constant_baseline"]["uncovered"] == 0
+    assert "uncovered" not in render_markdown(card)
+    sft["constant_baseline"]["uncovered"] = 2
+    assert "50.00% / 0.00% (2 uncovered)" in render_markdown(card)
 
 
 def test_inputs_must_be_named_unique_and_consistent(
