@@ -119,8 +119,23 @@ def compare_weights(first: Path, second: Path) -> WeightsComparison:
     run ID, step and metadata), so a file hash cannot say whether two endpoints are one model.
     This loads both (``read_weights``) and compares every tensor's name, dtype, shape and
     bytes. It reads both files whole: about 1.1 GB of memory for two 541 MB S checkpoints."""
-    a = read_weights(first)["model"]
-    b = read_weights(second)["model"]
+    return _compare(read_weights(first)["model"], read_weights(second)["model"])
+
+
+def compare_to_loaded(path: Path, reference: Path) -> WeightsComparison:
+    """Compare the model tensors of ``path`` bit for bit with ``reference`` as ``load_weights``
+    loads it, on the CPU: the weights a run that starts from ``reference`` holds.
+
+    For a checkpoint with one floating dtype that is the file's own tensors. For one with
+    several, the model keeps its own dtypes and ``load_state_dict`` casts into them, so a
+    check saved from the loaded model differs from the file in dtype yet holds the weights
+    the run started from; this compares against those, as the run 2 same-weights rule asks
+    (the weights the run loaded, not the file)."""
+    loaded = load_weights(reference).state_dict()
+    return _compare(read_weights(path)["model"], loaded)
+
+
+def _compare(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> WeightsComparison:
     for name in sorted(set(a) | set(b)):
         x, y = a.get(name), b.get(name)
         if (

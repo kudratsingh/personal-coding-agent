@@ -10,6 +10,7 @@ from scratchcoder.data.sft import SFTLoader, SFTRow
 from scratchcoder.eval.checkpoint import load_checkpoint
 from scratchcoder.model.gpt import GPT
 from scratchcoder.rl.checkpoint import (
+    compare_to_loaded,
     compare_weights,
     file_sha256,
     load_weights,
@@ -93,6 +94,40 @@ def test_the_same_weights_saved_twice_compare_equal_though_their_files_differ(
     zero = tmp_path / "zero.pt"
     save_weights(zero, model, tokenizer_hash="tok", run_id="c", step=3)
     assert not compare_weights(odd, zero).same
+
+
+def test_same_weights_compare_against_the_weights_the_run_loaded_not_the_file(
+    tmp_path: Path,
+) -> None:
+    """An SFT file with two floating dtypes loads into the model's own float32, so RL's
+    update-0 check (saved from the loaded model) differs from the file in dtype; it still
+    holds the weights the run started from, which is what the run 2 rule compares against.
+    One flipped bit in the check is still another model."""
+    model = trained_model()
+    with torch.no_grad():
+        model.embedding.weight.data = model.embedding.weight.data.to(torch.bfloat16)
+    sft = tmp_path / "sft-mixed.pt"
+    save_weights(sft, model, tokenizer_hash="tok", run_id="posttrain-1-sft", step=106)
+    dtypes = {value.dtype for value in read_weights(sft)["model"].values()}
+    assert dtypes == {torch.float32, torch.bfloat16}
+    check = tmp_path / "rl-check-0000.pt"
+    save_weights(check, load_weights(sft), tokenizer_hash="tok", run_id="posttrain-2-rl", step=0)
+    assert not compare_weights(check, sft).same  # The file: another dtype.
+    found = compare_to_loaded(check, sft)
+    assert found.same and found.first_difference is None
+    assert found.tensors == len(model.state_dict())
+    loaded = load_weights(sft)
+    with torch.no_grad():
+        loaded.embedding.weight.view(torch.int32)[0, 0] ^= 1
+    changed = tmp_path / "changed.pt"
+    save_weights(changed, loaded, tokenizer_hash="tok", run_id="posttrain-2-rl", step=12)
+    assert compare_to_loaded(changed, sft).first_difference == "embedding.weight"
+    # A uniform-dtype file loads as itself: the two comparisons agree.
+    uniform = tmp_path / "sft.pt"
+    save_weights(uniform, trained_model(), tokenizer_hash="tok", run_id="s", step=1)
+    again = tmp_path / "again.pt"
+    save_weights(again, load_weights(uniform), tokenizer_hash="tok", run_id="r", step=0)
+    assert compare_weights(again, uniform).same and compare_to_loaded(again, uniform).same
 
 
 def test_altered_bytes_and_identities_are_rejected(tmp_path: Path) -> None:

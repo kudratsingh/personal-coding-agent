@@ -69,7 +69,7 @@ from scratchcoder.rl.bridge import (
     read_bounded,
 )
 from scratchcoder.rl.bridge_mac import LEASE_FILE, LEASE_FORMAT
-from scratchcoder.rl.checkpoint import compare_weights, load_weights
+from scratchcoder.rl.checkpoint import compare_to_loaded, load_weights
 from scratchcoder.rl.control import ControlResult, run_more_sft
 from scratchcoder.rl.dev import ConstantBaseline, dev_subset
 from scratchcoder.rl.facts import constant_baseline_from_facts, load_facts
@@ -843,11 +843,14 @@ class Run2Worker(PosttrainWorker):
             started = self.clock()
             self.phase = f"{arm}-same-weights"
             sft = self.inputs["sft-weights"]
-            found = compare_weights(Path(selected.checkpoint), sft)
+            found = compare_to_loaded(Path(selected.checkpoint), sft)
             self.last_activity = self.clock()
             entry["same_weights_as_sft"] = found.same
             entry["comparison"] = {
-                "method": "every tensor's name, dtype, shape and bytes, on the CPU",
+                "method": (
+                    "every tensor's name, dtype, shape and bytes against the SFT weights as "
+                    "the run loaded them, on the CPU"
+                ),
                 "sft_weights_sha256": file_sha256(sft),
                 "tensors": found.tensors,
                 "first_difference": found.first_difference,
