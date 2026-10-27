@@ -15,9 +15,12 @@ A dev check scores the current policy on a fixed 200-task subset of the pool's d
 - **Metrics:** greedy pass@1, the mean pass rate of the 8 samples, and pass@8, each over all
   subset tasks.
 - **Constant baseline:** beside them, the subset's mean ``degenerate_baseline`` reward (the
-  best constant answer's fraction of hidden tests). A dev task the reward channel cannot
-  parse counts as 0 in that mean (the baseline is a lower bound there), and the number of
-  such tasks is recorded.
+  best constant answer's fraction of hidden tests) and, in the units of the pass rates
+  above, the constant pass rate: the share of subset tasks on which the best constant answer
+  passes every hidden test. The two pass rates and the pass@1 compare like with like; the
+  mean reward compares with a model's mean reward (the per-update monitoring). A dev task
+  the reward channel cannot parse counts as 0 in both (the baseline is a lower bound there),
+  and the number of such tasks is recorded.
 
 ``select_check`` picks the check with the highest greedy pass@1; ties go to the higher
 8-sample mean, then to the later check. See ``docs/rl.md``.
@@ -71,19 +74,26 @@ def dev_subset(tasks: Sequence[Task], n: int = DEV_SUBSET_SIZE) -> list[Task]:
 
 @dataclass(frozen=True)
 class ConstantBaseline:
-    """The best constant answer's mean reward over a task set (unparseable tasks as 0)."""
+    """The best constant answer over a task set (unparseable tasks counted as 0).
+
+    ``mean`` is its mean reward (the fraction of hidden tests it passes, averaged over
+    tasks); ``pass_rate`` is the share of tasks on which it passes every hidden test, the
+    unit of pass@1."""
 
     mean: float
     unparseable: int
     tasks: int
+    pass_rate: float = 0.0
+    solved: int = 0
 
 
 def constant_baseline(tasks: Sequence[Task]) -> ConstantBaseline:
-    """Mean ``degenerate_baseline`` reward; a task the channel cannot parse counts as 0."""
+    """Mean ``degenerate_baseline`` reward and the share of tasks it fully passes; a task
+    the channel cannot parse counts as 0 and as not passed."""
     if not tasks:
         raise ValueError("a constant baseline needs at least one task")
     values: list[float] = []
-    unparseable = 0
+    unparseable = solved = 0
     for task in tasks:
         baseline = baseline_of(task)
         if baseline.reward is None:
@@ -91,7 +101,10 @@ def constant_baseline(tasks: Sequence[Task]) -> ConstantBaseline:
             values.append(0.0)
         else:
             values.append(baseline.reward)
-    return ConstantBaseline(math.fsum(values) / len(values), unparseable, len(tasks))
+            solved += baseline.reward >= 1.0
+    return ConstantBaseline(
+        math.fsum(values) / len(values), unparseable, len(tasks), solved / len(tasks), solved
+    )
 
 
 @dataclass(frozen=True)
@@ -119,6 +132,10 @@ class DevCheck:
     context_limited: int = 0
     no_program: int = 0
     baseline_unparseable: int = 0
+    constant_pass_rate: float | None = None
+    """The share of dev tasks on which the best constant answer passes every hidden test:
+    the baseline in the units of the pass rates above (``None`` when not recorded).
+    ``constant_baseline`` is the mean fraction of hidden tests instead."""
     per_task: tuple[DevTaskResult, ...] = ()
 
     def __post_init__(self) -> None:
@@ -130,6 +147,9 @@ class DevCheck:
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or not 0 <= value <= 1:
                 raise ValueError(f"{name} must lie in [0, 1]")
+        rate = self.constant_pass_rate
+        if rate is not None and (not isinstance(rate, (int, float)) or not 0 <= rate <= 1):
+            raise ValueError("constant_pass_rate must lie in [0, 1] or be None")
         for name in ("generation_seconds", "wait_seconds"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
@@ -329,6 +349,7 @@ class PoolDevEvaluator:
             context_limited=sum(row.context_limited for row in generations),
             no_program=missing,
             baseline_unparseable=self.baseline.unparseable,
+            constant_pass_rate=self.baseline.pass_rate,
             per_task=tuple(results),
         )
 

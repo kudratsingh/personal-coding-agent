@@ -75,6 +75,9 @@ def test_constant_baseline_counts_unparseable_tasks_as_zero() -> None:
     baseline = constant_baseline(tasks)
     assert baseline.mean == pytest.approx(1.5 / 4)
     assert baseline.unparseable == 1 and baseline.tasks == 4
+    # The pass rate is in pass@1's units: only task a is fully passed by a constant answer,
+    # far below the mean reward of 0.375 that the half-credit task b also feeds.
+    assert baseline.solved == 1 and baseline.pass_rate == pytest.approx(0.25)
 
 
 def test_dev_metrics_are_over_all_tasks() -> None:
@@ -152,6 +155,7 @@ def test_pool_dev_evaluator_runs_end_to_end_on_a_tiny_model() -> None:
     result = evaluator.evaluate(model, 12)
     assert result.check == 12 and result.tasks == 3 and len(result.per_task) == 3
     assert result.constant_baseline == pytest.approx(1 / 3) and result.baseline_unparseable == 1
+    assert result.constant_pass_rate == pytest.approx(1 / 3)  # task b only; c is unparseable
     assert result.generation_seconds >= 0 and result.wait_seconds >= 0
     programs = 3 * 9 - result.no_program
     assert sum(executed) == programs
@@ -188,6 +192,11 @@ def test_dev_check_validation_and_json_round_trip() -> None:
     value = DevCheck(3, 0.5, 0.25, 0.75, 0.1, 4, 1.0, 2.0, per_task=(DevTaskResult("a", True, 2),))
     assert dev_check_from_json(value.to_json()) == value
     assert value.to_json(per_task=False)["per_task"] == []
+    assert value.constant_pass_rate is None  # not recorded unless the evaluator supplies it
+    rated = DevCheck(3, 0.5, 0.25, 0.75, 0.1, 4, 1.0, 2.0, constant_pass_rate=0.05)
+    assert dev_check_from_json(rated.to_json()) == rated and rated.to_json()["constant_pass_rate"]
+    with pytest.raises(ValueError):
+        DevCheck(3, 0.5, 0.25, 0.75, 0.1, 4, 1.0, 2.0, constant_pass_rate=1.5)
     for fields in (
         (-1, 0.5, 0.5, 0.5, 0.1, 4, 0.0, 0.0),
         (1, 1.5, 0.5, 0.5, 0.1, 4, 0.0, 0.0),

@@ -57,6 +57,7 @@ class ScriptedDevEvaluator:
     script: Callable[[int], tuple[float, float]] = lambda check: (0.0, 0.0)
     tasks: int = 200
     constant_baseline: float = 0.1
+    constant_pass_rate: float = 0.02
     timeout_at: int | None = None
     calls: list[int] = field(default_factory=list)
 
@@ -74,4 +75,5 @@ class ScriptedDevEvaluator:
             tasks=self.tasks,
             generation_seconds=0.0,
             wait_seconds=0.0,
+            constant_pass_rate=self.constant_pass_rate,
         )

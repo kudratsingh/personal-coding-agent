@@ -32,7 +32,11 @@ Under the rehearsal tokenizer, all 771 chat-v1 prompts fit the 1,024-token conte
 
 - greedy pass@1;
 - the 8-sample mean pass rate and pass@8;
-- beside them, the subset's mean constant-answer reward, so a score near what a constant answer earns is visible. A dev task the reward channel cannot parse counts as 0 in that mean, and the count of such tasks is recorded.
+- beside them, what a constant answer earns on the subset, in both units, so a score near it is visible:
+  - the **constant pass rate**, the share of tasks on which the best constant answer passes every hidden test. It is in the same unit as greedy pass@1, the 8-sample mean and pass@8, so compare those with it;
+  - the **constant baseline**, the mean fraction of hidden tests that answer passes. It is in the unit of a mean reward (the per-update monitoring), not of a pass rate. On the real 200-task subset it is 0.279, but a constant answer passes every hidden test on only 11 of the 200 tasks (5.5%), so a dev pass@1 of a few percent is at the constant answer's level, not far below 0.279.
+
+  A dev task the reward channel cannot parse counts as 0 in both, and the count of such tasks is recorded.
 
 Each check saves the weights. Every update's log also carries the mean constant-answer reward of its tasks beside its mean reward.
 
