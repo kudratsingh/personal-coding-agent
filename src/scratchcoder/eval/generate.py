@@ -27,6 +27,7 @@ from scratchcoder.eval.completions import (
     write_completions,
 )
 from scratchcoder.eval.protocols import load_suite_tasks, protocol_for
+from scratchcoder.tokenizer.bulk import FastEncoder
 from scratchcoder.train.trainer import training_device
 
 DEVICES = "cpu, cuda, cuda:N or mps"
@@ -93,7 +94,10 @@ def generate_completions(
     if resolved.type == "mps":
         model.to(resolved)
     context = model.config.context
-    prompts = {task.id: definition.prompt_ids(tokenizer, task) for task in tasks}
+    # The cached encoder gives the reference encoder's IDs exactly, in milliseconds a prompt
+    # rather than seconds at 65,536 tokens (2,000 pool prompts would take most of an hour).
+    encoder = FastEncoder(tokenizer)
+    prompts = {task.id: definition.prompt_ids(encoder, task) for task in tasks}
     attempts = [
         (task, sample, seed)
         for task in tasks

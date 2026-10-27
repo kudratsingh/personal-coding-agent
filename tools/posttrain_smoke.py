@@ -5,7 +5,8 @@ ARC and evaluation of the selected SFT weights, RL screening) and the pretrainin
 finalization on CPU, with nothing touching a network. The fixtures stand in for the real inputs:
 
 - three parent checkpoints of a 1-layer model, in the parent-checkpoint format;
-- the byte tokenizer with no merges;
+- a byte-level BPE tokenizer with real merges, trained on the fixtures' own kind of text
+  (``smoke_tokenizer``), so every prompt path runs the encoder the Pod runs;
 - authored pool dev and test tasks and RL candidates, each exported for the Pod with
   ``scratchcoder pod-task-export``'s code, so the worker sees placeholders, never tests;
 - authored benchmark tasks served in place of the pinned HumanEval and EvalPlus releases
@@ -39,7 +40,7 @@ from scratchcoder.eval.export import write_export
 from scratchcoder.eval.tasks import Task, load_tasks, save_tasks
 from scratchcoder.model.gpt import GPT
 from scratchcoder.rl.rollout import SCREENING_SEED
-from scratchcoder.tokenizer.bpe import ByteBPE
+from scratchcoder.tokenizer.bpe import FIRST_MERGE, ByteBPE
 from tools.posttrain_approved import run1_stages
 from tools.posttrain_run import PosttrainWorker as Worker
 from tools.posttrain_run import RunLimits, Specification
@@ -103,6 +104,21 @@ def _parent(path: Path, config: ModelConfig, tokenizer: ByteBPE, seed: int, name
     torch.save(state, path)
 
 
+SMOKE_MERGES = 96
+"""Merges of the smoke tokenizer: enough that prompts, rows and labels all merge."""
+
+
+def smoke_tokenizer() -> ByteBPE:
+    """A small BPE tokenizer with real merges, trained on text like the fixtures'."""
+    corpus = [
+        f"Write add_{index}(x) returning x + {index}. assert add_{index}(1) == {1 + index}\n"
+        f"def add_{index}(x):\n    return x + {index}\nRead n and print n + {index}.\n"
+        f"print(int(input()) + {index})\nWhich number is {index}? Say hello. Hello there."
+        for index in range(48)
+    ]
+    return ByteBPE.train(corpus, FIRST_MERGE + SMOKE_MERGES)
+
+
 def smoke_model(tokenizer: ByteBPE) -> ModelConfig:
     return ModelConfig(
         vocab_size=tokenizer.vocab_size, width=32, layers=1, heads=2, context=192, qk_norm=False
@@ -111,7 +127,7 @@ def smoke_model(tokenizer: ByteBPE) -> ModelConfig:
 
 def fixtures(root: Path) -> Fixtures:
     """Write every run-1 input of the smoke under ``root``; return their paths."""
-    tokenizer = ByteBPE()
+    tokenizer = smoke_tokenizer()
     inputs: dict[str, Path] = {}
     tokenizer_path = root / "tokenizer" / "tokenizer.json"
     tokenizer.save(tokenizer_path)

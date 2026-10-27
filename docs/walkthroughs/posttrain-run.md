@@ -4,7 +4,7 @@
 
 ## Worked example
 
-**The smoke.** `python -m tools.posttrain_run smoke --output runs/posttrain-smoke` writes tiny fixtures and runs all seven stages on CPU into an in-memory bucket in about three seconds. The model has 1 layer, width 32 and a 192-token context; the tokenizer is the byte tokenizer, so a prompt like `Write add_11(x) returning x + 11.` plus its public test is 61 chat-v1 tokens. With 3 pool tasks per split and the protocol cap of 512, each pool attempt may generate `min(512, 192 - 61) = 131` tokens. A greedy file has 3 attempts and an n = 8 file 24.
+**The smoke.** `python -m tools.posttrain_run smoke --output runs/posttrain-smoke` writes tiny fixtures and runs all seven stages on CPU into an in-memory bucket in about three seconds. The model has 1 layer, width 32 and a 192-token context; the tokenizer is a byte-level BPE with 96 merges trained on text like the fixtures' (`smoke_tokenizer`), so a prompt like `Write add_11(x) returning x + 11.` plus its public test is 24 chat-v1 tokens (61 with no merges). With 3 pool tasks per split and the protocol cap of 512, each pool attempt may generate `min(512, 192 - 24) = 168` tokens. A greedy file has 3 attempts and an n = 8 file 24.
 
 **The limits of run 1.** The ceiling is $3.00 at $0.60 an hour. `ceiling_limits(3.00, 0.60)` gives the wall `floor(3.00 x 3600 / 0.60) = 18,000 s`, the timer `18,000 - 180 = 17,820 s`, the worker's cost stop $3.00 and the watchdog's $2.99. A Pod whose create request went out at `ORIGIN` has its timer armed for `ORIGIN + 17,820`.
 
@@ -32,6 +32,7 @@
 - **Why a ceiling, not a wall.** A dead Mac must not let a Pod run to the pretraining rehearsal's $10: the timer, the watchdog and the worker all stop within $3.00 of spend. Deriving all three from one function keeps them from drifting apart.
 - **Why an in-Pod idle rule.** The Mac watchdog's idle rule needs the Mac. The in-Pod timer's needs only the Pod: 900 s with no GPU work and no progress stamp deletes it. The bootstrap stamps progress after every step, so a slow but live setup is not idle; a worker's rewritten heartbeat is not activity unless its GPU timestamp or `progress_unix` moves.
 - **Why every stage stops instead of skipping.** A stop leaves every artifact made so far in R2 and a report naming the reason; the owner re-prices. Skipping a stage would silently change what run 2 starts from.
+- **Why the cached encoder.** The reference `ByteBPE.encode` applies all 65,000 merges to every chunk: about a second per pool prompt and a third of a second per ARC question with the real tokenizer, so encoding 2,000 prompts before the first batch would idle the GPU past the 600 s limit. Every prompt path (the probe, ARC, `generate_completions`, screening) uses `FastEncoder`, whose IDs are the reference's exactly, in about a millisecond a prompt; the tests disable the reference encoder while the worker runs.
 - **Why weights only.** SFT's selected checkpoint feeds evaluation, screening and run 2, all of which start fresh optimizers, so the optimizer state (two thirds of a full checkpoint) is never needed.
 - **A common mistake** is running `eval-execute` on the Pod export: its placeholders would fail every attempt. The executor refuses an export, and refuses a full file whose export differs from the one the completions name.
 

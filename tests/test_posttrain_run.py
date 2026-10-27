@@ -22,6 +22,7 @@ from scratchcoder.eval.export import WITHHELD
 from scratchcoder.model.gpt import GPT
 from scratchcoder.rl.attempts import read_attempts_file
 from scratchcoder.rl.command import check_attempts_header, read_candidates
+from scratchcoder.tokenizer.bpe import ByteBPE
 from tools import posttrain_approved, posttrain_ops
 from tools.posttrain_run import (
     PROBE_STOP,
@@ -63,6 +64,10 @@ class Ran:
     heartbeat: dict[str, Any]
 
 
+def reference_encoder(self: ByteBPE, text: str, *, allow_special: bool = False) -> list[int]:
+    raise AssertionError("the reference BPE encoder ran on the worker's hot path")
+
+
 def execute(
     found: Fixtures,
     root: Path,
@@ -70,9 +75,12 @@ def execute(
     changes: Callable[[dict[str, Any]], None] | None = None,
     **options: Any,
 ) -> Ran:
+    """Run a worker; the reference encoder is disabled throughout: at 65,536 tokens it takes
+    about a second a prompt, so every prompt path must use the cached ``FastEncoder``."""
     bucket = MemoryBucket()
     worker = make_worker(found, root, bucket=bucket, changes=changes, **options)
-    with patched_benchmarks():
+    with patched_benchmarks(), pytest.MonkeyPatch.context() as patch:
+        patch.setattr(ByteBPE, "encode", reference_encoder)
         report = worker.execute()
     heartbeat = json.loads((root / "heartbeat.json").read_text())
     return Ran(report, root, bucket, heartbeat)
@@ -262,6 +270,19 @@ def test_the_benchmark_releases_are_the_pinned_ones(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not the pinned humaneval release"):
         benchmark_releases(tmp_path / "bench", download=fake_download)
     assert humaneval.DATA_BYTES == 44_877 and evalplus.release("mbpp-plus").task_count == 378
+
+
+def test_the_smoke_tokenizer_merges_so_the_encoders_are_exercised(found: Fixtures) -> None:
+    from scratchcoder.data import chat
+    from scratchcoder.eval.tasks import load_tasks
+    from scratchcoder.tokenizer.bulk import FastEncoder
+
+    assert len(found.tokenizer.merges) > 0
+    task = next(iter(load_tasks(found.inputs["pool-dev"])))
+    fast, reference = FastEncoder(found.tokenizer), found.tokenizer
+    assert chat.task_prompt(fast, task) == chat.task_prompt(reference, task)
+    text = chat.task_user_text(task)
+    assert len(reference.encode(text)) < len(text.encode())  # Real merges applied.
 
 
 def test_sft_keeps_the_lowest_quarter_dev_loss_as_weights_only(completed: Ran) -> None:
@@ -552,8 +573,6 @@ def test_readiness_refuses_a_policy_above_the_ceiling_derived_limits(
 
 def tiny_model() -> GPT:
     torch.manual_seed(0)
-    from scratchcoder.tokenizer.bpe import ByteBPE
-
     return GPT(smoke_model(ByteBPE())).eval()
 
 

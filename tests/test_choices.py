@@ -153,3 +153,27 @@ def test_choice_checkpoint_cli_end_to_end(tmp_path: Path) -> None:
     assert report["task_count"] == 1 and report["metrics"]["accuracy"] in {0.0, 1.0}
     assert report["per_task"][0]["status"] == "scored"
     assert json.loads(scorecard.read_text())["task_hash"] == report["task_hash"]
+
+
+def test_checkpoint_scoring_uses_the_cached_encoder_with_the_reference_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scratchcoder.engine.generation import score_answers
+    from scratchcoder.eval.choice_command import checkpoint_choice_scorer
+    from scratchcoder.tokenizer.bpe import FIRST_MERGE
+
+    prompt, labels = "Question: which colour is the sky?\nAnswer:", [" A", " B", " C"]
+    merged = ByteBPE.train([prompt * 3, " A B C"], FIRST_MERGE + 24)
+    assert merged.merges
+    torch.manual_seed(0)
+    model = GPT(ModelConfig(vocab_size=merged.vocab_size, width=16, layers=1, heads=2, context=64))
+    model.eval()
+    expected = score_answers(
+        model, merged.encode(prompt), [merged.encode(label) for label in labels]
+    )
+
+    def reference(self: ByteBPE, text: str, *, allow_special: bool = False) -> list[int]:
+        raise AssertionError("the reference encoder ran on the scoring path")
+
+    monkeypatch.setattr(ByteBPE, "encode", reference)
+    assert checkpoint_choice_scorer(model, merged)(prompt, labels) == expected

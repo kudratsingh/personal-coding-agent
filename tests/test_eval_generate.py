@@ -356,3 +356,51 @@ def test_greedy_generation_runs_on_a_real_mps_device_and_sampling_is_refused(
             sampling=Sampling(samples=2, temperature=0.8),
             device="mps",
         )
+
+
+def test_prompts_use_the_cached_encoder_with_the_reference_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At 65,536 tokens the reference encoder takes about a second a prompt; generation
+    encodes with ``FastEncoder``, whose IDs are the reference's exactly."""
+    from scratchcoder.eval.completions import prompt_sha256
+    from scratchcoder.tokenizer.bpe import FIRST_MERGE, ByteBPE
+
+    tasks_path, tasks = tasks_fixture(tmp_path)
+    merged = ByteBPE.train([chat.task_user_text(task) for task in tasks] * 4, FIRST_MERGE + 40)
+    assert merged.merges
+    tokenizer = tmp_path / "merged.json"
+    merged.save(tokenizer)
+    config = ModelConfig(vocab_size=merged.vocab_size, width=16, layers=1, heads=2, context=128)
+    torch.manual_seed(0)
+    checkpoint = tmp_path / "merged.pt"
+    torch.save(
+        {
+            "model": GPT(config).state_dict(),
+            "config": {"model": asdict(config)},
+            "tokenizer_hash": merged.sha256,
+        },
+        checkpoint,
+    )
+    expected = {task.id: chat.task_prompt(merged, task) for task in tasks}
+
+    def reference(self: ByteBPE, text: str, *, allow_special: bool = False) -> list[int]:
+        raise AssertionError("the reference encoder ran on the generation path")
+
+    monkeypatch.setattr(ByteBPE, "encode", reference)
+    output = tmp_path / "merged-completions.jsonl"
+    generate_completions(
+        checkpoint=checkpoint,
+        tokenizer_path=tokenizer,
+        suite="pool",
+        split="dev",
+        tasks_path=tasks_path,
+        protocol="chat-v1",
+        output=output,
+        batch_size=2,
+    )
+    completions = read_completions(output)
+    for task in tasks:
+        row = completions.row(task.id, 0)
+        assert row.prompt_sha256 == prompt_sha256(expected[task.id])
+        assert row.prompt_tokens == len(expected[task.id]) < len(chat.task_user_text(task))

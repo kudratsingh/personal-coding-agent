@@ -75,6 +75,7 @@ from scratchcoder.rl.attempts import ScreeningHeader, write_attempts
 from scratchcoder.rl.checkpoint import save_weights
 from scratchcoder.rl.rollout import screening_rollouts
 from scratchcoder.tokenizer.bpe import ByteBPE
+from scratchcoder.tokenizer.bulk import FastEncoder
 from scratchcoder.train.pilot import PilotStop
 from scratchcoder.train.trainer import Trainer, synchronized_time, training_device
 from scratchcoder.train.validation import assistant_loss, token_weighted_loss
@@ -927,6 +928,10 @@ class PosttrainWorker(Worker):
         self.tokenizer = ByteBPE.load(self.tokenizer_path)
         if self.tokenizer.vocab_size != spec.model.vocab_size:
             raise ValueError("the model vocabulary differs from the tokenizer")
+        # Every prompt the worker encodes goes through the cached encoder, which gives the
+        # reference encoder's IDs exactly: the reference applies all 65,000 merges to every
+        # chunk, about a second per pool prompt, which would idle the GPU past the 600 s limit.
+        self.encoder = FastEncoder(self.tokenizer)
         self.secrets = tuple(sorted({s for s in secrets if len(s) >= 4}, key=len, reverse=True))
         self.last_activity = clock()
         self.last_heartbeat = 0.0
@@ -1202,9 +1207,14 @@ class PosttrainWorker(Worker):
 
     def run_probe(self, stage: StagePlan) -> list[dict[str, Any]]:
         probe = self.plan.probe
-        model, tokenizer = self.load(stage.settings["checkpoint"])
+        model, _ = self.load(stage.settings["checkpoint"])
         tasks = list(load_tasks(self.inputs[stage.settings["prompts"]]))
-        lengths = sorted((len(chat.task_prompt(tokenizer, task)) for task in tasks), reverse=True)
+        lengths = []
+        for index, task in enumerate(tasks, 1):
+            lengths.append(len(chat.task_prompt(self.encoder, task)))
+            if index % 256 == 0:
+                self.tick()  # CPU work before the first batch keeps the heartbeat live too.
+        lengths.sort(reverse=True)
         window = int(probe["prompt_lengths"])
         middle = len(lengths) // 2
         start = max(0, min(middle - window // 2, len(lengths) - window))
@@ -1583,7 +1593,7 @@ class PosttrainWorker(Worker):
             rollouts = screening_rollouts(
                 model,
                 list(chunk),
-                tokenizer,
+                self.encoder,
                 tokenizer,
                 batch_size=int(generation["batch_size"]),
                 precision=str(generation["precision"]),
