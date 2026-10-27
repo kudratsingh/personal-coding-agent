@@ -432,7 +432,7 @@ Once the Pod is gone, the **owner** revokes the Pod's R2 token in the Cloudflare
 
 ## 17. After the run: execution on the Mac (Mac execution window)
 
-Model-written code now runs on the Mac. Before the window opens, the **owner** empties Docker Desktop's file sharing (Settings, Resources, File sharing: remove every entry), clears the SSH agent (`ssh-add -D`), and confirms the Pod token is revoked and gone from `.env` (step 15). Then, in a terminal where `.env` is sourced only to fetch the artifacts, record the sandbox image's local ID once, fetch the run's artifacts pinned to the verified report, and check the window:
+Model-written code now runs on the Mac. Before the window opens, the **owner** empties Docker Desktop's file sharing (Settings, Resources, File sharing: remove every entry, including the defaults `/Users`, `/Volumes`, `/private`, `/tmp` and `/var/folders`), clears the SSH agent (`ssh-add -D`; Docker Desktop forwards the login session's agent into its VM whatever the executor's environment holds), and confirms the Pod token is revoked and gone from `.env` (step 15). Then, in a terminal where `.env` is sourced only to fetch the artifacts, record the sandbox image's local ID once, fetch the run's artifacts pinned to the verified report, and check the window:
 
 ```sh
 export ART=$SHARED/artifacts
@@ -441,7 +441,7 @@ uv run --locked python -m tools.posttrain_ops fetch-artifacts --report "$CTRL/su
 uv run --locked python -m tools.mac_window_check check --image-id "$SANDBOX_IMAGE_ID" --dotenv .env --receipt "$SHARED/window-check.json"
 ```
 
-The window check fails in this terminal while `.env` is sourced (its environment check names the variables, never their values); every execution below runs through `mac_window_check exec`, which repeats the image and file-sharing checks before each batch and runs the executor in an environment without any `.env` variable, secret or SSH agent. The file-sharing check must fail to mount `/Users`; if it mounts, nothing runs.
+The window check fails in this terminal while `.env` is sourced (its environment check names the variables, never their values); every execution below runs through `mac_window_check exec`, which repeats the agent, image and file-sharing checks before each batch and runs the executor in an environment without any `.env` variable, secret or SSH agent. The agent check asks `ssh-add -l` of the shell's and the login session's agent sockets, each of which must hold no identity; the file-sharing check must fail to mount every one of the five default shares. If any check fails, nothing runs.
 
 Execute the four dev completions files and the dev constant-answer baseline (about 52,000 calls with the screening, about 2.4 hours):
 
