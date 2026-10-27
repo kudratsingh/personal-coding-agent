@@ -42,9 +42,9 @@ A language conversation uses the same turns without the python block. For `Hi` /
 
 - **Prompt:** `pool_prompt(task)` is `"""`, a newline, chat-v1's user turn, a newline, `"""` and a newline. A `"""` inside the text is written with a backslash before each quote, so the docstring cannot close early.
 - **Budget:** `pool_budget(prompt_tokens)` is `min(512, 1,024 − prompt_tokens)`. A value below one means no room to generate.
-- **Stops:** `truncate_pool_completion` cuts at the first of `\nif __name__`, `\nprint(`, `\nassert`, `\n"""` and `\n# Test`. The retained text is the program. These are prefix matches, so `\n# Testing` also stops. Because the prompt ends with a newline, a completion that begins with `assert` keeps nothing.
+- **Stops:** `truncate_pool_completion(text, mode=task.mode)` cuts at the first stop of the task's mode (`pool_stops(mode)`). Function-mode tasks stop at `\nif __name__`, `\nprint(`, `\nassert`, `\n"""` and `\n# Test`. I/O-mode tasks stop at the same strings except `\nprint(`. The mode has no default, and any value other than `function` or `io` raises. The retained text is the program. These are prefix matches, so `\n# Testing` also stops. Because the prompt ends with a newline, a completion that begins with `assert` keeps nothing.
 
-`prompt_protocol("chat")`, `prompt_protocol("chat-benchmark")` and `prompt_protocol("base-pool")` give the descriptions that reports record. All three strip the task text, so each records `prompt_stripped: true` and names the rule in `prompt_strip`.
+`prompt_protocol("chat")`, `prompt_protocol("chat-benchmark")` and `prompt_protocol("base-pool")` give the descriptions that reports record. All three strip the task text, so each records `prompt_stripped: true` and names the rule in `prompt_strip`. The base-pool record lists the stops per mode under `stop_strings_by_mode`; it has no single `stop_strings` list.
 
 ## Design choices and common mistakes
 
@@ -53,7 +53,7 @@ A language conversation uses the same turns without the python block. For `Hi` /
 - **`<|assistant_end|>` carries loss.** The model must learn when to stop. For code tasks `<|python_end|>` carries loss too, so the model learns to close its block.
 - **The prompt is a prefix of the row.** A test checks this for every task shape. If the prompt and the training row disagreed, for example in whitespace, the model would be scored on a context it never saw.
 - **Extraction works on token IDs, not text.** Decoded text cannot tell a real `<|python_start|>` from those bytes typed inside code, but the IDs can.
-- **Pool I/O tasks and the `\nprint(` stop.** A stdin/stdout program that prints at the top level is cut at its first top-level `print(` by `base-pool-completion-v1`. This is the protocol as declared. Applied to the 2026-10-25 pool's reference solutions, the stops cut 8 of the 26 dev I/O tasks and 705 of the 1,514 train I/O tasks, all at `\nprint(`. In the 1,850 dev OpenCodeInstruct tasks they cut 700 references, removing only trailing example code. It affects only base-model pool scores, which are labelled cross-protocol.
+- **Pool I/O tasks and the `\nprint(` stop.** A stdin/stdout program prints its answer at the top level, so a `\nprint(` stop would cut a correct I/O program short. The stop therefore applies to function-mode tasks only; the protocol was amended this way on 2026-10-26, before its first scored use. Applied to the 2026-10-25 pool's reference solutions, the declared stops cut 8 of the 26 dev I/O references and 705 of the 1,514 train I/O references, all at `\nprint(`. With the per-mode stops they cut none. Function-mode cuts are unchanged: 700 of the 1,850 dev OpenCodeInstruct references (removing trailing example code) and none of the 124 dev MBPP references. Base-model pool scores are labelled cross-protocol either way.
 - **Benchmarks are cross-protocol too.** `base-completion-rstrip-v1` scores the benchmark prompt plus the completion, so imports and helper functions in the prompt are part of the program. chat-v1 scores the extracted block alone, so the model must write those itself. Base-versus-chat benchmark comparisons are therefore cross-protocol, like the pool ones.
 
 ## Verification
@@ -68,7 +68,7 @@ A language conversation uses the same turns without the python block. For `Hi` /
 - turn-order and validation errors;
 - code normalization, and the I/O and benchmark user turns;
 - every extraction case, and a round trip through a rendered reference;
-- the base-pool prompt, quote escaping, every stop, and the budget.
+- the base-pool prompt, quote escaping, every stop of each mode, the required mode, and the budget.
 
 ```sh
 uv run --locked pytest tests/test_chat_format.py
@@ -83,3 +83,4 @@ These checks use the merge-free reference tokenizer. The SFT data builder render
 3. *Why is a training row's last token never an input?* It has nothing to predict. A row of `n` tokens gives `n − 1` input/target pairs.
 4. *Why strip the prompt and the public test?* So the user turn has one fixed shape: no stray leading newline from a stored test, and exactly one blank line between the two parts.
 5. *Why does base-pool stop at `\n"""`?* A base model often closes one docstring and opens another for the next problem. The program ends at the first new top-level docstring.
+6. *Why does `\nprint(` stop a function task but not an I/O task?* A function task's program is the function, so a top-level `print(` after it is example usage. An I/O task's program reads standard input and prints its answer at the top level, so there the `print(` is the program.
