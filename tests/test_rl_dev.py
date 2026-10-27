@@ -10,7 +10,7 @@ import torch
 
 from scratchcoder.common.config import ModelConfig
 from scratchcoder.data.chat import CODE_STOP_IDS, PYTHON_END, PYTHON_START, task_prompt
-from scratchcoder.engine.generation import Completion
+from scratchcoder.engine.generation import Completion, generate_many
 from scratchcoder.eval.harness import attempt_seed
 from scratchcoder.eval.tasks import Task
 from scratchcoder.model.gpt import GPT
@@ -181,7 +181,7 @@ def test_a_ticking_dev_check_generates_exactly_what_an_unticked_one_does() -> No
     prompts = [task_prompt(TOKENIZER, task) for task in tasks]
     options: dict[str, Any] = {"max_new_tokens": 6, "temperature": 0.8, "top_p": 0.95}
     seeds = list(range(10, 15))
-    expected = dev.generate_many(model, prompts, batch_size=2, seeds=seeds, **options)
+    expected = generate_many(model, prompts, batch_size=2, seeds=seeds, **options)
     calls: list[int] = []
     got = dev.ticking_generations(
         model, prompts, tick=calls.append, batch_size=2, seeds=seeds, **options

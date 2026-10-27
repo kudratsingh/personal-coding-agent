@@ -30,8 +30,11 @@ bridge directories are uploaded as one label, so a late reply is kept. See
 
 from __future__ import annotations
 
+import io
 import json
 import math
+import os
+import stat
 import tarfile
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -489,17 +492,34 @@ class Run2Worker(PosttrainWorker):
         self.uploaded.add(path.resolve())
         return self.export_label(label, [("checkpoint.pt", path)])
 
-    def salvage(self, directory: Path, label: str, outputs: list[dict[str, Any]]) -> None:
+    def salvage(
+        self,
+        directory: Path,
+        label: str,
+        outputs: list[dict[str, Any]],
+        *,
+        stage: str,
+        events: tuple[str, Path],
+    ) -> None:
         """After a failure: upload the newest weights the run saved that are not in R2 yet
-        (``run_rl`` and the control save the latest weights before an error propagates)."""
+        (``run_rl`` and the control save the latest weights before an error propagates),
+        then the arm's event log as the stage's label, which would otherwise be lost with
+        the Pod. Neither may mask the error that ended the stage."""
         try:
             saved = sorted(path for path in directory.glob("*.pt") if path.is_file())
             fresh = [path for path in saved if path.resolve() not in self.uploaded]
             if fresh:
                 outputs += self.upload_weights(label, fresh[-1])
-        except Exception as error:  # Never mask the error that ended the stage.
+        except Exception as error:
             self.report.setdefault("salvage_errors", []).append(
                 f"{label}: {type(error).__name__}: {str(error)[:200]}"
+            )
+        try:
+            if events[1].exists():
+                outputs += self.export_label(stage, [events])
+        except Exception as error:
+            self.report.setdefault("salvage_errors", []).append(
+                f"{stage}: {type(error).__name__}: {str(error)[:200]}"
             )
 
     # The RL stage -----------------------------------------------------------------------
@@ -567,11 +587,13 @@ class Run2Worker(PosttrainWorker):
             )
         except BaseException:
             record["status"] = "failed"
-            self.salvage(output / "checkpoints", "rl-latest-weights", outputs)
-            if (output / "events.jsonl").exists():
-                outputs += self.export_label(
-                    stage.name, [("events.jsonl", output / "events.jsonl")]
-                )
+            self.salvage(
+                output / "checkpoints",
+                "rl-latest-weights",
+                outputs,
+                stage=stage.name,
+                events=("events.jsonl", output / "events.jsonl"),
+            )
             raise
         finally:
             del model
@@ -758,7 +780,13 @@ class Run2Worker(PosttrainWorker):
             )
         except BaseException:
             record["status"] = "failed"
-            self.salvage(run_dir / "checkpoints", "more-sft-latest-weights", outputs)
+            self.salvage(
+                run_dir / "checkpoints",
+                "more-sft-latest-weights",
+                outputs,
+                stage=stage.name,
+                events=("control-events.jsonl", run_dir / "control-events.jsonl"),
+            )
             raise
         finally:
             self.release()
@@ -816,23 +844,72 @@ class Run2Worker(PosttrainWorker):
                 return
             path = self.root / "artifacts" / "bridge" / "bridge.tar"
             path.parent.mkdir(parents=True, exist_ok=True)
-            total = 0
-            with tarfile.open(path, "w") as archive:
-                members = [self.bridge_root / name for name in BRIDGE_FILES]
-                for box in BRIDGE_BOXES:
-                    directory = self.bridge_root / box
-                    if directory.is_dir() and not directory.is_symlink():
-                        members += sorted(directory.iterdir())
-                for member in members:
-                    if member.is_symlink() or not member.is_file():
-                        continue  # Only regular files; a link or a FIFO is never followed.
-                    total += member.stat().st_size
-                    if total > MAX_BRIDGE_TAR_BYTES:
-                        raise ValueError("the bridge directories exceed the label's bound")
-                    archive.add(member, arcname=str(member.relative_to(self.bridge_root)))
+            archived = self.archive_bridge(path)
             self.current = None
             self.export_label("bridge", [("bridge.tar", path)])
             self.report["bridge"]["archived_at"] = utc_now()
+            self.report["bridge"]["archive"] = archived
         except Exception as error:  # The finalization must run whatever happens here.
             self.report["bridge"]["archive_error"] = f"{type(error).__name__}: {str(error)[:200]}"
             self.publish()
+
+    def archive_bridge(self, path: Path) -> dict[str, Any]:
+        """Write the bridge directories' regular files into the tar at ``path``.
+
+        The Mac may still push a late reply, and renews ``server.lease`` by atomic rename,
+        while this runs: each file is read once through one descriptor opened without
+        following a link, so a file replaced meanwhile is archived whole (the old or the new
+        bytes, never a torn mix) and one removed after the listing is left out and named,
+        instead of losing the whole label. A link, a FIFO or any other non-regular file is
+        never followed or read."""
+        members = [self.bridge_root / name for name in BRIDGE_FILES]
+        for box in BRIDGE_BOXES:
+            directory = self.bridge_root / box
+            if directory.is_dir() and not directory.is_symlink():
+                members += sorted(directory.iterdir())
+        total, files, vanished = 0, 0, []
+        with tarfile.open(path, "w") as archive:
+            for member in members:
+                name = str(member.relative_to(self.bridge_root))
+                try:
+                    snapshot = regular_snapshot(member, MAX_BRIDGE_TAR_BYTES - total)
+                except FileNotFoundError:
+                    if name not in BRIDGE_FILES:  # A missing lock or lease is no news.
+                        vanished.append(name)
+                    continue
+                if snapshot is None:
+                    continue
+                data, mtime = snapshot
+                total += len(data)
+                info = tarfile.TarInfo(name)
+                info.size, info.mtime, info.mode = len(data), int(mtime), 0o600
+                archive.addfile(info, io.BytesIO(data))
+                files += 1
+        return {"files": files, "bytes": total, "vanished": vanished}
+
+
+def regular_snapshot(path: Path, limit: int) -> tuple[bytes, float] | None:
+    """The bytes and modification time of the regular file at ``path``, read through one
+    descriptor opened without following a link; ``None`` for a link or any other non-regular
+    file. A file removed before it is opened raises ``FileNotFoundError``; one longer than
+    ``limit`` bytes raises ``ValueError`` (the bridge label's bound)."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        raise
+    except OSError:  # A link (ELOOP under O_NOFOLLOW) or an unreadable entry.
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        chunks, size = [], 0
+        while chunk := os.read(descriptor, 1024 * 1024):
+            size += len(chunk)
+            if size > limit:
+                raise ValueError("the bridge directories exceed the label's bound")
+            chunks.append(chunk)
+        return b"".join(chunks), info.st_mtime
+    finally:
+        os.close(descriptor)

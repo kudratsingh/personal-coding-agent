@@ -103,7 +103,7 @@ On the Mac, in an execution window: `eval-execute` of the four dev completions f
 | `arc-post` | each arm's selected checkpoint; the ARC-Easy questions | `arc-post-rl`, `arc-post-more-sft`: `arc.json` |
 | `eval-rl`, `eval-more-sft` | each selected checkpoint; run 1's pool exports and benchmark releases | `eval-<arm>-<file>`: `completions.jsonl`, seven files each (`chat-v1`) |
 
-Then run 1's finalization, after the bridge directories (`outbox/`, `inbox/`, `done/`, `withdrawn/`, `rejected/`, `server.lease`, `server.lease.lock`, `client.lock`) are uploaded as one label, `bridge` (`bridge.tar`), so a late reply is kept.
+Then run 1's finalization, after the bridge directories (`outbox/`, `inbox/`, `done/`, `withdrawn/`, `rejected/`, `server.lease`, `server.lease.lock`, `client.lock`) are uploaded as one label, `bridge` (`bridge.tar`), so a late reply is kept; a file the Mac replaces while it is archived is kept whole, and one it removes is named in `report.json` and left out.
 
 **RL** runs `run_rl` on the frozen protocol: 100 updates of 32 kept tasks x G = 8, temperature 1.0, top-p 1.0, at most min(256, 1,024 - prompt) new tokens, tasks shuffled with seed 0 and reshuffled each pass, a fresh AdamW (0.9 / 0.95, weight decay 0.1) at 3e-6 after 5 linear warmup updates, clip 1.0, no KL, and the RL loop's stops (non-finite, collapse, dev patience 3, leakage above 1% of rewarded attempts, reward wait, external). Rewards come through `BridgeRewardSource` and dev checks through `BridgeDevEvaluator`, one `BridgeClient` for the run, with the Mac's facts in place of the hidden tests and the cached encoder for every prompt; the model trains with fused attention and the foreach AdamW, as SFT did. `report.json` records RL's GPU-busy seconds (rollout generation plus training steps) and, separately, the dev checks' generation, the Mac waits and the checkpoint saves (RL does not compile). A reward-wait timeout, a lost bridge, a margin stop or a limit ends the run after the latest weights reach R2, since the control needs the bridge too; any other stop is a result and the control runs.
 
@@ -167,7 +167,7 @@ At the planned $5.80 and $0.60 an hour (`ceiling_limits`): the worker stops at $
 | Dev-check generation stamps the GPU and the heartbeat after every batch | `Run2Worker.dev_tick`, `scratchcoder.rl.dev.ticking_generations` | `test_posttrain_run2.py`, `test_rl_dev.py` |
 | Margin for one full wait | `Run2Worker.should_stop`, `before_wait` (`wait_margin`) | `test_posttrain_run2.py`, `test_posttrain_run2_guards.py` |
 | A wait ended by an error withdraws its request | `BridgeClient._exchange` | `test_rl_bridge.py` |
-| Each check's weights in R2 at once; the latest weights before any end | `Run2Worker.upload_weights`, `salvage` | `test_posttrain_run2.py` |
+| Each check's weights in R2 at once; the latest weights and the arm's event log before any end, in either arm | `Run2Worker.upload_weights`, `salvage` | `test_posttrain_run2.py` |
 | No hidden test on the Pod | `scratchcoder.rl.pod_export`; `posttrain_binding.require_withheld`, `require_facts`; `load_facts` | `test_rl_pod_export.py`, `test_posttrain_run2.py` |
 | Run 1's safeguards (ceiling-derived lifetime, projected finish, reserve, prefix guard, verified teardown) | as run 1 | the run-2 tests above and run 1's |
 

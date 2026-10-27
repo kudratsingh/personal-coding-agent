@@ -10,6 +10,7 @@ reference BPE encoder is disabled so every prompt goes through the cached encode
 
 import copy
 import json
+import os
 import tarfile
 import time
 from collections.abc import Callable
@@ -23,6 +24,7 @@ import torch
 from scratchcoder.rl.bridge import BridgeRefused
 from scratchcoder.rl.bridge_mac import LEASE_FORMAT
 from scratchcoder.rl.fakes import FakeRewardSource
+from scratchcoder.rl.rewards import RewardHostFailure, RewardTimeout
 from scratchcoder.rl.withheld import is_withheld
 from scratchcoder.tokenizer.bpe import ByteBPE
 from tools import posttrain_approved, posttrain_ops
@@ -36,12 +38,13 @@ from tools.posttrain_run import (
     launch_fit,
     planned_seconds,
 )
-from tools.posttrain_run2 import Run2Worker
+from tools.posttrain_run2 import BRIDGE_BOXES, Run2Worker
 from tools.posttrain_smoke import patched_benchmarks
 from tools.posttrain_smoke2 import (
     HIDDEN_MARKERS,
     SMOKE2_POD_ID,
     Fixtures2,
+    ReferenceDev,
     fixtures2,
     mac_server,
     mac_thread,
@@ -83,10 +86,12 @@ def execute(
     mac_dev: Any = None,
     mac_wall: Callable[[], float] | None = None,
     pod_task_sha256: dict[str, str] | None = None,
+    setup: Callable[[Run2Worker, Any], None] | None = None,
     raises: type[BaseException] | None = None,
     **options: Any,
 ) -> Ran:
-    """Run a run-2 worker with the Mac in a thread; every heartbeat it writes is kept."""
+    """Run a run-2 worker with the Mac in a thread; every heartbeat it writes is kept.
+    ``setup`` sees the worker and the Mac's server before the run starts."""
     bucket = MemoryBucket()
     worker = make_run2_worker(found, root, bucket=bucket, **options)
     beats: list[dict[str, Any]] = []
@@ -117,6 +122,8 @@ def execute(
                 server.pod_task_sha256 = pod_task_sha256
             if mac_dev is not None:
                 server.dev_execute = mac_dev
+            if setup is not None:
+                setup(worker, server)
             with mac_thread(server):
                 error = run(worker, raises)
         else:
@@ -155,6 +162,17 @@ class SlowClock:
 
     def __call__(self) -> float:
         return self.start + (time.monotonic() - self.real) / 1_000
+
+
+class JumpClock(SlowClock):
+    """``SlowClock`` that a test can move forward at once (``offset``)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.offset = 0.0
+
+    def __call__(self) -> float:
+        return super().__call__() + self.offset
 
 
 class FastClock:
@@ -627,27 +645,41 @@ def test_a_dead_mac_is_a_lost_bridge_and_the_pod_dies_within_the_idle_bound(
     )
     stamped = [beat for beat in ran.beats if beat.get("progress_unix")]
     assert max(beat["progress_unix"] for beat in stamped) == last
-    # The in-Pod timer on the last heartbeat written while waiting, read at the same clock.
+    # The in-Pod timer on the last heartbeat written while waiting, armed when the GPU last
+    # worked (the wait's start, 300 s before the last renewal): the lease's stamp, and only
+    # it, carries the timer to 900 s after the last renewal.
     waiting = [beat for beat in ran.beats if beat["status"] == "awaiting_rewards"][-1]
-    snapshot = tmp_path / "heartbeat-snapshot.json"
-    snapshot.write_text(json.dumps(waiting))
-    now = [last]
-    unit = SelfDestruct(
-        pod_id=SMOKE2_POD_ID,
-        token="",
-        deadline_unix=last + 34_000,
-        receipt_path=str(tmp_path / "self-destruct.json"),
-        clock=lambda: now[0],
-        monotonic=lambda: 0.0,
-        sleep=lambda _: None,
-        dry_run=True,
-        idle_seconds=900.0,
-        activity=(str(snapshot),),
-    )
-    now[0] = last + 899
-    assert unit.due() is None
-    now[0] = last + 900
-    assert unit.due() == "idle_limit"
+    armed = waiting["last_gpu_activity_unix"]
+    assert armed == start and waiting["progress_unix"] == last == armed + 300
+
+    def timer(beat: dict[str, Any], name: str) -> tuple[SelfDestruct, list[float]]:
+        snapshot = tmp_path / f"{name}.json"
+        snapshot.write_text(json.dumps(beat))
+        now = [armed]
+        unit = SelfDestruct(
+            pod_id=SMOKE2_POD_ID,
+            token="",
+            deadline_unix=armed + 34_000,
+            receipt_path=str(tmp_path / f"{name}-self-destruct.json"),
+            clock=lambda: now[0],
+            monotonic=lambda: 0.0,
+            sleep=lambda _: None,
+            dry_run=True,
+            idle_seconds=900.0,
+            activity=(str(snapshot),),
+        )
+        return unit, now
+
+    unit, now = timer(waiting, "with-lease")
+    for at, due in ((armed + 900, None), (last + 899, None), (last + 900, "idle_limit")):
+        now[0] = at
+        assert unit.due() == due, at
+    # Without the lease's stamp the same heartbeat dies 900 s after the GPU's last work.
+    stripped = {key: value for key, value in waiting.items() if key != "progress_unix"}
+    unit, now = timer(stripped, "without-lease")
+    for at, due in ((armed + 899, None), (armed + 900, "idle_limit")):
+        now[0] = at
+        assert unit.due() == due, at
 
 
 def test_the_cost_stop_keeps_one_full_wait_free(found: Fixtures2, tmp_path: Path) -> None:
@@ -752,6 +784,211 @@ def test_an_rl_early_stop_is_a_result_and_the_control_runs(
     assert [row["check"] for row in report["rl"]["checks"]] == [0, 1]  # The stop-time check.
     assert report["more_sft"]["stop_reason"] in {"budget", "passes_exhausted"}
     assert report["selection"]["rl"]["selected"]["check"] in {0, 1}
+
+
+# Stops in the control ------------------------------------------------------------------------
+
+
+def in_the_control(worker: Run2Worker) -> bool:
+    return worker.stage_name == "more-sft"
+
+
+class FailsInTheControl:
+    """The Mac's dev verdicts: the reference rule during RL; ``error`` during the control."""
+
+    def __init__(self, worker: Run2Worker, error: Exception) -> None:
+        self.worker, self.error, self.reference = worker, error, ReferenceDev()
+
+    def __call__(self, pairs: Any) -> list[bool]:
+        if in_the_control(self.worker):
+            raise self.error
+        return self.reference(pairs)
+
+
+def assert_the_control_ended_the_run(ran: Ran, reason: str) -> None:
+    """RL's result stands, the control stopped with ``reason``, nothing after it ran, and the
+    run finalized in full with the bridge directories kept."""
+    report = ran.report
+    assert (report["status"], report["stop_reason"]) == ("stopped", reason)
+    assert statuses(report) == {
+        "rl": "completed",
+        "more-sft": "stopped",
+        "arc-post": "skipped",
+        "eval-rl": "skipped",
+        "eval-more-sft": "skipped",
+    }
+    assert {"rl", "more-sft", "bridge"} <= labels(report)
+    events = {row["name"] for row in report["artifacts"] if row["label"] == "more-sft"}
+    assert {"control-result.json", "control-events.jsonl"} <= events
+    beat = json.loads((ran.worker.root / "heartbeat.json").read_text())
+    assert beat["status"] == "stopped" and "r2_final" in beat
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (RewardTimeout("the Mac's dev bound passed"), "reward_wait"),
+        (RewardHostFailure("the sandbox host failed through its retries"), "reward_host_failure"),
+    ],
+)
+def test_a_channel_stop_in_the_control_ends_the_run_with_its_weights_in_r2(
+    found: Fixtures2, tmp_path: Path, error: Exception, reason: str
+) -> None:
+    """The Mac answers the control's first own dev check with a timeout or a host failure."""
+    ran = execute(
+        found,
+        tmp_path / "run",
+        setup=lambda worker, server: setattr(
+            server, "dev_execute", FailsInTheControl(worker, error)
+        ),
+    )
+    assert_the_control_ended_the_run(ran, reason)
+    control = ran.report["more_sft"]
+    assert control["stop_reason"] == reason and control["checks"] == []
+    assert "more-sft-stop-weights" in labels(ran.report)
+    waits = ran.report["bridge"]["waits"]
+    assert waits[-1]["kind"] == "dev" and waits[-1]["outcome"] == "failed"
+
+
+def test_a_mac_that_dies_during_the_control_is_a_lost_bridge(
+    found: Fixtures2, tmp_path: Path
+) -> None:
+    """The Mac stops renewing its lease while the control waits on a dev check: 700 s later
+    the worker gives the wait up as ``bridge_lost``, uploads the control's weights and
+    finalizes. (The Mac's lease is dated by the Pod's clock until it dies, and the Pod's clock
+    jumps the 700 s at once, so the test does not depend on the runner's speed.)"""
+    clock = JumpClock()
+    died: list[float] = []
+
+    def mac_wall() -> float:
+        return died[0] if died else clock()
+
+    class DiesInTheControl:
+        def __init__(self, worker: Run2Worker) -> None:
+            self.worker, self.reference = worker, ReferenceDev()
+
+        def __call__(self, pairs: Any) -> list[bool]:
+            if not in_the_control(self.worker):
+                return self.reference(pairs)
+            died.append(clock())  # no renewal is dated later than this
+            clock.offset += 700.0
+            deadline = time.monotonic() + 120  # wide: only a stalled runner takes this long
+            while self.worker.report["bridge"]["lost"] is None:
+                assert time.monotonic() < deadline, "the Pod never gave the wait up"
+                time.sleep(0.01)
+            return [False] * len(pairs)
+
+    ran = execute(
+        found,
+        tmp_path / "run",
+        clock=clock,
+        mac_wall=mac_wall,
+        setup=lambda worker, server: setattr(server, "dev_execute", DiesInTheControl(worker)),
+    )
+    assert_the_control_ended_the_run(ran, BRIDGE_LOST_STOP)
+    lost = ran.report["bridge"]["lost"]
+    assert lost["kind"] == "dev" and lost["silent_seconds"] >= 600
+    assert lost["lease_last_renewed_unix"] <= died[0]
+    assert ran.report["more_sft"]["stop_reason"] == "reward_wait"
+    assert "more-sft-stop-weights" in labels(ran.report)
+
+
+def test_no_control_update_starts_without_one_full_wait_free(
+    found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RL leaves 1,550 s of spend before the cost stop, less than one full wait (1,572.5 s
+    here): the control stops before its first update (``wait_margin``) and finalizes in full."""
+    clock = JumpClock()
+    window = 10_000.0
+    limits = RunLimits(
+        pod_seconds=18_000,
+        quoted_total_hourly=0.6,
+        cost_stop_usd=3.0,
+        idle_seconds=600,
+        starting_cost_usd=3.0 - window / 3600 * 0.6,
+    )
+    original = Run2Worker.run_more_sft
+
+    def after_a_long_rl(self: Run2Worker, stage: Any) -> list[dict[str, Any]]:
+        clock.offset += window - 1_550.0
+        self.last_activity = self.clock()
+        return original(self, stage)
+
+    monkeypatch.setattr(Run2Worker, "run_more_sft", after_a_long_rl)
+    ran = execute(found, tmp_path / "run", clock=clock, limits=limits, pod_created=clock())
+    assert_the_control_ended_the_run(ran, WAIT_MARGIN_STOP)
+    control = ran.report["more_sft"]
+    assert control["stop_reason"] == "external" and control["updates"] == 0
+    assert control["stop_detail"].startswith("wait_margin: one full wait would pass the cost")
+    margin = ran.report["bridge"]["margin_stop"]
+    assert (margin["kind"], margin["limit"], margin["wait_seconds"]) == (
+        "next update",
+        "cost_limit",
+        1_572.5,
+    )
+
+
+def test_a_refusal_during_the_control_fails_the_run_after_its_weights_and_events_reach_r2(
+    found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    servers: list[Any] = []
+    original = Run2Worker.run_more_sft
+
+    def refused(self: Run2Worker, stage: Any) -> list[dict[str, Any]]:
+        servers[0].pod_task_sha256 = {**servers[0].pod_task_sha256, "dev": "d" * 64}
+        return original(self, stage)
+
+    monkeypatch.setattr(Run2Worker, "run_more_sft", refused)
+    ran = execute(
+        found,
+        tmp_path / "run",
+        setup=lambda worker, server: servers.append(server),
+        raises=BridgeRefused,
+    )
+    report = ran.report
+    assert report["status"] == "failed" and report["error_type"] == "BridgeRefused"
+    assert report["more_sft"]["status"] == "failed"
+    assert {"more-sft-latest-weights", "more-sft", "bridge"} <= labels(report)
+    (events,) = [
+        row
+        for row in report["artifacts"]
+        if row["label"] == "more-sft" and row["name"] == "control-events.jsonl"
+    ]
+    assert b"control_failed" in ran.bucket.objects[events["key"]]
+    assert "salvage_errors" not in report
+
+
+def test_a_file_that_vanishes_during_the_bridge_archive_is_left_out_not_the_label(
+    found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Mac may still push a late reply while the Pod archives its bridge directories: a
+    file listed and then moved aside is named and left out; links and FIFOs are never read."""
+    worker = make_run2_worker(found, tmp_path / "run", bucket=MemoryBucket())
+    root = worker.bridge_root
+    for box in BRIDGE_BOXES:
+        (root / box).mkdir(parents=True)
+    (root / "server.lease").write_text("lease")
+    (root / "inbox" / "a.json").write_text("{}")
+    (root / "done" / "b.json").write_text('{"x": 1}')
+    (root / "outbox" / "link.json").symlink_to(root / "done" / "b.json")
+    os.mkfifo(root / "outbox" / "fifo.json")
+    listed = Path.iterdir
+
+    def with_a_ghost(self: Path) -> Any:
+        yield from listed(self)
+        if self.name == "inbox":
+            yield self / "gone.json"  # listed, then set aside before it is read
+
+    monkeypatch.setattr(Path, "iterdir", with_a_ghost)
+    archived = worker.archive_bridge(tmp_path / "bridge.tar")
+    assert archived == {"files": 3, "bytes": 5 + 2 + 8, "vanished": ["inbox/gone.json"]}
+    with tarfile.open(tmp_path / "bridge.tar") as tar:
+        assert sorted(tar.getnames()) == ["done/b.json", "inbox/a.json", "server.lease"]
+        member = tar.extractfile("done/b.json")
+        assert member is not None and member.read() == b'{"x": 1}'
+    monkeypatch.setattr("tools.posttrain_run2.MAX_BRIDGE_TAR_BYTES", 6)
+    with pytest.raises(ValueError, match="bound"):
+        worker.archive_bridge(tmp_path / "small.tar")
 
 
 class FirstCheckOnly:
