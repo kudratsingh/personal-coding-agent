@@ -1951,6 +1951,30 @@ class Worker:
         self.report["ended_at"] = utc_now()
 
     # Finalization ----------------------------------------------------------------------
+    #
+    # ``tools.posttrain_run.PosttrainWorker`` reuses the methods below unchanged; it reaches
+    # the specification only through ``transfer_window_seconds`` and builds its own
+    # ``r2_final`` in ``closing_record``.
+
+    @property
+    def transfer_window_seconds(self) -> float:
+        """The watchdog policy's transfer window the final drain plans within."""
+        return self.spec.max_transfer_seconds
+
+    def closing_record(self, report_key: str, report_sha256: str) -> dict[str, Any]:
+        """The heartbeat's ``r2_final``: the report and the last milestone's checkpoint.
+
+        The last milestone, a stage-final label, is what the supervisor verifies; a rolling
+        label never closes a run.
+        """
+        final = self.milestones[-1]
+        files = {name: digest for name, _, digest in self.label_files[final]}
+        return {
+            "report_key": report_key,
+            "report_sha256": report_sha256,
+            "checkpoint_key": f"{self.prefix}{final}/checkpoint.pt",
+            "checkpoint_sha256": files["checkpoint.pt"],
+        }
 
     def handover_due(self) -> float:
         """When the final heartbeat is due: ``PULL_RESERVE_SECONDS`` before the watchdog's
@@ -1964,7 +1988,7 @@ class Worker:
         window still to run.
         """
         return min(
-            self.last_activity + self.spec.max_transfer_seconds - PULL_RESERVE_SECONDS,
+            self.last_activity + self.transfer_window_seconds - PULL_RESERVE_SECONDS,
             self.pod_end - 60,
         )
 
@@ -2154,7 +2178,7 @@ class Worker:
         receipt: dict[str, Any] = {
             "training_status": trained,
             "started_unix": self.clock(),
-            "transfer_window_end_unix": self.last_activity + self.spec.max_transfer_seconds,
+            "transfer_window_end_unix": self.last_activity + self.transfer_window_seconds,
             "handover_due_unix": self.handover,
         }
         report_key = self.prefix + "report.json"
@@ -2201,16 +2225,7 @@ class Worker:
                 raise RuntimeError("report.json differs in R2 after upload")
             receipt["report_sha256"] = report_sha256
             if durable:
-                # The last milestone, a stage-final label, is what the supervisor verifies;
-                # a rolling label never closes a run.
-                final = self.milestones[-1]
-                files = {name: digest for name, _, digest in self.label_files[final]}
-                self.r2_final = {
-                    "report_key": report_key,
-                    "report_sha256": report_sha256,
-                    "checkpoint_key": f"{self.prefix}{final}/checkpoint.pt",
-                    "checkpoint_sha256": files["checkpoint.pt"],
-                }
+                self.r2_final = self.closing_record(report_key, report_sha256)
             # Rolling labels last, for the record only: no ending depends on them.
             self.record_rolling(labels, receipt)
         except Exception as error:
