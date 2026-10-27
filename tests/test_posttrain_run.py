@@ -731,3 +731,19 @@ def test_ticking_generation_is_generate_many_batch_for_batch(temperature: float)
     found = ticking_generate(ticks.append)(model, prompts, **options)
     assert found == expected
     assert len(ticks) == 3 and sum(ticks) == sum(len(item.tokens) for item in found)
+
+
+def test_the_worker_refuses_a_full_task_file_as_an_input(found: Fixtures, tmp_path: Path) -> None:
+    full = Fixtures(
+        found.root,
+        found.tokenizer,
+        {**found.inputs, "pool-test": found.full_tasks["test"]},
+        found.full_tasks,
+    )
+
+    def unpinned(raw: dict[str, Any]) -> None:
+        raw["inputs"]["pool-test"].update(size_bytes=None, sha256=None)
+
+    with pytest.raises(ValueError, match="pool-test is not a Pod export"):
+        make_worker(full, tmp_path / "run", bucket=MemoryBucket(), changes=unpinned)
+    assert not (tmp_path / "run").exists()

@@ -13,6 +13,9 @@ public benchmark releases and the ARC-Easy test questions.
     pins, and write the binding: for each input its kind, R2 key, Pod path, size and SHA-256.
     An input with a key in the specification is ``existing`` (already in R2, never
     uploaded); every other input is ``staged`` under ``posttrain-inputs/<sha256>/<file>``.
+``check-exports`` (Mac, at the go)
+    Check that each given pool or candidates file is a Pod export (no task carries hidden
+    tests) holding the tasks the specification prices; print the counts.
 ``stage`` (Mac, at the go)
     Upload every staged input with the Mac's key under the storage cap, and HEAD every
     existing input: its stored SHA-256 and size must be the binding's.
@@ -20,6 +23,13 @@ public benchmark releases and the ARC-Easy test questions.
     Download inputs pinned to their size and SHA-256 into a root; ``--only`` selects some.
 ``verify`` (Pod or Mac)
     Re-hash every input under a root against the binding.
+
+Every pool and candidates input must be a Pod export (``require_export``): ``build`` refuses a
+file in which any task still carries its hidden tests before anything is written or staged,
+and ``verify`` repeats the check on the Pod. A spec pin protects the dev split and the
+candidates; the test split's export is pinned only at the go, so this check is what keeps the
+sealed hidden tests on the Mac. ``build`` also checks that each export holds the tasks the
+specification prices.
 
 R2 credentials come only from the environment and are never printed.
 """
@@ -37,6 +47,8 @@ from typing import Any
 
 from scratchcoder.common.records import atomic_json, git_state, utc_now
 from scratchcoder.data.shards import file_sha256
+from scratchcoder.eval.export import is_exported
+from scratchcoder.eval.tasks import load_tasks
 from tools.r2_store import Store, upload
 from tools.rehearsal_binding import (
     _hex,
@@ -63,6 +75,8 @@ INPUT_KINDS = (
 )
 BINDING_KEYS = {"schema_version", "kind", "run", "created_at", "binder", "specification", "inputs"}
 INPUT_KEYS = {"kind", "key", "path", "size_bytes", "sha256", "origin", "source"}
+EXPORT_KINDS = frozenset({"pool-export", "candidates-export"})
+"""Input kinds that are task files the Pod reads: only ever Pod exports, never hidden tests."""
 NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 GIT_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
@@ -74,6 +88,73 @@ def _serialized(binding: Mapping[str, Any]) -> bytes:
 
 def binding_sha256(binding: Mapping[str, Any]) -> str:
     return hashlib.sha256(_serialized(binding)).hexdigest()
+
+
+def require_export(name: str, kind: str, path: Path) -> int | None:
+    """For a pool or candidates input, refuse any task that is not a Pod export placeholder;
+    return the task count (None for another kind). Errors name task IDs, never tests."""
+    if kind not in EXPORT_KINDS:
+        return None
+    tasks = list(load_tasks(path))
+    if not tasks:
+        raise ValueError(f"input {name} holds no tasks")
+    leaked = [task.id for task in tasks if not is_exported(task)]
+    if leaked:
+        raise ValueError(
+            f"input {name} is not a Pod export: {len(leaked)} of {len(tasks)} tasks carry their "
+            f"hidden tests (e.g. {leaked[0]}); give the file scratchcoder pod-task-export wrote"
+        )
+    return len(tasks)
+
+
+def planned_task_counts(specification: Mapping[str, Any]) -> dict[str, int]:
+    """The task count the specification prices for each pool and candidates export input."""
+    planned: dict[str, int] = {}
+
+    def plan(name: object, count: object) -> None:
+        if not isinstance(name, str) or type(count) is not int:
+            raise ValueError("a stage names its task input and planned tasks")
+        if planned.setdefault(name, count) != count:
+            raise ValueError(f"input {name} is planned at two task counts")
+
+    stages = specification.get("stages")
+    if not isinstance(stages, list):
+        raise ValueError("the specification lists no stages")
+    for stage in stages:
+        if not isinstance(stage, dict):
+            raise ValueError("a stage must be an object")
+        for entry in stage.get("files") or []:
+            if isinstance(entry, dict) and entry.get("suite") == "pool":
+                plan(entry.get("tasks"), entry.get("planned_tasks"))
+        if stage.get("kind") == "screen":
+            screening = specification.get("screening")
+            count = screening.get("planned_tasks") if isinstance(screening, dict) else None
+            plan(stage.get("tasks"), count)
+    return planned
+
+
+def check_exports(specification_path: Path, local: Mapping[str, Path]) -> dict[str, int]:
+    """``require_export`` and the planned count for each given pool or candidates input."""
+    specification = json.loads(specification_path.read_text(encoding="utf-8"))
+    if not isinstance(specification, dict) or not isinstance(specification.get("inputs"), dict):
+        raise ValueError("the specification lists no inputs")
+    if not local:
+        raise ValueError("give at least one --input NAME=PATH")
+    planned = planned_task_counts(specification)
+    counts = {}
+    for name, path in sorted(local.items()):
+        pin = specification["inputs"].get(name)
+        kind = pin.get("kind") if isinstance(pin, dict) else None
+        if kind not in EXPORT_KINDS:
+            raise ValueError(f"input {name} is not a pool or candidates input")
+        count = require_export(name, str(kind), _plain_file(path))
+        assert count is not None
+        if name in planned and count != planned[name]:
+            raise ValueError(
+                f"input {name} holds {count} tasks; the specification plans {planned[name]}"
+            )
+        counts[name] = count
+    return counts
 
 
 def staged_key(sha256: str, file: str) -> str:
@@ -198,6 +279,7 @@ def build_binding(
     unknown = sorted(set(local) - set(wanted))
     if unknown:
         raise ValueError(f"--input names {unknown} are not inputs of the specification")
+    planned = planned_task_counts(specification)
     inputs: dict[str, dict[str, Any]] = {}
     for name, pin in sorted(wanted.items()):
         if not isinstance(pin, dict):
@@ -207,6 +289,11 @@ def build_binding(
             if path is None:
                 raise ValueError(f"input {name} is staged: give it with --input {name}=PATH")
             source = _plain_file(path)
+            count = require_export(name, str(pin.get("kind")), source)
+            if count is not None and name in planned and count != planned[name]:
+                raise ValueError(
+                    f"input {name} holds {count} tasks; the specification plans {planned[name]}"
+                )
             digest, size = file_sha256(source), source.stat().st_size
             entry = {
                 "kind": pin.get("kind"),
@@ -345,6 +432,7 @@ def verify(binding: Mapping[str, Any], root: Path, *, only: Sequence[str] = ()) 
     for name in names:
         entry = checked["inputs"][name]
         paths[name] = _pinned(root, entry["path"], entry["size_bytes"], entry["sha256"])
+        require_export(name, entry["kind"], paths[name])  # Never hidden tests on the Pod.
     return {
         "binding_sha256": binding_sha256(checked),
         "run": checked["run"],
@@ -429,6 +517,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     build.add_argument("--run", required=True)
     build.add_argument("--input", action="append", default=[], metavar="NAME=PATH")
     build.add_argument("--output", type=Path, required=True)
+    exports = commands.add_parser(
+        "check-exports", help="check Pod exports hold no hidden tests (Mac, at the go)"
+    )
+    exports.add_argument("--specification", type=Path, required=True)
+    exports.add_argument("--input", action="append", required=True, metavar="NAME=PATH")
     releases = commands.add_parser(
         "benchmarks", help="download and check the pinned benchmark releases (Mac, at the go)"
     )
@@ -450,6 +543,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "build":
         binding = build_binding(args.specification, _local(args.input), args.output, run=args.run)
         print(json.dumps({"binding": str(args.output), "sha256": binding_sha256(binding)}))
+        return 0
+    if args.command == "check-exports":
+        counts = check_exports(args.specification, _local(args.input))
+        print(json.dumps({"exports": counts, "hidden_tests": 0}))
         return 0
     if args.command == "benchmarks":
         paths = benchmark_releases(args.output)

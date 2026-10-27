@@ -31,7 +31,7 @@ Then `report.json` at the prefix root. The seven evaluation files of a stage are
 
 ## Hidden tests never leave the Mac
 
-The Pod holds prompts, public tests and reference solutions only. `scratchcoder pod-task-export` writes a pool split, the RL candidates or the ARC-Easy questions for the Pod: every hidden test is replaced by a placeholder that names only its salted SHA-256, keeps the file a valid task file, and fails any program run against it. The export is deterministic, and its record binds it to the source file by SHA-256.
+The Pod holds prompts, public tests and reference solutions only. `scratchcoder pod-task-export` writes a pool split, the RL candidates or the ARC-Easy questions for the Pod: every hidden test is replaced by a placeholder that names only its salted SHA-256, keeps the file a valid task file, and fails any program run against it. The export is deterministic, and its record binds it to the source file by SHA-256. A pin in the specification protects the dev split and the candidates, but the test split's export is pinned only at the go, so every pool and candidates input is checked to be an export wherever it is handled: `posttrain_binding check-exports` at the go, the binding before it writes or stages anything, the Pod's `verify` and the worker at its start all refuse a file in which any task carries hidden tests, naming task IDs only.
 
 `eval-execute` and `rl-screen` take the full task file. When a header names a task file other than the one given, they derive the export from the given file again and compare SHA-256s; the record is never read. Because each placeholder hashes the test it replaced, a full file with other hidden tests derives another export and is refused, and an export given as the full file is refused too. The pool dev baseline records its file's export hash, so the scorecard matches it to completions generated on the Pod.
 
@@ -66,7 +66,7 @@ The **launch rule** (worker and readiness receipt): the lifetime left must hold 
 | Weights-only upload rate, 3.06 MB/s | `posttrain_ops.REQUIRED_UPLOAD_BYTES_PER_SECOND`; the receipt's `r2_round_trip_tested` | `test_posttrain_guards.py`, `test_posttrain_readiness.py` |
 | One bucket-scoped Pod token per run, over SSH stdin | `rehearsal_ops pod-env`, the bootstrap's 0600 key check; revocation and `.env` removal are owner runbook steps | `test_rehearsal_bootstrap.py`, `test_posttrain_bootstrap.py` |
 | Mac execution windows: no file sharing, no credentials, the pinned image ID | `tools/mac_window_check.py` before every batch; emptying Docker Desktop's file sharing and `ssh-add -D` are owner steps | `test_mac_window_check.py` |
-| Hidden tests stay on the Mac | `scratchcoder.eval.export`, `validate_against_tasks`, `rl.command.check_attempts_header` | `test_pod_task_export.py`, `test_posttrain_run.py` |
+| Hidden tests stay on the Mac | `scratchcoder.eval.export`; `posttrain_binding.require_export` (check-exports, build, verify, the worker); `validate_against_tasks`, `rl.command.check_attempts_header` | `test_pod_task_export.py`, `test_posttrain_binding.py`, `test_posttrain_run.py` |
 | Verified teardown | `pilot_supervisor --mode posttrain` (`PosttrainSupervisor`) and `posttrain_ops.verify_final` | `test_posttrain_integration.py` |
 
 ## Projected cost

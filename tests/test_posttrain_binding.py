@@ -168,3 +168,73 @@ def test_the_macs_parent_copies_are_a_partial_fetch_its_receipt_names(
     with pytest.raises(ValueError, match="exactly"):
         check_fetch_receipt(record, binding)
     assert verify(binding, tmp_path / "mac", only=parents)["inputs"].keys() == set(parents)
+
+
+def test_a_full_task_file_is_never_bound_as_a_pod_input(found: Fixtures, tmp_path: Path) -> None:
+    """The test split's export is pinned only at the go, so the spec's pin cannot catch a full
+    file there: the binding itself refuses any pool or candidates file with hidden tests."""
+    unpinned = specification(found, tmp_path, **{"pool-test": {"size_bytes": None, "sha256": None}})
+    full = {**staged_inputs(found), "pool-test": found.full_tasks["test"]}
+    output = tmp_path / "binding.json"
+    with pytest.raises(ValueError, match="pool-test is not a Pod export") as error:
+        build_binding(unpinned, full, output, run="1")
+    hidden = json.loads(found.full_tasks["test"].read_text().splitlines()[0])["hidden_tests"]
+    assert hidden not in str(error.value)  # The message names task IDs, never tests.
+    assert not output.exists()
+    # The exported file binds; a full train file as the candidates export does not.
+    build_binding(unpinned, staged_inputs(found), tmp_path / "exported.json", run="1")
+    pinned_off = specification(
+        found, tmp_path, **{"rl-candidates": {"size_bytes": None, "sha256": None}}
+    )
+    with pytest.raises(ValueError, match="rl-candidates is not a Pod export"):
+        build_binding(
+            pinned_off,
+            {**staged_inputs(found), "rl-candidates": found.full_tasks["train"]},
+            tmp_path / "c.json",
+            run="1",
+        )
+
+
+def test_an_export_of_another_size_than_planned_is_refused(found: Fixtures, tmp_path: Path) -> None:
+    raw = json.loads(specification(found, tmp_path).read_text())
+    for plan in raw["stages"]:
+        for entry in plan.get("files", []):
+            if entry["tasks"] == "pool-dev":
+                entry["planned_tasks"] = 2_000
+    path = tmp_path / "planned.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="pool-dev holds 3 tasks; the specification plans 2000"):
+        build_binding(path, staged_inputs(found), tmp_path / "binding.json", run="1")
+
+
+def test_the_pod_refuses_a_bound_file_with_hidden_tests(found: Fixtures, tmp_path: Path) -> None:
+    binding, _ = built(found, tmp_path)
+    root = tmp_path / "pod"
+    for name, entry in binding["inputs"].items():
+        target = root / entry["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(found.inputs[name].read_bytes())
+    verify(binding, root)
+    # Bytes that match a (mistaken) pin but carry hidden tests are still refused on the Pod.
+    full = found.full_tasks["test"].read_bytes()
+    target = root / binding["inputs"]["pool-test"]["path"]
+    target.write_bytes(full)
+    entry = binding["inputs"]["pool-test"]
+    entry.update(size_bytes=len(full), sha256=hashlib.sha256(full).hexdigest())
+    entry["key"] = posttrain_binding.staged_key(entry["sha256"], target.name)
+    with pytest.raises(ValueError, match="not a Pod export"):
+        verify(binding, root)
+
+
+def test_the_runbook_export_check_names_counts_and_refuses_full_files(
+    found: Fixtures, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    spec = specification(found, tmp_path)
+    argv = ["check-exports", "--specification", str(spec)]
+    exported = [f"--input=pool-test={found.inputs['pool-test']}"]
+    assert posttrain_binding.main([*argv, *exported]) == 0
+    assert json.loads(capsys.readouterr().out) == {"exports": {"pool-test": 3}, "hidden_tests": 0}
+    with pytest.raises(ValueError, match="not a Pod export"):
+        posttrain_binding.main([*argv, f"--input=pool-test={found.full_tasks['test']}"])
+    with pytest.raises(ValueError, match="not a pool or candidates input"):
+        posttrain_binding.main([*argv, f"--input=sft-train={found.inputs['sft-train']}"])

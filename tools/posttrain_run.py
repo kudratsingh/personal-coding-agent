@@ -917,6 +917,9 @@ class PosttrainWorker(Worker):
     ) -> None:
         if set(inputs) != set(spec.inputs):
             raise ValueError("the inputs differ from the specification's")
+        for name, path in inputs.items():
+            # Hidden tests never reach the Pod: every task file it reads is a Pod export.
+            posttrain_binding.require_export(name, str(spec.inputs[name]["kind"]), path)
         if root.exists() or root.is_symlink():
             raise FileExistsError("post-training output must be a new directory")
         self.plan, self.root, self.inputs = spec, root, dict(inputs)

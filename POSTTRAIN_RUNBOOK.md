@@ -89,10 +89,11 @@ uv run --locked scratchcoder pod-task-export --kind candidates --tasks "$POOL/tr
 uv run --locked --extra evaluation scratchcoder pod-task-export --kind arc --arc-directory "$ARC_DATA" --output "$EXPORTS/arc-easy-test.jsonl" --record "$EXPORTS/arc-export.json"
 python3 -c 'import hashlib,json,sys; s=json.load(open(sys.argv[1]))["inputs"]; bad=[n for n,p in (("pool-dev",sys.argv[2]),("rl-candidates",sys.argv[3]),("arc-easy-test",sys.argv[4])) if hashlib.sha256(open(p,"rb").read()).hexdigest()!=s[n]["sha256"]]; print("exports match the specification" if not bad else "MISMATCH: " + ", ".join(bad))' "$SPEC" "$EXPORTS/dev-export.jsonl" "$EXPORTS/candidates-export.jsonl" "$EXPORTS/arc-easy-test.jsonl"
 uv run --locked scratchcoder pod-task-export --kind pool --tasks "$POOL/test.jsonl" --output "$EXPORTS/test-export.jsonl" --record "$EXPORTS/test-export.json"
+uv run --locked python -m tools.posttrain_binding check-exports --specification "$SPEC" --input pool-dev="$EXPORTS/dev-export.jsonl" --input pool-test="$EXPORTS/test-export.jsonl" --input rl-candidates="$EXPORTS/candidates-export.jsonl"
 uv run --locked python -m tools.posttrain_binding benchmarks --output "$SHARED/benchmarks"
 ```
 
-The check must print `exports match the specification`; anything else means the export code or a source file changed since the specification was pinned: stop and ask the owner. The ARC export needs the optional `evaluation` extra (PyArrow) and the three pinned ARC-Easy Parquet files in `$ARC_DATA`.
+The pin check must print `exports match the specification`; anything else means the export code or a source file changed since the specification was pinned: stop and ask the owner. The test export has no pin until step 5, so `check-exports` is what keeps the sealed split's hidden tests on the Mac: it must print `{"exports": {"pool-dev": 2000, "pool-test": 2000, "rl-candidates": 1000}, "hidden_tests": 0}`, and it refuses any file in which a task still carries its hidden tests, naming task IDs only. The binding (step 5) and the Pod's verification repeat the check. The ARC export needs the optional `evaluation` extra (PyArrow) and the three pinned ARC-Easy Parquet files in `$ARC_DATA`.
 
 ## 5. Binding and staging (Mac, at the go; R2 storage only)
 
