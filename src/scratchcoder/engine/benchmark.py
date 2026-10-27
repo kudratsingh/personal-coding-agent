@@ -73,6 +73,12 @@ def benchmark_generation(
     every row spends its whole budget. Each repeat first times a one-token run
     (prefill and one draw), then the full run; ``tokens_per_second`` is generated
     tokens over the median full-run time, prefill included.
+
+    Each batch is one ``generate_batch`` call, left-padded to its longest prompt.
+    With mixed lengths it is one unsorted batch, padded more than the
+    length-sorted batches of ``generate_many``; ``prompt_slots`` (batch size times
+    the longest prompt) and ``prompt_padding_fraction`` record that padding. To
+    time a sorted batch, give lengths from one batch of the sorted pool.
     """
     batch_sizes = _positive(batch_sizes, "batch sizes")
     prompt_lengths = _positive(prompt_lengths, "prompt lengths")
@@ -110,11 +116,14 @@ def benchmark_generation(
             prefill.append(middle - start)
             seconds.append(synchronized_time(device) - middle)
         generated = sum(len(completion.tokens) for completion in completions)
+        slots = batch_size * max(lengths)
         memory, memory_kind = peak_memory(device)
         results.append(
             {
                 "batch_size": batch_size,
                 "prompt_tokens": sum(lengths),
+                "prompt_slots": slots,
+                "prompt_padding_fraction": 1 - sum(lengths) / slots,
                 "generated_tokens": generated,
                 "seconds": seconds,
                 "tokens_per_second": generated / statistics.median(seconds),

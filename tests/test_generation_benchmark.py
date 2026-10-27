@@ -75,6 +75,9 @@ def test_benchmark_cli_reports_random_weight_throughput_as_json(
     rows = result["results"]
     assert [row["batch_size"] for row in rows] == [1, 3]
     assert [row["prompt_tokens"] for row in rows] == [4, 4 + 9 + 4]
+    # One unsorted batch of lengths 4, 9, 4 is left-padded to 9 slots per row.
+    assert [row["prompt_slots"] for row in rows] == [4, 3 * 9]
+    assert [row["prompt_padding_fraction"] for row in rows] == pytest.approx([0, 10 / 27])
     assert [row["generated_tokens"] for row in rows] == [5, 15]
     for row in rows:
         assert len(row["seconds"]) == 2 and row["tokens_per_second"] > 0
