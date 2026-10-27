@@ -13,7 +13,7 @@ SPEC = Path(__file__).resolve().parents[1] / "configs" / "rehearsal-a40-s-post-1
 def test_run_one_fits_its_ceiling_at_the_planning_speeds() -> None:
     report = posttrain_report(SPEC)
     planned = report["scenarios"]["1x generation"]
-    assert planned["generation_tokens_per_second"] == 5_000
+    assert planned["generation_tokens_per_second"] == 8_279  # The batch-128 floor.
     stages = planned["stages"]
     assert list(stages) == [
         "setup",
@@ -26,10 +26,10 @@ def test_run_one_fits_its_ceiling_at_the_planning_speeds() -> None:
         "screen",
         "finalization",
     ]
-    assert stages["eval-base"]["hours"] == pytest.approx((140 + 18_612_480 / 5_000) / 3600)
-    assert stages["screen"]["hours"] == pytest.approx((20 + 2_048_000 / 5_000) / 3600)
-    assert planned["total_hours"] == pytest.approx(3.08, abs=0.01)
-    assert planned["total_usd"] == pytest.approx(1.85, abs=0.01)
+    assert stages["eval-base"]["hours"] == pytest.approx((140 + 18_612_480 / 8_279) / 3600)
+    assert stages["screen"]["hours"] == pytest.approx((20 + 2_048_000 / 8_279) / 3600)
+    assert planned["total_hours"] == pytest.approx(2.21, abs=0.01)
+    assert planned["total_usd"] == pytest.approx(1.33, abs=0.01)
     assert planned["fits_lifetime"] and planned["fits_ceiling"]
     assert report["sft"] == {
         "train_rows": 3_390,
@@ -43,7 +43,9 @@ def test_run_one_fits_its_ceiling_at_the_planning_speeds() -> None:
     )
     slow = report["scenarios"]["0.5x generation"]
     assert slow["probe_stops_run"] and slow["spend_if_probe_stops_usd"] < 0.4
-    assert not slow["fits_ceiling"]  # Never run: the probe stops it first.
+    # At half the floors the run would still fit the ceiling, but it never runs: the probe
+    # stops it first.
+    assert slow["fits_ceiling"] and slow["total_usd"] == pytest.approx(2.12, abs=0.01)
 
 
 def test_the_cli_prints_the_table_and_writes_the_report(
@@ -52,7 +54,7 @@ def test_the_cli_prints_the_table_and_writes_the_report(
     output = tmp_path / "feasibility.json"
     assert main(["posttrain", "--quoted-gpu-hourly", "0.59", "--output", str(output)]) == 0
     text = capsys.readouterr().out
-    assert "| **Total** | **3.08** | **$1.85** |" in text
+    assert "| **Total** | **2.21** | **$1.33** |" in text
     assert "the probe stops the run" in text
     assert json.loads(output.read_text())["kind"] == "posttrain-feasibility"
     assert render_posttrain_markdown(posttrain_report(SPEC, quoted_gpu_hourly=0.59)) == text

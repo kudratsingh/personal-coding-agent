@@ -7,6 +7,7 @@ and no generated code runs.
 
 import copy
 import json
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -116,16 +117,46 @@ def test_the_specification_file_is_the_approved_run_one() -> None:
     assert "private/" not in text and "D-3" not in text
 
 
+FIRST_LAUNCH_PROBE = {
+    "64": 4_606.988824354963,
+    "128": 8_714.860743907404,
+    "256": 9_756.688216709286,
+}
+"""Generated tokens a second at the probe of run 1's first launch, from its verified report. It
+stopped below that launch's floors (5,000 at batch 64, 10,000 at batch 256)."""
+
+
+def test_run_one_generates_at_batch_128_with_floors_5_percent_under_the_first_probe() -> None:
+    """Evaluation and screening generate at batch 128, which the probe measures against a
+    floor; each floor is 5% under the first launch's rate at its batch, rounded down, and the
+    planning speeds are the floors. Nothing generates at batch 64, so it has no floor."""
+    raw = json.loads(SPEC.read_text())
+    assert raw["generation"] == {"batch_size": 128, "precision": "bfloat16"}
+    floors = raw["probe"]["minimum_tokens_per_second"]
+    assert floors == {
+        batch: float(math.floor(0.95 * FIRST_LAUNCH_PROBE[batch])) for batch in ("128", "256")
+    }
+    assert floors == {"128": 8_279.0, "256": 9_268.0}
+    assert 128 in raw["probe"]["batch_sizes"] and str(raw["generation"]["batch_size"]) in floors
+    assert raw["planning"]["generation_tokens_per_second"] == floors
+    spec = Specification.from_dict(raw)
+    assert spec.generation_batch == 128
+    assert Rates.planning(spec).generation_tokens_per_second == 8_279.0
+    # The first launch's rates pass every floor now.
+    assert all(FIRST_LAUNCH_PROBE[batch] >= floor for batch, floor in floors.items())
+
+
 @pytest.mark.parametrize(
     "path, value",
     [
         (("limits", "ceiling_usd"), 3.5),
-        (("probe", "minimum_tokens_per_second", "64"), 4_000.0),
+        (("probe", "minimum_tokens_per_second", "128"), 8_000.0),
+        (("generation", "batch_size"), 64),
         (("sft", "learning_rate"), 1e-4),
         (("screening", "samples"), 4),
         (("stages", 2, "files", 0, "protocol"), "chat-v1"),
         (("inputs", "b-mixed-final", "sha256"), "0" * 64),
-        (("planning", "generation_tokens_per_second", "64"), 9_000.0),
+        (("planning", "generation_tokens_per_second", "128"), 9_000.0),
     ],
 )
 def test_the_receipt_check_refuses_any_unapproved_value(path: tuple[Any, ...], value: Any) -> None:
@@ -150,14 +181,15 @@ def test_the_pool_test_pin_may_be_filled_only_at_the_go() -> None:
 def test_the_launch_plan_fits_the_ceiling_with_the_setup_allowance() -> None:
     spec = Specification.load(SPEC)
     plan = planned_seconds(spec, Rates.planning(spec))
-    # Base and SFT evaluation price 18.6M and 18.8M tokens at cap at 5,000 tok/s.
-    assert plan["stages"]["eval-base"] == pytest.approx(7 * 20 + 18_612_480 / 5_000)
-    assert plan["stages"]["eval-sft"] == pytest.approx(7 * 20 + 18_792_960 / 5_000)
-    assert plan["stages"]["screen"] == pytest.approx(20 + 1_000 * 8 * 256 / 5_000)
+    # Base and SFT evaluation price 18.6M and 18.8M tokens at cap at 8,279 tok/s (batch 128).
+    assert plan["stages"]["eval-base"] == pytest.approx(7 * 20 + 18_612_480 / 8_279)
+    assert plan["stages"]["eval-sft"] == pytest.approx(7 * 20 + 18_792_960 / 8_279)
+    assert plan["stages"]["screen"] == pytest.approx(20 + 1_000 * 8 * 256 / 8_279)
     lifetime = spec.ceiling.self_destruct_seconds
     fit = launch_fit(spec, remaining_seconds=lifetime - spec.limits["startup_seconds"])
-    assert fit["fits_at_planning"] and fit["planning_seconds_needed"] < 10_100
-    assert not launch_fit(spec, remaining_seconds=9_000)["fits_at_planning"]
+    assert fit["fits_at_planning"]
+    assert fit["planning_seconds_needed"] == pytest.approx(6_878, abs=1)
+    assert not launch_fit(spec, remaining_seconds=6_800)["fits_at_planning"]
 
 
 # A completed run ------------------------------------------------------------------------------
@@ -655,7 +687,7 @@ def test_readiness_accepts_the_receipt_and_applies_the_launch_rule() -> None:
     assert launch.end == CREATED - 5 + 17_820  # The armed timer is the first guard.
     assert launch.fit["fits_at_planning"]
     with pytest.raises(ValueError, match="cannot hold"):
-        ready(receipt(), now=CREATED + 9_000)  # Setup ran too long for the whole run.
+        ready(receipt(), now=CREATED + 11_000)  # Setup ran too long for the whole run.
 
 
 def test_a_mac_clock_ahead_of_the_provider_still_arms_within_the_wall() -> None:
