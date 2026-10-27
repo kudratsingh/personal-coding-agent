@@ -63,7 +63,7 @@ A descent step therefore raises `θ₂` (token 2 appeared in the above-average a
 
 - the worked example's gradient `(1/96, 1/12, −3/32)` and loss `(ln 2 − 0.5 ln 3)/8` to 1e-15, and the same gradient from autograd on the loss written term by term;
 - advantages and the skip rule, and the denominator over non-skipped groups;
-- micro-batches of 1, 2, 3, 7 and 64 against each sequence run alone and unpadded through a real float64 model, and the pad ID's irrelevance;
+- micro-batches of 1, 2, 3, 7 and 64 against each sequence run alone and unpadded through a real model with float64 weights (its normalization and attention softmax run in float32, so the comparison uses a float32 tolerance, which still fails for a mask off by one, left padding or a 0.01% weight error), and the pad ID's irrelevance;
 - a non-finite loss raising before backward, and CPU bfloat16 staying close to float32.
 
 `tests/test_rl_loop.py` covers:

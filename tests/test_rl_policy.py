@@ -181,7 +181,10 @@ def test_accumulated_micro_batches_equal_the_full_batch(micro_batch: int) -> Non
     measured = [p.grad for p in model.parameters() if p.grad is not None]
     assert len(measured) == len(expected)
     for left, right in zip(measured, expected, strict=True):
-        torch.testing.assert_close(left, right, rtol=1e-10, atol=1e-12)
+        # The model normalizes and takes the attention softmax in float32 even when its
+        # weights are float64, so batching changes rounding at float32 level on some BLAS
+        # builds (Linux, not macOS). A padding or masking error is orders of magnitude larger.
+        torch.testing.assert_close(left, right, rtol=1e-5, atol=1e-7)
 
 
 def test_the_padding_token_does_not_change_the_gradient() -> None:
