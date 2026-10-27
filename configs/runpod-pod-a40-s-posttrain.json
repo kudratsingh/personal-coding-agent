@@ -1,0 +1,10 @@
+{
+  "name": "posttrain-a40-s-1",
+  "image": "runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404",
+  "cloud": "SECURE",
+  "gpu": {"id": "NVIDIA A40", "count": 1, "minCudaVersion": "12.8"},
+  "disk": 40,
+  "ports": ["22/tcp"],
+  "startSsh": true,
+  "startJupyter": false
+}

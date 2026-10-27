@@ -1283,6 +1283,179 @@ def rehearsal_main(argv: Sequence[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Post-training run 1: hours and dollars per stage against the run's ceiling
+
+POSTTRAIN_DISCLAIMER = (
+    "Post-training figures are projections: generation at the planning speeds (no generation "
+    "rate has been measured), pool attempts priced at their token caps, SFT at run B's "
+    "measured 56,765 slots/s; run 1's probe measures generation before anything else runs"
+)
+POSTTRAIN_STORAGE_BYTES = 1_500_000_000
+"""Run 1's artifacts in R2: the selected SFT weights (0.55 GB), 14 completions files and the
+screening attempts (well under 1 GB together), the staged inputs and the records."""
+
+
+def posttrain_report(
+    specification: Path,
+    *,
+    quoted_gpu_hourly: float | None = None,
+    speed_factors: Sequence[float] = (0.5, 1.0, 2.0),
+) -> dict[str, Any]:
+    """Run 1 at the planning rates (and at ``speed_factors`` times the generation speed)."""
+    from tools import posttrain_ops
+    from tools.posttrain_run import Rates, Specification, planned_seconds
+    from tools.r2_store import monthly_storage_usd
+
+    spec = Specification.load(specification)
+    derived = spec.ceiling
+    gpu = (
+        float(spec.limits["quoted_gpu_hourly"]) if quoted_gpu_hourly is None else quoted_gpu_hourly
+    )
+    hourly = max(derived.quoted_total_hourly, rehearsal_total_hourly(gpu, d35.CONTAINER_DISK_GB))
+    setup = float(spec.limits["startup_seconds"])
+    base = Rates.planning(spec)
+    scenarios = {}
+    for factor in speed_factors:
+        rates = replace(
+            base, generation_tokens_per_second=base.generation_tokens_per_second * factor
+        )
+        plan = planned_seconds(spec, rates)
+        stages = {
+            "setup": setup,
+            **plan["stages"],
+            "finalization": plan["finalization_reserve_seconds"],
+        }
+        total = math.fsum(stages.values())
+        scenarios[f"{factor:g}x generation"] = {
+            "generation_tokens_per_second": rates.generation_tokens_per_second,
+            "stages": {
+                name: {"seconds": seconds, "hours": seconds / 3600, "usd": seconds / 3600 * hourly}
+                for name, seconds in stages.items()
+            },
+            "total_seconds": total,
+            "total_hours": total / 3600,
+            "total_usd": total / 3600 * hourly,
+            "fits_lifetime": total <= derived.self_destruct_seconds,
+            "fits_ceiling": total / 3600 * hourly < derived.worker_cost_stop_usd,
+            # Below the planning speed the probe ends the run: setup, probe and finalization.
+            "probe_stops_run": factor < 1,
+            "spend_if_probe_stops_usd": (setup + stages["probe"] + stages["finalization"])
+            / 3600
+            * hourly,
+        }
+    return {
+        "schema_version": 1,
+        "kind": "posttrain-feasibility",
+        "run": spec.run,
+        "source": str(specification),
+        "quoted_gpu_hourly": gpu,
+        "quoted_total_hourly": hourly,
+        "limits": asdict(derived),
+        "sft": {
+            "train_rows": spec.sft["train_rows"],
+            "updates": spec.sft_updates,
+            "token_slots": spec.sft_updates * spec.slots_per_update,
+            "training_slots_per_second": base.training_slots_per_second,
+        },
+        "scenarios": scenarios,
+        "r2_upload": {
+            "label_bytes": d35.S_LABEL_CHECKPOINT_BYTES,
+            "weights_label_bytes": posttrain_ops.S_WEIGHTS_LABEL_BYTES,
+            "required_upload_bytes_per_second": posttrain_ops.REQUIRED_UPLOAD_BYTES_PER_SECOND,
+        },
+        "r2_storage": {
+            "bytes": POSTTRAIN_STORAGE_BYTES,
+            "monthly_usd": monthly_storage_usd(POSTTRAIN_STORAGE_BYTES),
+        },
+        "disclaimer": POSTTRAIN_DISCLAIMER,
+    }
+
+
+def render_posttrain_markdown(report: Mapping[str, Any]) -> str:
+    limits = report["limits"]
+    lines = [
+        f"# Post-training run {report['run']} feasibility",
+        "",
+        f"Quote ${report['quoted_gpu_hourly']:.2f}/h GPU, ${report['quoted_total_hourly']:.2f}/h "
+        f"with the container disk. Ceiling ${limits['ceiling_usd']:.2f}: the worker stops at "
+        f"${limits['worker_cost_stop_usd']:.2f}, the watchdog at "
+        f"${limits['watchdog_cost_stop_usd']:.2f}, the in-Pod timer at "
+        f"{limits['self_destruct_seconds']:,} s of a {limits['wall_seconds']:,} s wall. SFT: "
+        f"{report['sft']['train_rows']:,} rows, {report['sft']['updates']} updates, "
+        f"{report['sft']['token_slots'] / 1e6:.2f}M token slots at "
+        f"{report['sft']['training_slots_per_second']:,.0f} slots/s.",
+        "",
+    ]
+    for name, scenario in report["scenarios"].items():
+        lines += [
+            f"## {name} ({scenario['generation_tokens_per_second']:,.0f} tok/s at the "
+            "generation batch)",
+            "",
+            "| Stage | Hours | Dollars |",
+            "| --- | ---: | ---: |",
+        ]
+        for stage, row in scenario["stages"].items():
+            lines.append(f"| {stage} | {row['hours']:.2f} | ${row['usd']:.2f} |")
+        lines += [
+            f"| **Total** | **{scenario['total_hours']:.2f}** | **${scenario['total_usd']:.2f}** |",
+            "",
+            f"Within the timer's lifetime: {'yes' if scenario['fits_lifetime'] else '**no**'}; "
+            f"below the ${limits['ceiling_usd']:.2f} ceiling: "
+            f"{'yes' if scenario['fits_ceiling'] else '**no**'}.",
+            "",
+        ]
+        if scenario["probe_stops_run"]:
+            lines += [
+                "Below the planning speed the probe stops the run, so this row never runs: it "
+                f"ends after setup, the probe and finalization, about "
+                f"${scenario['spend_if_probe_stops_usd']:.2f}.",
+                "",
+            ]
+    upload = report["r2_upload"]
+    lines += [
+        f"R2 upload: one weights-only label of {upload['weights_label_bytes'] / 1e9:.2f} GB per "
+        f"drain with a 2x margin needs {upload['required_upload_bytes_per_second'] / 1e6:.2f} MB/s "
+        f"(D-35's 1.65 GB labels needed {d35.REQUIRED_UPLOAD_BYTES_PER_SECOND / 1e6:.2f} MB/s). "
+        f"R2 storage about {report['r2_storage']['bytes'] / GB:.1f} GB, "
+        f"${report['r2_storage']['monthly_usd']:.2f}/month.",
+        "",
+        f"**{report['disclaimer']}.**",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def posttrain_main(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m tools.pilot_feasibility posttrain",
+        description="Hours and dollars per stage of a post-training run against its ceiling.",
+    )
+    parser.add_argument(
+        "--specification",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent / "configs" / "rehearsal-a40-s-post-1.json",
+    )
+    parser.add_argument("--quoted-gpu-hourly", type=float)
+    parser.add_argument("--speed-factor", type=float, action="append", help="generation speed x")
+    parser.add_argument("--output", type=Path, help="optional JSON report path")
+    args = parser.parse_args(argv)
+    try:
+        report = posttrain_report(
+            args.specification,
+            quoted_gpu_hourly=args.quoted_gpu_hourly,
+            speed_factors=tuple(args.speed_factor or (0.5, 1.0, 2.0)),
+        )
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        parser.error(str(error))
+    if args.output is not None:
+        args.output.write_text(
+            json.dumps(report, indent=2, allow_nan=False, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    print(render_posttrain_markdown(report), end="")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 
 
@@ -1345,6 +1518,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments[:1] == ["rehearsal"]:
         return rehearsal_main(arguments[1:])
+    if arguments[:1] == ["posttrain"]:
+        return posttrain_main(arguments[1:])
     parser = build_parser()
     args = parser.parse_args(arguments)
     try:
