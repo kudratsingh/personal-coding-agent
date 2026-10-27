@@ -182,6 +182,24 @@ def test_an_arm_on_the_pod_or_never_evaluated(tmp_path: Path, rl: str, executing
         assert not any(label.startswith("eval-rl") for label in value["lists"]["run2-pool-dev"])
 
 
+def test_an_arm_whose_evaluation_never_reached_r2_is_not_evaluated(tmp_path: Path) -> None:
+    """A later stop (the projected finish, the reserve) can come between an arm's selection for
+    the Pod and its evaluation: none of it is executed, and the record says why."""
+    paths = fixtures(tmp_path, rl="pod")
+    report = json.loads(paths["run2_report"].read_text())
+    report["artifacts"] = [
+        row for row in report["artifacts"] if not row["label"].startswith("eval-rl-")
+    ]
+    paths["run2_report"].write_text(json.dumps(report))
+    value = posttrain_endpoints.plan(**paths)
+    assert value["endpoints"]["rl"]["source"] == "not-evaluated"
+    assert (
+        "7 of its 8 evaluation artifacts are not in run 2's report"
+        in value["endpoints"]["rl"]["reason"]
+    )
+    assert not any(label.startswith("eval-rl") for label in value["lists"]["run2-pool-test"])
+
+
 def test_a_reuse_is_refused_unless_the_pins_reports_and_copies_agree(tmp_path: Path) -> None:
     paths = fixtures(tmp_path)
     copy = paths["run1_artifacts"] / "eval-sft-pool-dev-n8" / "completions.jsonl"

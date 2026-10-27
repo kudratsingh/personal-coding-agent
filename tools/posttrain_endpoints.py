@@ -160,9 +160,23 @@ def plan(
             }
             continue
         evaluation = entry.get("evaluation")
-        if evaluation == POD:
-            if f"arc-post-{arm}/arc.json" not in run2_rows:
-                raise ValueError(f"run 2's report lists no arc-post-{arm} report")
+        missing = [
+            name
+            for name in (
+                f"arc-post-{arm}/arc.json",
+                *(f"eval-{arm}-{file}/completions.jsonl" for file in SFT_RESULT_FILES),
+            )
+            if name not in run2_rows
+        ]
+        if evaluation == POD and missing:
+            # Selected for the Pod, but a later stop (the projected finish, the reserve, a
+            # limit) came before its evaluation reached R2: nothing of it is executed here.
+            endpoints[arm] = {
+                "source": NOT_EVALUATED,
+                "reason": f"selected {entry['selected']} for the Pod, but {len(missing)} of its "
+                f"8 evaluation artifacts are not in run 2's report, e.g. {missing[0]}",
+            }
+        elif evaluation == POD:
             endpoints[arm] = {
                 "source": POD,
                 "checkpoint_sha256": entry["checkpoint_sha256"],

@@ -352,6 +352,14 @@ def test_the_cost_limit_is_the_lower_of_the_ceiling_and_120_percent_of_the_estim
             posttrain_approved.check_run2(changed)
         with pytest.raises(ValueError, match="differs from its derivation"):
             Specification.from_dict(changed)
+    # The launch rule still refuses a plan that does not fit at the planning rates: at a $2.00
+    # estimate the limit is $2.40, a 14,220 s timer, short of the 20,288 s the plan needs.
+    low = Specification.from_dict(
+        posttrain_approved.run2_specification({**gate_values(), "gate_estimate_usd": 2.00})
+    )
+    assert low.ceiling.self_destruct_seconds == 14_220
+    fit = launch_fit(low, remaining_seconds=low.ceiling.self_destruct_seconds)
+    assert fit["fits_at_planning"] is False
     run1 = Specification.load(posttrain_approved.SPECIFICATION_PATH)
     assert type(run1.ceiling) is posttrain_ops.CeilingLimits
     assert run1.ceiling == posttrain_ops.ceiling_limits(3.0, 0.60)
