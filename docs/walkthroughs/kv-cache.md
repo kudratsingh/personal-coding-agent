@@ -41,7 +41,7 @@ Rotary embeddings use these positions, not the slot numbers. B's prompt token is
 - cosine and sine `[B, C, D/2]`: rows of a float32 `[context, D/2]` rotary table, gathered at each row's positions (clamped to `context − 1`; only already-finished rows reach the clamp), and cast once to bfloat16 when autocast needs it;
 - `padding [B, C]`: true for slot `s < pad[b]`;
 - `future [C, C]`: true for key slot after query slot;
-- per layer, keys and values `[B, H, C, D]`, allocated on first write in the dtype of `k` and `v` and never regrown.
+- per layer, keys and values `[B, H, C, D]`, allocated on first write and never regrown. Both use the dtype of `v`, the activation dtype. Under bfloat16 autocast, query/key normalization's float32 gain makes `k` float32; attention would round it to bfloat16 at every step, so `store` rounds it once on write instead. The result is the same bit for bit, and the key cache is half the size.
 
 **One forward.** `GPT.decode(ids [B, T], cache)` runs the next `T` slots. In each layer, `q`, `k` and `v` are `[B, H, T, D]`; the rotation is the slice `[B, 1, T, D/2]`; `store` writes `k`, `v` into slots `length .. length+T−1` and returns views `[B, H, length+T, D]`; the mask is `[B, 1, T, length+T]`; attention scores are `[B, H, T, length+T]`. For a decoding step (`T = 1` after the prompt) the mask is just a slice of `padding`. The final norm and vocabulary projection use only the last slot, in float32 even under bfloat16 autocast, and return `[B, V]`. `cache.length` then advances by `T`.
 
@@ -100,6 +100,7 @@ uv run --locked pytest tests/test_generation.py tests/test_sampling_integrity.py
   - stop sets end each row, and early exit happens at the first check after every row stopped;
   - log probabilities match the filtered distribution recomputed from a full forward pass;
   - bfloat16 autocast runs and keeps float32 logits;
+  - with query/key normalization under bfloat16 autocast, both caches are bfloat16 and the logits equal those of a float32 key cache bit for bit;
   - no sort runs at `top_p = 1.0` and no `torch.cat` runs in the loop;
   - host reads are a fixed handful, whatever the number of steps;
   - non-finite logits raise and invalid requests are rejected.

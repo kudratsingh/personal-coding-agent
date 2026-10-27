@@ -267,6 +267,48 @@ def test_bfloat16_autocast_runs_and_keeps_float32_logits() -> None:
     torch.testing.assert_close(logits, reference, atol=0.05, rtol=0.05)
 
 
+def test_bfloat16_cache_keeps_normalized_keys_in_the_value_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Query/key normalization's float32 gain promotes k to float32 under autocast.
+    model = model_fixture(replace(CONFIG, qk_norm=True))
+    prompts = prompt_fixture([5, 2])
+    pad = torch.tensor([0, 3])
+    ids = torch.tensor([prompts[0], [0, 0, 0, *prompts[1]]])
+    follow = torch.randint(0, 272, (2, 3), generator=torch.Generator().manual_seed(6))
+
+    def run() -> tuple[Tensor, KVCache]:
+        cache = KVCache(model.config, pad, width=5, capacity=8)
+        with torch.no_grad(), torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            steps = [model.decode(ids, cache)]
+            for index in range(3):
+                steps.append(model.decode(follow[:, index : index + 1], cache))
+        return torch.stack(steps), cache
+
+    logits, cache = run()
+    for keys, values in zip(cache.keys, cache.values, strict=True):
+        assert keys is not None and values is not None
+        assert keys.dtype == values.dtype == torch.bfloat16
+
+    def float32_keys(self: KVCache, layer: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """The earlier store: the key buffer took k's float32 dtype."""
+        stop = self.length + k.shape[-2]
+        if self.keys[layer] is None:
+            self.keys[layer] = k.new_empty((*k.shape[:2], self.capacity, k.shape[-1]))
+            self.values[layer] = v.new_empty((*v.shape[:2], self.capacity, v.shape[-1]))
+        keys, values = self.keys[layer], self.values[layer]
+        assert keys is not None and values is not None
+        keys[:, :, self.length : stop] = k
+        values[:, :, self.length : stop] = v
+        return keys[:, :, :stop], values[:, :, :stop]
+
+    monkeypatch.setattr(KVCache, "store", float32_keys)
+    reference, earlier = run()
+    assert earlier.keys[0] is not None and earlier.keys[0].dtype == torch.float32
+    # Attention rounded the float32 keys to bfloat16 anyway, so nothing changes.
+    assert torch.equal(logits, reference)
+
+
 def test_decoding_loop_makes_no_per_step_host_reads(monkeypatch: pytest.MonkeyPatch) -> None:
     model = model_fixture()
     prompts = prompt_fixture([3, 9, 5])

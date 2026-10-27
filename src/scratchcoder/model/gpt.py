@@ -129,14 +129,20 @@ class KVCache:
         return (self.future[start:stop, :stop] | skip)[:, None]
 
     def store(self, layer: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
-        """Write k/v [B,H,T,D] at the next slots; return the filled [B,H,length+T,D] views."""
+        """Write k/v [B,H,T,D] at the next slots; return the filled [B,H,length+T,D] views.
+
+        Both buffers use the dtype of ``v``, the activation dtype. Under autocast,
+        query/key normalization's float32 gain promotes ``k`` to float32; attention
+        would round it to the activation dtype at every step, so it is rounded once
+        here, with the same result, instead of keeping a float32 key cache.
+        """
         stop = self.length + k.shape[-2]
         keys, values = self.keys[layer], self.values[layer]
         if keys is None or values is None:
-            keys = k.new_empty((*k.shape[:2], self.capacity, k.shape[-1]))
+            keys = v.new_empty((*k.shape[:2], self.capacity, k.shape[-1]))
             values = v.new_empty((*v.shape[:2], self.capacity, v.shape[-1]))
             self.keys[layer], self.values[layer] = keys, values
-        keys[:, :, self.length : stop] = k
+        keys[:, :, self.length : stop] = k.to(keys.dtype)
         values[:, :, self.length : stop] = v
         return keys[:, :, :stop], values[:, :, :stop]
 
