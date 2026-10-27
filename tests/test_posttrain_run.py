@@ -232,6 +232,38 @@ def test_no_hidden_test_reaches_the_pod_and_the_mac_binds_every_output(
     assert identity == "export"
 
 
+def test_the_mac_fetches_every_artifact_pinned_from_the_verified_report(
+    completed: Ran, tmp_path: Path
+) -> None:
+    report = completed.root / "report.json"
+    store = completed.bucket.store()
+    fetched = posttrain_ops.fetch_artifacts(
+        store, report, tmp_path / "artifacts", receipt=tmp_path / "fetch.json", labels=["eval-"]
+    )
+    assert len(fetched["files"]) == 28  # 14 completions files and their records.
+    for row in fetched["files"]:
+        assert Path(row["path"]).read_bytes() == completed.bucket.objects[row["key"]]
+    again = posttrain_ops.fetch_artifacts(
+        store, report, tmp_path / "artifacts", receipt=tmp_path / "fetch2.json", labels=["eval-"]
+    )
+    assert {row["method"] for row in again["files"]} == {"present"}
+
+
+def test_the_benchmark_releases_are_the_pinned_ones(tmp_path: Path) -> None:
+    from scratchcoder.data import evalplus, humaneval
+    from tools.posttrain_binding import benchmark_releases
+
+    fixtures_by_size: dict[int, bytes] = {}
+
+    def fake_download(manifest: Any, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(fixtures_by_size.get(manifest.size_bytes, b"not the release"))
+
+    with pytest.raises(ValueError, match="not the pinned humaneval release"):
+        benchmark_releases(tmp_path / "bench", download=fake_download)
+    assert humaneval.DATA_BYTES == 44_877 and evalplus.release("mbpp-plus").task_count == 378
+
+
 def test_sft_keeps_the_lowest_quarter_dev_loss_as_weights_only(completed: Ran) -> None:
     sft = completed.report["sft"]
     quarters = sft["quarters"]

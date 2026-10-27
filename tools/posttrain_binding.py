@@ -377,6 +377,38 @@ def check_fetch_receipt(
             raise ValueError(f"the fetch receipt's {name} differs from the binding")
 
 
+BENCHMARK_FILES = {
+    "humaneval": "HumanEval.jsonl.gz",
+    "humaneval-plus": "HumanEvalPlus-OriginFmt.jsonl.gz",
+    "mbpp-plus": "MbppPlus-OriginFmt.jsonl.gz",
+}
+
+
+def benchmark_releases(
+    output: Path, *, download: Callable[[Any, Path], Any] | None = None
+) -> dict[str, Path]:
+    """The pinned HumanEval and EvalPlus releases under ``output``, each size- and
+    SHA-256-checked by ``scratchcoder.data.manifest.download``; a present file is checked."""
+    from scratchcoder.data import evalplus, humaneval
+    from scratchcoder.data.manifest import download as fetch_manifest
+
+    get = fetch_manifest if download is None else download
+    manifests = {
+        "humaneval": humaneval.manifest(),
+        "humaneval-plus": evalplus.release("humaneval-plus").manifest,
+        "mbpp-plus": evalplus.release("mbpp-plus").manifest,
+    }
+    paths = {}
+    for suite, manifest in manifests.items():
+        path = output / BENCHMARK_FILES[suite]
+        if not path.exists():
+            get(manifest, path)
+        if (path.stat().st_size, file_sha256(path)) != (manifest.size_bytes, manifest.sha256):
+            raise ValueError(f"{path} is not the pinned {suite} release")
+        paths[suite] = path
+    return paths
+
+
 def _local(values: Sequence[str]) -> dict[str, Path]:
     found: dict[str, Path] = {}
     for item in values:
@@ -397,6 +429,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     build.add_argument("--run", required=True)
     build.add_argument("--input", action="append", default=[], metavar="NAME=PATH")
     build.add_argument("--output", type=Path, required=True)
+    releases = commands.add_parser(
+        "benchmarks", help="download and check the pinned benchmark releases (Mac, at the go)"
+    )
+    releases.add_argument("--output", type=Path, required=True)
     stage_command = commands.add_parser("stage", help="upload the staged inputs (Mac)")
     fetch_command = commands.add_parser("fetch", help="download inputs pinned (Pod or Mac)")
     verify_command = commands.add_parser("verify", help="re-hash inputs under a root")
@@ -414,6 +450,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "build":
         binding = build_binding(args.specification, _local(args.input), args.output, run=args.run)
         print(json.dumps({"binding": str(args.output), "sha256": binding_sha256(binding)}))
+        return 0
+    if args.command == "benchmarks":
+        paths = benchmark_releases(args.output)
+        print(json.dumps({suite: str(path) for suite, path in paths.items()}, indent=1))
         return 0
     binding = load_binding(args.binding, expected_sha256=args.expected_sha256)
     if args.command == "stage":

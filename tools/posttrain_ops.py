@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from scratchcoder.common.records import atomic_json, utc_now
+from scratchcoder.data.shards import file_sha256
 from tools import rehearsal_ops
 from tools.r2_store import SHA256_HEX, Store
 from tools.rehearsal_binding import r2_credentials
@@ -431,11 +432,60 @@ def run_summary(
     }
 
 
+def fetch_artifacts(
+    store: ObjectStore,
+    report_path: Path,
+    output: Path,
+    *,
+    receipt: Path,
+    labels: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Download the artifacts a verified ``report.json`` lists, each pinned to its SHA-256.
+
+    ``labels`` keeps only labels that start with one of these prefixes. Files land at
+    ``<output>/<label>/<name>``; one already present with the pinned bytes is kept.
+    """
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if not isinstance(report, dict) or report.get("kind") != REPORT_KIND:
+        raise ValueError("not a post-training run report")
+    prefix = run_prefix(str(report.get("run")), str(report.get("pod_id")))
+    rows = []
+    for row in report_artifacts(report, prefix=prefix):
+        if labels and not any(row["label"].startswith(label) for label in labels):
+            continue
+        target = output / row["label"] / row["name"]
+        record = rehearsal_ops.fetch_object(
+            store,
+            key=row["key"],
+            sha256=row["sha256"],
+            size=row["bytes"],
+            output=target,
+            receipt=output / ".receipts" / f"{row['label']}--{row['name']}.json",
+        )
+        rows.append({**row, "path": str(target), "method": record["method"]})
+    value = {
+        "schema_version": 1,
+        "kind": "posttrain-artifact-fetch",
+        "created_at": utc_now(),
+        "report_sha256": file_sha256(report_path),
+        "files": rows,
+    }
+    atomic_json(receipt, value)
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    artifacts = commands.add_parser(
+        "fetch-artifacts", help="download a verified run's artifacts pinned (Mac)"
+    )
+    artifacts.add_argument("--report", type=Path, required=True, help="the verified report.json")
+    artifacts.add_argument("--output", type=Path, required=True)
+    artifacts.add_argument("--receipt", type=Path, required=True)
+    artifacts.add_argument("--label", action="append", default=[], help="a label prefix")
     limits = commands.add_parser("limits", help="print a specification's derived limits (Mac)")
     limits.add_argument("--specification", type=Path, required=True)
     limits.add_argument("--origin", type=float, help="the billing origin (unix seconds)")
@@ -504,6 +554,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             atomic_json(args.output / "r2-verification.json", result)
             print(json.dumps({key: result[key] for key in ("status", "report_status")}))
+            return 0
+        if args.command == "fetch-artifacts":
+            store = Store(r2_credentials(key_prefix=rehearsal_ops.MAC_KEY_PREFIX))
+            fetched = fetch_artifacts(
+                store, args.report, args.output, receipt=args.receipt, labels=args.label
+            )
+            print(json.dumps({"files": len(fetched["files"]), "output": str(args.output)}))
             return 0
         prefix = run_prefix(args.run, args.pod_id)
         store = GuardedStore(Store(r2_credentials(key_prefix=args.key_prefix)), prefix)
