@@ -464,7 +464,7 @@ for name in eval-base-pool-test-greedy eval-base-pool-test-n8 eval-sft-pool-test
 done
 ```
 
-Score the screening attempts. The header binds them to the candidates export, which `rl-screen` derives again from the full train split; `--require-header` refuses a file without it. `--timeout` is the worst case for one batch of 256 attempts on 8 workers: 32 rounds of the longest attempt (the 27 s budget of a 100-case I/O task plus the channel's 15 s slack, 4 tries and 7 s of backoff), 32 x 175 = 5,600 s:
+Score the screening attempts. The header binds them to the candidates export, which `rl-screen` derives again from the full train split, and to the screening protocol's sampling (8 samples, temperature 1.0, top-p 1.0, 256 new tokens, the screening seed base); `--require-header` refuses a file without it. `--timeout` is the worst case for one batch of 256 attempts on 8 workers: 32 rounds of the longest attempt (the 27 s budget of a 100-case I/O task plus the channel's 15 s slack, 4 tries and 7 s of backoff), 32 x 175 = 5,600 s:
 
 ```sh
 uv run --locked python -m tools.mac_window_check exec --image-id "$SANDBOX_IMAGE_ID" --dotenv .env -- uv run --locked scratchcoder rl-screen --tasks "$POOL/train.jsonl" --candidates "$SFT/rl_candidates.jsonl" --attempts "$ART/screen/attempts.jsonl" --output "$SHARED/screening.json" --timeout 5600 --workers 8 --require-header

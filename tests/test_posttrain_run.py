@@ -20,7 +20,7 @@ from scratchcoder.engine.generation import generate_many
 from scratchcoder.eval.completions import read_completions, validate_against_tasks
 from scratchcoder.eval.export import WITHHELD
 from scratchcoder.model.gpt import GPT
-from scratchcoder.rl.attempts import read_attempts_file
+from scratchcoder.rl.attempts import SCREENING_PROTOCOL, read_attempts_file
 from scratchcoder.rl.command import check_attempts_header, read_candidates
 from scratchcoder.tokenizer.bpe import ByteBPE
 from scratchcoder.train.pilot import PilotStop
@@ -237,10 +237,25 @@ def test_no_hidden_test_reaches_the_pod_and_the_mac_binds_every_output(
     assert header is not None and header.attempts == len(attempts) == 4 * 8
     candidates = found.inputs["rl-candidates-list"]
     tasks = read_candidates(found.full_tasks["train"], candidates)
+    # The smoke screens at a 16-token cap; the Mac checks every other protocol value.
+    smoke_protocol = {**SCREENING_PROTOCOL, "max_new_tokens": 16}
     identity = check_attempts_header(
-        header, attempts, tasks, tasks_path=found.full_tasks["train"], candidates_path=candidates
+        header,
+        attempts,
+        tasks,
+        tasks_path=found.full_tasks["train"],
+        candidates_path=candidates,
+        protocol=smoke_protocol,
     )
     assert identity == "export"
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        check_attempts_header(
+            header,
+            attempts,
+            tasks,
+            tasks_path=found.full_tasks["train"],
+            candidates_path=candidates,
+        )
 
 
 def test_the_mac_fetches_every_artifact_pinned_from_the_verified_report(

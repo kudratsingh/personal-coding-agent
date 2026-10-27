@@ -347,7 +347,16 @@ def test_rl_screen_binds_pod_attempts_to_the_full_train_file(
 
 @pytest.mark.parametrize(
     "problem",
-    ["other_candidates", "other_tasks", "missing_sample", "export_given", "no_header"],
+    [
+        "other_candidates",
+        "other_tasks",
+        "missing_sample",
+        "export_given",
+        "no_header",
+        "other_temperature",
+        "other_cap",
+        "other_seed",
+    ],
 )
 def test_rl_screen_refuses_attempts_it_cannot_bind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, problem: str
@@ -365,6 +374,12 @@ def test_rl_screen_refuses_attempts_it_cannot_bind(
         attempts = [*attempts[:15], Attempt("a", 9, "x", 3)]
     elif problem == "export_given":
         tasks_path = shipped
+    elif problem == "other_temperature":
+        header = attempts_header(shipped, candidates, temperature=0.8)
+    elif problem == "other_cap":
+        header = attempts_header(shipped, candidates, max_new_tokens=512)
+    elif problem == "other_seed":
+        header = attempts_header(shipped, candidates, seed_base=0)
     path = tmp_path / "attempts.jsonl"
     if problem == "no_header":
         path.write_text("".join(json.dumps(item.to_json()) + "\n" for item in attempts))
@@ -413,3 +428,17 @@ def test_an_arc_export_writes_choice_lines_in_id_order(
     assert record["questions"] == 2 and record["source"]["manifests"] == metadata["data_manifests"]
     with pytest.raises(ValueError, match="data directory only"):
         write_export("arc", tasks_path=output, output=tmp_path / "a", record=tmp_path / "b")
+
+
+def test_the_screening_protocol_is_the_rollouts() -> None:
+    from scratchcoder.rl.attempts import SCREENING_PROTOCOL
+    from scratchcoder.rl.rollout import ROLLOUT_TOKENS, SCREENING_SEED
+    from scratchcoder.rl.screening import SAMPLES
+
+    assert SCREENING_PROTOCOL == {
+        "samples": SAMPLES,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": ROLLOUT_TOKENS,
+        "seed_base": SCREENING_SEED,
+    }

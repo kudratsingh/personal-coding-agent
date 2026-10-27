@@ -32,6 +32,17 @@ from scratchcoder.rl.rewards import Attempt
 FORMAT = "scratchcoder-screening-attempts"
 SCHEMA_VERSION = 1
 SHA256_HEX_DIGITS = frozenset("0123456789abcdef")
+SCREENING_PROTOCOL: Mapping[str, int | float] = {
+    "samples": 8,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "max_new_tokens": 256,
+    "seed_base": 2**40,
+}
+"""The screening protocol's sampling: ``rl.rollout.screening_rollouts``' defaults (8 samples
+at temperature 1.0 and top-p 1.0, at most 256 new tokens, ``SCREENING_SEED``). A header must
+carry exactly these; ``tests/test_pod_task_export.py`` keeps them equal to the rollout's
+constants, which live in a module that imports torch, which ``rl-screen`` does not need."""
 
 
 def _sha(value: object, name: str) -> str:
@@ -107,6 +118,19 @@ class ScreeningHeader:
         if set(fields) != set(cls.__dataclass_fields__):
             raise ValueError("screening attempts header fields differ from the schema")
         return cls(**fields)
+
+
+def check_protocol(
+    header: ScreeningHeader, protocol: Mapping[str, int | float] = SCREENING_PROTOCOL
+) -> None:
+    """The header's sampling is the screening protocol's: samples, temperature, top-p, the
+    new-token cap and the seed base. Screening scores attempts drawn under that protocol."""
+    for name, expected in protocol.items():
+        found = getattr(header, name)
+        if found != expected:
+            raise ValueError(
+                f"the screening header's {name} is {found!r}, not the protocol's {expected!r}"
+            )
 
 
 def check_grid(

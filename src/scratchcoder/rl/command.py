@@ -9,14 +9,15 @@ candidate that is not a train task.
 
 A file the post-training Pod worker wrote starts with a header (``scratchcoder.rl.attempts``)
 naming the task file it was generated from: on a Pod, the candidates export with the hidden
-tests removed. ``screen_attempts`` then checks the candidate file's SHA-256 and derives the
-export from the full train file again to compare SHA-256s, and every candidate must have
-exactly the header's samples. ``require_header`` refuses a file without one.
+tests removed. ``screen_attempts`` then checks the header's sampling against the screening
+protocol and the candidate file's SHA-256, derives the export from the full train file again
+to compare SHA-256s, and every candidate must have exactly the header's samples.
+``require_header`` refuses a file without one.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,13 @@ from scratchcoder.eval.export import (
     task_file_identity,
 )
 from scratchcoder.eval.tasks import Task
-from scratchcoder.rl.attempts import ScreeningHeader, check_grid, read_attempts_file
+from scratchcoder.rl.attempts import (
+    SCREENING_PROTOCOL,
+    ScreeningHeader,
+    check_grid,
+    check_protocol,
+    read_attempts_file,
+)
 from scratchcoder.rl.rewards import Attempt, LocalRewardSource
 from scratchcoder.rl.screening import (
     DEFAULT_THRESHOLD,
@@ -64,13 +71,16 @@ def check_attempts_header(
     *,
     tasks_path: Path,
     candidates_path: Path,
+    protocol: Mapping[str, int | float] = SCREENING_PROTOCOL,
 ) -> str:
     """Bind a header to the given files; return ``"file"`` or ``"export"`` (what it names).
 
-    The candidate file must hash to the header's ``candidates_sha256``. The header's task file
+    The header's sampling must be the screening protocol's (``check_protocol``). The
+    candidate file must hash to the header's ``candidates_sha256``. The header's task file
     must be the given train file itself or the candidates export derived from it again; the
     export's record is never read. Every candidate must have exactly the header's samples.
     """
+    check_protocol(header, protocol)
     if file_sha256(candidates_path) != header.candidates_sha256:
         raise ValueError("the candidate file's SHA-256 differs from the screening header")
     try:
