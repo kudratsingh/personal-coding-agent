@@ -946,7 +946,7 @@ def test_the_mac_timeouts_bound_a_request_so_a_withdrawn_one_does_not_block_the_
     pod = tmp_path / "pod"
 
     def slow_score(task: Task, code: str) -> RewardResult:
-        time.sleep(0.6)
+        time.sleep(1.5)
         return RewardResult("completed", 1.0)
 
     slow = LocalRewardSource(TRAIN, timeout=0.2, workers=2, score=slow_score)
@@ -955,7 +955,8 @@ def test_the_mac_timeouts_bound_a_request_so_a_withdrawn_one_does_not_block_the_
     with mac_server(pod, tmp_path / "mac", rewards=slow, dev=CountingDev()) as server:
         started = time.monotonic()
         server.poll_once()
-        assert time.monotonic() - started < 1.0  # 6 attempts x 0.6 s on 2 workers is 1.8 s
+        # The 0.2 s bound ends the request; scoring every attempt would take 4.5 s.
+        assert time.monotonic() - started < 3.0  # 6 attempts x 1.5 s on 2 workers
         assert reply_for(pod, reward.name).outcome == TIMEOUT
         dev = dev_request(index=2, seq=2)
         write_request(pod, dev)

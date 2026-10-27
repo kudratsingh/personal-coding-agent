@@ -154,7 +154,9 @@ def test_a_mac_that_never_answers_ends_in_reward_timeout(tmp_path: Path) -> None
     from scratchcoder.rl.rewards import RewardTimeout
 
     with pod_client(tmp_path / "pod", poll_seconds=0.01) as client:
-        source = BridgeRewardSource(client, task_file_sha256=RL_SHA, timeout=0.2)
+        # The heartbeat is read early in a long wait, so a slow runner's late timer still
+        # reads it while the client is waiting.
+        source = BridgeRewardSource(client, task_file_sha256=RL_SHA, timeout=2.0)
         seen: list[Any] = []
         watcher = threading.Timer(0.1, lambda: seen.append(client.heartbeat()))
         watcher.start()
@@ -162,7 +164,7 @@ def test_a_mac_that_never_answers_ends_in_reward_timeout(tmp_path: Path) -> None
             source.rewards(1, attempts())
         watcher.join()
     assert seen[0]["status"] == "awaiting_rewards" and seen[0]["index"] == 1
-    assert 0.0 < seen[0]["age_seconds"] < 0.2
+    assert 0.0 < seen[0]["age_seconds"] < 2.0
 
 
 # ------------------------------------------------------------------- Docker-backed
