@@ -9,9 +9,11 @@ turns a candidate failure into a host failure, and that the I/O fork server agre
 evaluation path of record.
 """
 
+import ast
 import base64
 import dataclasses
 import json
+import math
 import os
 import shutil
 import stat
@@ -120,6 +122,8 @@ def test_supported_forms_parse(hidden: str) -> None:
         "assert f() < 2",
         "assert f() in [1, 2]",
         "assert 1 <= f() <= 2",
+        # A bare ``assert CALL`` has a known passing outcome (truthy), which a candidate could
+        # steer through its own objects or literals visible in the call source.
         "assert f()",
         "assert all(x > 0 for x in f())",
         "assert f() == g()",
@@ -141,6 +145,11 @@ def test_supported_forms_parse(hidden: str) -> None:
         "assert f() is 0.0",
         "assert None is None",
         "assert not 0",
+        "assert True",
+        "assert f() and g()",
+        # Expected values the driver could never report.
+        "assert f() == 1j",
+        "assert f() == ...",
     ],
 )
 def test_unsupported_forms_are_not_parseable(hidden: str) -> None:
@@ -318,6 +327,8 @@ def wire(value: object) -> object:
         return ["tuple", [wire(item) for item in value]]
     if isinstance(value, set):
         return ["set", [wire(item) for item in value]]
+    if isinstance(value, frozenset):
+        return ["frozenset", [wire(item) for item in value]]
     if isinstance(value, dict):
         return ["dict", [[wire(k), wire(v)] for k, v in value.items()]]
     raise TypeError("unsupported in fake")
@@ -397,40 +408,113 @@ def test_a_row_must_carry_its_own_index() -> None:
     assert result.outcomes == (False, True)
 
 
-def test_type_strictness_bool_is_not_int_tuple_is_not_list_and_float_is_not_int() -> None:
-    def reward_for(hidden: str, value: object) -> float | None:
-        return score_attempt(
-            function_task(hidden), "c", container=function_container([value])
-        ).reward
-
-    assert reward_for("assert f() == 1", True) == 0.0
-    assert reward_for("assert f() == (1, 2)", [1, 2]) == 0.0
-    # int and float stay distinct (the brief compares type and value).
-    assert reward_for("assert f() == 2", 2.0) == 0.0
-    # Sets compare order-independently, dicts by their items.
-    assert reward_for("assert f() == {1, 2, 3}", {3, 1, 2}) == 1.0
-    assert reward_for("assert f() == {'b': 2, 'a': 1}", {"a": 1, "b": 2}) == 1.0
+def reward_for(hidden: str, value: object) -> float | None:
+    return score_attempt(function_task(hidden), "c", container=function_container([value])).reward
 
 
-def test_is_none_and_not_forms() -> None:
-    assert (
-        score_attempt(
-            function_task("assert f() is None"), "c", container=function_container([None])
-        ).reward
-        == 1.0
-    )
-    assert (
-        score_attempt(
-            function_task("assert not f()"), "c", container=function_container([[]])
-        ).reward
-        == 1.0
-    )
-    assert (
-        score_attempt(
-            function_task("assert not f()"), "c", container=function_container([[1]])
-        ).reward
-        == 0.0
-    )
+# (expected literal, reported built-in value) pairs, including numeric-tower, NaN, signed
+# zero, infinity, container-type and hash-equal key cases.
+EQUALITY_CASES: list[tuple[str, object]] = [
+    ("2", 2.0),
+    ("2", 2),
+    ("2.0", 2),
+    ("1", True),
+    ("0", False),
+    ("True", 1),
+    ("True", 1.0),
+    ("False", 0),
+    ("1", 1.0000000000000002),
+    ("100000000000000000000", 1e20),
+    ("0.30000000000000004", 0.1 + 0.2),
+    ("0.3", 0.1 + 0.2),
+    ("0.0", -0.0),
+    ("-0.0", 0),
+    ("1e999", math.inf),
+    ("-1e999", -math.inf),
+    ("1e999", math.nan),
+    ("0.0", math.nan),
+    ("[1.0]", [math.nan]),
+    ("(1, 2)", [1, 2]),
+    ("[1, 2]", [1, 2]),
+    ("[1, 2]", [1.0, 2.0]),
+    ("[1, 2]", [2, 1]),
+    ("{1, 2, 3}", {3, 1, 2}),
+    ("{1, 2}", frozenset({1.0, 2})),
+    ("{0.0}", {-0.0}),
+    ("{'b': 2, 'a': 1}", {"a": 1, "b": 2}),
+    ("{1: 'a'}", {1.0: "a"}),
+    ("{1: 'a'}", {True: "a"}),
+    ("{'a': [1, (2, 3)]}", {"a": [1.0, (2, 3.0)]}),
+    ("'a'", b"a"),
+    ("b'a'", b"a"),
+    ("None", 0),
+    ("[]", ()),
+    ("set()", {}),
+    ("{}", {}),
+]
+
+
+@pytest.mark.parametrize("literal,value", EQUALITY_CASES)
+def test_equality_is_decided_as_the_assertion_itself_would(literal: str, value: object) -> None:
+    # The reference: Python's own ``==`` between the same built-in values, which is what the
+    # evaluation runner's in-process ``assert CALL == LITERAL`` computes for them.
+    expected = ast.literal_eval(literal)
+    for hidden in (f"assert f() == {literal}", f"assert {literal} == f()"):
+        assert reward_for(hidden, value) == (1.0 if value == expected else 0.0), hidden
+
+
+@pytest.mark.parametrize(
+    "hidden,value,passes",
+    [
+        # Identity forms stay identity: an equal value that is not the singleton fails.
+        ("assert f() is True", True, True),
+        ("assert f() is True", 1, False),
+        ("assert f() is True", 1.0, False),
+        ("assert f() is False", False, True),
+        ("assert f() is False", 0, False),
+        ("assert f() is None", None, True),
+        ("assert f() is None", 0, False),
+        ("assert f() is None", [], False),
+        ("assert None is f()", None, True),
+        # Truthiness for negated calls.
+        ("assert not f()", [], True),
+        ("assert not f()", "", True),
+        ("assert not f()", 0.0, True),
+        ("assert not f()", -0.0, True),
+        ("assert not f()", [1], False),
+        ("assert not f()", math.nan, False),
+        ("assert not f()", None, True),
+    ],
+)
+def test_identity_and_truthiness_forms(hidden: str, value: object, passes: bool) -> None:
+    assert reward_for(hidden, value) == (1.0 if passes else 0.0)
+
+
+def test_reconstruction_yields_only_built_in_types() -> None:
+    reported: dict[str, object] = {"ok": True}
+    wire_value = [
+        "dict",
+        [[["tuple", [["int", 1], ["float_s", "nan"]]], ["set", [["bytes", [97]]]]]],
+    ]
+    value = reward._value_from_wire(wire_value)
+    seen: list[type] = []
+
+    def walk(item: object) -> None:
+        seen.append(type(item))
+        if isinstance(item, dict):
+            for key, inner in item.items():
+                walk(key)
+                walk(inner)
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            for inner in item:
+                walk(inner)
+
+    walk(value)
+    assert set(seen) <= {dict, tuple, int, float, set, bytes}
+    # A set element or dict key Python could not hash is a malformed report, not a crash.
+    for bad in (["set", [["list", []]]], ["dict", [[["list", []], ["int", 1]]]]):
+        reported["v"] = bad
+        assert not check_passes(Check("f()", "eq", set()), reported)
 
 
 def test_unserialisable_and_errored_calls_fail() -> None:
@@ -1201,6 +1285,78 @@ def test_live_subclasses_are_reported_as_their_base_type() -> None:
     )
     result = live(function_task(hidden), code)
     assert result.status == COMPLETED and result.reward == 1.0
+
+
+# (hidden assertion, candidate code, whether the evaluation runner's in-process assertion
+# passes it). The reward channel must agree on every row except the last, the documented
+# residual: a result of a candidate-defined type cannot be reported, so it fails in reward
+# mode even though its own ``__eq__`` lets the in-process assertion pass.
+LIVE_EQUALITY: list[tuple[str, str, bool]] = [
+    ("assert half(4) == 2", "def half(n):\n    return n / 2", True),
+    ("assert is_even(4) == 1", "def is_even(n):\n    return n % 2 == 0", True),
+    ("assert is_even(4) == True", "def is_even(n):\n    return 1", True),
+    ("assert is_even(4) is True", "def is_even(n):\n    return 1", False),
+    ("assert pair() == (1, 2)", "def pair():\n    return [1, 2]", False),
+    ("assert pair() == [1, 2]", "def pair():\n    return [1.0, 2]", True),
+    ("assert nan() == 0.0", "def nan():\n    return float('nan')", False),
+    ("assert zero() == 0", "def zero():\n    return -0.0", True),
+    ("assert big() == 1e999", "def big():\n    return float('inf')", True),
+    ("assert not empty()", "def empty():\n    return 0.0", True),
+    ("assert keys() == {1: 'a'}", "def keys():\n    return {True: 'a'}", True),
+    (
+        "assert point() == (1, 2)",
+        "class P:\n    def __eq__(self, other):\n        return other == (1, 2)\n"
+        "def point():\n    return P()",
+        True,
+    ),
+]
+
+
+@integration
+def test_live_equality_matches_the_in_process_assertion() -> None:
+    def verdicts(item: tuple[str, str, bool]) -> tuple[str, float | None, bool, bool]:
+        hidden, code, expected = item
+        rewarded = live(function_task(hidden), code).reward
+        return hidden, rewarded, runner.run(code, hidden).passed, expected
+
+    with ThreadPoolExecutor(4) as pool:
+        rows = list(pool.map(verdicts, LIVE_EQUALITY))
+    for hidden, rewarded, evaluated, expected in rows[:-1]:
+        assert evaluated is expected, hidden
+        assert rewarded == (1.0 if expected else 0.0), hidden
+    hidden, rewarded, evaluated, _ = rows[-1]
+    assert evaluated and rewarded == 0.0, hidden
+
+
+# (hidden tests, candidate code, whether the evaluation runner passes it): the candidate runs
+# as the main script, and the hidden tests' imports come after it, in both paths.
+LIVE_MAIN_SCRIPT: list[tuple[str, str, bool]] = [
+    (
+        "assert db.get('a') == 1",
+        "class D(dict):\n    pass\nif __name__ == '__main__':\n    db = D(a=1)",
+        True,
+    ),
+    (
+        "assert where() == '/tmp'",
+        "import os\ndef where():\n    return os.path.dirname(os.path.abspath(__file__))",
+        True,
+    ),
+    ("import math\nassert f() == 3", "X = math.floor(3.5)\ndef f():\n    return X", False),
+    ("from math import floor\nassert floor(2.5) == 2", "def floor(x):\n    return 99", True),
+]
+
+
+@integration
+def test_live_candidate_runs_as_the_main_script_as_in_evaluation() -> None:
+    def verdicts(item: tuple[str, str, bool]) -> tuple[str, float | None, bool, bool]:
+        hidden, code, expected = item
+        rewarded = live(function_task(hidden), code).reward
+        return hidden, rewarded, runner.run(code, hidden).passed, expected
+
+    with ThreadPoolExecutor(4) as pool:
+        for hidden, rewarded, evaluated, expected in pool.map(verdicts, LIVE_MAIN_SCRIPT):
+            assert evaluated is expected, hidden
+            assert rewarded == (1.0 if expected else 0.0), hidden
 
 
 @integration

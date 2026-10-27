@@ -142,10 +142,13 @@ def main():
     _row_bytes = config["row_bytes"]
     calls = config["calls"]
     per_call = config["per_call"]
-    namespace = {"__name__": "__candidate__"}
+    # As in the evaluation program: the candidate runs as the main script (its
+    # ``if __name__ == "__main__":`` block runs and ``__file__`` names the script), and the
+    # hidden tests' imports come after it.
+    namespace = {"__name__": "__main__", "__file__": "/tmp/candidate.py", "__cached__": None}
     try:
-        exec(compile(config["setup"], "<setup>", "exec"), namespace)
         exec(compile(config["code"], "<candidate>", "exec"), namespace)
+        exec(compile(config["setup"], "<setup>", "exec"), namespace)
     except BaseException:
         for index in range(len(calls)):
             _emit(_dumps({"i": index, "ok": False, "e": "candidate_error"}))

@@ -14,12 +14,15 @@ The fix: the *expected* values never enter the container. For a supported hidden
 ``assert CALL == LITERAL`` the host parses ``LITERAL`` with :func:`ast.literal_eval` and keeps
 it; only ``CALL``'s source goes into the container with the candidate. Inside, the trusted
 supervisor (``reward_program.py``) runs the candidate in a child process, evaluates each
-``CALL`` there, and reports a type-preserving encoding of its value. The host decodes that and
-compares type and value against the literal it kept. Forging the reported value earns nothing,
-because the candidate never learns which value would pass; a value that cannot be encoded
-(an always-equal object, a function, a live handle) is a failure. The reward denominator comes
-from the task file, never from the container. For I/O tasks every case runs under its own
-deadline and the per-attempt budget; the container returns bounded stdout and the host compares
+``CALL`` there, and reports a type-tagged encoding of its value. The host rebuilds that value
+from built-in types only and decides the check as the assertion itself would: Python ``==``
+against the literal it kept, identity for ``is None/True/False``, truthiness for
+``assert not CALL``. No candidate-defined method ever runs on the host.
+Forging the reported value earns nothing, because the candidate never learns which value would
+pass; a value that cannot be encoded (an always-equal object, a function, a live handle) is a
+failure. The reward denominator comes from the task file, never from the container. For I/O
+tasks every case runs in turn under one shared deadline, the pool verification's rule from
+:mod:`scratchcoder.sandbox.budget`; the container returns bounded stdout and the host compares
 with expected outputs it never shared.
 
 Host failures are separated from candidate failures by framing: the supervisor writes a
@@ -126,7 +129,9 @@ class RewardResult:
 @dataclass(frozen=True)
 class Check:
     """One parsed hidden assertion: ``call`` is evaluated in the container, and the host
-    applies ``predicate`` ("eq" or "falsy") to the reported value against ``expected``."""
+    applies ``predicate`` to the reported value: ``"eq"`` (``value == expected``), ``"is"``
+    (``value is expected``, for ``None``/``True``/``False``) or ``"falsy"``
+    (``assert not CALL``)."""
 
     call: str
     predicate: str
@@ -164,11 +169,24 @@ def _safe_literal(node: ast.expr) -> tuple[bool, object]:
         value = ast.literal_eval(node)
     except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
         return False, None
-    try:
-        _canonical_from_value(value)
-    except TypeError:
-        return False, None
-    return True, value
+    return _representable(value), value
+
+
+def _representable(value: object, depth: int = 0) -> bool:
+    """Whether ``value`` is built only from the types the driver can report. An expected
+    value outside them (``1j``, ``...``) makes the task not parseable."""
+    if depth > 32:
+        return False
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return True
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return all(_representable(item, depth + 1) for item in value)
+    if isinstance(value, dict):
+        return all(
+            _representable(key, depth + 1) and _representable(item, depth + 1)
+            for key, item in value.items()
+        )
+    return False
 
 
 def _call_is_safe(node: ast.expr) -> bool:
@@ -203,7 +221,7 @@ def _parse_predicate(test: ast.expr) -> Check | None:
                     and (other.value is None or other.value is True or other.value is False)
                     and _call_is_safe(expression)
                 ):
-                    return Check(ast.unparse(expression), "eq", other.value)
+                    return Check(ast.unparse(expression), "is", other.value)
             return None
         return None
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
@@ -298,44 +316,8 @@ def is_parseable(task: Task, *, limits: Limits | None = None) -> bool:
 
 
 # --------------------------------------------------------------------------------------
-# Type-preserving value comparison (host side).
+# Value reconstruction and comparison (host side).
 # --------------------------------------------------------------------------------------
-
-
-def _canonical_from_value(value: object, depth: int = 0) -> object:
-    """A hashable, type-tagged canonical form of a Python value kept by the host. ``bool`` is
-    checked before ``int`` so ``True`` never compares equal to ``1``."""
-    if depth > 32:
-        raise TypeError("value nested too deeply")
-    if value is None:
-        return ("none",)
-    if isinstance(value, bool):
-        return ("bool", value)
-    if isinstance(value, int):
-        return ("int", value)
-    if isinstance(value, float):
-        return ("float", value)
-    if isinstance(value, str):
-        return ("str", value)
-    if isinstance(value, bytes):
-        return ("bytes", value)
-    if isinstance(value, list):
-        return ("list", tuple(_canonical_from_value(item, depth + 1) for item in value))
-    if isinstance(value, tuple):
-        return ("tuple", tuple(_canonical_from_value(item, depth + 1) for item in value))
-    if isinstance(value, set):
-        return ("set", frozenset(_canonical_from_value(item, depth + 1) for item in value))
-    if isinstance(value, frozenset):
-        return ("frozenset", frozenset(_canonical_from_value(item, depth + 1) for item in value))
-    if isinstance(value, dict):
-        return (
-            "dict",
-            frozenset(
-                (_canonical_from_value(key, depth + 1), _canonical_from_value(val, depth + 1))
-                for key, val in value.items()
-            ),
-        )
-    raise TypeError("unsupported value type")
 
 
 def _wire_from_value(value: object) -> object:
@@ -373,72 +355,76 @@ def _honest_row_bytes(index: int, value: object) -> int:
 
 
 _SCALAR_TYPES: dict[str, type] = {"bool": bool, "int": int, "float": float, "str": str}
-_SPECIAL_FLOATS = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}
+_SPECIAL_FLOATS = frozenset({"nan", "inf", "-inf"})
 
 
-def _canonical_from_wire(node: object, depth: int = 0) -> object:
-    """The same canonical form, rebuilt from the container's type-tagged encoding. The
-    encoding is untrusted: every node's shape, length and payload type is checked, and any
-    deviation raises ``ValueError``."""
+def _value_from_wire(node: object, depth: int = 0) -> object:
+    """Rebuild a reported value from the container's type-tagged encoding, using built-in
+    types only (``None``, ``bool``, ``int``, ``float``, ``str``, ``bytes``, ``list``,
+    ``tuple``, ``set``, ``frozenset``, ``dict``), so comparing it with an expected literal
+    runs no candidate-defined method. The encoding is untrusted: every node's shape, length
+    and payload type is checked, and any deviation raises ``ValueError`` (an unhashable set
+    element or dict key raises ``TypeError``, as Python itself would)."""
     if depth > 64 or type(node) is not list or not node or type(node[0]) is not str:
         raise ValueError("malformed encoded value")
     kind = node[0]
     if kind == "none":
         if len(node) != 1:
             raise ValueError("malformed none")
-        return ("none",)
+        return None
     if len(node) != 2:
         raise ValueError("malformed encoded value")
     payload = node[1]
     if kind in _SCALAR_TYPES:
         if type(payload) is not _SCALAR_TYPES[kind]:
             raise ValueError("malformed scalar")
-        return (kind, payload)
+        return payload
     if kind == "float_s":
         if type(payload) is not str or payload not in _SPECIAL_FLOATS:
             raise ValueError("malformed special float")
-        return ("float", _SPECIAL_FLOATS[payload])
+        return float(payload)
     if type(payload) is not list:
         raise ValueError("malformed container")
     if kind == "bytes":
         if any(type(item) is not int or not 0 <= item <= 255 for item in payload):
             raise ValueError("malformed bytes")
-        return ("bytes", bytes(payload))
-    if kind in ("list", "tuple"):
-        return (kind, tuple(_canonical_from_wire(item, depth + 1) for item in payload))
-    if kind in ("set", "frozenset"):
-        return (kind, frozenset(_canonical_from_wire(item, depth + 1) for item in payload))
+        return bytes(payload)
+    if kind in ("list", "tuple", "set", "frozenset"):
+        items = [_value_from_wire(item, depth + 1) for item in payload]
+        if kind == "list":
+            return items
+        if kind == "tuple":
+            return tuple(items)
+        return set(items) if kind == "set" else frozenset(items)
     if kind == "dict":
         pairs = []
         for pair in payload:
             if type(pair) is not list or len(pair) != 2:
                 raise ValueError("malformed dict item")
             pairs.append(
-                (_canonical_from_wire(pair[0], depth + 1), _canonical_from_wire(pair[1], depth + 1))
+                (_value_from_wire(pair[0], depth + 1), _value_from_wire(pair[1], depth + 1))
             )
-        return ("dict", frozenset(pairs))
+        return dict(pairs)
     raise ValueError("unknown encoded kind")
 
 
-def _truthy(canonical: object) -> bool:
-    """Truthiness of a canonical value, for the ``assert not CALL`` form."""
-    assert isinstance(canonical, tuple)
-    if canonical[0] == "none":
-        return False
-    return bool(canonical[1])
-
-
 def check_passes(check: Check, reported: object) -> bool:
-    """Whether one reported call result satisfies its check. Any malformed, errored or
-    unserialisable report is a failure, whatever exception decoding it raises; equality is
-    strict in type and value."""
+    """Whether one reported call result satisfies its check, decided as the hidden
+    assertion itself would decide it on the rebuilt built-in value: ``==`` against the
+    expected literal (so ``2.0`` passes ``== 2`` and ``True`` passes ``== 1``), identity for
+    ``is None/True/False``, and truthiness for ``assert not CALL``. Any malformed, errored or
+    unserialisable report is a failure, whatever exception decoding it raises."""
     try:
         if not isinstance(reported, dict) or reported.get("ok") is not True:
             return False
-        canonical = _canonical_from_wire(reported.get("v"))
+        value = _value_from_wire(reported.get("v"))
         if check.predicate == "falsy":
-            return not _truthy(canonical)
-        return canonical == _canonical_from_value(check.expected)
+            return not value
+        if check.predicate == "is":
+            return value is check.expected
+        if check.predicate == "eq":
+            return bool(value == check.expected)
+        return False
     except Exception:
         return False
 
