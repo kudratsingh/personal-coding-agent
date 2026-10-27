@@ -110,7 +110,7 @@ uv run --locked python -m tools.pilot_feasibility posttrain --specification "$SP
   --output "$SHARED/feasibility.json"
 ```
 
-Replace `0.59` with the console's price; above $0.59, stop and ask the owner (the gate step refuses such a projection). The projection prints **the gate's estimate**, its total at run 1's measured rates, the stop 120% of it gives and what that stop leaves for setup after the launch rule's need at the planning rates (`the gate refuses it` when less than the 900 s setup); the gate step reads the estimate from `$SHARED/feasibility.json`. The owner fixes the ceiling (about $5.80, about 1.6 times the estimate) and gives the go or not. Record the ceiling:
+Replace `0.59` with the console's price; above $0.59, stop and ask the owner (the gate step refuses such a projection). The projection prints **the gate's estimate**, its total at run 1's measured rates, the stop 120% of it gives and what that stop leaves for setup after the launch rule's need at the planning rates (`the gate refuses it` when less than the 900 s setup); the gate step reads the estimate from `$SHARED/feasibility.json`. A faster run 1 makes a margin stop in the control likely, before its budget is spent ([Can a margin stop happen?](docs/posttrain-runs.md#an-arms-stop)): report that to the owner with the estimate. The owner fixes the ceiling (about $5.80, about 1.6 times the estimate) and gives the go or not. Record the ceiling:
 
 ```sh
 export CEILING=<the owner's ceiling in dollars>

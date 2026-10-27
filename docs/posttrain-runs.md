@@ -125,7 +125,21 @@ A wall or cost stop ends the run, as in run 1. A stop of the Mac's side in eithe
 
 The evaluation that follows needs no Mac wait and runs under the projected-finish rule, the finalization reserve and every limit; the projection prices only the stages and ARC entries that will run. An arm with the SFT weights is not evaluated (above). With no RL dev check scored there is nothing to select and the run finalizes at once. The run then ends `stopped` with the arm's reason, recorded in `report.json`'s `arm_stop` and the archived summary. While the evaluation runs the heartbeat reads `running`, never `awaiting_rewards`, so the watchdog's 600 s idle rule and the in-Pod 900 s rule apply as to any stage.
 
-**Can a margin stop happen?** At the planning rates, with a 900 s setup and the stop at 120% of the planning-speed estimate ($3.53, so $4.23: a 25,200 s lifetime whose reserve starts at 24,300 s), the margin check (one full wait, 11,746.5 s) keeps at least 3,638 s free through RL but only 515 s at the control's last dev check. A setup 600 s longer than its 900 s allowance, or a Mac 10% slower than its planning time, leaves less than one full wait there: the control's last check would then be a margin stop, its endpoint selected from its earlier checks, and both arms still evaluated (their 7,945 s of evaluation fit). At the $5.80 ceiling alone the smallest margin is 9,935 s.
+**Can a margin stop happen?** Yes, in the control, and it grows more likely the faster run 1 measures. The margin is fixed (one full wait at its worst, 11,746.5 s), while the time the 120% stop leaves after the control is 20% of the estimate plus the evaluation, ARC and reserve that follow it. Roughly, the control's last check keeps `0.2 x estimate (in seconds at $0.60/h) + the evaluation and ARC after the control + its dev wait - 180 - 11,746.5` seconds free; when that is negative the control margin-stops, at its last check or earlier, before its budget is spent. A faster Mac lowers the estimate; a faster GPU lowers both the estimate and the evaluation after the control, so it bites hardest. RL keeps at least 1,392 s free in every case below, so RL never margin-stops at these rates. The cases, each with the estimate projected at the given rates (the planning time scaled) and the run simulated at those same rates, from a 900 s setup (and a 1,500 s one):
+
+| Mac time, GPU time (x planning) | Estimate, stop | First margin stop, 900 s setup | 1,500 s setup |
+| --- | --- | --- | --- |
+| 1.0, 1.0 | $3.53, $4.23 | none (515 s free at the control's last check) | the control's last check |
+| 1.1, 1.0 | $3.67, $4.39 | none (695 s) | none (95 s) |
+| 0.9, 1.0 | $3.40, $4.07 | none (335 s) | the control at 85% of its budget |
+| 0.75, 1.0 | $3.19, $3.83 | none (65 s) | the control at 80% |
+| 0.7, 1.0 | $3.13, $3.75 | the control's last check | the control's fourth check, at 80% |
+| 0.6, 1.0 | $2.99, $3.58 | the control at 85% | the control at 60% |
+| 1.0, 0.9 | $3.35, $4.02 | the control at 80% | the control at 60% |
+| 1.0, 0.8 | $3.17, $3.80 | the control at 40% | the control at 20% |
+| 0.5, 1.0 or 0.8, 0.8 | $2.86 or $2.90 | refused at the gate (below) | refused at the gate |
+
+A margin stop in the control is safe (the worker selects its endpoint from the checks it scored and evaluates both arms as admitted, `test_no_control_update_starts_without_one_full_wait_free`), but the control then has not spent RL's GPU-busy budget, so the comparison it makes is not compute-matched; `more_sft.within_tolerance` says so. Whether to base the margin on run 1's measured wait or to raise the stop fraction for a low estimate is the owner's decision; the code keeps the fixed margin and the 120% stop.
 
 ### Inputs and the gate
 
