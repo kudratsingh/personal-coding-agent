@@ -184,8 +184,12 @@ def _task_scores(run: Run, metric: str) -> dict[str, float]:
 
 
 def _pool_baseline_for(run: Run, baselines: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    """The baseline of the run's task file, or of the full file whose Pod export it is."""
     for baseline in baselines:
-        if baseline.get("task_file_sha256") == run.header.task_file_sha256:
+        if run.header.task_file_sha256 in (
+            baseline.get("task_file_sha256"),
+            baseline.get("pod_export_sha256"),
+        ):
             return baseline
     return None
 

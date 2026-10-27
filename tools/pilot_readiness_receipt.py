@@ -282,14 +282,23 @@ def shards_staged_and_hash_checked(
     return True
 
 
-def round_trip_passed(probe: dict[str, Any], *, run: str, pod_id: str) -> bool:
+def round_trip_passed(
+    probe: dict[str, Any],
+    *,
+    run: str,
+    pod_id: str,
+    prefix: str | None = None,
+    required: float = rehearsal_ops.REQUIRED_UPLOAD_BYTES_PER_SECOND,
+) -> bool:
     """True when the Pod's R2 round trip passed under this run's own prefix, fast enough.
 
     The probe must hold at least ``ROUND_TRIP_PROBE_BYTES`` and its measured upload rate
     (the bytes over the PUT's seconds) must reach ``REQUIRED_UPLOAD_BYTES_PER_SECOND``:
-    slower, the final drain cannot move the stage-final milestone inside its 360 s.
+    slower, the final drain cannot move the stage-final milestone inside its 360 s. A
+    post-training run gives its own ``prefix`` and ``required`` rate.
     """
-    prefix = rehearsal_ops.run_prefix(run, pod_id)
+    if prefix is None:
+        prefix = rehearsal_ops.run_prefix(run, pod_id)
     if (
         probe.get("kind") != "r2-round-trip"
         or probe.get("status") != "passed"
@@ -326,7 +335,6 @@ def round_trip_passed(probe: dict[str, Any], *, run: str, pod_id: str) -> bool:
         if not math.isclose(rate, size / seconds, rel_tol=1e-6):
             raise ValueError(f"the R2 round trip's {name} disagrees with its {step}")
         rates[name] = rate
-    required = rehearsal_ops.REQUIRED_UPLOAD_BYTES_PER_SECOND
     if rates["upload_bytes_per_second"] < required:
         raise ValueError(
             f"the Pod's measured R2 upload rate of {rates['upload_bytes_per_second'] / 1e6:.2f} "
@@ -636,6 +644,10 @@ def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments[:1] == ["rehearsal"]:
         return rehearsal_main(arguments[1:])
+    if arguments[:1] == ["posttrain"]:
+        from tools.posttrain_readiness import main as posttrain_main
+
+        return posttrain_main(arguments[1:])
     argv = arguments
     parser = argparse.ArgumentParser(description=__doc__)
     for name in (

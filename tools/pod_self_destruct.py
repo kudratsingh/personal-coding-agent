@@ -9,6 +9,18 @@ host or the Runpod control plane is unavailable, or if the Pod-scoped key is
 not permitted to terminate its own Pod (verify on the real Pod before relying
 on it). Only the Python standard library is used so the timer works even when
 the project environment failed to install.
+
+With ``--idle-seconds`` (post-training runs) the timer also deletes the Pod after that long
+with no activity, independent of the Mac. Activity is the latest of the timer's own arming
+and, in each ``--activity`` JSON file (the worker's heartbeat, the bootstrap's setup
+progress), the ``last_gpu_activity_unix`` and ``progress_unix`` values. A missing,
+unreadable, oversized, non-regular or malformed file adds nothing (a FIFO is never opened
+for a blocking read, and no content can raise out of the check), and a value more than
+``CLOCK_SKEW_SECONDS`` in the future is ignored, so a broken writer can only bring the
+deletion closer: the wall-clock and monotonic deadlines are checked before the idle rule on
+every pass, whatever the activity files hold. ``progress_unix`` is the documented hook for
+waits that keep the Pod busy without GPU work: run 2's reward waits stamp it when the Mac's
+reward files arrive.
 """
 
 from __future__ import annotations
@@ -19,6 +31,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,8 +47,63 @@ POD_ID_ENV = "RUNPOD_POD_ID"
 MAX_RESPONSE_BYTES = 1_048_576
 MAX_DEADLINE_SECONDS = 5_400  # The pilot's default Pod lifetime ceiling.
 ABSOLUTE_DEADLINE_SECONDS = 60_000  # The rehearsal runs' 16.7-hour limit (D-35); never more.
+MIN_IDLE_SECONDS = 60.0
+MAX_IDLE_SECONDS = 3_600.0
+CLOCK_SKEW_SECONDS = 60.0
+MAX_ACTIVITY_BYTES = 65_536
+ACTIVITY_FIELDS = ("last_gpu_activity_unix", "progress_unix")
 _SAFE_POD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _BACKOFF = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+
+
+def _read_regular(path: str) -> bytes | None:
+    """At most ``MAX_ACTIVITY_BYTES + 1`` bytes of a regular file, or None.
+
+    The file is opened without blocking and must be a regular file once open, so a FIFO,
+    a device or a socket at an activity path can never stall the timer's loop.
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1  # The stream owns it now and closes it.
+            return stream.read(MAX_ACTIVITY_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def activity_unix(path: str, *, now: float) -> float | None:
+    """The latest activity stamp one file records, or None when it records none usable.
+
+    Nothing a writer puts in the file can raise here: an unreadable, oversized, non-regular
+    or malformed file, a deeply nested document, an integer too large for a float and a
+    stamp from the future all read as no activity.
+    """
+    try:
+        raw = _read_regular(path)
+        if raw is None or len(raw) > MAX_ACTIVITY_BYTES:
+            return None
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            return None
+        found = []
+        for name in ACTIVITY_FIELDS:
+            stamp = value.get(name)
+            if isinstance(stamp, bool) or not isinstance(stamp, int | float):
+                continue
+            number = float(stamp)  # An integer past the float range raises OverflowError.
+            if math.isfinite(number) and 0 < number <= now + CLOCK_SKEW_SECONDS:
+                found.append(number)
+        return max(found) if found else None
+    except Exception:  # Any malformed content is no activity.
+        return None
 
 
 class Transport(Protocol):
@@ -125,6 +193,8 @@ class SelfDestruct:
         stop_file: str | None = None,
         dry_run: bool = False,
         runpodctl: str | None = None,
+        idle_seconds: float | None = None,
+        activity: tuple[str, ...] = (),
     ) -> None:
         if not _SAFE_POD_ID.fullmatch(pod_id):
             raise ValueError("Pod ID contains unsafe characters")
@@ -134,12 +204,25 @@ class SelfDestruct:
             raise ValueError("deadline must be a finite future unix timestamp")
         if not 0 < poll_seconds <= 60:
             raise ValueError("poll seconds must be in (0, 60]")
+        if idle_seconds is not None and (
+            not math.isfinite(idle_seconds)
+            or not MIN_IDLE_SECONDS <= idle_seconds <= MAX_IDLE_SECONDS
+            or not activity
+        ):
+            raise ValueError(
+                f"an idle limit must lie in [{MIN_IDLE_SECONDS:g}, {MAX_IDLE_SECONDS:g}] s "
+                "and name at least one activity file"
+            )
+        if activity and idle_seconds is None:
+            raise ValueError("activity files need an idle limit")
+        self.idle_seconds, self.activity = idle_seconds, tuple(activity)
         self.pod_id, self._token, self.deadline = pod_id, token, deadline_unix
         self.receipt_path, self.transport = receipt_path, transport or UrllibTransport()
         self.clock, self.monotonic, self.sleep = clock, monotonic, sleep
         self.request_timeout, self.poll_seconds = request_timeout, poll_seconds
         self.stop_file, self.dry_run, self.runpodctl = stop_file, dry_run, runpodctl
         self.armed_at = clock()
+        self.last_activity = self.armed_at
         # Fire on whichever clock reaches the deadline first: a wall-clock jump
         # must not postpone termination, and a monotonic clock cannot be set back.
         self.deadline_monotonic = monotonic() + (deadline_unix - self.armed_at)
@@ -163,8 +246,20 @@ class SelfDestruct:
                 "dry_run": self.dry_run,
                 "attempts": self.attempts[-50:],
                 "guarantee": ("in-pod best-effort backstop; not a provider-enforced lifetime cap"),
+                "idle_seconds": self.idle_seconds,
+                "activity_files": list(self.activity),
+                "last_activity_unix": self.last_activity,
             },
         )
+
+    def observe_activity(self) -> float:
+        """Advance ``last_activity`` to the latest usable stamp; it never moves back."""
+        now = self.clock()
+        for path in self.activity:
+            stamp = activity_unix(path, now=now)
+            if stamp is not None and stamp > self.last_activity:
+                self.last_activity = stamp
+        return self.last_activity
 
     def _request(self, method: str, path: str) -> tuple[int, dict[str, str], bytes]:
         headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
@@ -177,6 +272,13 @@ class SelfDestruct:
             return "wall_clock_deadline"
         if self.monotonic() >= self.deadline_monotonic:
             return "monotonic_deadline"
+        if self.idle_seconds is not None:
+            try:
+                last = self.observe_activity()
+            except Exception:  # A failed read is no new activity.
+                last = self.last_activity
+            if self.clock() - last >= self.idle_seconds:
+                return "idle_limit"
         return None
 
     def wait(self) -> str:
@@ -184,8 +286,13 @@ class SelfDestruct:
             remaining = min(
                 self.deadline - self.clock(), self.deadline_monotonic - self.monotonic()
             )
+            if self.idle_seconds is not None:
+                remaining = min(remaining, self.last_activity + self.idle_seconds - self.clock())
             self.reason = f"waiting; {max(0.0, remaining):.0f}s remaining"
-            self.record()
+            try:
+                self.record()
+            except OSError:  # A full disk must not end the wait: the deadline still fires.
+                pass
             self.sleep(max(0.05, min(self.poll_seconds, remaining)))
         return reason
 
@@ -288,6 +395,17 @@ def main(argv: list[str] | None = None) -> int:
         default=MAX_DEADLINE_SECONDS,
         help="refuse deadlines further than this from now (pilot ceiling 5400)",
     )
+    parser.add_argument(
+        "--idle-seconds",
+        type=float,
+        help="also delete the Pod after this long with no activity in any --activity file",
+    )
+    parser.add_argument(
+        "--activity",
+        action="append",
+        default=[],
+        help="a JSON file whose last_gpu_activity_unix or progress_unix counts as activity",
+    )
     args = parser.parse_args(argv)
     token = os.environ.get(API_KEY_ENV, "")
     if not args.pod_id:
@@ -309,6 +427,8 @@ def main(argv: list[str] | None = None) -> int:
             poll_seconds=args.poll_seconds,
             stop_file=args.stop_file,
             dry_run=args.dry_run,
+            idle_seconds=args.idle_seconds,
+            activity=tuple(args.activity),
         )
     except ValueError as error:
         parser.error(str(error))

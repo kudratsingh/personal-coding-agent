@@ -30,16 +30,27 @@ MAX_RESPONSE_BYTES = 1_048_576
 MAX_POD_WALL_SECONDS = 5_400
 # The owner-approved rehearsal runs (D-35) have a 60,000-second (16.7-hour) Pod limit, so the
 # $10 cap at $0.60/h is the binding limit; the pilot keeps 5,400.
-MODE_WALL_SECONDS = {"pilot": MAX_POD_WALL_SECONDS, "rehearsal": 60_000}
+# The post-training runs keep the same absolute 60,000-second ceiling here; each run's own wall
+# is derived from its ceiling (run 1: $3.00 at $0.60/h, 18,000 s) and enforced by its policy file,
+# which the readiness receipt checks against that derivation.
+MODE_WALL_SECONDS = {"pilot": MAX_POD_WALL_SECONDS, "rehearsal": 60_000, "posttrain": 60_000}
 MAX_GPU_IDLE_SECONDS = 600
 MAX_TRANSFER_SECONDS = 1_800
 CLOCK_SKEW_SECONDS = 60.0  # Tolerated difference between Pod, provider and Mac clocks.
 TRANSFER_STATUSES = frozenset(
     {"awaiting_transfer", "completed", "time_limited", "stopped", "failed", "uploading"}
 )
-MODE_STATUSES = {"pilot": frozenset(), "rehearsal": frozenset({"uploading"})}
+MODE_STATUSES = {
+    "pilot": frozenset(),
+    "rehearsal": frozenset({"uploading"}),
+    "posttrain": frozenset({"uploading", "awaiting_rewards"}),
+}
 """Worker statuses beyond the pilot's that a mode's heartbeat may carry. A rehearsal worker
-reads ``uploading`` while it drains its last checkpoints to R2 with the GPU idle."""
+reads ``uploading`` while it drains its last checkpoints to R2 with the GPU idle. A
+post-training worker may also read ``awaiting_rewards``, run 2's wait for the Mac's RL
+rewards; here it is an ordinary in-progress status, so the idle rule applies to it unchanged.
+Run 2 extends it with Mac-stamped reward progress (as ``transfer_progress_unix`` extends an
+upload); run 1 never writes it."""
 _SAFE_POD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 
@@ -167,7 +178,7 @@ class Policy:
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{key} must be a finite positive number")
         if self.mode not in MODE_WALL_SECONDS:
-            raise ValueError("mode must be pilot or rehearsal")
+            raise ValueError(f"mode must be one of {', '.join(sorted(MODE_WALL_SECONDS))}")
         if self.max_wall_seconds > MODE_WALL_SECONDS[self.mode]:
             raise ValueError(
                 f"max_wall_seconds cannot exceed the {self.mode} ceiling "
@@ -454,15 +465,16 @@ def check_once(
     base URL, Pod ID or key scope would otherwise read as a successful
     shutdown while the Pod keeps billing.
 
-    A heartbeat naming another Pod reads as absent. Under a rehearsal policy so does one
-    updated before this Pod's ``createdAt``: a controller directory reused for a new Pod
-    still holds the old Pod's mirrored heartbeat, which must never delete the new one.
+    A heartbeat naming another Pod reads as absent. Under a rehearsal or post-training
+    policy so does one updated before this Pod's ``createdAt``: a controller directory reused
+    for a new Pod still holds the old Pod's mirrored heartbeat, which must never delete the
+    new one.
     """
     raw_now = now()
     clock_valid = _is_number(raw_now) and math.isfinite(raw_now)
     checked_at = float(raw_now) if clock_valid else 0.0
     try:
-        created_unix = parse_timestamp(identity.created_at) if policy.mode == "rehearsal" else None
+        created_unix = parse_timestamp(identity.created_at) if policy.mode != "pilot" else None
     except ValueError:
         created_unix = None  # The guard below fails closed on the same timestamp.
     heartbeat = read_heartbeat(
@@ -599,6 +611,38 @@ def _transfer_in_progress(heartbeat: Heartbeat, policy: Policy, now: float) -> b
     )
 
 
+POLICY_FILE_FIELDS = (
+    "mode",
+    "max_wall_seconds",
+    "max_cost_usd",
+    "max_idle_seconds",
+    "quoted_total_hourly",
+    "max_transfer_seconds",
+    "billing_started_at_unix",
+)
+"""The limits a ``--policy`` file pins. ``idle_baseline_unix`` is left out: the runbook's
+helper re-baselines it on every restart."""
+
+
+def check_policy_file(policy: Policy, path: Path) -> None:
+    """Refuse a watchdog whose flags give other limits than the policy file the readiness
+    receipt checked, so a mistyped shell variable can never start a weaker watchdog."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read the policy file: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError("the policy file must hold a JSON object")
+    missing = [name for name in POLICY_FILE_FIELDS if name not in value]
+    if missing:
+        raise ValueError(f"the policy file lacks {', '.join(missing)}")
+    differ = [name for name in POLICY_FILE_FIELDS if getattr(policy, name) != value[name]]
+    if value.get("starting_cost_usd", 0.0) != policy.starting_cost_usd:
+        differ.append("starting_cost_usd")
+    if differ:
+        raise ValueError("the watchdog's flags differ from the policy file in " + ", ".join(differ))
+
+
 def _load_identity(path: Path) -> PodIdentity:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -620,7 +664,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=sorted(MODE_WALL_SECONDS),
         default="pilot",
-        help="wall ceiling: pilot 5400 s, rehearsal 60000 s",
+        help="wall ceiling: pilot 5400 s, rehearsal and posttrain 60000 s",
     )
     parser.add_argument("--max-cost-usd", type=float, required=True)
     parser.add_argument("--max-idle-seconds", type=float, default=600)
@@ -646,6 +690,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--pidfile",
         type=Path,
         help="write this process's PID here, so one Pod's watchdog can be restarted alone",
+    )
+    parser.add_argument(
+        "--policy",
+        type=Path,
+        help="refuse to start unless the flags give exactly this policy file's limits",
     )
     return parser
 
@@ -677,6 +726,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         identity = _load_identity(args.identity)
         policy = policy_from_args(args)
+        if args.policy is not None:
+            check_policy_file(policy, args.policy)
     except ValueError as error:
         parser.error(str(error))
     client = RunpodClient(token, UrllibTransport())

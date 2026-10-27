@@ -50,6 +50,7 @@ from scratchcoder.eval.completions import (
     read_completions,
     validate_against_tasks,
 )
+from scratchcoder.eval.export import ExportError, refuse_exported, task_file_identity
 from scratchcoder.eval.harness import HOST_RETRIES, isolated_execution
 from scratchcoder.eval.parallel import Call, Execute, Outcome, run_calls
 from scratchcoder.eval.protocols import CHAT, POOL, load_suite_tasks, protocol_for
@@ -580,9 +581,16 @@ def run_test_baseline(
     ledger = SealLedger(seal_ledger)
     finished = ledger.finished_unseal(record)
     expected = finished["task_file_sha256"]
-    if file_sha256(tasks_path) != expected:
-        raise SealError("the task file is not the test task file the sealed completions name")
-    tasks, _ = load_suite_tasks("pool", "test", tasks_path)
+    try:
+        # The sealed files may name the full task file or its Pod export, derived again here;
+        # the export itself, with placeholder tests, is never the file to run.
+        task_file_identity(tasks_path, expected)
+        tasks, _ = load_suite_tasks("pool", "test", tasks_path)
+        refuse_exported(tasks, tasks_path)
+    except ExportError as error:
+        raise SealError(
+            "the task file is not the test task file the sealed completions name"
+        ) from error
     path = _test_baseline(
         ledger,
         {task.id: task for task in tasks},

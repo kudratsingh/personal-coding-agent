@@ -39,6 +39,7 @@ from typing import Any
 from scratchcoder.common.records import atomic_json, git_state, utc_now
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.choices import ChoiceTask
+from scratchcoder.eval.export import export_sha256
 from scratchcoder.eval.harness import HOST_RETRIES, isolated_execution
 from scratchcoder.eval.parallel import OVERSIZED, Call, Execute, Outcome, run_calls
 from scratchcoder.eval.protocols import load_suite_tasks
@@ -591,6 +592,8 @@ def pool_baseline_report(
         **report,
         "split": split,
         "task_file_sha256": file_sha256(tasks_path),
+        # Completions generated on a Pod name the task file's export (hidden tests removed).
+        "pod_export_sha256": export_sha256(tasks_path),
         "git_commit": commit,
         "dirty": dirty,
         "created_at": utc_now(),

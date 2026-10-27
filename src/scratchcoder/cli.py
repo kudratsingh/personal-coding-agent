@@ -98,6 +98,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     rl_screen.add_argument("--threshold", type=float, default=0.5)
     rl_screen.add_argument("--cap", type=int, default=1000)
     rl_screen.add_argument("--floor", type=int, default=320)
+    rl_screen.add_argument(
+        "--require-header",
+        action="store_true",
+        help="refuse an attempts file without the Pod worker's header binding it to the tasks",
+    )
+    export = subparsers.add_parser(
+        "pod-task-export",
+        help="write a task file for a Pod with the hidden tests removed, and its record",
+    )
+    export.add_argument("--kind", choices=("pool", "candidates", "arc"), required=True)
+    export.add_argument("--tasks", type=Path, help="pool: a split file; candidates: train.jsonl")
+    export.add_argument("--candidates", type=Path, help="candidates: the RL candidate list")
+    export.add_argument("--arc-directory", type=Path, help="arc: the pinned ARC-Easy Parquet files")
+    export.add_argument("--output", type=Path, required=True, help="the new export file")
+    export.add_argument("--record", type=Path, required=True, help="the new record file")
     from scratchcoder.eval import pipeline_cli
 
     pipeline_cli.add_parsers(subparsers)
@@ -122,8 +137,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 threshold=args.threshold,
                 cap=args.cap,
                 floor=args.floor,
+                require_header=args.require_header,
             )
         sys.stdout.write(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n")
+        return 0
+    if args.command == "pod-task-export":
+        import json
+
+        from scratchcoder.eval.export import write_export
+
+        record = write_export(
+            args.kind,
+            output=args.output,
+            record=args.record,
+            tasks_path=args.tasks,
+            candidates_path=args.candidates,
+            arc_directory=args.arc_directory,
+        )
+        printed = {key: record[key] for key in ("export", "output") if key in record}
+        sys.stdout.write(json.dumps(printed, indent=2, sort_keys=True) + "\n")
         return 0
     if args.command == "generation-benchmark":
         import json

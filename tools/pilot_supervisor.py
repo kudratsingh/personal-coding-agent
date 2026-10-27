@@ -40,6 +40,7 @@ import torch
 
 from scratchcoder.common.records import atomic_json
 from scratchcoder.data.shards import file_sha256
+from tools import posttrain_ops
 from tools.pilot_transfer import Artifact, _ssh_command, child_environment, pull_artifacts
 from tools.r2_store import SHA256_HEX, Store, bounded_store
 from tools.rehearsal_binding import RUNS, r2_credentials
@@ -668,7 +669,7 @@ class RehearsalSupervisor(Supervisor):
         pod_created_unix: float | None = None,
         quick_store: SupervisedStore | None = None,
     ) -> None:
-        run_prefix(run, pod_id)
+        self.layout_prefix(run, pod_id)
         if not 0 < failure_grace_seconds <= IDLE_SECONDS:
             raise ValueError("the failure grace must be positive and within the idle limit")
         if not 0 <= transfer_window_seconds <= WATCHDOG_TRANSFER_CEILING_SECONDS:
@@ -678,7 +679,7 @@ class RehearsalSupervisor(Supervisor):
         )
         self.run, self.pod_id, self.store = run, pod_id, store
         self.quick_store = store if quick_store is None else quick_store
-        self.prefix = run_prefix(run, pod_id)
+        self.prefix = self.layout_prefix(run, pod_id)
         self.fetch_report = fetch_report
         self.fetch_finalization = fetch_finalization
         self.recover = recover
@@ -706,6 +707,12 @@ class RehearsalSupervisor(Supervisor):
         self.recovering = False
         self.recovery_staged = 0
         self.milestone_error: dict[str, Any] | None = None
+
+    @staticmethod
+    def layout_prefix(run: str, pod_id: str) -> str:
+        """The run's R2 prefix: ``rehearsal-runs/<run>/<pod id>/`` (a post-training run has
+        its own layout, ``PosttrainSupervisor``)."""
+        return run_prefix(run, pod_id)
 
     def observe_r2_progress(self) -> None:
         """Stamp ``transfer_progress_unix`` when the run's prefix holds a new object.
@@ -1171,6 +1178,286 @@ class RehearsalSupervisor(Supervisor):
         self.refresh_heartbeat()
 
 
+WEIGHTS_LABEL_FILES = frozenset(item.name for item in RECOVERED_ARTIFACTS)
+"""A post-training label the verified SSH pull can carry: weights (``checkpoint.pt``) and its
+``record.json``, nothing else (``pilot_transfer`` allows no other file names)."""
+
+
+def posttrain_unverified(finalization: object) -> dict[str, list[tuple[str, str]]]:
+    """Each label ``finalization.json`` lists as unverified: its files as (name, SHA-256)."""
+    if not isinstance(finalization, dict):
+        raise ValueError("finalization.json must be an object")
+    rows = finalization.get("unverified_milestones") or []
+    if not isinstance(rows, list):
+        raise ValueError("unverified_milestones must be a list")
+    found: dict[str, list[tuple[str, str]]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("files"), list):
+            raise ValueError("each unverified label must list its files")
+        label = row.get("label")
+        if not isinstance(label, str) or not LISTED_FILE.fullmatch(label) or label in found:
+            raise ValueError(f"an unverified label has an unsafe or repeated name: {label!r}")
+        files = []
+        for item in row["files"]:
+            name, sha256 = (
+                (item.get("name"), item.get("sha256")) if isinstance(item, dict) else (None, None)
+            )
+            if not isinstance(name, str) or not LISTED_FILE.fullmatch(name):
+                raise ValueError(f"unverified label {label} lists a malformed file")
+            if not isinstance(sha256, str) or not SHA256_HEX.fullmatch(sha256):
+                raise ValueError(f"unverified label {label} lists a malformed file")
+            files.append((name, sha256))
+        if not files or len({name for name, _ in files}) != len(files):
+            raise ValueError(f"unverified label {label} lists its files malformed")
+        found[label] = files
+    return found
+
+
+class PosttrainSupervisor(RehearsalSupervisor):
+    """Supervise one post-training run (``tools.posttrain_run``): its R2 layout and final check.
+
+    The machinery is the rehearsal supervisor's: the mirrored heartbeat with the Mac's own
+    progress stamps, the watchdog guard, the failure grace and the archive. Teardown is
+    approved when:
+
+    - the heartbeat carries ``r2_final`` (``awaiting_transfer``, or ``stopped``/``failed``
+      with every label verified), the SSH copy of ``report.json`` hashes to it, and
+      ``posttrain_ops.verify_final`` finds the report and every artifact it lists in R2 with
+      the Mac's own key; the report and a summary are then archived;
+    - the run stopped or failed with no ``r2_final`` and no label at risk, after the grace;
+    - labels ``finalization.json`` lists as unverified are each found whole in R2 by the
+      Mac's HEAD checks, or, for the weights label (``checkpoint.pt`` and ``record.json``),
+      pulled over SSH with the pilot's verified pull and checked. Any other unverified label
+      is recorded in ``MILESTONES-NOT-SECURED.json`` for a rescue by hand, and teardown is not
+      approved: the watchdog's limits end the Pod.
+    """
+
+    def __init__(self, root: Path, **options: Any) -> None:
+        super().__init__(root, **options)
+        self.at_risk_files: dict[str, list[tuple[str, str]]] = {}
+        """Each label at risk and its files, from the last ``finalization.json`` read."""
+
+    @staticmethod
+    def layout_prefix(run: str, pod_id: str) -> str:
+        return posttrain_ops.run_prefix(run, pod_id)
+
+    def finish(self, r2_final: object, raw: bytes, *, statuses: Sequence[str]) -> None:
+        final = self.root / "final"
+        if self.r2_verified is None:
+            checked = posttrain_ops.check_r2_final(r2_final, run=self.run, pod_id=self.pod_id)
+            if hashlib.sha256(raw).hexdigest() != checked["report_sha256"]:
+                raise ValueError("the SSH copy of report.json differs from the final R2 report")
+            verification = posttrain_ops.verify_final(
+                self.store,
+                checked,
+                run=self.run,
+                pod_id=self.pod_id,
+                destination=final,
+                statuses=statuses,
+            )
+            if (final / "report.json").read_bytes() != raw:
+                raise ValueError("the R2 report.json differs from the SSH copy")
+            summary = posttrain_ops.run_summary(
+                json.loads(raw),
+                run=self.run,
+                pod_id=self.pod_id,
+                verification=verification,
+                source="r2-final-report",
+            )
+            atomic_json(final / "r2-verification.json", verification)
+            atomic_json(final / "summary.json", summary)
+            self.r2_verified, self.summary, self.latest = verification, summary, final
+        self.archive_verified(final)
+        self.shutdown_ready = True
+        self.refresh_heartbeat()
+
+    def milestones_at_risk(self, report: dict[str, Any]) -> dict[str, str] | None:
+        """Labels a stopped or failed run may hold only on the Pod: label to its first file's
+        SHA-256 (the weights' for the weights label); ``None`` when none is at risk.
+
+        Every label ``finalization.json`` lists is checked in R2 with the Mac's key, file by
+        file, through the bounded ``quick_store``; one found whole is secured. After an R2
+        failure (``r2_milestones_unverified``, ``r2_finalization``) the list must be readable.
+        """
+        recovery = report.get("failure") in RECOVERY_FAILURES
+        try:
+            finalization = self.read_finalization()
+        except Exception:
+            if recovery:
+                raise
+            finalization = {}
+        listed = posttrain_unverified(finalization)
+        self.at_risk_files = listed
+        settled = self.recovered.keys() | self.r2_unconfirmed
+        if not self.window_closed:
+            settled |= self.r2_unreachable
+        at_risk: dict[str, str] = {}
+        for label, files in listed.items():
+            if label in self.r2_secured:
+                continue
+            if label in settled or not self.secured_in_posttrain(label, files):
+                weights = dict(files).get("checkpoint.pt")
+                at_risk[label] = weights if weights is not None else files[0][1]
+        if not at_risk and not recovery:
+            return None
+        return at_risk
+
+    def secured_in_posttrain(self, label: str, files: Sequence[tuple[str, str]]) -> bool:
+        rows = []
+        for name, digest in files:
+            try:
+                rows.append(
+                    head_sha256(self.quick_store, f"{self.prefix}{label}/{name}", expected=digest)
+                )
+            except Exception as error:  # missing, mismatched or unreachable
+                self.r2_check_failed(label, error)
+                return False
+        self.r2_secured[label] = {"label": label, "files": rows}
+        return True
+
+    def secure(
+        self,
+        raw: bytes,
+        report: dict[str, Any],
+        heartbeat: dict[str, Any],
+        at_risk: dict[str, str],
+    ) -> None:
+        """Pull the weights label over SSH; any other label at risk needs a rescue by hand."""
+        files = self.at_risk_files
+        unpullable = [
+            label
+            for label in at_risk
+            if {name for name, _ in files.get(label, [])} != WEIGHTS_LABEL_FILES
+        ]
+        if unpullable:
+            self.fail_milestones(
+                at_risk,
+                f"{', '.join(sorted(unpullable))}: not carried by the verified SSH pull; copy "
+                "each listed file from the Pod's exports by hand and check its SHA-256",
+            )
+            return
+        activity = heartbeat.get("last_gpu_activity_unix")
+        for label in sorted(at_risk):
+            if label in self.recovered:
+                continue
+            if self.recover is None:
+                self.fail_milestones(at_risk, "no SSH pull is configured")
+                return
+            if (
+                not isinstance(activity, (int, float))
+                or isinstance(activity, bool)
+                or not 0 < activity < math.inf
+            ):
+                self.fail_milestones(at_risk, "the heartbeat carries no last GPU activity")
+                return
+            left = float(activity) + self.transfer_window_seconds - self.clock()
+            if left <= 0:
+                self.window_closed = True
+                self.fail_milestones(at_risk, "the watchdog's transfer window is over")
+                return
+            self.recovering = True
+            try:
+                bundle = self.recovery_root / label
+                if not bundle.exists():
+                    self.recovery_root.mkdir(parents=True, exist_ok=True)
+                    bundle = self.recover(f"exports/{label}", self.recovery_root, left)
+                row = verify_recovered(bundle, label=label, sha256=at_risk[label])
+            except Exception as error:
+                self.fail_milestones(at_risk, f"{label}: {type(error).__name__}: {error}")
+                return
+            finally:
+                self.recovering = False
+            self.recovered[label] = row
+        self.diagnose(
+            raw,
+            report,
+            recovery={
+                "failure": report.get("failure"),
+                "pulled_over_ssh": [self.recovered[label] for label in sorted(at_risk)],
+                "verified_in_r2_by_mac": [
+                    self.r2_secured[label] for label in sorted(self.r2_secured)
+                ],
+            },
+        )
+
+    def fail_milestones(self, at_risk: dict[str, str], detail: str) -> None:
+        listed = self.at_risk_files
+        record = {
+            "error_type": "MilestonesNotSecured",
+            "detail": (
+                "these labels are neither verified in R2 nor pulled to the Mac; teardown is "
+                "NOT approved and the watchdog's limits will end the Pod: " + detail
+            )[:2000],
+            "files": [
+                {
+                    "label": label,
+                    "pod_paths": [f"exports/{label}/{name}" for name, _ in listed.get(label, [])],
+                    "sha256": dict(listed.get(label, [])),
+                    "pulled": label in self.recovered,
+                }
+                for label in sorted(at_risk)
+            ],
+            "local_destination": str(self.recovery_root),
+            "recorded_unix": self.clock(),
+        }
+        atomic_json(self.root / MILESTONE_ERROR_FILE, record)
+        atomic_json(self.root / "controller-error.json", record)
+        if self.milestone_error is None or self.milestone_error["detail"] != record["detail"]:
+            print(
+                f"\n*** post-training run {self.run} Pod {self.pod_id}: LABELS NOT SECURED: "
+                f"{', '.join(sorted(at_risk))}\n*** {detail}\n*** see "
+                f"{self.root / MILESTONE_ERROR_FILE}\n",
+                file=sys.stderr,
+                flush=True,
+            )
+        self.milestone_error = record
+
+    def final_r2_check(self) -> dict[str, bool]:
+        """After supervision: check each unreachable label in R2 once more, for the record."""
+        pending = sorted(
+            self.r2_unreachable - self.r2_unconfirmed - self.r2_rechecked - self.r2_secured.keys()
+        )
+        listed = self.at_risk_files
+        checked: dict[str, bool] = {}
+        for label in pending:
+            self.r2_rechecked.add(label)
+            if label in listed:
+                checked[label] = self.secured_in_posttrain(label, listed[label])
+        return checked
+
+    def diagnose(
+        self, raw: bytes, report: dict[str, Any], *, recovery: dict[str, Any] | None = None
+    ) -> None:
+        directory = self.root / "diagnostics"
+        directory.mkdir(exist_ok=True)
+        (directory / "report.json").write_bytes(raw)
+        summary = posttrain_ops.run_summary(
+            report,
+            run=self.run,
+            pod_id=self.pod_id,
+            verification=None,
+            source="ssh-terminal-report",
+        )
+        try:
+            summary["r2_labels_present"] = sorted(
+                {
+                    str(item["key"])[len(self.prefix) :].split("/", 1)[0]
+                    for item in self.quick_store.objects()
+                    if str(item["key"]).startswith(self.prefix)
+                }
+            )
+        except Exception as error:  # recorded; diagnostics are archived regardless
+            summary["r2_listing_error"] = type(error).__name__
+        if recovery is not None:
+            summary["label_recovery"] = recovery
+        atomic_json(directory / "summary.json", summary)
+        self.summary, self.latest = summary, directory
+        self.archive_verified(directory)
+        self.shutdown_ready = True
+        self.milestone_error = None
+        self.refresh_heartbeat()
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The supervisor command line; the runbooks' commands are tested against it."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1194,11 +1481,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cycle-seconds", type=float, default=5.0)
     parser.add_argument(
         "--mode",
-        choices=("pilot", "rehearsal"),
+        choices=("pilot", "rehearsal", "posttrain"),
         default="pilot",
-        help="rehearsal: verify the final state in R2 instead of pulling checkpoints",
+        help="rehearsal or posttrain: verify the final state in R2 instead of pulling checkpoints",
     )
-    parser.add_argument("--run", choices=sorted(RUNS), help="the rehearsal run (A or B)")
+    parser.add_argument(
+        "--run",
+        choices=[*sorted(RUNS), *posttrain_ops.RUNS],
+        help="the rehearsal run (A or B) or the post-training run (1)",
+    )
     parser.add_argument(
         "--failure-grace-seconds",
         type=float,
@@ -1297,10 +1588,10 @@ def main(argv: list[str] | None = None) -> int:
     if not PurePosixPath(args.remote_root).is_absolute():
         parser.error("remote root must be absolute")
     ssh = _ssh_command(args.host, args.port, args.identity_file, args.known_hosts)
-    if args.mode == "rehearsal":
+    if args.mode in ("rehearsal", "posttrain"):
         return _rehearsal_main(args, parser, identity, policy, token, ssh)
     if args.run is not None:
-        parser.error("--run applies only to --mode rehearsal")
+        parser.error("--run applies only to --mode rehearsal or posttrain")
     supervisor = Supervisor(
         args.output,
         fetch=lambda name: fetch_status(ssh, args.remote_root, name),
@@ -1372,11 +1663,14 @@ def _rehearsal_main(
     token: str,
     ssh: list[str],
 ) -> int:
-    """Supervise one rehearsal Pod; nothing is pulled over SSH except bounded status files."""
-    if args.run is None:
-        parser.error("--mode rehearsal needs --run A or --run B")
-    if policy.mode != "rehearsal":
-        parser.error('a rehearsal supervisor needs a policy with "mode": "rehearsal"')
+    """Supervise one rehearsal or post-training Pod; nothing is pulled over SSH except bounded
+    status files and, to rescue them, unverified milestones."""
+    posttrain = args.mode == "posttrain"
+    runs = posttrain_ops.RUNS if posttrain else tuple(sorted(RUNS))
+    if args.run not in runs:
+        parser.error(f"--mode {args.mode} needs --run {' or --run '.join(runs)}")
+    if policy.mode != args.mode:
+        parser.error(f'a {args.mode} supervisor needs a policy with "mode": "{args.mode}"')
     if not 0 < args.failure_grace_seconds <= IDLE_SECONDS:
         parser.error(f"--failure-grace-seconds must be within the {IDLE_SECONDS}-second idle limit")
     try:
@@ -1388,7 +1682,8 @@ def _rehearsal_main(
     # The same key, bounded to 5 s per socket operation, for the checks the watchdog's
     # transfer window depends on: the mirror's listing and the at-risk HEADs.
     quick_store = bounded_store(credentials, timeout=MAC_CHECK_TIMEOUT_SECONDS)
-    root = f"rehearsal-runs/{args.run}"
+    root = f"{posttrain_ops.RUN_ROOT if posttrain else 'rehearsal-runs'}/{args.run}"
+    kind = "post-training" if posttrain else "rehearsal"
 
     def archive(bundle: Path) -> dict[str, Any]:
         return archive_bundle(
@@ -1397,7 +1692,7 @@ def _rehearsal_main(
             run_id=identity.pod_id,
             files=("report.json", "summary.json"),
             root=root,
-            message="Save rehearsal report and summary",
+            message=f"Save {kind} report and summary",
         )
 
     def recover(name: str, destination: Path, timeout: float) -> Path:
@@ -1415,7 +1710,7 @@ def _rehearsal_main(
             timeout=min(timeout, args.transfer_timeout),
         )
 
-    supervisor = RehearsalSupervisor(
+    supervisor = (PosttrainSupervisor if posttrain else RehearsalSupervisor)(
         args.output,
         run=args.run,
         pod_id=identity.pod_id,
@@ -1443,7 +1738,7 @@ def _rehearsal_main(
             time.sleep(args.cycle_seconds)
     else:
         print(
-            "rehearsal supervisor: no heartbeat over SSH; not started (the run's watchdog "
+            f"{kind} supervisor: no heartbeat over SSH; not started (the run's watchdog "
             "still guards the Pod)",
             file=sys.stderr,
         )
@@ -1470,7 +1765,7 @@ def _rehearsal_main(
     receipt = args.output / "watchdog-receipt.json"
     record: dict[str, Any] = {
         "schema_version": 1,
-        "kind": "rehearsal-supervisor-closing",
+        "kind": "posttrain-supervisor-closing" if posttrain else "rehearsal-supervisor-closing",
         "run": args.run,
         "pod_id": identity.pod_id,
         "shutdown_ready": supervisor.shutdown_ready,
@@ -1486,13 +1781,13 @@ def _rehearsal_main(
         "resolved_after_close"
     ):
         print(
-            f"rehearsal supervisor: run {args.run}: every milestone at risk was verified in R2 "
+            f"{kind} supervisor: run {args.run}: every milestone at risk was verified in R2 "
             f"by the Mac after supervision ended; see {args.output / MILESTONE_ERROR_FILE}",
             file=sys.stderr,
         )
     elif supervisor.milestone_error is not None:
         print(
-            f"rehearsal supervisor: run {args.run} ended with milestones NOT secured; see "
+            f"{kind} supervisor: run {args.run} ended with milestones NOT secured; see "
             f"{args.output / MILESTONE_ERROR_FILE}",
             file=sys.stderr,
         )
@@ -1504,7 +1799,7 @@ def _rehearsal_main(
             run_id=identity.pod_id,
             files=("summary.json",),
             root=root,
-            message="Save rehearsal closing record",
+            message=f"Save {kind} closing record",
         )
     except Exception as error:
         archive_failed = True
