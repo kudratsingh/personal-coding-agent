@@ -32,7 +32,7 @@ from test_mac_window_check import FakeAgent, FakeDocker
 from test_rl_bridge import lease_file, serve_in_thread, wait_until, write_request
 
 from scratchcoder.cli import main
-from scratchcoder.rl import bridge_command
+from scratchcoder.rl import bridge_command, bridge_mac
 from scratchcoder.rl.bridge import REWARD, BridgeRequest, RequestName
 from scratchcoder.rl.bridge_command import window_pass
 from scratchcoder.rl.bridge_mac import (
@@ -434,6 +434,32 @@ def test_a_restarted_bridge_keeps_every_earlier_receipt(tmp_path: Path) -> None:
     for name, data in before.items():
         assert (state / "window-checks" / name).read_bytes() == data
     assert rows[2]["bridge_pass"]["reason"] == "start"
+
+
+@pytest.mark.parametrize("kind", ["file", "dangling symlink"])
+def test_a_receipt_the_numbering_missed_stops_the_pass_and_is_left_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """The overwrite guard stands on its own: a scan that misses an earlier receipt (here
+    forced to 0) must not let the next pass write over it, whether it is a file or a link."""
+    pod, state, clock = tmp_path / "pod", tmp_path / "mac", FakeClock()
+    (pod / "outbox").mkdir(parents=True)
+    (pod / "inbox").mkdir()
+    existing = state / "window-checks" / "pass-00001.json"
+    existing.parent.mkdir(parents=True)
+    if kind == "file":
+        existing.write_bytes(b'{"status": "failed"}')
+    else:
+        existing.symlink_to(tmp_path / "missing.json")
+    monkeypatch.setattr(bridge_mac, "highest_window_pass", lambda _state: 0)
+    with server_for(pod, state, clock, window_check=Passes("passed")) as server:
+        with pytest.raises(WindowCheckFailed, match="never overwritten"):
+            server.serve(poll_seconds=0.0, max_polls=1, progress_seconds=None)
+    if kind == "file":
+        assert existing.read_bytes() == b'{"status": "failed"}'
+    else:
+        assert existing.is_symlink() and not existing.exists()
+    assert [path.name for path in existing.parent.iterdir()] == ["pass-00001.json"]
 
 
 def test_every_pass_asks_the_shell_agent_the_bridge_was_started_from(tmp_path: Path) -> None:
