@@ -1,0 +1,402 @@
+{
+  "schema_version": 1,
+  "kind": "posttrain-run-specification",
+  "run": "2",
+  "model": {
+    "vocab_size": 65536,
+    "width": 768,
+    "layers": 12,
+    "heads": 12,
+    "context": 1024,
+    "qk_norm": false
+  },
+  "limits": {
+    "ceiling_usd": null,
+    "quoted_gpu_hourly": 0.59,
+    "quoted_total_hourly": 0.6,
+    "self_destruct_margin_seconds": 180,
+    "watchdog_margin_usd": 0.01,
+    "mac_idle_seconds": 600,
+    "pod_idle_seconds": 900,
+    "max_transfer_seconds": 900,
+    "finalization_reserve_seconds": 900,
+    "startup_seconds": 900
+  },
+  "planning": {
+    "generation_tokens_per_second": {
+      "64": 5000.0,
+      "256": 10000.0
+    },
+    "training_slots_per_second": 56765.0,
+    "arc_seconds_per_checkpoint": 54,
+    "checkpoint_load_seconds": 20,
+    "weights_save_seconds": 5,
+    "reward_wait_seconds_per_update": 48,
+    "dev_wait_seconds_per_check": 300
+  },
+  "generation": {
+    "batch_size": 64,
+    "precision": "bfloat16"
+  },
+  "rl": {
+    "updates": 100,
+    "tasks_per_update": 32,
+    "group_size": 8,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "max_new_tokens": 256,
+    "learning_rate": 3e-06,
+    "warmup_updates": 5,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "adam_epsilon": 1e-08,
+    "weight_decay": 0.1,
+    "gradient_clip": 1.0,
+    "micro_batch": 16,
+    "generation_batch": 256,
+    "optimizer_foreach": true,
+    "shuffle_seed": 0,
+    "rollout_seed": 2199023255552,
+    "dev_checks": [
+      0,
+      12,
+      25,
+      50,
+      75,
+      100
+    ],
+    "patience": 3,
+    "collapse_distinct": 2.0,
+    "collapse_updates": 5,
+    "leakage_rate": 0.01,
+    "leakage_min_rewarded": 100,
+    "check_at_stop": true,
+    "check_at_external_stop": false,
+    "attention": "fused",
+    "dev_tasks": 200,
+    "dev_samples": 8,
+    "dev_batch_size": 64,
+    "min_tasks": 320
+  },
+  "control": {
+    "batch_size": 16,
+    "accumulation_steps": 2,
+    "learning_rate": 6e-05,
+    "warmup_updates": 10,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "adam_epsilon": 1e-08,
+    "weight_decay": 0.1,
+    "gradient_clip": 1.0,
+    "seed": 0,
+    "pass_checks": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "max_passes": 400,
+    "tolerance": 0.05,
+    "optimizer_foreach": true,
+    "check_at_stop": true,
+    "check_at_external_stop": false
+  },
+  "bridge": {
+    "root": "/workspace/posttrain-bridge",
+    "workers": 8,
+    "mac_poll_seconds": 2.0,
+    "pod_poll_seconds": 0.5,
+    "ssh_timeout_seconds": 120.0,
+    "ssh_list_timeout_seconds": 30.0,
+    "ssh_retries": 4,
+    "awaiting_slack_seconds": 60.0,
+    "reward_timeout_seconds": 6997.5,
+    "dev_timeout_seconds": 10889.5,
+    "mac_reward_timeout_seconds": 5600.0,
+    "mac_dev_timeout_seconds": 9492.0,
+    "awaiting_reward_extension_seconds": 7057.5,
+    "awaiting_dev_extension_seconds": 10949.5,
+    "wait_margin_seconds": 10889.5,
+    "lost_bridge_seconds": 600.0
+  },
+  "stages": [
+    {
+      "name": "rl",
+      "kind": "rl",
+      "parent": "sft-weights",
+      "tasks": "rl-tasks",
+      "dev": "rl-dev",
+      "facts": "rl-facts"
+    },
+    {
+      "name": "more-sft",
+      "kind": "more-sft",
+      "parent": "sft-weights",
+      "tasks": "rl-tasks",
+      "dev": "rl-dev",
+      "facts": "rl-facts"
+    },
+    {
+      "name": "arc-post",
+      "kind": "arc",
+      "checkpoints": [
+        "rl",
+        "more-sft"
+      ],
+      "questions": "arc-easy-test"
+    },
+    {
+      "name": "eval-rl",
+      "kind": "eval",
+      "checkpoint": "rl",
+      "files": [
+        {
+          "name": "pool-dev-greedy",
+          "suite": "pool",
+          "split": "dev",
+          "tasks": "pool-dev",
+          "protocol": "chat-v1",
+          "samples": 1,
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "seed": 0,
+          "planned_tasks": 2000
+        },
+        {
+          "name": "pool-dev-n8",
+          "suite": "pool",
+          "split": "dev",
+          "tasks": "pool-dev",
+          "protocol": "chat-v1",
+          "samples": 8,
+          "temperature": 0.8,
+          "top_p": 0.95,
+          "seed": 0,
+          "planned_tasks": 2000
+        },
+        {
+          "name": "pool-test-greedy",
+          "suite": "pool",
+          "split": "test",
+          "tasks": "pool-test",
+          "protocol": "chat-v1",
+          "samples": 1,
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "seed": 0,
+          "planned_tasks": 2000
+        },
+        {
+          "name": "pool-test-n8",
+          "suite": "pool",
+          "split": "test",
+          "tasks": "pool-test",
+          "protocol": "chat-v1",
+          "samples": 8,
+          "temperature": 0.8,
+          "top_p": 0.95,
+          "seed": 0,
+          "planned_tasks": 2000
+        },
+        {
+          "name": "humaneval-greedy",
+          "suite": "humaneval",
+          "split": "eval",
+          "tasks": "humaneval",
+          "protocol": "chat-v1",
+          "samples": 1,
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "seed": 0,
+          "planned_tasks": 164
+        },
+        {
+          "name": "humaneval-plus-greedy",
+          "suite": "humaneval-plus",
+          "split": "eval",
+          "tasks": "humaneval-plus",
+          "protocol": "chat-v1",
+          "samples": 1,
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "seed": 0,
+          "planned_tasks": 163
+        },
+        {
+          "name": "mbpp-plus-greedy",
+          "suite": "mbpp-plus",
+          "split": "eval",
+          "tasks": "mbpp-plus",
+          "protocol": "chat-v1",
+          "samples": 1,
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "seed": 0,
+          "planned_tasks": 378
+        }
+      ]
+    },
+    {
+      "name": "eval-more-sft",
+      "kind": "eval",
+      "checkpoint": "more-sft",
+      "files": [
+        {
+          "name": "pool-dev-greedy",
+          "suite": "pool",
+          "split": "dev",
+          "tasks": "pool-dev",
+          "protocol": "chat-v1",
+          "samples": 1,
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "seed": 0,
+          "planned_tasks": 2000
+        },
+        {
+          "name": "pool-dev-n8",
+          "suite": "pool",
+          "split": "dev",
+          "tasks": "pool-dev",
+          "protocol": "chat-v1",
+          "samples": 8,
+          "temperature": 0.8,
+          "top_p": 0.95,
+          "seed": 0,
+          "planned_tasks": 2000
+        },
+        {
+          "name": "pool-test-greedy",
+          "suite": "pool",
+          "split": "test",
+          "tasks": "pool-test",
+          "protocol": "chat-v1",
+          "samples": 1,
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "seed": 0,
+          "planned_tasks": 2000
+        },
+        {
+          "name": "pool-test-n8",
+          "suite": "pool",
+          "split": "test",
+          "tasks": "pool-test",
+          "protocol": "chat-v1",
+          "samples": 8,
+          "temperature": 0.8,
+          "top_p": 0.95,
+          "seed": 0,
+          "planned_tasks": 2000
+        },
+        {
+          "name": "humaneval-greedy",
+          "suite": "humaneval",
+          "split": "eval",
+          "tasks": "humaneval",
+          "protocol": "chat-v1",
+          "samples": 1,
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "seed": 0,
+          "planned_tasks": 164
+        },
+        {
+          "name": "humaneval-plus-greedy",
+          "suite": "humaneval-plus",
+          "split": "eval",
+          "tasks": "humaneval-plus",
+          "protocol": "chat-v1",
+          "samples": 1,
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "seed": 0,
+          "planned_tasks": 163
+        },
+        {
+          "name": "mbpp-plus-greedy",
+          "suite": "mbpp-plus",
+          "split": "eval",
+          "tasks": "mbpp-plus",
+          "protocol": "chat-v1",
+          "samples": 1,
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "seed": 0,
+          "planned_tasks": 378
+        }
+      ]
+    }
+  ],
+  "inputs": {
+    "tokenizer": {
+      "kind": "tokenizer",
+      "key": "rehearsal-s-20261025/tokenizer/tokenizer.json",
+      "size_bytes": 717466,
+      "sha256": "13e2eb08dc4930f645d5582b23f2b39a58c3735dbc264720b8c78fef1c21c23e"
+    },
+    "sft-weights": {
+      "kind": "checkpoint",
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    },
+    "rl-tasks": {
+      "kind": "rl-tasks",
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    },
+    "rl-dev": {
+      "kind": "rl-dev-tasks",
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    },
+    "rl-facts": {
+      "kind": "rl-facts",
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    },
+    "pool-dev": {
+      "kind": "pool-export",
+      "key": null,
+      "size_bytes": 3912528,
+      "sha256": "8e59c314a9918235ecff65ad3f2a82f684557d2f06bd2f6f9191a2e282a76045"
+    },
+    "pool-test": {
+      "kind": "pool-export",
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    },
+    "humaneval": {
+      "kind": "benchmark",
+      "key": null,
+      "size_bytes": 44877,
+      "sha256": "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef"
+    },
+    "humaneval-plus": {
+      "kind": "benchmark",
+      "key": null,
+      "size_bytes": 1350689,
+      "sha256": "daa7661c8189924068069b0872a440b491edb60f8bdf431d5957adc88d18bae5"
+    },
+    "mbpp-plus": {
+      "kind": "benchmark",
+      "key": null,
+      "size_bytes": 549938,
+      "sha256": "7a5aec547b134fa297ee6c45f829298aa3f58de02547b8d8a5c3d85d9cb10efc"
+    },
+    "arc-easy-test": {
+      "kind": "arc-export",
+      "key": null,
+      "size_bytes": 1090258,
+      "sha256": "56fd1ec0da7497b3399cb6e3f2f0900887f236eba4c9414bc4271f4702b82870"
+    }
+  },
+  "r2": {
+    "storage_cap_usd_per_month": 5.0
+  }
+}

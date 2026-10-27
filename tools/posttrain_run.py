@@ -1,4 +1,4 @@
-"""Post-training worker for rehearsal run 1 on one existing Pod; never provisions.
+"""Post-training worker for rehearsal runs 1 and 2 on one existing Pod; never provisions.
 
 ``run`` (Pod)
     Check the readiness receipt that ``python -m tools.pilot_readiness_receipt posttrain``
@@ -19,8 +19,24 @@
 
     Then the pretraining rehearsal's finalization: drain, HEAD checks, ``report.json`` and
     ``r2_final``.
+
+    Run 2 (RL with the Mac in the loop, the more-SFT control and their evaluation) runs:
+
+    1. ``rl``: ``run_rl`` from run 1's selected SFT weights on the withheld kept tasks, its
+       rewards and dev verdicts from the Mac through the reward bridge
+       (``BridgeRewardSource``, ``BridgeDevEvaluator``), each dev check's weights uploaded
+       at once. A reward-wait timeout, a lost bridge or a margin stop ends the run (the
+       control needs the bridge too); collapse, patience, leakage or completion is a result.
+    2. ``more-sft``: ``run_more_sft`` from the same SFT weights on the kept tasks' references,
+       its GPU-busy budget RL's measured busy seconds, its dev checks through the bridge.
+    3. ``arc-post``: ARC-Easy on the RL-selected and the control-selected checkpoints.
+    4. ``eval-rl``, ``eval-more-sft``: the seven completions files of each (chat-v1).
+
+    While the bridge client waits the heartbeat reads ``awaiting_rewards``, and a Mac lease
+    renewed on the Pod counts as progress for the in-Pod idle rule (``RUN2_LIVENESS``).
 ``smoke`` (CPU)
-    Run 1 end to end on a tiny model, fixture tasks and an in-memory bucket.
+    Run 1 (or, with ``--run 2``, run 2 with a Mac bridge server thread) end to end on a tiny
+    model, fixture tasks and an in-memory bucket.
 
 Every stage start checks the wall, cost and idle limits and applies the projected-finish
 rule (``PROJECTED_FINISH_RULE``); during a stage the worker stops at the finalization reserve
@@ -76,7 +92,9 @@ from scratchcoder.eval.tasks import load_tasks
 from scratchcoder.model.gpt import GPT
 from scratchcoder.rl.attempts import ScreeningHeader, write_attempts
 from scratchcoder.rl.checkpoint import save_weights
-from scratchcoder.rl.rollout import screening_rollouts
+from scratchcoder.rl.control import ControlConfig
+from scratchcoder.rl.loop import RLConfig
+from scratchcoder.rl.rollout import DEV_TOKENS, screening_rollouts
 from scratchcoder.tokenizer.bpe import ByteBPE
 from scratchcoder.tokenizer.bulk import FastEncoder
 from scratchcoder.train.pilot import PilotStop
@@ -104,15 +122,29 @@ SCHEMA_VERSION = 1
 SPECIFICATION_KIND = "posttrain-run-specification"
 REPORT_KIND = posttrain_ops.REPORT_KIND
 DEFAULT_REVISION = Path("/workspace/posttrain/revision.json")
-STAGE_KINDS = ("probe", "arc", "eval", "sft", "screen")
-"""Run 1's stage kinds, each run by ``PosttrainWorker.run_<kind>``. Run 2 adds ``rl``,
-``more-sft`` and their ``eval`` stages on the same machinery."""
+STAGE_KINDS = ("probe", "arc", "eval", "sft", "screen", "rl", "more-sft")
+"""The stage kinds, each run by ``PosttrainWorker.run_<kind>`` (``-`` read as ``_``): run 1's
+first five, and run 2's ``rl`` and ``more-sft`` (its ARC and evaluation stages are ``arc``
+and ``eval`` stages of the selected checkpoints)."""
 CHECKPOINT_KINDS = frozenset({"checkpoint"})
 SFT_REFERENCE = "sft"
 """A stage's checkpoint reference to the weights the ``sft`` stage selected."""
+RL_REFERENCE = "rl"
+CONTROL_REFERENCE = "more-sft"
+PRODUCED_REFERENCES = {"sft": SFT_REFERENCE, "rl": RL_REFERENCE, "more-sft": CONTROL_REFERENCE}
+"""The checkpoint reference each producing stage kind selects: a later stage names it in
+place of an input (the SFT stage's lowest dev loss; RL's and the control's selected check)."""
 PROBE_STOP = "generation_below_planning_speed"
 SPEED_STOP = "sft_throughput_below_limit"
 PROJECTED_STOP = "projected_finish_after_deadline"
+WAIT_MARGIN_STOP = "wait_margin"
+"""Run 2: the next bridge wait would pass the cost stop, the wall or the finalization reserve.
+``should_stop`` is not read during a wait, so the worker stops before one while the time and
+money for one full wait (``BridgeTimeouts.wait_margin_seconds``) are not left; unlike the wall
+and cost stops it finalizes in full."""
+BRIDGE_LOST_STOP = "bridge_lost"
+"""Run 2: a wait whose Mac lease stayed stale for ``lost_bridge_seconds`` was given up, before
+the in-Pod idle rule deletes the Pod, so the latest weights and the report still reach R2."""
 RESERVE_STOP = "finalization_reserve"
 """A stage still running when only the finalization reserve is left stops here. Unlike the
 wall and cost stops it finalizes in full: the drain, the HEAD checks, ``report.json`` and the
@@ -232,7 +264,101 @@ STAGE_KEYS = {
     "sft": {"name", "kind", "parent", "train", "dev"},
     "screen": {"name", "kind", "checkpoint", "tasks", "candidates"},
 }
+RUN2_TOP_KEYS = {
+    "schema_version",
+    "kind",
+    "run",
+    "model",
+    "limits",
+    "planning",
+    "generation",
+    "rl",
+    "control",
+    "bridge",
+    "stages",
+    "inputs",
+    "r2",
+}
+RUN2_PLANNING_KEYS = {
+    "generation_tokens_per_second",
+    "training_slots_per_second",
+    "arc_seconds_per_checkpoint",
+    "checkpoint_load_seconds",
+    "weights_save_seconds",
+    "reward_wait_seconds_per_update",
+    "dev_wait_seconds_per_check",
+}
+"""Run 2's planning rates: generation by batch size (the evaluation batch, RL's rollout batch
+and its dev-check batch), training slots, ARC, loads and saves, and the Mac's time: one
+update's reward wait and one dev check's wait."""
+RL_CONFIG_KEYS = tuple(name for name in RLConfig.__dataclass_fields__)
+RL_KEYS = {*RL_CONFIG_KEYS, "attention", "dev_tasks", "dev_samples", "dev_batch_size", "min_tasks"}
+"""The RL protocol: every ``RLConfig`` setting, the trained model's attention kernel, the dev
+subset (its size, samples and generation batch) and the fewest kept tasks the run accepts."""
+CONTROL_CONFIG_KEYS = tuple(
+    name
+    for name in ControlConfig.__dataclass_fields__
+    if name not in {"attention", "sequence_length"}
+)
+CONTROL_KEYS = set(CONTROL_CONFIG_KEYS)
+"""The control's ``ControlConfig`` settings; its attention kernel is RL's (``RLResult.attention``)
+and its rows use the model's whole context."""
+BRIDGE_STAGE_KEYS = {"name", "kind", "parent", "tasks", "dev", "facts"}
+RUN2_STAGE_KEYS = {
+    "rl": BRIDGE_STAGE_KEYS,
+    "more-sft": BRIDGE_STAGE_KEYS,
+    "arc": STAGE_KEYS["arc"],
+    "eval": STAGE_KEYS["eval"],
+}
+RUN2_GATE_FIELDS: tuple[tuple[str, ...], ...] = (
+    ("limits", "ceiling_usd"),
+    ("inputs", "sft-weights", "key"),
+    ("inputs", "sft-weights", "size_bytes"),
+    ("inputs", "sft-weights", "sha256"),
+    ("inputs", "rl-tasks", "size_bytes"),
+    ("inputs", "rl-tasks", "sha256"),
+    ("inputs", "rl-dev", "size_bytes"),
+    ("inputs", "rl-dev", "sha256"),
+    ("inputs", "rl-facts", "size_bytes"),
+    ("inputs", "rl-facts", "sha256"),
+    ("inputs", "pool-test", "size_bytes"),
+    ("inputs", "pool-test", "sha256"),
+)
+"""Run 2's values fixed at the owner's gate, ``null`` in the tracked specification: the ceiling
+(re-priced from run 1's measured rates), run 1's selected SFT weights (key, size, SHA-256),
+the three ``rl-pod-export`` files and the pool test export. The worker and the readiness
+receipt refuse a specification in which any is still ``null``."""
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,47}\Z")
+
+
+def gate_nulls(raw: Mapping[str, Any]) -> list[str]:
+    """The run-2 gate fields (``RUN2_GATE_FIELDS``) still ``null`` in ``raw``, dotted."""
+    missing = []
+    for path in RUN2_GATE_FIELDS:
+        value: Any = raw
+        for key in path:
+            value = value.get(key) if isinstance(value, Mapping) else None
+        if value is None:
+            missing.append(".".join(path))
+    return missing
+
+
+def rl_config_of(rl: Mapping[str, Any]) -> RLConfig:
+    """``RLConfig`` from a specification's ``rl`` section (its rules are ``RLConfig``'s)."""
+    values = {name: rl[name] for name in RL_CONFIG_KEYS}
+    if not isinstance(values["dev_checks"], list | tuple):
+        raise ValueError("rl.dev_checks must be a list of update numbers")
+    values["dev_checks"] = tuple(values["dev_checks"])
+    return RLConfig(**values)
+
+
+def control_config_of(control: Mapping[str, Any], *, attention: str) -> ControlConfig:
+    """``ControlConfig`` from a specification's ``control`` section and RL's attention kernel."""
+    values = {name: control[name] for name in CONTROL_CONFIG_KEYS}
+    if not isinstance(values["pass_checks"], list | tuple):
+        raise ValueError("control.pass_checks must be a list of pass counts")
+    values["pass_checks"] = tuple(values["pass_checks"])
+    return ControlConfig(**values, attention=attention)
 
 
 def _exact(value: Any, keys: set[str], name: str) -> dict[str, Any]:
@@ -328,7 +454,7 @@ class StagePlan:
     def checkpoint_references(self) -> list[str]:
         if self.kind == "arc":
             return list(self.settings["checkpoints"])
-        if self.kind == "sft":
+        if self.kind in ("sft", "rl", "more-sft"):
             return [self.settings["parent"]]
         return [self.settings["checkpoint"]]
 
@@ -347,10 +473,29 @@ class Specification:
     inputs: Mapping[str, Mapping[str, Any]]
     r2: Mapping[str, Any]
     raw: Mapping[str, Any] = field(repr=False, compare=False, default_factory=dict)
+    rl: Mapping[str, Any] = field(default_factory=dict)
+    """Run 2's RL protocol (``RL_KEYS``); empty for run 1."""
+    control: Mapping[str, Any] = field(default_factory=dict)
+    """Run 2's more-SFT control settings (``CONTROL_KEYS``); empty for run 1."""
+    bridge: Mapping[str, Any] = field(default_factory=dict)
+    """Run 2's reward bridge (``posttrain_ops.BRIDGE_KEYS``); empty for run 1."""
 
     @property
     def ceiling(self) -> posttrain_ops.CeilingLimits:
         return posttrain_ops.specification_limits(self.raw)
+
+    @property
+    def bridge_timeouts(self) -> posttrain_ops.BridgeTimeouts | None:
+        """Run 2's derived wait bounds; ``None`` for a run without the bridge."""
+        return posttrain_ops.specification_bridge_timeouts(self.raw)
+
+    def rl_config(self) -> RLConfig:
+        """The ``RLConfig`` of run 2's protocol."""
+        return rl_config_of(self.rl)
+
+    def control_config(self, *, attention: str) -> ControlConfig:
+        """The control's ``ControlConfig``, with RL's attention kernel."""
+        return control_config_of(self.control, attention=attention)
 
     @property
     def max_transfer_seconds(self) -> float:
@@ -390,7 +535,11 @@ class Specification:
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     @classmethod
-    def from_dict(cls, raw: Any) -> Specification:
+    def from_dict(cls, raw: Any, *, allow_gate_nulls: bool = False) -> Specification:
+        """Parse a specification. Run 2's gate values must all be filled unless
+        ``allow_gate_nulls`` (the cost projection of the tracked template only)."""
+        if isinstance(raw, dict) and raw.get("run") == "2":
+            return cls._from_run2(raw, allow_gate_nulls=allow_gate_nulls)
         top = _exact(raw, TOP_KEYS, "the specification")
         if top["schema_version"] != SCHEMA_VERSION or top["kind"] != SPECIFICATION_KIND:
             raise ValueError("not a post-training run specification of this schema")
@@ -486,12 +635,108 @@ class Specification:
             raw=json.loads(json.dumps(top)),
         )
 
+    @classmethod
+    def _from_run2(cls, raw: dict[str, Any], *, allow_gate_nulls: bool) -> Specification:
+        """Run 2: RL, the more-SFT control, ARC and evaluation of both selected checkpoints."""
+        top = _exact(raw, RUN2_TOP_KEYS, "the run-2 specification")
+        if top["schema_version"] != SCHEMA_VERSION or top["kind"] != SPECIFICATION_KIND:
+            raise ValueError("not a post-training run specification of this schema")
+        missing = gate_nulls(top)
+        if missing and not allow_gate_nulls:
+            raise ValueError(
+                f"run 2's gate values are still null: {missing}; they are fixed at the owner's "
+                "gate (python -m tools.posttrain_approved run2-gate)"
+            )
+        model = ModelConfig(**_exact(top["model"], set(ModelConfig.__dataclass_fields__), "model"))
+        limits = posttrain_ops.read_limits(top["limits"], allow_null=("ceiling_usd",))
+        if top["limits"]["ceiling_usd"] is not None:
+            posttrain_ops.specification_limits(top)  # The derived limits must exist.
+        planning = _exact(top["planning"], RUN2_PLANNING_KEYS, "planning")
+        rates = _rates(planning["generation_tokens_per_second"], "planning rates")
+        for name in RUN2_PLANNING_KEYS - {"generation_tokens_per_second"}:
+            _positive(planning[name], f"planning.{name}")
+        generation = _exact(top["generation"], GENERATION_KEYS, "generation")
+        rl = _exact(top["rl"], RL_KEYS, "rl")
+        control = _exact(top["control"], CONTROL_KEYS, "control")
+        for name in ("dev_tasks", "dev_samples", "dev_batch_size", "min_tasks"):
+            _count(rl[name], f"rl.{name}")
+        if rl["attention"] not in ("reference", "fused"):
+            raise ValueError("rl.attention must be reference or fused")
+        rl_config_of(rl)  # Every RLConfig rule holds.
+        control_config_of(control, attention=str(rl["attention"]))
+        for batch in (generation["batch_size"], rl["generation_batch"], rl["dev_batch_size"]):
+            if batch not in rates:
+                raise ValueError(f"generation batch {batch} has no planning rate")
+        if generation["precision"] not in ("float32", "bfloat16"):
+            raise ValueError("generation.precision must be float32 or bfloat16")
+        if rl["max_new_tokens"] >= model.context:
+            raise ValueError("RL rollouts must leave room for a prompt in the model context")
+        bridge = top["bridge"]
+        posttrain_ops.specification_bridge_timeouts(top)  # Every bound equals its derivation.
+        if not isinstance(bridge["root"], str) or not bridge["root"].startswith("/"):
+            raise ValueError("bridge.root must be an absolute Pod path")
+        inputs = top["inputs"]
+        if not isinstance(inputs, dict) or not inputs:
+            raise ValueError("the specification must list its inputs")
+        for name, pin in inputs.items():
+            _exact(pin, INPUT_PIN_KEYS, f"input {name}")
+            if not posttrain_binding.NAME.fullmatch(name):
+                raise ValueError(f"input name {name!r} is not plain")
+            if pin["kind"] not in posttrain_binding.INPUT_KINDS:
+                raise ValueError(f"input {name} has an unknown kind")
+        stages = tuple(cls._stage(item, inputs, RUN2_STAGE_KEYS) for item in top["stages"])
+        names = [stage.name for stage in stages]
+        if len(set(names)) != len(names) or not stages:
+            raise ValueError("stage names must be unique and the stage list nonempty")
+        kinds = [stage.kind for stage in stages]
+        if kinds.count("rl") != 1 or kinds[0] != "rl" or kinds.count("more-sft") > 1:
+            raise ValueError("run 2 starts with its one rl stage and has at most one control")
+        first = stages[0].settings
+        produced: set[str] = set()
+        for stage in stages:
+            for reference in stage.checkpoint_references():
+                if reference in PRODUCED_REFERENCES.values() and reference not in produced:
+                    raise ValueError(
+                        f"{stage.name} reads the {reference} weights before they exist"
+                    )
+            if stage.kind == "more-sft":
+                same = {key: stage.settings[key] for key in ("parent", "tasks", "dev", "facts")}
+                if same != {key: first[key] for key in same}:
+                    raise ValueError(
+                        "the control starts from RL's parent, tasks, dev set and facts"
+                    )
+            if stage.kind in PRODUCED_REFERENCES:
+                produced.add(PRODUCED_REFERENCES[stage.kind])
+        r2 = _exact(top["r2"], {"storage_cap_usd_per_month"}, "r2")
+        _positive(r2["storage_cap_usd_per_month"], "r2.storage_cap_usd_per_month")
+        return cls(
+            run=top["run"],
+            model=model,
+            limits=limits,
+            planning=planning,
+            probe={},
+            generation=generation,
+            sft={},
+            screening={},
+            stages=stages,
+            inputs=inputs,
+            r2=r2,
+            raw=json.loads(json.dumps(top)),
+            rl=rl,
+            control=control,
+            bridge=bridge,
+        )
+
     @staticmethod
-    def _stage(item: Any, inputs: Mapping[str, Any]) -> StagePlan:
-        if not isinstance(item, dict) or item.get("kind") not in STAGE_KEYS:
-            raise ValueError(f"a stage needs a kind among {sorted(STAGE_KEYS)}")
+    def _stage(
+        item: Any,
+        inputs: Mapping[str, Any],
+        allowed: Mapping[str, set[str]] = STAGE_KEYS,
+    ) -> StagePlan:
+        if not isinstance(item, dict) or item.get("kind") not in allowed:
+            raise ValueError(f"a stage needs a kind among {sorted(allowed)}")
         kind = item["kind"]
-        settings = dict(_exact(item, STAGE_KEYS[kind], f"stage {item.get('name')}"))
+        settings = dict(_exact(item, allowed[kind], f"stage {item.get('name')}"))
         if not isinstance(settings["name"], str) or not _NAME.fullmatch(settings["name"]):
             raise ValueError("a stage needs a plain name")
 
@@ -500,7 +745,10 @@ class Specification:
                 raise ValueError(f"stage {settings['name']}: {reference!r} is not a {kinds} input")
 
         def checkpoint(reference: Any) -> None:
-            if reference != SFT_REFERENCE:
+            produced = (
+                (SFT_REFERENCE,) if allowed is STAGE_KEYS else (RL_REFERENCE, CONTROL_REFERENCE)
+            )
+            if reference not in produced:
                 input_of(reference, CHECKPOINT_KINDS)
 
         if kind == "probe":
@@ -534,6 +782,11 @@ class Specification:
                 raise ValueError("the sft stage lists its dev sets")
             for reference in dev:
                 input_of(reference, {"sft-rows"})
+        elif kind in ("rl", "more-sft"):
+            input_of(settings["parent"], CHECKPOINT_KINDS)
+            input_of(settings["tasks"], {"rl-tasks"})
+            input_of(settings["dev"], {"rl-dev-tasks"})
+            input_of(settings["facts"], {"rl-facts"})
         else:
             checkpoint(settings["checkpoint"])
             input_of(settings["tasks"], {"candidates-export"})
@@ -557,11 +810,47 @@ class Rates:
     compile_seconds: float
     weights_save_seconds: float
     basis: Mapping[str, str] = field(default_factory=dict)
+    rollout_tokens_per_second: float | None = None
+    """Run 2: RL rollout generation at its batch (256), priced at the token cap."""
+    dev_generation_tokens_per_second: float | None = None
+    """Run 2: dev-check generation at its batch, priced at the token cap."""
+    reward_wait_seconds_per_update: float | None = None
+    dev_wait_seconds_per_check: float | None = None
+    """Run 2: the Mac's time for one update's rewards and one dev check's verdicts."""
+    rl_busy_seconds: float | None = None
+    """Run 2: RL's measured GPU-busy seconds, the control's budget, once RL has run."""
+
+    def recorded(self) -> dict[str, float]:
+        """The rates as a report records them (run 1's keys only for run 1)."""
+        return {
+            key: value
+            for key, value in asdict(self).items()
+            if key != "basis" and value is not None
+        }
 
     @classmethod
     def planning(cls, spec: Specification) -> Rates:
         plan = spec.planning
         generation = _rates(plan["generation_tokens_per_second"], "planning rates")
+        if spec.run == "2":
+            return cls(
+                generation_tokens_per_second=generation[spec.generation_batch],
+                training_slots_per_second=float(plan["training_slots_per_second"]),
+                forward_tokens_per_second=0.0,
+                arc_seconds_per_checkpoint=float(plan["arc_seconds_per_checkpoint"]),
+                checkpoint_load_seconds=float(plan["checkpoint_load_seconds"]),
+                probe_seconds=0.0,
+                compile_seconds=0.0,
+                weights_save_seconds=float(plan["weights_save_seconds"]),
+                basis={
+                    name: "planning"
+                    for name in ("generation", "training", "arc", "rollout", "dev", "mac")
+                },
+                rollout_tokens_per_second=generation[int(spec.rl["generation_batch"])],
+                dev_generation_tokens_per_second=generation[int(spec.rl["dev_batch_size"])],
+                reward_wait_seconds_per_update=float(plan["reward_wait_seconds_per_update"]),
+                dev_wait_seconds_per_check=float(plan["dev_wait_seconds_per_check"]),
+            )
         return cls(
             generation_tokens_per_second=generation[spec.generation_batch],
             training_slots_per_second=float(plan["training_slots_per_second"]),
@@ -575,9 +864,60 @@ class Rates:
         )
 
 
+def rl_parts(spec: Specification, rates: Rates) -> dict[str, float]:
+    """Run 2's RL stage at ``rates``, part by part (the proposal's rows), at the token caps.
+
+    Rollouts: updates x tasks x G attempts at the rollout cap; training: the same attempts as
+    whole-context slots; reward waits: one per update; dev checks: each the subset's greedy and
+    sampled programs at the 512-token cap, its Mac wait and its weights save."""
+    rl = spec.rl
+    attempts = int(rl["updates"]) * int(rl["tasks_per_update"]) * int(rl["group_size"])
+    checks = len(rl["dev_checks"])
+    assert rates.rollout_tokens_per_second and rates.reward_wait_seconds_per_update is not None
+    return {
+        "load": rates.checkpoint_load_seconds,
+        "rollouts": attempts * int(rl["max_new_tokens"]) / rates.rollout_tokens_per_second,
+        "training": attempts * spec.model.context / rates.training_slots_per_second,
+        "reward_waits": int(rl["updates"]) * rates.reward_wait_seconds_per_update,
+        "dev_generation": checks * dev_check_generation_seconds(spec, rates),
+        "dev_waits": checks * float(rates.dev_wait_seconds_per_check or 0.0),
+        "saves": checks * rates.weights_save_seconds,
+    }
+
+
+def dev_check_generation_seconds(spec: Specification, rates: Rates) -> float:
+    """One dev check's generation: greedy plus the samples of every subset task at the cap."""
+    programs = int(spec.rl["dev_tasks"]) * (int(spec.rl["dev_samples"]) + 1)
+    assert rates.dev_generation_tokens_per_second
+    return programs * DEV_TOKENS / rates.dev_generation_tokens_per_second
+
+
+def control_parts(spec: Specification, rates: Rates) -> dict[str, float]:
+    """Run 2's control at ``rates``: its budget (RL's busy seconds, planned or measured) and
+    its checks after 1, 2, 4 and 8 passes and at the budget's end (the start is RL's)."""
+    parts = rl_parts(spec, rates)
+    busy = (
+        parts["rollouts"] + parts["training"]
+        if rates.rl_busy_seconds is None
+        else rates.rl_busy_seconds
+    )
+    checks = len(spec.control["pass_checks"]) + 1
+    return {
+        "load": rates.checkpoint_load_seconds,
+        "training": busy,
+        "dev_generation": checks * dev_check_generation_seconds(spec, rates),
+        "dev_waits": checks * float(rates.dev_wait_seconds_per_check or 0.0),
+        "saves": checks * rates.weights_save_seconds,
+    }
+
+
 def stage_seconds(spec: Specification, stage: StagePlan, rates: Rates) -> float:
     """One stage's planned seconds at ``rates``; generation is priced at the token caps."""
     load = rates.checkpoint_load_seconds
+    if stage.kind == "rl":
+        return math.fsum(rl_parts(spec, rates).values())
+    if stage.kind == "more-sft":
+        return math.fsum(control_parts(spec, rates).values())
     if stage.kind == "probe":
         return rates.probe_seconds
     if stage.kind == "arc":
@@ -614,7 +954,7 @@ def planned_seconds(
         "stages": parts,
         "finalization_reserve_seconds": reserve,
         "total_seconds": math.fsum(parts.values()) + reserve,
-        "rates": {key: value for key, value in asdict(rates).items() if key != "basis"},
+        "rates": rates.recorded(),
         "basis": dict(rates.basis),
     }
 
@@ -676,6 +1016,21 @@ def check_policy(policy: Policy, spec: Specification) -> None:
         raise ValueError("the watchdog policy is weaker than the ceiling-derived limits")
     if policy.max_transfer_seconds != spec.max_transfer_seconds:
         raise ValueError("the watchdog's transfer window differs from the specification's")
+    # Run 2's bounded idle extension while the Pod awaits the Mac is exactly the derived
+    # bound (the Pod's own timeout for that wait plus the slack): more would let a hung worker
+    # idle longer, less would delete the Pod during a legitimate wait. Run 1 waits on nothing
+    # and has none.
+    bridge = spec.bridge_timeouts
+    for kind, granted in (
+        ("reward", policy.awaiting_reward_extension_seconds),
+        ("dev", policy.awaiting_dev_extension_seconds),
+    ):
+        bound = 0.0 if bridge is None else bridge.extension(kind)
+        if granted != bound:
+            raise ValueError(
+                f"the watchdog's {kind}-wait idle extension ({granted:g} s) is not the derived "
+                f"bound ({bound:g} s)"
+            )
 
 
 def check_self_destruct(receipt: Mapping[str, Any], spec: Specification, *, heartbeat: str) -> None:
@@ -1105,8 +1460,17 @@ class PosttrainWorker(Worker):
             value["r2_final"] = self.r2_final
         if not self.uploading and "failure" in self.report:
             value["failure"] = self.report["failure"]
+        self.heartbeat_fields(value)
         self.write_json(self.root / "heartbeat.json", value, limit=MAX_HEARTBEAT_BYTES)
         self.last_heartbeat = self.clock()
+
+    def heartbeat_fields(self, value: dict[str, Any]) -> None:
+        """A hook for a run's own heartbeat fields (run 2's ``awaiting_rewards``); run 1 adds
+        none."""
+
+    def before_finalize(self) -> None:
+        """A hook for labels made just before the finalization (run 2's bridge directories);
+        run 1 has none."""
 
     # Limits -----------------------------------------------------------------------------
 
@@ -1725,7 +2089,9 @@ class PosttrainWorker(Worker):
         record.update(status="running", started_unix=started)
         self.publish()
         self.heartbeat()
-        runner: Callable[[StagePlan], list[dict[str, Any]]] = getattr(self, f"run_{stage.kind}")
+        runner: Callable[[StagePlan], list[dict[str, Any]]] = getattr(
+            self, "run_" + stage.kind.replace("-", "_")
+        )
         outputs = runner(stage)
         if outputs != record["outputs"]:
             raise RuntimeError(f"stage {stage.name}'s outputs differ from its exported labels")
@@ -1790,6 +2156,7 @@ class PosttrainWorker(Worker):
                 if record["status"] == "pending":
                     record["status"] = "skipped"
             self.account()
+            self.before_finalize()
             self.finalize()
             self.release()
         return self.report
@@ -1806,10 +2173,7 @@ class PosttrainWorker(Worker):
             "ceiling_usd": self.plan.ceiling.ceiling_usd,
             "basis": "quoted rate times Pod lifetime; reconcile with provider billing",
         }
-        self.report["rates"] = {
-            **{key: value for key, value in asdict(self.rates).items() if key != "basis"},
-            "basis": dict(self.rates.basis),
-        }
+        self.report["rates"] = {**self.rates.recorded(), "basis": dict(self.rates.basis)}
         self.report["generated_tokens"] = self.generated_tokens
         self.report["timings"].update(ended_unix=now)
         self.report["ended_at"] = utc_now()
@@ -1859,7 +2223,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     verified = posttrain_binding.verify(binding, args.root)
     inputs = {name: Path(path) for name, path in verified["paths"].items()}
     limits = RunLimits.of(spec, pod_seconds=launch.end - launch.origin)
-    worker = PosttrainWorker(
+    worker_class: type[PosttrainWorker] = PosttrainWorker
+    if spec.run == "2":
+        from tools.posttrain_run2 import Run2Worker
+
+        worker_class = Run2Worker
+    worker = worker_class(
         spec,
         args.output,
         inputs=inputs,
@@ -1894,10 +2263,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_parser.add_argument(f"--{name}", type=Path, required=True)
     run_parser.add_argument("--binding-sha256", required=True)
     run_parser.add_argument("--revision", type=Path, default=DEFAULT_REVISION)
-    smoke_parser = commands.add_parser("smoke", help="run 1 end to end on tiny fixtures, CPU")
+    smoke_parser = commands.add_parser("smoke", help="run 1 or 2 end to end on tiny fixtures, CPU")
     smoke_parser.add_argument("--output", type=Path, required=True)
+    smoke_parser.add_argument(
+        "--run", choices=posttrain_ops.RUNS, default="1", help="1 (default) or 2"
+    )
     args = parser.parse_args(argv)
     if args.command == "smoke":
+        if args.run == "2":
+            from tools.posttrain_smoke2 import smoke as smoke2
+
+            print(json.dumps(smoke2(args.output), indent=1, sort_keys=True))
+            return 0
         from tools.posttrain_smoke import smoke
 
         print(json.dumps(smoke(args.output), indent=1, sort_keys=True))
