@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-COMMANDS = ("eval-generate",)
+COMMANDS = ("eval-generate", "eval-baseline")
 
 
 def _print(value: dict[str, Any]) -> None:
@@ -35,6 +35,13 @@ def add_parsers(subparsers: Any) -> None:
     generate.add_argument("--top-p", type=float, default=1.0)
     generate.add_argument("--top-k", type=int)
     generate.add_argument("--seed", type=int, default=0)
+    baseline = subparsers.add_parser(
+        "eval-baseline",
+        help="constant-answer baseline of the pool dev split (the test split is sealed)",
+    )
+    baseline.add_argument("--tasks", type=Path, required=True, help="pool dev JSONL")
+    baseline.add_argument("--output", type=Path, required=True, help="new JSON file")
+    baseline.add_argument("--workers", type=int, default=8)
 
 
 def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -76,5 +83,14 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 "generation_seconds": header.generation_seconds,
             }
         )
+        return 0
+    if args.command == "eval-baseline":
+        from scratchcoder.eval.baseline import pool_baseline_report, save_baseline
+
+        if args.output.exists():
+            parser.error("--output must be a new file")
+        report = pool_baseline_report(args.tasks, split="dev", workers=args.workers)
+        save_baseline(args.output, report)
+        _print({"baseline": str(args.output), **report["summary"]})
         return 0
     raise ValueError(f"unknown pipeline command {args.command}")
