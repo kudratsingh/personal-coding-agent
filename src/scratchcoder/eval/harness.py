@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
@@ -12,7 +13,15 @@ from typing import Any
 from scratchcoder.common.records import atomic_json, git_state, utc_now
 from scratchcoder.eval.metrics import mean_pass_rate, paired_bootstrap, pass_at_k
 from scratchcoder.eval.tasks import Task
-from scratchcoder.sandbox.runner import Result, run
+from scratchcoder.sandbox.budget import io_seconds
+from scratchcoder.sandbox.runner import Limits, Result, run
+
+SCORED_STATUSES = frozenset({"passed", "failed", "timeout", "output_limit", "resource_limit"})
+"""Runner statuses that are a verdict on the candidate. Anything else is a host failure."""
+HOST_RETRIES = 3
+"""How many times a host failure is retried before the attempt is given up as unresolved."""
+HOST_BACKOFF_SECONDS = 2.0
+HOST_BACKOFF_MAX_SECONDS = 30.0
 
 
 class ContextLimitError(ValueError):
@@ -45,8 +54,37 @@ class EvaluationConfig:
             )
 
 
+def execution_limits(tests: str, mode: str) -> Limits:
+    """The evaluation runner's limits for one call: the pool verification's deadline rule.
+
+    A function call gets the default 2 s. An I/O call runs every case in sequence under one
+    deadline of 2 s plus 0.25 s per case, at most 60 s
+    (:func:`scratchcoder.sandbox.budget.io_seconds`), which is the deadline the pool's
+    reference solutions were verified under. Memory and the other limits are the defaults.
+    """
+    if mode != "io":
+        return Limits()
+    cases = json.loads(tests)
+    count = len(cases) if isinstance(cases, list) else 0
+    return Limits(timeout_seconds=io_seconds(count))
+
+
 def isolated_execution(code: str, tests: str, mode: str) -> Result:
-    return run(code, tests, mode=mode)
+    """Run a candidate with its tests in the sandbox under :func:`execution_limits`."""
+    return run(code, tests, execution_limits(tests, mode), mode=mode)
+
+
+def is_host_failure(result: Result) -> bool:
+    """A result that says nothing about the candidate: the host stalled, Docker was
+    unavailable or the runner failed. Such a result is retried and never scored."""
+    return result.host_stalled or result.status not in SCORED_STATUSES
+
+
+def host_backoff(failures: int) -> float:
+    """The wait before retry number ``failures`` (1, 2, 3, ...): 2 s doubling, at most 30 s."""
+    if type(failures) is not int or failures < 1:
+        raise ValueError("failures must be a positive integer")
+    return float(min(HOST_BACKOFF_MAX_SECONDS, HOST_BACKOFF_SECONDS * 2.0 ** (failures - 1)))
 
 
 def attempt_seed(seed: int, task_id: str, index: int) -> int:
@@ -62,7 +100,14 @@ def evaluate(
     checkpoint_hash: str,
     tokenizer_hash: str,
     execute: Callable[[str, str, str], Result] = isolated_execution,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
+    """Generate and score every attempt, in task-ID order.
+
+    A result with ``host_stalled`` set is retried up to ``HOST_RETRIES`` times with
+    :func:`host_backoff` and never scored; if it is still stalled, or if isolation is
+    unavailable or fails, evaluation aborts rather than report a score.
+    """
     if not tasks or len({task.id for task in tasks}) != len(tasks):
         raise ValueError("evaluation needs nonempty unique tasks")
     if any(task.split == "train" for task in tasks):
@@ -87,18 +132,16 @@ def evaluate(
             try:
                 code = generate(task, seed)
                 result = execute(code, task.hidden_tests, task.mode)
+                stalls = 0
+                while result.host_stalled and stalls < HOST_RETRIES:
+                    stalls += 1
+                    sleep(host_backoff(stalls))
+                    result = execute(code, task.hidden_tests, task.mode)
                 code_hash = hashlib.sha256(code.encode()).hexdigest()
             except ContextLimitError:
                 result = Result("context_limit")
                 code_hash = None
-            if result.status not in {
-                "passed",
-                "failed",
-                "timeout",
-                "output_limit",
-                "resource_limit",
-                "context_limit",
-            }:
+            if result.status != "context_limit" and is_host_failure(result):
                 raise RuntimeError("evaluation aborted: isolation is unavailable or failed")
             successes.append(result.passed)
             outcomes.append({"seed": seed, "status": result.status, "code_hash": code_hash})
