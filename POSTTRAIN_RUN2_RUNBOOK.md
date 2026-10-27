@@ -2,14 +2,14 @@
 
 Operational sequence for post-training run 2 of the 135M-parameter S rehearsal model, on one Runpod A40 Pod, from run 1's selected SFT weights. Run 1's [runbook](POSTTRAIN_RUNBOOK.md) is the base: the Pod creation, the bootstrap, the receipt, the supervisor, the teardown and the billing reads are its steps with run 2's values, and this page says so where they are. The worker (`tools/posttrain_run.py`, run 2's stages in `tools/posttrain_run2.py`) runs five stages in order and uploads every artifact to R2 under `posttrain-runs/2/<pod id>/` as soon as it exists:
 
-1. **rl:** 100 updates of 32 kept tasks x 8 samples at temperature 1.0 and top-p 1.0, at most min(256, 1,024 - prompt) new tokens, a fresh AdamW at 3e-6 after 5 warmup updates, no KL; dev checks at updates 0, 12, 25, 50, 75 and 100 on the fixed 200-task dev subset. Rewards and dev verdicts come from the Mac through the reward bridge (step 12); each check's weights are uploaded at once as `rl-check-<update>`.
+1. **rl:** 100 updates of 32 kept tasks x 8 samples at temperature 1.0 and top-p 1.0, at most min(256, 1,024 - prompt) new tokens, a fresh AdamW at 3e-6 after 5 warmup updates, no KL; dev checks at updates 0, 12, 25, 50, 75 and 100 on the fixed 200-task dev subset. Rewards and dev verdicts come from the Mac through the reward bridge (step 11); each check's weights are uploaded at once as `rl-check-<update>`.
 2. **more-sft:** the compute-matched control from the same SFT weights on the kept tasks' references, its GPU-busy budget RL's measured busy seconds, checks after 1, 2, 4 and 8 passes and at the budget's end, through the bridge; each check's weights uploaded as `more-sft-check-<step>`.
 3. **arc-post:** ARC-Easy (base protocol) on the RL-selected and the control-selected checkpoints.
 4. **eval-rl**, **eval-more-sft:** the seven completions files of each selected checkpoint under `chat-v1`, as run 1's `eval-sft`.
 
 Then run 1's finalization, with the bridge directories uploaded as one label (`bridge`) first, so a late reply is kept. A reward-wait timeout, a lost bridge, a margin stop or a limit during RL or the control ends the run after the latest weights reach R2: the control and the evaluation cannot run without the bridge. Any other RL stop (completed, collapse, dev patience, leakage, non-finite) is a result, and the control runs.
 
-Commands marked **Mac** run on the owner's Mac inside the repository checkout; **Pod** commands run inside the rented Pod over SSH. One terminal drives the run, a second runs the supervisor (step 13), and a third runs the reward bridge (step 12) in a terminal where `.env` has never been sourced. Nothing in steps 1 to 6 starts a Pod; step 5 stores inputs in R2 (cents a month). Step 7 creates the Pod and starts billing: do not execute it without the owner's explicit go for run 2 at the gate. Runpod offers no provider-enforced Pod lifetime: termination is layered best effort.
+Commands marked **Mac** run on the owner's Mac inside the repository checkout; **Pod** commands run inside the rented Pod over SSH. One terminal drives the run, a second runs the supervisor (step 13), and a third, prepared in step 6 before the Pod exists, runs the reward bridge (step 11) in a terminal where `.env` has never been sourced. Nothing in steps 1 to 6 starts a Pod; step 5 stores inputs in R2 (cents a month). Step 7 creates the Pod and starts billing: do not execute it without the owner's explicit go for run 2 at the gate. Runpod offers no provider-enforced Pod lifetime: termination is layered best effort.
 
 **Limits, all derived from the ceiling the owner fixes at the gate** (`tools/posttrain_ops.py` `ceiling_limits`; `limits` prints them): at the planned **$5.80** and the quoted $0.60/h the worker stops at **$5.80**, the Mac watchdog at **$5.79**, the Pod wall is **34,800 s** and the in-Pod timer fires at **34,620 s**, 180 s inside it. The fixed 60,000 s of the pretraining rehearsal is never used: it stays only as the in-Pod timer's absolute cap. The watchdog's idle limit is 600 s; the in-Pod timer also deletes the Pod after **900 s** with no GPU work and no progress.
 
@@ -30,7 +30,7 @@ Commands marked **Mac** run on the owner's Mac inside the repository checkout; *
 
 **Liveness while the Pod waits on the Mac.** While the bridge client waits, the worker heartbeats `awaiting_rewards` with the request it waits on (`awaiting`: request ID, kind, index, count, start and age). The Mac watchdog, under run 2's policy, then lets the GPU idle for that kind's extension and never more, so a worker that hangs while claiming to wait is still deleted. The Mac's bridge server renews its lease, `server.lease` in the Pod's bridge root and dated by the Pod's own clock, with every poll and every few seconds while it scores; the worker stamps the heartbeat's `progress_unix` from a lease renewed within its 60 s, which the in-Pod idle rule counts as progress, and a stale lease counts as nothing. A dead Mac therefore lets the Pod go: the worker gives the wait up 600 s after the last renewal (`bridge_lost`), uploads its weights and finalizes, and if it could not, the in-Pod timer deletes the Pod 900 s after that renewal. `should_stop` is not read during a wait, so before every update and every request the worker stops (`wait_margin`) unless one full wait fits before the cost stop, the wall and the finalization reserve; unlike the cost and wall stops it finalizes in full.
 
-**The time rules.** The readiness receipt (step 10) and the worker at launch (step 11) apply the launch rule: the lifetime left must hold every stage at the planning rates (generation at 5,000 tok/s at batch 64 and 10,000 at batch 256, every attempt priced at its token cap, training at 56,765 slots/s, the Mac at 48 s per reward request and 300 s per dev check) plus the 900 s finalization reserve: 21,302 s, so setup may take up to about 3.6 hours of the 34,620 s at $5.80. Then the projected-finish rule before every stage, at the rates RL has measured once it has run; a stage still running 900 s before the end of the lifetime stops there and finalizes in full. The projection at the planning speeds (step 4) is about 6.2 hours and $3.70.
+**The time rules.** The readiness receipt (step 10) and the worker at launch (step 12) apply the launch rule: the lifetime left must hold every stage at the planning rates (generation at 5,000 tok/s at batch 64 and 10,000 at batch 256, every attempt priced at its token cap, training at 56,765 slots/s, the Mac at 48 s per reward request and 300 s per dev check) plus the 900 s finalization reserve: 21,302 s, so setup may take up to about 3.6 hours of the 34,620 s at $5.80. Then the projected-finish rule before every stage, at the rates RL has measured once it has run; a stage still running 900 s before the end of the lifetime stops there and finalizes in full. The projection at the planning speeds (step 4) is about 6.2 hours and $3.70.
 
 **Hidden tests never leave the Mac.** The Pod receives the withheld RL task file and the withheld dev subset (every hidden test replaced by a fixed placeholder), the facts file (each task's parseability and best constant answer's reward, computed on the Mac; the answer itself is left out) and run 1's Pod exports. `scratchcoder rl-pod-export` writes the three run-2 files on the Mac from the full train and dev splits and the screening record; the binding, the Pod's verification and the worker refuse any file in which a task carries its hidden tests, and the worker checks the facts file against its pinned SHA-256. The sealed test split is not read again for run 2: its Pod export is run 1's.
 
@@ -166,13 +166,35 @@ printf '%s  %s\n' "$BINDING_SHA256" "$BINDING" | shasum -a 256 -c -
 uv run --locked python -m tools.posttrain_binding stage --binding "$BINDING" --expected-sha256 "$BINDING_SHA256" --receipt "$SHARED/stage-receipt.json"
 ```
 
-## 6. The Mac's copy of the SFT weights (Mac, before the Pod; R2 egress is free)
+## 6. The Mac's copy of the SFT weights and the bridge's terminal (Mac, before the Pod; free)
 
 The readiness receipt requires the Mac's own pinned copy of run 2's parent:
 
 ```sh
 uv run --locked python -m tools.posttrain_binding fetch --binding "$BINDING" --expected-sha256 "$BINDING_SHA256" --root runs/posttrain-parents-2 --only sft-weights --receipt "$SHARED/mac-copy.json" --key-prefix R2_
 ```
+
+**Prepare the reward bridge now, before any billing.** The bridge (step 11) runs model-written code in Docker Desktop on the Mac while the Pod is up, so the run-1 execution-window rules hold from here until step 16 ends the Pod, with one difference: the Pod's R2 token cannot be revoked yet (the worker uploads with it), so it stays in `.env`, which no container can reach. The **owner** now empties Docker Desktop's file sharing (Settings, Resources, File sharing: remove every entry, including the defaults `/Users`, `/Volumes`, `/private`, `/tmp` and `/var/folders`) and clears the SSH agent (`ssh-add -D`). Nothing in steps 7 to 16 needs either: every SSH call uses `$POD_SSH_KEY` and the pinned known-hosts file only, never the agent. Doing it here keeps it off the clock: once the Pod exists, steps 11 to 13 must run back to back (step 11 says why).
+
+Open the third terminal and **never source `.env` in it**. Export only what the bridge needs (paste the values from the first terminal; none is a secret) and check the window:
+
+```sh
+export RUN=2
+export SHARED=runs/posttrain-shared-2
+export RUN1_SHARED=runs/posttrain-shared
+export POOL=runs/task-pool-20261025/pool
+export BRIDGE_STATE=$SHARED/bridge-state
+export KNOWN_HOSTS=~/.ssh/posttrain_2_known_hosts
+export POD_SSH_KEY=~/.ssh/runpod_ed25519
+export POD_REWARD_SHA256=<from step 4>
+export POD_DEV_SHA256=<from step 4>
+export MAC_REWARD_TIMEOUT=<from step 4>
+export MAC_DEV_TIMEOUT=<from step 4>
+export SANDBOX_IMAGE_ID=$(docker image inspect --format '{{.Id}}' python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe)
+uv run --locked python -m tools.mac_window_check check --image-id "$SANDBOX_IMAGE_ID" --dotenv .env --receipt "$SHARED/window-check-bridge.json"
+```
+
+The window check must pass: no `.env` variable or secret in this terminal, no identity in the shell's or the login session's SSH agent, the pinned image, and none of the five default shares mountable. If it fails, fix it now; the Pod is not created until it passes. Leave this terminal open: step 11 adds the Pod's address and starts the bridge in it.
 
 ## 7. Pod creation, identity and the watchdog (Mac, BILLABLE)
 
@@ -385,9 +407,36 @@ podscp "$CTRL/readiness-receipt.json" root@$POD_HOST:/workspace/posttrain/readin
 watchdog
 ```
 
-## 11. Worker launch (Pod, billable)
+## 11. The reward bridge (Mac, the third terminal; a Mac execution window while the Pod is up)
+
+Start the bridge before the worker, so dev check 0, RL's first request, is answered at once. Until RL creates the bridge root on the Pod the bridge's listings find no root and it polls with `pod_ready False`; that is an idle poll, not a failure, and it takes no lease. **Steps 11, 12 and 13 run back to back:** the watchdog last re-based its idle clock at the end of step 10, and it reads the worker's heartbeat only through the supervisor's mirror (step 13), so until the supervisor runs it deletes the Pod 600 s after its last restart.
+
+In the third terminal of step 6, add the Pod's address from the first terminal (`cat "$CTRL/run.env"` there prints it), then start the bridge, through the window check so it runs in an environment without any `.env` variable, secret or SSH agent:
 
 ```sh
+export POD_HOST=<the Pod's host>
+export POD_PORT=<the Pod's port>
+uv run --locked python -m tools.mac_window_check exec --image-id "$SANDBOX_IMAGE_ID" --dotenv .env -- uv run --locked scratchcoder rl-bridge \
+  --host root@$POD_HOST --port $POD_PORT --identity-file "$POD_SSH_KEY" --known-hosts "$KNOWN_HOSTS" \
+  --remote-root /workspace/posttrain-bridge --train-tasks "$POOL/train.jsonl" --kept "$RUN1_SHARED/screening.json" \
+  --dev-tasks "$POOL/dev.jsonl" --pod-reward-sha256 "$POD_REWARD_SHA256" --pod-dev-sha256 "$POD_DEV_SHA256" \
+  --state "$BRIDGE_STATE" --reward-timeout "$MAC_REWARD_TIMEOUT" --dev-timeout "$MAC_DEV_TIMEOUT" \
+  --image-id "$SANDBOX_IMAGE_ID" --dotenv .env
+```
+
+- **The timeouts** are the Mac's bounds, the Pod's less the bridge allowance: 5,600 s for a reward request and 9,492 s for a dev check. A request that runs past its bound gets a `timeout` reply the Pod can still read.
+- **`.env`:** `--dotenv .env` names the file whose variable names the bridge refuses to run with; it refuses to start when no `.env` can be found, so give `--no-dotenv` only if the Mac has none. Exit **2** means it refused to start (a secret in its environment, a missing `.env`, a sealed split or a bad record): read its message, fix the terminal, start it again.
+- **Exit 3** means another bridge server holds this Pod's lease. Stop that one (only one server may score a Pod: two would score each request twice), or wait for its lease to lapse 60 s after its last renewal.
+- **A dead bridge** (the Mac slept, the process crashed, an SSH outage outlasted its retries): start the same command again with the same `--state` at once. A restart over the same state is the same server and takes its lease back at once; every reply it sent is stored there, so nothing is scored twice. It must be back within 600 s of its last lease renewal, or the worker gives the wait up as `bridge_lost` and ends the run; the in-Pod timer would delete the Pod 900 s after that renewal.
+
+Leave the bridge running until step 16 ends the Pod; then stop it with Ctrl-C (exit 0). Go back to the first terminal for step 12 at once.
+
+## 12. Worker launch (Pod, billable)
+
+Re-base the watchdog, launch the worker and wait for its first heartbeat:
+
+```sh
+watchdog
 if podssh 'test -e /workspace/posttrain/run.log'; then
   echo "run $RUN: a worker was launched on this Pod before; the wait below follows that one."
 else
@@ -406,59 +455,11 @@ done
 podssh 'test -s /workspace/posttrain-run/heartbeat.json' && watchdog
 ```
 
-RL starts at once: its first request is dev check 0, so start the bridge (step 12) now. The worker gives a wait up as `bridge_lost` 600 s after it starts with no Mac lease renewal.
-
-## 12. The reward bridge (Mac, a third terminal; a Mac execution window while the Pod is up)
-
-The bridge runs model-written code in Docker Desktop on the Mac while the Pod is up, so the run-1 execution-window rules hold for its whole life, with one difference: the Pod's R2 token cannot be revoked yet (the worker uploads with it), so it stays in `.env`, which no container can reach. Before the bridge starts the **owner** empties Docker Desktop's file sharing (Settings, Resources, File sharing: remove every entry, including the defaults `/Users`, `/Volumes`, `/private`, `/tmp` and `/var/folders`) and clears the SSH agent (`ssh-add -D`). The bridge reaches the Pod with `$POD_SSH_KEY` and the pinned known-hosts file only, never the agent.
-
-Open the third terminal and **never source `.env` in it**. Export only what the bridge needs (paste the values from the first terminal; none is a secret):
-
-```sh
-export RUN=2
-export SHARED=runs/posttrain-shared-2
-export RUN1_SHARED=runs/posttrain-shared
-export POOL=runs/task-pool-20261025/pool
-export BRIDGE_STATE=$SHARED/bridge-state
-export KNOWN_HOSTS=~/.ssh/posttrain_2_known_hosts
-export POD_SSH_KEY=~/.ssh/runpod_ed25519
-export POD_HOST=<the Pod's host>
-export POD_PORT=<the Pod's port>
-export POD_REWARD_SHA256=<from step 4>
-export POD_DEV_SHA256=<from step 4>
-export MAC_REWARD_TIMEOUT=<from step 4>
-export MAC_DEV_TIMEOUT=<from step 4>
-export SANDBOX_IMAGE_ID=$(docker image inspect --format '{{.Id}}' python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe)
-uv run --locked python -m tools.mac_window_check check --image-id "$SANDBOX_IMAGE_ID" --dotenv .env --receipt "$SHARED/window-check-bridge.json"
-```
-
-The window check must pass: no `.env` variable or secret in this terminal, no identity in the shell's or the login session's SSH agent, the pinned image, and none of the five default shares mountable. Then start the bridge, through the window check so it runs in an environment without any `.env` variable, secret or SSH agent:
-
-```sh
-uv run --locked python -m tools.mac_window_check exec --image-id "$SANDBOX_IMAGE_ID" --dotenv .env -- uv run --locked scratchcoder rl-bridge \
-  --host root@$POD_HOST --port $POD_PORT --identity-file "$POD_SSH_KEY" --known-hosts "$KNOWN_HOSTS" \
-  --remote-root /workspace/posttrain-bridge --train-tasks "$POOL/train.jsonl" --kept "$RUN1_SHARED/screening.json" \
-  --dev-tasks "$POOL/dev.jsonl" --pod-reward-sha256 "$POD_REWARD_SHA256" --pod-dev-sha256 "$POD_DEV_SHA256" \
-  --state "$BRIDGE_STATE" --reward-timeout "$MAC_REWARD_TIMEOUT" --dev-timeout "$MAC_DEV_TIMEOUT" \
-  --image-id "$SANDBOX_IMAGE_ID" --dotenv .env
-```
-
-- **The timeouts** are the Mac's bounds, the Pod's less the bridge allowance: 5,600 s for a reward request and 9,492 s for a dev check. A request that runs past its bound gets a `timeout` reply the Pod can still read.
-- **`.env`:** `--dotenv .env` names the file whose variable names the bridge refuses to run with; it refuses to start when no `.env` can be found, so give `--no-dotenv` only if the Mac has none. Exit **2** means it refused to start (a secret in its environment, a missing `.env`, a sealed split or a bad record): read its message, fix the terminal, start it again.
-- **Exit 3** means another bridge server holds this Pod's lease. Stop that one (only one server may score a Pod: two would score each request twice), or wait for its lease to lapse 60 s after its last renewal.
-- **A dead bridge** (the Mac slept, the process crashed, an SSH outage outlasted its retries): start the same command again with the same `--state` at once. A restart over the same state is the same server and takes its lease back at once; every reply it sent is stored there, so nothing is scored twice. It must be back within 600 s of its last lease renewal, or the worker gives the wait up as `bridge_lost` and ends the run; the in-Pod timer would delete the Pod 900 s after that renewal.
-
-Confirm the Pod is ready once RL has started (the worker creates the bridge root at RL's start) and that the first request was answered:
-
-```sh
-python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print("pod_ready", p["pod_ready"], "state", p["state"], "answered", p["answered"], "last", p["last_answered"])' "$BRIDGE_STATE/progress.json"
-```
-
-It must print `pod_ready True` within a minute of RL's start. Leave the bridge running until step 16 ends the Pod; then stop it with Ctrl-C (exit 0).
+Start the supervisor (step 13) as soon as this block has found the heartbeat: the watchdog's idle clock runs from the restart that ends it. Prepare the second window (step 2 and the reopened-terminal line of step 7) while the block waits. RL starts at once, and its first request, dev check 0, goes to the bridge started in step 11; the worker gives a wait up as `bridge_lost` 600 s after it starts with no Mac lease renewal.
 
 ## 13. Supervisor (Mac, billable; the second window)
 
-Run 1's step 12 with `--run "$RUN"` and run 2's policy:
+Start the supervisor as soon as the heartbeat exists. Run 1's step 12 with `--run "$RUN"` and run 2's policy:
 
 ```sh
 uv run --locked python -m tools.pilot_supervisor --mode posttrain --run "$RUN" \
@@ -467,6 +468,14 @@ uv run --locked python -m tools.pilot_supervisor --mode posttrain --run "$RUN" \
   --host root@$POD_HOST --port $POD_PORT --remote-root /workspace/posttrain-run \
   --repository "$PRIVATE_REPO" --poll-seconds 20 2>&1 | tee -a "$CTRL/supervisor.log"
 ```
+
+Then, in the third terminal, confirm that the bridge sees the Pod (the worker creates the bridge root at RL's start) and that the first request was answered:
+
+```sh
+python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print("pod_ready", p["pod_ready"], "state", p["state"], "answered", p["answered"], "last", p["last_answered"])' "$BRIDGE_STATE/progress.json"
+```
+
+It must print `pod_ready True` within a minute of RL's start.
 
 ## 14. Monitoring (Mac, read-only)
 

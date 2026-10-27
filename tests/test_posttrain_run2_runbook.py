@@ -207,6 +207,41 @@ def test_the_bridge_runs_in_the_window_with_the_derived_mac_bounds(
         assert phrase in text, phrase
 
 
+def test_the_bridge_and_the_supervisor_start_before_the_watchdogs_idle_clock_runs_out() -> None:
+    """The watchdog reads the heartbeat only through the supervisor's mirror, so from the
+    receipt's last re-base the bridge, the worker and the supervisor start back to back; the
+    owner's slow preparation of the bridge's window comes before the Pod exists."""
+    text = RUNBOOK.read_text()
+    titles = re.findall(r"^## (\d+)\. (.*)$", text, re.M)
+    number = {
+        key: next(int(n) for n, title in titles if title.startswith(prefix))
+        for key, prefix in (
+            ("pod", "Pod creation"),
+            ("receipt", "Readiness receipt"),
+            ("bridge", "The reward bridge"),
+            ("worker", "Worker launch"),
+            ("supervisor", "Supervisor"),
+        )
+    }
+    assert [number[key] for key in ("receipt", "bridge", "worker", "supervisor")] == list(
+        range(number["receipt"], number["receipt"] + 4)
+    )
+    pod = text.index(f"## {number['pod']}. Pod creation")
+    for phrase in (
+        "empties Docker Desktop's file sharing",
+        "ssh-add -D",
+        "never source `.env` in it",
+        '--receipt "$SHARED/window-check-bridge.json"',
+    ):
+        assert -1 < text.index(phrase) < pod, phrase
+    assert text.index("scratchcoder rl-bridge") < text.index("tools.posttrain_run run")
+    worker = text[text.index(f"## {number['worker']}. ") : text.index(f"## {number['supervisor']}. ")]
+    assert "```sh\nwatchdog\n" in worker  # The watchdog is re-based just before the launch.
+    supervisor = text[text.index(f"## {number['supervisor']}. ") :]
+    supervisor = supervisor[: supervisor.index("\n## ")]
+    assert "as soon as the heartbeat exists" in supervisor and "pod_ready True" in supervisor
+
+
 def test_the_pod_and_mac_commands_name_run_twos_paths_and_limits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
