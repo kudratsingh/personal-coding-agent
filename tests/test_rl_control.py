@@ -332,3 +332,21 @@ def test_cpu_end_to_end_rl_then_the_more_sft_control(tmp_path: Path) -> None:
     assert result.selected in result.checks
     record = json.loads((tmp_path / "control" / "more-sft" / "control-result.json").read_text())
     assert record["budget_seconds"] == budget and "mismatch_fraction" in record
+
+
+def test_an_unexpected_error_in_the_control_saves_its_weights(
+    tmp_path: Path, parent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    use_clock(monkeypatch, [0.5] * 50)
+
+    def script(check: int) -> tuple[float, float]:
+        if check == 3:
+            raise RuntimeError("executor crashed")
+        return 0.1, 0.0
+
+    with pytest.raises(RuntimeError):
+        control(tmp_path, parent, 100.0, evaluator=ScriptedDevEvaluator(script=script))
+    run = tmp_path / "control" / "more-sft"
+    assert (run / "checkpoints" / "step-00003.pt").exists()
+    assert not (run / "control-result.json").exists()
+    assert json.loads((run / "record.json").read_text())["status"] == "failed"

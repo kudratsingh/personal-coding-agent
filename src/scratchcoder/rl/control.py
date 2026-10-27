@@ -361,6 +361,17 @@ def run_more_sft(
             pass
         except FloatingPointError as error:
             stop.update(reason=NON_FINITE, detail=f"step {trainer.step + 1}: {error}")
+        except Exception as error:
+            # Keep the latest weights before the error propagates.
+            logger.event(
+                "control_failed",
+                error_type=type(error).__name__,
+                detail=str(error)[:500],
+                updates=trainer.step,
+            )
+            if trainer.step > (checks[-1].optimizer_steps if checks else 0):
+                save(trainer.step, checked=False)
+            raise
         reason = stop.get("reason", PASSES_EXHAUSTED)
         detail = stop.get("detail", f"loader exhausted after {trainer.step} updates")
         last = checks[-1].optimizer_steps if checks else 0

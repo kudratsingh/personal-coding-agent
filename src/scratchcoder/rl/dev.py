@@ -289,9 +289,10 @@ class PoolDevEvaluator:
         execute: DevExecutor,
         *,
         batch_size: int = 256,
-        precision: str = "float32",
+        precision: str | None = None,
         samples: int = DEV_SAMPLES,
     ) -> None:
+        """``precision=None`` follows the model's device: bfloat16 on CUDA, float32 otherwise."""
         if not tasks:
             raise ValueError("a dev evaluator needs tasks")
         self.tasks = list(tasks)
@@ -308,7 +309,7 @@ class PoolDevEvaluator:
             self.encoder,
             self.decoder,
             batch_size=self.batch_size,
-            precision=self.precision,
+            precision=self.precision or ("bfloat16" if device.type == "cuda" else "float32"),
             samples=self.samples,
         )
         generated = _synchronized(device)

@@ -530,3 +530,21 @@ def test_rl_config_validation() -> None:
     assert defaults.dev_checks == (0, 12, 25, 50, 75, 100)
     assert (defaults.beta1, defaults.beta2, defaults.weight_decay) == (0.9, 0.95, 0.1)
     assert defaults.gradient_clip == 1.0 and defaults.max_new_tokens == 256
+
+
+def test_an_unexpected_error_saves_the_latest_weights_then_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Broken:
+        def rewards(self, update: int, attempts: Sequence[Attempt]) -> list[AttemptReward]:
+            if update == 2:
+                raise KeyError("bridge reply lost a field")
+            return FakeRewardSource().rewards(update, attempts)
+
+    with pytest.raises(KeyError):
+        run(tmp_path, monkeypatch, rewards=Broken(), dev_checks=(0,))
+    saved = torch.load(tmp_path / "rl" / "checkpoints" / "update-0001.pt", weights_only=True)
+    assert saved["metadata"]["checked"] is False and saved["metadata"]["optimizer_steps"] == 1
+    (failure,) = events(tmp_path, "rl_failed")
+    assert failure["error_type"] == "KeyError" and failure["updates"] == 1
+    assert not (tmp_path / "rl" / "result.json").exists()

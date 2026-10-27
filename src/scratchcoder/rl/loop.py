@@ -419,221 +419,249 @@ def run_rl(
             )
             return record
 
-        logger.event(
-            "rl_started",
-            tasks=len(tasks),
-            device=str(device),
-            precision=precision,
-            schedule_sha256=schedule_sha256,
-            config=config.to_json(),
-        )
         try:
-            if 0 in config.dev_checks:
-                best = dev_check(0).dev.greedy_pass_at_1
-        except RewardTimeout as error:
-            stop_reason, stop_detail = REWARD_WAIT, f"dev check 0: {error}"
-        except RewardHostFailure as error:
-            stop_reason, stop_detail = REWARD_HOST_FAILURE, f"dev check 0: {error}"
-        while stop_reason is None and completed < config.updates:
-            if should_stop is not None:
-                requested = stop_request(should_stop())
-                if requested is not None:
-                    stop_reason, stop_detail = EXTERNAL, requested
-                    break
-            update = completed + 1
-            epoch, ids = schedule[update - 1]
-            batch = [by_id[identifier] for identifier in ids]
-            started = synchronized_time(device)
-            rollouts = generate_rollouts(
-                model,
-                batch,
-                [prompts[task.id] for task in batch],
-                decoder,
-                samples=group,
-                seed_of=_rollout_seeds(update, group, config.rollout_seed),
-                temperature=config.temperature,
-                top_p=config.top_p,
-                max_new_tokens=config.max_new_tokens,
-                batch_size=config.generation_batch,
+            logger.event(
+                "rl_started",
+                tasks=len(tasks),
+                device=str(device),
                 precision=precision,
+                schedule_sha256=schedule_sha256,
+                config=config.to_json(),
             )
-            generation_seconds = synchronized_time(device) - started
-            seconds["rollout_generation"] += generation_seconds
-            for rollout in rollouts:
-                if rollout.seed in seen_seeds:
-                    raise RuntimeError(f"rollout seed {rollout.seed} repeated in update {update}")
-                seen_seeds.add(rollout.seed)
-            attempts = [rollout.attempt for rollout in rollouts]
-            waited = time.perf_counter()
             try:
-                replies = list(rewards.rewards(update, attempts))
-            except RewardError as error:
+                if 0 in config.dev_checks:
+                    best = dev_check(0).dev.greedy_pass_at_1
+            except RewardTimeout as error:
+                stop_reason, stop_detail = REWARD_WAIT, f"dev check 0: {error}"
+            except RewardHostFailure as error:
+                stop_reason, stop_detail = REWARD_HOST_FAILURE, f"dev check 0: {error}"
+            while stop_reason is None and completed < config.updates:
+                if should_stop is not None:
+                    requested = stop_request(should_stop())
+                    if requested is not None:
+                        stop_reason, stop_detail = EXTERNAL, requested
+                        break
+                update = completed + 1
+                epoch, ids = schedule[update - 1]
+                batch = [by_id[identifier] for identifier in ids]
+                started = synchronized_time(device)
+                rollouts = generate_rollouts(
+                    model,
+                    batch,
+                    [prompts[task.id] for task in batch],
+                    decoder,
+                    samples=group,
+                    seed_of=_rollout_seeds(update, group, config.rollout_seed),
+                    temperature=config.temperature,
+                    top_p=config.top_p,
+                    max_new_tokens=config.max_new_tokens,
+                    batch_size=config.generation_batch,
+                    precision=precision,
+                )
+                generation_seconds = synchronized_time(device) - started
+                seconds["rollout_generation"] += generation_seconds
+                for rollout in rollouts:
+                    if rollout.seed in seen_seeds:
+                        raise RuntimeError(
+                            f"rollout seed {rollout.seed} repeated in update {update}"
+                        )
+                    seen_seeds.add(rollout.seed)
+                attempts = [rollout.attempt for rollout in rollouts]
+                waited = time.perf_counter()
+                try:
+                    replies = list(rewards.rewards(update, attempts))
+                except RewardError as error:
+                    wait_seconds = time.perf_counter() - waited
+                    seconds["reward_wait"] += wait_seconds
+                    stop_reason = (
+                        REWARD_WAIT if isinstance(error, RewardTimeout) else REWARD_HOST_FAILURE
+                    )
+                    stop_detail = f"update {update}: {error}"
+                    logger.event(
+                        "rl_reward_failed",
+                        update=update,
+                        reason=stop_reason,
+                        detail=str(error),
+                        seconds={
+                            "rollout_generation": generation_seconds,
+                            "reward_wait": wait_seconds,
+                        },
+                    )
+                    break
                 wait_seconds = time.perf_counter() - waited
                 seconds["reward_wait"] += wait_seconds
-                stop_reason = (
-                    REWARD_WAIT if isinstance(error, RewardTimeout) else REWARD_HOST_FAILURE
+                check_rewards(attempts, replies)
+                values = [float(reply.reward) for reply in replies]
+                nonfinite_reward = not all(math.isfinite(value) for value in values)
+                groups = (
+                    []
+                    if nonfinite_reward
+                    else [
+                        group_advantages(task.id, values[index * group : (index + 1) * group])
+                        for index, task in enumerate(batch)
+                    ]
                 )
-                stop_detail = f"update {update}: {error}"
-                logger.event(
-                    "rl_reward_failed",
-                    update=update,
-                    reason=stop_reason,
-                    detail=str(error),
-                    seconds={"rollout_generation": generation_seconds, "reward_wait": wait_seconds},
-                )
-                break
-            wait_seconds = time.perf_counter() - waited
-            seconds["reward_wait"] += wait_seconds
-            check_rewards(attempts, replies)
-            values = [float(reply.reward) for reply in replies]
-            nonfinite_reward = not all(math.isfinite(value) for value in values)
-            groups = (
-                []
-                if nonfinite_reward
-                else [
-                    group_advantages(task.id, values[index * group : (index + 1) * group])
-                    for index, task in enumerate(batch)
-                ]
-            )
-            for reply in replies:
-                rewarded = math.isfinite(reply.reward) and reply.reward > 0
-                tally.observe(reply.audit_flags, rewarded=rewarded)
-            loss: float | None = None
-            norm: float | None = None
-            rate: float | None = None
-            denominator = 0
-            stepped = False
-            started = synchronized_time(device)
-            if nonfinite_reward:
-                stop_reason, stop_detail = NON_FINITE, f"update {update}: reward"
-            else:
-                sequences, denominator = policy_sequences(
-                    [rollout.prompt for rollout in rollouts],
-                    [rollout.tokens for rollout in rollouts],
-                    [advantage for item in groups for advantage in item.advantages],
-                    [item.skipped for item in groups for _ in range(group)],
-                )
-                if sequences:
-                    optimizer.zero_grad()
-                    stage = "loss"
-                    try:
-                        loss = policy_gradient_backward(
-                            model,
-                            sequences,
-                            denominator=denominator,
-                            micro_batch=config.micro_batch,
-                            device=device,
-                            precision=precision,
-                            pad_id=BOS,
-                            temperature=config.temperature,
-                        )
-                        stage = "gradient_norm"
-                        norm = clip_gradients(model.parameters(), config.gradient_clip)
-                    except FloatingPointError:
-                        optimizer.zero_grad()
-                        stop_reason, stop_detail = NON_FINITE, f"update {update}: {stage}"
-                        loss = norm = None
-                    else:
-                        rate = learning_rate(
-                            steps,
-                            total_steps=config.updates,
-                            warmup_steps=config.warmup_updates,
-                            peak=config.learning_rate,
-                            minimum_ratio=1.0,
-                        )
-                        optimizer.lr = rate
-                        optimizer.step()
-                        optimizer.zero_grad()
-                        steps += 1
-                        stepped = True
-                if not stepped and stop_reason is None:
-                    skipped_updates.append(update)
-            training_seconds = synchronized_time(device) - started
-            seconds["training_step"] += training_seconds
-            completed = update
-            skipped = sum(item.skipped for item in groups)
-            distinct = _mean(
-                [
-                    float(
-                        len({rollout.tokens for rollout in rollouts[k * group : (k + 1) * group]})
-                    )
-                    for k in range(len(batch))
-                ]
-            )
-            update_rewarded = [reply for reply in replies if reply.reward > 0]
-            update_rewarded_flagged = sum(bool(reply.audit_flags) for reply in update_rewarded)
-            tokens = [rollout.attempt.completion_tokens for rollout in rollouts]
-            row: dict[str, Any] = {
-                "update": update,
-                "pass": epoch,
-                "task_ids": list(ids),
-                "groups": len(batch),
-                "attempts": len(attempts),
-                "mean_reward": None if nonfinite_reward else _mean(values),
-                "baseline_mean": _mean([baselines[task.id] for task in batch]),
-                "skipped_groups": skipped,
-                "skipped_share": skipped / len(batch),
-                "loss_tokens": denominator,
-                "mean_attempt_length": _mean([float(count) for count in tokens]),
-                "stopped_share": sum(r.finish == "stop" for r in rollouts) / len(rollouts),
-                "no_program": sum(attempt.code is None for attempt in attempts),
-                "timeouts": sum(reply.unfinished > 0 for reply in replies),
-                "statuses": dict(sorted(Counter(reply.status for reply in replies).items())),
-                "distinct_per_group": distinct,
-                "audit_flagged": sum(bool(reply.audit_flags) for reply in replies),
-                "rewarded": len(update_rewarded),
-                "rewarded_flagged": update_rewarded_flagged,
-                "rewarded_flagged_rate": (
-                    update_rewarded_flagged / len(update_rewarded) if update_rewarded else 0.0
-                ),
-                "cumulative_rewarded": tally.rewarded,
-                "cumulative_rewarded_flagged_rate": tally.rewarded_rate,
-                "loss": loss,
-                "gradient_norm": norm,
-                "learning_rate": rate,
-                "optimizer_step": stepped,
-                "optimizer_steps": steps,
-                "seconds": {
-                    "rollout_generation": generation_seconds,
-                    "training_step": training_seconds,
-                    "reward_wait": wait_seconds,
-                },
-            }
-            monitoring.append(row)
-            logger.event("rl_update", **row)
-            if stop_reason is not None:
-                break
-            collapse_run = collapse_run + 1 if distinct < config.collapse_distinct else 0
-            if collapse_run >= config.collapse_updates:
-                stop_reason = COLLAPSE
-                stop_detail = f"{collapse_run} updates below {config.collapse_distinct} distinct"
-                break
-            if (
-                tally.rewarded >= config.leakage_min_rewarded
-                and tally.rewarded_rate > config.leakage_rate
-            ):
-                stop_reason = LEAKAGE
-                stop_detail = (
-                    f"{tally.rewarded_flagged} of {tally.rewarded} rewarded attempts flagged"
-                )
-                break
-            if update in config.dev_checks:
-                try:
-                    greedy = dev_check(update).dev.greedy_pass_at_1
-                except RewardTimeout as error:
-                    stop_reason, stop_detail = REWARD_WAIT, f"dev check {update}: {error}"
-                    break
-                except RewardHostFailure as error:
-                    stop_reason, stop_detail = REWARD_HOST_FAILURE, f"dev check {update}: {error}"
-                    break
-                if best is None or greedy > best:
-                    best, since_best = greedy, 0
+                for reply in replies:
+                    rewarded = math.isfinite(reply.reward) and reply.reward > 0
+                    tally.observe(reply.audit_flags, rewarded=rewarded)
+                loss: float | None = None
+                norm: float | None = None
+                rate: float | None = None
+                denominator = 0
+                stepped = False
+                started = synchronized_time(device)
+                if nonfinite_reward:
+                    stop_reason, stop_detail = NON_FINITE, f"update {update}: reward"
                 else:
-                    since_best += 1
-                    if since_best >= config.patience:
-                        stop_reason = DEV_PATIENCE
-                        stop_detail = f"{since_best} checks not above {best}"
+                    sequences, denominator = policy_sequences(
+                        [rollout.prompt for rollout in rollouts],
+                        [rollout.tokens for rollout in rollouts],
+                        [advantage for item in groups for advantage in item.advantages],
+                        [item.skipped for item in groups for _ in range(group)],
+                    )
+                    if sequences:
+                        optimizer.zero_grad()
+                        stage = "loss"
+                        try:
+                            loss = policy_gradient_backward(
+                                model,
+                                sequences,
+                                denominator=denominator,
+                                micro_batch=config.micro_batch,
+                                device=device,
+                                precision=precision,
+                                pad_id=BOS,
+                                temperature=config.temperature,
+                            )
+                            stage = "gradient_norm"
+                            norm = clip_gradients(model.parameters(), config.gradient_clip)
+                        except FloatingPointError:
+                            optimizer.zero_grad()
+                            stop_reason, stop_detail = NON_FINITE, f"update {update}: {stage}"
+                            loss = norm = None
+                        else:
+                            rate = learning_rate(
+                                steps,
+                                total_steps=config.updates,
+                                warmup_steps=config.warmup_updates,
+                                peak=config.learning_rate,
+                                minimum_ratio=1.0,
+                            )
+                            optimizer.lr = rate
+                            optimizer.step()
+                            optimizer.zero_grad()
+                            steps += 1
+                            stepped = True
+                    if not stepped and stop_reason is None:
+                        skipped_updates.append(update)
+                training_seconds = synchronized_time(device) - started
+                seconds["training_step"] += training_seconds
+                completed = update
+                skipped = sum(item.skipped for item in groups)
+                distinct = _mean(
+                    [
+                        float(
+                            len(
+                                {
+                                    rollout.tokens
+                                    for rollout in rollouts[k * group : (k + 1) * group]
+                                }
+                            )
+                        )
+                        for k in range(len(batch))
+                    ]
+                )
+                update_rewarded = [reply for reply in replies if reply.reward > 0]
+                update_rewarded_flagged = sum(bool(reply.audit_flags) for reply in update_rewarded)
+                tokens = [rollout.attempt.completion_tokens for rollout in rollouts]
+                row: dict[str, Any] = {
+                    "update": update,
+                    "pass": epoch,
+                    "task_ids": list(ids),
+                    "groups": len(batch),
+                    "attempts": len(attempts),
+                    "mean_reward": None if nonfinite_reward else _mean(values),
+                    "baseline_mean": _mean([baselines[task.id] for task in batch]),
+                    "skipped_groups": skipped,
+                    "skipped_share": skipped / len(batch),
+                    "loss_tokens": denominator,
+                    "mean_attempt_length": _mean([float(count) for count in tokens]),
+                    "stopped_share": sum(r.finish == "stop" for r in rollouts) / len(rollouts),
+                    "no_program": sum(attempt.code is None for attempt in attempts),
+                    "timeouts": sum(reply.unfinished > 0 for reply in replies),
+                    "statuses": dict(sorted(Counter(reply.status for reply in replies).items())),
+                    "distinct_per_group": distinct,
+                    "audit_flagged": sum(bool(reply.audit_flags) for reply in replies),
+                    "rewarded": len(update_rewarded),
+                    "rewarded_flagged": update_rewarded_flagged,
+                    "rewarded_flagged_rate": (
+                        update_rewarded_flagged / len(update_rewarded) if update_rewarded else 0.0
+                    ),
+                    "cumulative_rewarded": tally.rewarded,
+                    "cumulative_rewarded_flagged_rate": tally.rewarded_rate,
+                    "loss": loss,
+                    "gradient_norm": norm,
+                    "learning_rate": rate,
+                    "optimizer_step": stepped,
+                    "optimizer_steps": steps,
+                    "seconds": {
+                        "rollout_generation": generation_seconds,
+                        "training_step": training_seconds,
+                        "reward_wait": wait_seconds,
+                    },
+                }
+                monitoring.append(row)
+                logger.event("rl_update", **row)
+                if stop_reason is not None:
+                    break
+                collapse_run = collapse_run + 1 if distinct < config.collapse_distinct else 0
+                if collapse_run >= config.collapse_updates:
+                    stop_reason = COLLAPSE
+                    stop_detail = (
+                        f"{collapse_run} updates below {config.collapse_distinct} distinct"
+                    )
+                    break
+                if (
+                    tally.rewarded >= config.leakage_min_rewarded
+                    and tally.rewarded_rate > config.leakage_rate
+                ):
+                    stop_reason = LEAKAGE
+                    stop_detail = (
+                        f"{tally.rewarded_flagged} of {tally.rewarded} rewarded attempts flagged"
+                    )
+                    break
+                if update in config.dev_checks:
+                    try:
+                        greedy = dev_check(update).dev.greedy_pass_at_1
+                    except RewardTimeout as error:
+                        stop_reason, stop_detail = REWARD_WAIT, f"dev check {update}: {error}"
                         break
+                    except RewardHostFailure as error:
+                        stop_reason, stop_detail = (
+                            REWARD_HOST_FAILURE,
+                            f"dev check {update}: {error}",
+                        )
+                        break
+                    if best is None or greedy > best:
+                        best, since_best = greedy, 0
+                    else:
+                        since_best += 1
+                        if since_best >= config.patience:
+                            stop_reason = DEV_PATIENCE
+                            stop_detail = f"{since_best} checks not above {best}"
+                            break
+        except Exception as error:
+            # Keep the policy's latest weights before the error propagates.
+            logger.event(
+                "rl_failed",
+                error_type=type(error).__name__,
+                detail=str(error)[:500],
+                updates=completed,
+                optimizer_steps=steps,
+            )
+            if not checks or checks[-1].optimizer_steps < steps:
+                save(completed, checked=False)
+            raise
         if stop_reason is None:
             stop_reason = COMPLETED
         unchecked = not checks or checks[-1].optimizer_steps < steps
