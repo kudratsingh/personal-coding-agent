@@ -492,6 +492,14 @@ def build_scorecard(
                 )
             )
     all_rows = [row for _, _, row in rows] + arc_rows
+    costs: dict[tuple[str, str, str], dict[str, float]] = {}
+    for item in all_rows:
+        total = costs.setdefault(
+            (item["checkpoint"], item["suite"], item["split"]),
+            {"gpu_minutes": 0.0, "sandbox_minutes": 0.0},
+        )
+        total["gpu_minutes"] += item["gpu_minutes"] or 0.0
+        total["sandbox_minutes"] += item["sandbox_minutes"] or 0.0
     leak = {
         name: any(row.get("leak_flag", False) for row in all_rows if row["checkpoint"] == name)
         for name in checkpoints
@@ -506,6 +514,10 @@ def build_scorecard(
         "checkpoints": dict(checkpoints),
         "rows": sorted(all_rows, key=lambda row: (row["suite"], row["split"], row["checkpoint"])),
         "comparisons": comparisons,
+        "costs": [
+            {"checkpoint": name, "suite": suite, "split": split, **total}
+            for (name, suite, split), total in sorted(costs.items())
+        ],
         "leak": {
             "rule": f"greedy pass@1 above {LEAK_THRESHOLD:.0%} on {LEAK_SUITE} is a leak until "
             "shown otherwise",

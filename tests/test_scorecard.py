@@ -217,6 +217,10 @@ def test_pool_metrics_slices_and_baselines_by_hand(
     assert all(item["precision"] for item in card["rows"])
     assert sft["sandbox_minutes"] == pytest.approx(4 * 30 / 60)
     assert sft["gpu_minutes"] == pytest.approx(1.5 / 60)
+    costs = {(item["checkpoint"], item["suite"]): item for item in card["costs"]}
+    # Per suite: the greedy file's 4 calls and the sampled file's 16, 30 s each.
+    assert costs[("sft", "pool")]["sandbox_minutes"] == pytest.approx(20 * 30 / 60)
+    assert costs[("sft", "pool")]["gpu_minutes"] == pytest.approx(2 * 1.5 / 60)
 
 
 def test_unresolved_attempts_are_counted_not_scored(

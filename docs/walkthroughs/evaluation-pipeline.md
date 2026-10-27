@@ -65,7 +65,7 @@ Budgets are `min(512, context − prompt)` for chat-v1 and the base pool protoco
 
 **Benchmark artifact** (`tools/benchmark_score.py`): `benchmark-<suite>-<sha256>.json` in the artifact `benchmark-results-<sha256>`. It holds the completions header, the canonical preflight, one entry per attempt, the per-task constant answers and the sandbox seconds.
 
-**Scorecard** (`scratchcoder.eval.scorecard`): one row per checkpoint and completions file, plus ARC rows, then the paired comparisons and the leak flags. Each row carries:
+**Scorecard** (`scratchcoder.eval.scorecard`): one row per checkpoint and completions file, plus ARC rows, then the paired comparisons, GPU- and sandbox-minute totals per checkpoint and suite, and the leak flags. Each row carries:
 
 - the score;
 - the suite's constant-answer baseline beside it;
