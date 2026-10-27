@@ -68,7 +68,9 @@ host: classify the invocation from the frames → validate and decode each row i
   any assertion outside these forms, makes the whole task **not parseable**
   (`parse_function_checks` returns `None`, `is_parseable` is `False`), so a partial parse can
   never under-count the denominator and over-reward. A task whose expected value could not fit
-  in one result row (64 KiB by default) is not parseable either. In the container the child
+  in one result row (64 KiB by default) is not parseable either, and neither is one whose
+  call sources and import lines together exceed the sandbox input limit (128,000 bytes),
+  because they enter the container with the candidate. In the container the child
   runs the candidate as the main script `/tmp/candidate.py`, where the supervisor writes its
   source: a fresh `__main__` module in `sys.modules` (so its `if __name__ == "__main__":`
   block runs and its classes pickle), `__file__` and `sys.argv[0]` are `/tmp/candidate.py`,
@@ -96,8 +98,9 @@ host: classify the invocation from the frames → validate and decode each row i
   evaluation path. Files a case writes to `/tmp` stay for the later cases, as in the pool
   verification's I/O program. Each case's stdout returns base64-encoded and the host compares it, after
   `strip()`, with the expected output it kept. Every case runs (no stop at first failure);
-  cases that do not run count as failed. A task with malformed cases, more than 100 cases, or an
-  expected output larger than the output cap is not parseable.
+  cases that do not run count as failed. A task with malformed cases, more than 100 cases, inputs
+  that together exceed the sandbox input limit (128,000 bytes), or an expected output larger
+  than the output cap is not parseable.
 - **The encoding and the comparison** (`reward_program.DRIVER` in the container,
   `_value_from_wire` and `check_passes` on the host). The encoding is type-tagged, so the host
   rebuilds exactly the built-in value the call returned. It then uses Python's own semantics,
@@ -297,9 +300,6 @@ host: classify the invocation from the frames → validate and decode each row i
    empty `deque`. It cannot be encoded, so it fails here, while the in-process assertion would
    compare it. A subclass of a reported type is judged by its base value, so its own `__eq__`
    can make the two disagree in either direction. For plain built-in values the two agree.
-8. **Can an answer that solves nothing still earn reward?** Yes, on weak tests: returning
-   `None` or printing `YES` passes every check that expects that value.
-   `degenerate_baseline(task)` measures this per task so RL screening can drop such tasks.
 6. **Why does an I/O attempt's budget grow with its cases?** It is the deadline the task
    pool verification gave the same task (2 s plus 0.25 s per case), so a reference that passed
    the pool verification in time is not cut short by the budget. A flat budget would cut
@@ -307,3 +307,6 @@ host: classify the invocation from the frames → validate and decode each row i
 7. **Is this a kernel security boundary?** No. It reuses the development container's isolation
    flags unchanged and adds grading integrity on top. See
    [ADR 0004](../adr/0004-development-sandbox.md) for the threat boundary and residual risks.
+8. **Can an answer that solves nothing still earn reward?** Yes, on weak tests: returning
+   `None` or printing `YES` passes every check that expects that value.
+   `degenerate_baseline(task)` measures this per task so RL screening can drop such tasks.

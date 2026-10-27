@@ -337,8 +337,10 @@ def parse_task(task: Task, *, limits: Limits | None = None) -> FunctionChecks | 
 
 def is_parseable(task: Task, *, limits: Limits | None = None) -> bool:
     """Whether the reward channel can score ``task``. RL screening keeps only parseable
-    tasks: a function task is parseable iff every hidden assertion is a supported form; an
-    I/O task iff its cases are well formed and every expected output fits the output cap."""
+    tasks: a function task is parseable iff every hidden assertion is a supported form, each
+    expected value fits one result row, and the call sources with the import lines fit the
+    sandbox input limit; an I/O task iff its cases are well formed (at most 100), their inputs
+    together fit the sandbox input limit, and every expected output fits the output cap."""
     return parse_task(task, limits=limits) is not None
 
 
