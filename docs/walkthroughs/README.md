@@ -20,7 +20,7 @@ Implemented: [one-pass loader and masked final update](one-pass-loader.md).
 
 Implemented: [whole-document validation windows and batched validation](validation-windows.md).
 
-Implemented: [cached generation](kv-cache.md).
+Implemented: [batched cached generation and the seeded sampler](kv-cache.md).
 
 Implemented: [evaluation metrics](metrics.md).
 
