@@ -40,6 +40,7 @@ from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.choices import ChoiceTask
 from scratchcoder.eval.harness import HOST_RETRIES, isolated_execution
 from scratchcoder.eval.parallel import OVERSIZED, Call, Execute, Outcome, run_calls
+from scratchcoder.eval.protocols import load_suite_tasks
 from scratchcoder.eval.tasks import Task
 from scratchcoder.sandbox.reward import (
     FUNCTION_DEGENERATE_ANSWERS,
@@ -513,8 +514,6 @@ def pool_baseline_report(
     allow_test: bool = False,
 ) -> dict[str, Any]:
     """:func:`pool_constant_baseline` for a pool task file, with its identity recorded."""
-    from scratchcoder.eval.protocols import load_suite_tasks
-
     if split == "test" and not allow_test:
         raise PermissionError(
             "the pool test split's baseline is computed only inside the logged unseal step"

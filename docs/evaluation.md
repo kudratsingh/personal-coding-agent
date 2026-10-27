@@ -41,7 +41,7 @@ Generation and execution are separate steps joined by a hashed completions file;
   - **Output:** the file's SHA-256 is printed, and the file runs no code.
 - **`scratchcoder eval-execute`:** executes a pool completions file through the evaluation runner, with `--workers` (default 8) and `--tokenizer` (required for chat-v1, whose extraction reads token IDs).
   - **Scoring:** host failures, including `host_stalled` results, are retried three times with bounded backoff and never scored. An attempt still failing is listed as unresolved. Every passing attempt records the reward channel's static audit.
-  - **Results file:** append-only, keyed by task and sample, and named by the completions SHA-256. Running it again continues an interrupted run.
+  - **Results file:** append-only, keyed by task and sample, and named by the completions SHA-256. Running it again continues an interrupted run. The command exits with status 3 while any attempt is unresolved.
 - **`scratchcoder eval-seal`:** records a pool test completions file's SHA-256 in a hash-chained seal ledger.
   - **Unsealing:** `eval-execute` refuses the test split unless given `--seal-ledger` and `--unseal`. The unseal record is a JSON file naming all four frozen endpoints' checkpoint SHA-256 values and the completions SHA-256 values to unseal.
   - **One read:** each test completions file is executed once, as a logged read that can resume after an interruption. A second execution is refused.
