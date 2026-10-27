@@ -57,8 +57,9 @@ class Result:
     elapsed_seconds: float = 0.0
     host_stalled: bool = False
     """True when the host watchdog, not the supervisor, ended the call. The status stays
-    ``timeout`` (evaluation scoring is unchanged); callers that must not count a host stall
-    against a candidate, such as RL dev checks, retry on this flag."""
+    ``timeout`` so the status vocabulary is unchanged, but such a result is not a verdict on
+    the candidate: callers must retry it and never score it (as a pass, a failure or a
+    timeout)."""
 
     @property
     def passed(self) -> bool:

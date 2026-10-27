@@ -31,13 +31,26 @@ puts the expected test values in the container. For a supported hidden assertion
 `ast.literal_eval` and keeps it; only `CALL`'s source enters the container with the candidate.
 A `CALL` that itself compares anything, for example `(f(x) == 5) is True`, is not supported,
 because the comparison would carry the expected value into the container and be judged there.
-The container's trusted supervisor runs the candidate in a child process, evaluates each `CALL`
-there, and reports a type-preserving encoding of its value; the host decodes it and compares
-type and value against the literal it kept. The reward is `passed / total`, with the
-denominator taken from the task file. For I/O tasks every case runs under a per-case deadline
-and an overall per-attempt wall budget; only the inputs enter the container, the container
-returns each case's bounded stdout, and the host compares with expected outputs it never
-shared. Cases or calls that do not run count as failed.
+The container's trusted supervisor runs the candidate in a child process as the main script,
+followed by the tests' imports, as the evaluation program does; it evaluates each `CALL` there
+and reports a type-tagged encoding of its value. The host rebuilds that value from
+built-in types only and decides the check as the hidden assertion itself would: Python `==`
+against the literal it kept (so `2.0` passes `== 2` and `True` passes `== 1`, as the
+evaluation runner's in-process assertion would), identity for `is None/True/False`, and
+truthiness for `assert not CALL`. Because the rebuilt value holds only built-in types, no
+candidate-defined `__eq__` ever runs on the host. The reward is `passed / total`, with the
+denominator taken from the task file. For I/O tasks the cases run in turn under one deadline
+shared by all of them; only the inputs enter the container, the container returns each case's
+bounded stdout, and the host compares with expected outputs it never shared. Cases or calls
+that do not run count as failed.
+
+The attempt budgets are 8 s for a function task (4 s per call) and, for an I/O task, the task
+pool verification's own deadline rule: 2 s plus 0.25 s per case, at most 60 s, kept in one
+function (`scratchcoder.sandbox.budget.io_seconds`) that the pool verification also uses, with
+the same container limits. As in the pool verification's I/O program there is no separate
+per-case limit, so a reference that passed the pool verification in time is not cut short;
+a case that never ends uses up the budget and leaves the later cases unrun. Each result
+records the budget it ran under, and the host's stall deadline is that budget plus 15 s.
 
 This closes the in-program grading hole: because the candidate never learns which value would
 pass, forging the reported value — including flooding the result channel, printing fake output,
@@ -58,8 +71,8 @@ I/O cases run from a fork server inside the container: one clean interpreter sta
 attempt and each case runs in a fresh fork of it, which finishes through the interpreter's own
 shutdown. No candidate state survives from one case to the next, and per-case verdicts match
 the evaluation runner on the reference corpus in the tests; the difference is cost (a fork
-instead of an interpreter start), so a correct 99-case solution now completes within the 8 s
-budget even with eight attempts running at once.
+instead of an interpreter start), so the cases spend less of the shared deadline than the pool
+verification, which starts an interpreter per case.
 
 **Limits.** This adds grading integrity, not a stronger isolation boundary: it reuses every
 container flag unchanged. It is not a tamper-proof grader against a candidate that simply
@@ -92,8 +105,9 @@ and after every I/O case, it kills every other process in the container, so no s
 the pid limit, memory or a pipe into the next case.
 
 The evaluation runner keeps its status vocabulary; when its own host watchdog ends a call it
-still reports `timeout` but marks the result `host_stalled`, so a caller such as an RL dev
-check can retry a host stall instead of counting it against the candidate.
+still reports `timeout` but marks the result `host_stalled`. Such a result is not a verdict on
+the candidate: callers must retry it and never score it. The task pool's verification already
+retries such stalls; the evaluation harness does not yet.
 
 ### Rehearsal-only execution decision
 
@@ -125,9 +139,17 @@ are out of scope here.
   candidate started (for example the virtual machine runs out of memory) and before it
   reported, the attempt scores 0.0 rather than being retried. This can only lower rewards, and
   the alternative would let a candidate that provokes such a kill skip its failure.
-- **Strict types.** `int` and `float` stay distinct (`2.0` does not match `== 2`), as do `bool`
-  and `int`, and `tuple` and `list`; a correct solution that returns the other numeric type
-  scores 0 on that check although the evaluation path would pass it.
+- **Candidate-defined result types.** A call whose result is an object of a type the
+  candidate defined (not a built-in or a subclass of one) cannot be encoded, so the check fails
+  in reward mode even where the evaluation runner's in-process assertion could pass it through
+  that type's own `__eq__`. This is the price of never running candidate comparison code on
+  the host; for built-in values and their subclasses the two decide alike.
+- **Call sources are visible to the candidate.** The call sources and the setup imports enter
+  the container and share the candidate's process; only the compared literal is kept from it.
+  A literal written inside `CALL` itself (rare forms such as `assert f(1) - 2.5 == 0` or
+  `assert not isclose(f(1), 2.5)`) can therefore be read by a candidate that inspects its
+  process, which the static audit flags. A bare `assert CALL`, whose passing outcome is known in
+  advance, is not supported.
 - **Docker Desktop's built-in `/var/folders` file share.** This share cannot be removed from
   Docker Desktop's configuration and is a known residual. A container cannot reach it unless
   code asks for a mount, and the sandbox never requests any mount; the exposure would require an
@@ -135,5 +157,6 @@ are out of scope here.
 - **Emulation on the Mac.** The pinned image is `linux/amd64` emulated on an arm64 laptop. This
   is a development environment with emulation in the loop, not a production host, so timing and
   any emulation-layer behavior are not a security guarantee. An I/O solution whose own compute
-  exceeds the 8 s budget still loses the cases it did not reach (reported in each result's
-  `unfinished` count); the 8 s default is a planning value and a parameter.
+  exceeds its budget still loses the cases it did not reach (reported in each result's
+  `unfinished` count). With the per-case rule an I/O attempt can take up to 27 s at 100 cases,
+  so the reward time per RL update is a measured quantity, not a fixed bound.
