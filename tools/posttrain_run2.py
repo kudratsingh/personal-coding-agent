@@ -85,7 +85,6 @@ from tools import posttrain_ops
 from tools.posttrain_run import (
     BRIDGE_LOST_STOP,
     CONTROL_REFERENCE,
-    PROJECTED_STOP,
     RESERVE_STOP,
     RL_REFERENCE,
     SFT_ARC,

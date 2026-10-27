@@ -515,7 +515,7 @@ def test_the_command_needs_the_pinned_image_so_its_passes_always_run(tmp_path: P
 
     files = command_files(tmp_path)
     with pytest.raises(TypeError):
-        bridge_command.serve_command(  # type: ignore[call-arg]
+        bridge_command.serve_command(
             host="unused",
             port=22,
             identity_file=tmp_path / "unused",

@@ -1776,6 +1776,8 @@ def render_posttrain2_markdown(report: Mapping[str, Any]) -> str:
     labels = dict(RUN2_ROWS)
     for name, scenario in report["scenarios"].items():
         tokens = scenario["evaluation_tokens"]
+        launch = scenario["launch_at_this_estimate"]
+        verdict = "the gate accepts it" if launch["fits"] else "**the gate refuses it**"
         lines += [f"## {name}", "", "| Stage | Hours | Dollars |", "| --- | ---: | ---: |"]
         for key, row in scenario["rows"].items():
             label = labels[key]
@@ -1797,11 +1799,9 @@ def render_posttrain2_markdown(report: Mapping[str, Any]) -> str:
             f"${scenario['stop_at_120_percent_usd']:.2f}, so a run with this estimate stops at "
             f"${scenario['limits_at_this_estimate']['limit_usd']:.2f} with a "
             f"{scenario['limits_at_this_estimate']['wall_seconds']:,} s wall. At that stop the "
-            f"launch rule (the planning rates, "
-            f"{scenario['launch_at_this_estimate']['planning_seconds_needed']:,.0f} s) leaves "
-            f"{scenario['launch_at_this_estimate']['setup_allowance_seconds']:,.0f} s for the "
-            f"{scenario['launch_at_this_estimate']['startup_seconds']:,.0f} s setup: "
-            f"{'the gate accepts it' if scenario['launch_at_this_estimate']['fits'] else '**the gate refuses it**'}.",
+            f"launch rule (the planning rates, {launch['planning_seconds_needed']:,.0f} s) "
+            f"leaves {launch['setup_allowance_seconds']:,.0f} s for the "
+            f"{launch['startup_seconds']:,.0f} s setup: {verdict}.",
             "",
         ]
     if report.get("gate_estimate_usd") is not None:
