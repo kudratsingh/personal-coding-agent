@@ -4,6 +4,7 @@ import datetime as dt
 import hashlib
 import json
 import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -257,3 +258,19 @@ def test_gh_never_sees_storage_or_cloud_credentials() -> None:
     )
     assert environment == {"HOME": "/h", "GH_TOKEN": "t"}
     assert benchmark_dispatch.MAX_EXPIRES_SECONDS == 3600
+
+
+def test_the_tool_runs_as_a_module_from_the_repository_root() -> None:
+    # It imports its sibling tools.r2_store, so `python tools/benchmark_dispatch.py` cannot
+    # work; the documented form is the module form.
+    root = Path(__file__).resolve().parents[1]
+    done = subprocess.run(
+        [sys.executable, "-m", "tools.benchmark_dispatch", "--help"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "usage: python -m tools.benchmark_dispatch" in done.stdout
+    assert "--expires-seconds" in done.stdout

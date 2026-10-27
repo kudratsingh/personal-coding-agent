@@ -11,6 +11,11 @@ The completions file (HumanEval, HumanEval+ or MBPP+ only) must already be in R2
 4. waits for the run, downloads the ``benchmark-results-<sha256>`` artifact and checks that
    the results name the same completions SHA-256, suite and request ID.
 
+Run it as a module from the repository root (it imports its sibling ``tools.r2_store``)::
+
+    uv run --locked python -m tools.benchmark_dispatch --completions he.jsonl \\
+        --suite humaneval --key evaluation/he.jsonl --repo owner/name --output runs/he-results
+
 The link appears in the public repository's run metadata, which is why it names one
 object, expires quickly and may only point at public-benchmark completions. R2 credentials
 stay on the Mac: they sign the link here and are removed from ``gh``'s environment. Pool
@@ -280,7 +285,9 @@ def dispatch(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(
+        prog="python -m tools.benchmark_dispatch", description=__doc__.split("\n\n")[0]
+    )
     parser.add_argument("--completions", type=Path, required=True)
     parser.add_argument("--suite", choices=BENCHMARK_SUITES, required=True)
     parser.add_argument("--key", required=True, help="the completions file's R2 object key")
