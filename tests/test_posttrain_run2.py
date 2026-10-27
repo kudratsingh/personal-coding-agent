@@ -398,6 +398,44 @@ def test_run_two_fits_its_ceiling_at_the_planning_rates() -> None:
     )
 
 
+def test_rls_dev_checks_only_ever_tighten_the_evaluation_projection(
+    found: Fixtures2, tmp_path: Path
+) -> None:
+    """Run 2 has no probe: the evaluation is projected at the lower of the planning speed and
+    RL's dev-check rate, and the evaluation files' own rate may only lower it further, as in
+    run 1 (where the probe is the floor)."""
+    from types import SimpleNamespace
+
+    from scratchcoder.rl.rollout import DEV_TOKENS
+
+    worker = make_run2_worker(found, tmp_path / "run", bucket=MemoryBucket())
+    planned = worker.rates.generation_tokens_per_second
+    rl = worker.plan.rl
+    programs = int(rl["dev_tasks"]) * (int(rl["dev_samples"]) + 1)
+
+    def result(dev_rate: float) -> Any:
+        seconds = {"rollout_generation": 1.0, "training_step": 1.0, "reward_wait": 1.0}
+        seconds |= {"dev_generation": programs * DEV_TOKENS / dev_rate, "dev_wait": 1.0}
+        return SimpleNamespace(seconds=seconds, updates=1, checks=[None], busy_seconds=2.0)
+
+    worker.measure_rl(result(10 * planned))  # A fast reading never loosens the projection.
+    assert worker.rates.generation_tokens_per_second == planned
+    assert worker.rates.basis["generation"] == "planning"
+    assert worker.rates.dev_generation_tokens_per_second == pytest.approx(10 * planned)
+    worker.measure_rl(result(planned / 2))
+    assert worker.rates.generation_tokens_per_second == pytest.approx(planned / 2)
+    assert worker.rates.basis["generation"] == "measured-dev-checks"
+    floor = worker.rates.generation_tokens_per_second
+    entry = worker.plan.stage("eval-rl").files[0]
+    worker.observe_generation(entry, entry.planned_tokens / (10 * floor))  # A fast file.
+    assert worker.rates.generation_tokens_per_second == pytest.approx(floor)
+    assert worker.rates.basis["generation"] == "measured-dev-checks"
+    assert worker.report["generation_observed"]["floor_basis"] == "measured-dev-checks"
+    worker.observe_generation(entry, 100 * entry.planned_tokens / floor)  # A slow one.
+    assert worker.rates.generation_tokens_per_second < floor
+    assert worker.rates.basis["generation"] == "observed-evaluation"
+
+
 # A completed run --------------------------------------------------------------------------------
 
 

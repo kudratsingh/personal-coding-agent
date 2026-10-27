@@ -323,8 +323,18 @@ def test_the_cost_stop_keeps_one_full_wait_at_the_quoted_rate() -> None:
     derived = spec.ceiling
     margin_usd = bounds.wait_margin_seconds / 3600 * derived.quoted_total_hourly
     assert margin_usd == pytest.approx(1.81492, abs=1e-5)  # 10,889.5 s at $0.60/h.
-    # A wait may start only while it ends before the $5.80 stop: by $3.985 of quoted spend.
-    assert derived.worker_cost_stop_usd - margin_usd == pytest.approx(3.98508, abs=1e-5)
+    # A wait may start only while it ends before every stop. At launch the worker's lifetime
+    # is the in-Pod timer's, 34,620 s, and the finalization reserve takes its last 900 s, so
+    # the reserve binds first: no wait starts after 22,830.5 s, $3.805 of quoted spend (the
+    # lifetime's end alone would allow $3.955, the $5.80 cost stop $3.985).
+    lifetime = derived.self_destruct_seconds
+    rate = derived.quoted_total_hourly / 3600
+    reserve = lifetime - spec.finalization_reserve_seconds - bounds.wait_margin_seconds
+    end = lifetime - bounds.wait_margin_seconds
+    cost = derived.worker_cost_stop_usd / rate - bounds.wait_margin_seconds
+    assert (lifetime, reserve, end) == (34_620, 22_830.5, 23_730.5)
+    assert cost == pytest.approx(23_910.5)
+    assert [round(seconds * rate, 3) for seconds in (reserve, end, cost)] == [3.805, 3.955, 3.985]
     # The margin is the longer wait's: a reward wait alone needs less.
     assert bounds.reward_timeout_seconds < bounds.wait_margin_seconds == bounds.dev_timeout_seconds
 

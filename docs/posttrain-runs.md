@@ -153,7 +153,7 @@ The proposal's flat 420 s is not used: 256 slow I/O attempts on 8 workers can ta
 
 ### Limits of run 2
 
-At the planned $5.80 and $0.60 an hour (`ceiling_limits`): the worker stops at $5.80, the watchdog at $5.79, the Pod wall is 34,800 s, the in-Pod timer 34,620 s; the in-Pod idle limit 900 s, the watchdog's 600 s outside waits, the transfer window 900 s. The launch rule needs 21,302 s at the planning rates, which leaves about 3.6 hours of the timer's lifetime for setup.
+At the planned $5.80 and $0.60 an hour (`ceiling_limits`): the worker stops at $5.80, the watchdog at $5.79, the Pod wall is 34,800 s, the in-Pod timer 34,620 s; the in-Pod idle limit 900 s, the watchdog's 600 s outside waits, the transfer window 900 s. The launch rule needs 21,302 s at the planning rates, which leaves about 3.6 hours of the timer's lifetime for setup. Run 2 has no probe: the projected-finish rule prices RL's later stages at RL's measured rates, and the evaluation at the lower of the planning speed and RL's dev-check rate (the same batch and token cap), lowered further by slow evaluation files; a fast measurement never loosens it, as in run 1.
 
 ### Safeguards of run 2
 

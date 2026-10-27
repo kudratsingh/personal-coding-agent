@@ -71,6 +71,7 @@ from tools.posttrain_run import (
     RESERVE_STOP,
     RL_REFERENCE,
     WAIT_MARGIN_STOP,
+    EvalFile,
     PosttrainWorker,
     Specification,
     StagePlan,
@@ -216,6 +217,7 @@ class Run2Worker(PosttrainWorker):
         self.uploaded: set[Path] = set()
         self.ending: str | None = None
         """Why the run ends early, if it does: the stop reason the worker reports."""
+        self.generation_floor_basis = "planning"
         super().__init__(spec, root, **options)
         self.report.update(
             rl=None,
@@ -670,15 +672,33 @@ class Run2Worker(PosttrainWorker):
         if checks and seconds["dev_generation"] > 0:
             rate = checks * programs * DEV_TOKENS / seconds["dev_generation"]
             changes["dev_generation_tokens_per_second"] = rate
-            if int(rl["dev_batch_size"]) == self.plan.generation_batch:
+            current = self.rates.generation_tokens_per_second
+            if int(rl["dev_batch_size"]) == self.plan.generation_batch and rate < current:
                 # The dev checks generate at the evaluation batch and the same 512-token cap:
-                # the evaluation stages are projected at their measured rate, not the
-                # planning speed (run 2 has no probe of its own).
+                # the evaluation stages are projected at the lower of the planning speed and
+                # the checks' measured rate (run 2 has no probe of its own), so, as in run 1,
+                # a measurement only makes the projected-finish rule stricter.
                 changes["generation_tokens_per_second"] = rate
                 basis["generation"] = "measured-dev-checks"
         if checks:
             changes["dev_wait_seconds_per_check"] = seconds["dev_wait"] / checks
         self.rates = replace(self.rates, **changes, basis={**self.rates.basis, **basis})
+
+    def observe_generation(self, entry: EvalFile, seconds: float) -> None:
+        """Run 1's rule, the lower of a floor and the evaluation files' rate so far, with
+        run 2's floor: there is no probe, so the floor is the rate the evaluation was
+        projected at when it began (the planning speed, or RL's dev checks where slower).
+        The projection never loosens past it."""
+        batch = self.plan.generation_batch
+        if batch not in self.probe_rates:
+            self.probe_rates[batch] = self.rates.generation_tokens_per_second
+            self.generation_floor_basis = self.rates.basis.get("generation", "planning")
+        super().observe_generation(entry, seconds)
+        if self.rates.generation_tokens_per_second == self.probe_rates[batch]:
+            basis = {**self.rates.basis, "generation": self.generation_floor_basis}
+            self.rates = replace(self.rates, basis=basis)
+        if "generation_observed" in self.report:
+            self.report["generation_observed"]["floor_basis"] = self.generation_floor_basis
 
     def end_reason(self, stop: str, detail: str) -> str:
         """The run's stop reason when an arm's stop ends it: ``bridge_lost``, ``wait_margin``
