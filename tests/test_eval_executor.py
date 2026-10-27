@@ -430,6 +430,13 @@ def test_an_arm_with_the_sft_weights_reuses_its_reads_and_one_checkpoint_execute
     [
         (lambda e: e.update(base={"reuses": "sft", "selected_checkpoint_sha256": "e" * 64}), ""),
         (lambda e: e.update(rl={"reuses": "rl", "selected_checkpoint_sha256": "e" * 64}), ""),
+        (  # Only SFT's reads stand for an arm: never base's.
+            lambda e: e.update(
+                rl={"reuses": "base", "selected_checkpoint_sha256": "e" * 64},
+                **{"more-sft": {"reuses": "base", "selected_checkpoint_sha256": "e" * 64}},
+            ),
+            "only SFT's reads",
+        ),
         (lambda e: e.update(rl={"reuses": "sft"}), "selected checkpoint"),
         (lambda e: e.update(rl={"reuses": "sft", "selected_checkpoint_sha256": "x"}), ""),
         (
@@ -437,7 +444,7 @@ def test_an_arm_with_the_sft_weights_reuses_its_reads_and_one_checkpoint_execute
                 rl={"reuses": "more-sft", "selected_checkpoint_sha256": "e" * 64},
                 **{"more-sft": {"not_evaluated": "lost"}},
             ),
-            "not read itself",
+            "only SFT's reads",
         ),
         (lambda e: e.update(rl={"not_evaluated": ""}), "reason"),
         (lambda e: e.update(sft={"not_evaluated": "no"}), ""),

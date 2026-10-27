@@ -67,6 +67,9 @@ from scratchcoder.eval.completions import SHA256, Completions, read_completions
 ENDPOINTS = ("base", "sft", "rl", "more-sft")
 REUSING_ENDPOINTS = ("rl", "more-sft")
 """The endpoints that may reuse another's reads or be absent: run 2's arms."""
+REUSED_ENDPOINT = "sft"
+"""The one endpoint whose reads an arm may reuse: an arm whose selected weights are the SFT
+weights it started from (the owner's run 2 gate rulings), never base or the other arm."""
 UNSEAL_KIND = "unseal"
 LEDGER_FORMAT = "scratchcoder-seal-ledger"
 GENESIS = "0" * 64
@@ -142,14 +145,13 @@ class UnsealRecord:
                 selected = item.get("selected_checkpoint_sha256")
                 if (
                     set(item) != {"reuses", "selected_checkpoint_sha256"}
-                    or item["reuses"] not in ENDPOINTS
-                    or item["reuses"] == name
+                    or item["reuses"] != REUSED_ENDPOINT
                     or not isinstance(selected, str)
                     or not SHA256.fullmatch(selected)
                 ):
                     raise SealError(
-                        f"endpoint {name}: a reuse names another endpoint and the arm's "
-                        "selected checkpoint SHA-256"
+                        f"endpoint {name}: a reuse names {REUSED_ENDPOINT} (only SFT's reads "
+                        "stand for an arm) and the arm's selected checkpoint SHA-256"
                     )
                 reuses.append(Reuse(name, item["reuses"], selected))
                 continue
