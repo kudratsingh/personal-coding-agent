@@ -588,6 +588,14 @@ def dev_pool(count: int = 210) -> list[Task]:
     return [Task(**{**DEV_TASKS[0].__dict__, "id": f"pool-dev-{index}"}) for index in range(count)]
 
 
+COMMAND_WINDOW: dict[str, Any] = {
+    "image_id": "sha256:" + "d" * 64,
+    "window_check": lambda: {"status": "passed", "checks": {}},
+}
+"""The pinned image's ID (required) and a passing window check in place of the real passes
+(``tests/test_rl_bridge_window.py`` covers those)."""
+
+
 def command_files(tmp_path: Path) -> dict[str, Any]:
     files = {
         "train_tasks": tmp_path / "pool" / "train.jsonl",
@@ -625,6 +633,7 @@ def test_the_command_serves_with_the_kept_list_and_the_dev_subset(tmp_path: Path
         max_polls=2,
         environ=environ,
         transport=DirectoryTransport(pod),
+        **COMMAND_WINDOW,
         **files,
     )
     assert status == 0 and environ == {"PATH": "/usr/bin"}  # the agent socket is cleared
@@ -650,6 +659,7 @@ def test_the_command_refuses_secrets_sealed_files_and_bad_records(tmp_path: Path
         "dev_timeout": 300,
         "max_polls": 1,
         "transport": DirectoryTransport(tmp_path / "pod"),
+        **COMMAND_WINDOW,
     }
     dotenv = tmp_path / ".env"
     dotenv.write_text("MY_TOKEN=secret-value\n")
@@ -752,6 +762,7 @@ def test_a_second_command_on_one_pod_is_refused(
         "dotenv": None,
         "max_polls": 2,
         "environ": {},
+        **COMMAND_WINDOW,
         **files,
     }
     assert (
@@ -815,6 +826,7 @@ def test_the_command_refuses_a_missing_dotenv_and_a_bad_root_or_timeout(tmp_path
         "max_polls": 1,
         "environ": {},
         "transport": DirectoryTransport(tmp_path / "pod"),
+        **COMMAND_WINDOW,
     }
     with pytest.raises(BridgeEnvironmentError, match="does not exist"):
         serve_command(**{**options, **files}, dotenv=tmp_path / "missing.env")

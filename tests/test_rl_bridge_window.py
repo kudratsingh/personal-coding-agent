@@ -41,6 +41,7 @@ from scratchcoder.rl.bridge_mac import (
     DirectoryTransport,
     WindowCheckFailed,
 )
+from scratchcoder.sandbox.window import RESIDUAL_SHARES, SHARES, SHELL_AGENT_SOCKET
 
 IMAGE_ID = "sha256:" + "d" * 64
 
@@ -253,7 +254,7 @@ def test_the_bridges_pass_checks_its_own_environment_names_only(tmp_path: Path) 
             dotenv=[dotenv],
             environ=environ,
             session_socket=lambda: "/session/Listeners",
-            run=docker or FakeDocker(),
+            run=docker or FakeDocker(shared=RESIDUAL_SHARES),
             run_agent=agent,
         )
         return dict(check())
@@ -271,7 +272,7 @@ def test_the_bridges_pass_checks_its_own_environment_names_only(tmp_path: Path) 
         assert record["checks"]["environment"]["set"] == [name]
         if name != "SSH_AUTH_SOCK":  # A socket path is recorded, as the window check does.
             assert value not in json.dumps(record)
-    shared = outcome(dict(clean), FakeDocker(shared=("/Users",)))
+    shared = outcome(dict(clean), FakeDocker(shared=("/Users", *RESIDUAL_SHARES)))
     assert shared["checks"]["file_sharing"]["passed"] is False
     keyed = FakeAgent({"/session/Listeners": (0, "256 SHA256:k key (ED25519)\n")})
     agent_record = window_pass(
@@ -279,12 +280,14 @@ def test_the_bridges_pass_checks_its_own_environment_names_only(tmp_path: Path) 
         dotenv=None,
         environ=dict(clean),
         session_socket=lambda: "/session/Listeners",
-        run=FakeDocker(),
+        run=FakeDocker(shared=RESIDUAL_SHARES),
         run_agent=keyed,
     )()
     assert agent_record["checks"]["ssh_agent"]["passed"] is False
     assert "SHA256:k" not in json.dumps(agent_record)
-    tampered = outcome(dict(clean), FakeDocker(image_id="sha256:" + "e" * 64))
+    tampered = outcome(
+        dict(clean), FakeDocker(image_id="sha256:" + "e" * 64, shared=RESIDUAL_SHARES)
+    )
     assert tampered["checks"]["image"]["passed"] is False
     with pytest.raises(ValueError, match="image ID"):
         window_pass("latest", dotenv=None, environ={})
@@ -329,6 +332,7 @@ def test_the_command_runs_its_window_passes_on_its_own_environment(
     assert status == 0 and len(built) == 1
     assert built[0]["image_id"] == IMAGE_ID and built[0]["environ"] is environ
     assert "SSH_AUTH_SOCK" not in environ  # Cleared before the first pass reads it.
+    assert built[0]["shell_socket"] == "/tmp/agent"  # Still asked by every pass.
     (row,) = receipts(tmp_path / "mac")
     assert row["bridge_pass"]["reason"] == "start"
 
@@ -371,8 +375,14 @@ def test_the_pods_timeouts_hold_the_checks_at_their_call_bounds() -> None:
     assert (bounds.window_check_seconds, bounds.image_check_seconds) == (730.0, 127.0)
 
 
-def test_the_interval_must_be_positive(tmp_path: Path) -> None:
-    for bad in (0, -1.0, float("inf"), float("nan"), True):
+def test_the_interval_must_be_positive_and_at_most_the_justified_bound(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A typed 9000 for 900 would turn the repeat into a start-only check: refused, by the
+    server and by the command line (exit 2), as is anything above 900 s."""
+    from test_rl_bridge_end_to_end import cli_arguments
+
+    for bad in (0, -1.0, float("inf"), float("nan"), True, 901.0, 9000.0, 1e12):
         with pytest.raises(ValueError, match="window_check_seconds"):
             server_for(
                 tmp_path / "pod",
@@ -381,3 +391,201 @@ def test_the_interval_must_be_positive(tmp_path: Path) -> None:
                 window_check=Passes("passed"),
                 window_check_seconds=bad,
             )
+    server_for(
+        tmp_path / "pod",
+        tmp_path / "mac-ok",
+        FakeClock(),
+        window_check=Passes("passed"),
+        window_check_seconds=WINDOW_CHECK_INTERVAL_SECONDS,
+    ).close()
+    (tmp_path / "empty.env").write_text("")
+    for typed in ("901", "9000", "inf", "0"):
+        with pytest.raises(SystemExit) as caught:
+            main([*cli_arguments(tmp_path), "--window-check-interval", typed, "--no-dotenv"])
+        assert caught.value.code == 2
+        assert "window-check-interval" in capsys.readouterr().err
+
+
+def test_a_restarted_bridge_keeps_every_earlier_receipt(tmp_path: Path) -> None:
+    """A pass fails and stops the server; the owner fixes the window and starts the same
+    command over the same state. The new server numbers its passes after the highest receipt,
+    so the failed pass's receipt, and those before it, are never overwritten."""
+    pod, state, clock = tmp_path / "pod", tmp_path / "mac", FakeClock()
+    (pod / "outbox").mkdir(parents=True)
+    (pod / "inbox").mkdir()
+    clock.hooks.append(lambda: write_request(pod, request(1)))
+    with server_for(
+        pod, state, clock, window_check=Passes("passed", "failed"), window_check_seconds=5.0
+    ) as server:
+        with pytest.raises(WindowCheckFailed):
+            server.serve(poll_seconds=10.0, max_polls=5, progress_seconds=None)
+    before = {path.name: path.read_bytes() for path in (state / "window-checks").iterdir()}
+    assert sorted(before) == ["pass-00001.json", "pass-00002.json"]
+    clock.hooks.clear()
+    with server_for(pod, state, clock, window_check=Passes("passed")) as server:
+        server.serve(poll_seconds=0.0, max_polls=1, progress_seconds=None)
+        assert answered(pod, 1)
+    rows = receipts(state)
+    assert [(row["bridge_pass"]["pass"], row["status"]) for row in rows] == [
+        (1, "passed"),
+        (2, "failed"),
+        (3, "passed"),
+    ]
+    for name, data in before.items():
+        assert (state / "window-checks" / name).read_bytes() == data
+    assert rows[2]["bridge_pass"]["reason"] == "start"
+
+
+def test_every_pass_asks_the_shell_agent_the_bridge_was_started_from(tmp_path: Path) -> None:
+    """``mac_window_check exec`` withholds ``SSH_AUTH_SOCK`` from the bridge and hands it the
+    shell's socket path instead; the command also keeps a socket it clears itself. Every
+    pass asks that agent beside the login session's, so a key added to the shell's agent
+    during the window stops the bridge."""
+    shell = "/var/folders/x/T/ssh-abc/agent.1"
+    keyed = FakeAgent({shell: (0, "256 SHA256:k key (ED25519)\n")})
+    clean = {"PATH": "/usr/bin:/bin"}
+    for environ, given in (({**clean, SHELL_AGENT_SOCKET: shell}, None), (dict(clean), shell)):
+        record = window_pass(
+            IMAGE_ID,
+            dotenv=None,
+            environ=environ,
+            session_socket=lambda: "/session/L",
+            shell_socket=given,
+            run=FakeDocker(shared=RESIDUAL_SHARES),
+            run_agent=keyed,
+        )()
+        assert record["status"] == "failed" and record["checks"]["ssh_agent"]["passed"] is False
+        assert record["checks"]["environment"]["passed"] is True  # A path, not an agent.
+        assert keyed.asked[-2:] == [shell, "/session/L"]
+        assert "SHA256:k" not in json.dumps(record)
+    empty = FakeAgent()
+    record = window_pass(
+        IMAGE_ID,
+        dotenv=None,
+        environ={**clean, SHELL_AGENT_SOCKET: shell},
+        session_socket=lambda: "/session/L",
+        run=FakeDocker(shared=RESIDUAL_SHARES),
+        run_agent=empty,
+    )()
+    assert record["status"] == "passed" and empty.asked == [shell, "/session/L"]
+
+
+class DaemonDown(FakeDocker):
+    """Docker fails every container start (exit 125) for a reason other than a share."""
+
+    def __call__(self, argv: list[str]) -> Any:
+        found = super().__call__(argv)
+        if argv[3] == "run":
+            found.returncode, found.stdout, found.stderr = 125, "", "docker: no space left"
+        return found
+
+
+def test_the_residual_share_is_the_positive_control_of_a_bridge_pass() -> None:
+    """A pass counts a removable share as refused only on Docker's mount-denied answer, and
+    the ``/var/folders`` residual must mount: a daemon failing every container start, with
+    ``/Users`` shared again, fails the pass instead of reading as refused shares."""
+
+    def run(docker: FakeDocker) -> dict[str, Any]:
+        return dict(
+            window_pass(
+                IMAGE_ID,
+                dotenv=None,
+                environ={},
+                session_socket=lambda: None,
+                run=docker,
+                run_agent=FakeAgent(),
+            )()
+        )
+
+    clean = run(FakeDocker(shared=RESIDUAL_SHARES))
+    assert clean["status"] == "passed"
+    rows = {row["share"]: row for row in clean["checks"]["file_sharing"]["shares"]}
+    assert rows["/var/folders"]["mounted"] is True
+    assert all(rows[share]["mount_denied"] and rows[share]["refused"] for share in SHARES)
+    for docker in (FakeDocker(), DaemonDown(shared=("/Users",))):
+        record = run(docker)
+        assert record["status"] == "failed", type(docker).__name__
+        assert record["checks"]["file_sharing"]["passed"] is False
+    down = run(DaemonDown())
+    assert not any(row["refused"] for row in down["checks"]["file_sharing"]["shares"])
+
+
+def test_the_command_needs_the_pinned_image_so_its_passes_always_run(tmp_path: Path) -> None:
+    from test_rl_bridge_end_to_end import command_files
+
+    files = command_files(tmp_path)
+    with pytest.raises(TypeError):
+        bridge_command.serve_command(  # type: ignore[call-arg]
+            host="unused",
+            port=22,
+            identity_file=tmp_path / "unused",
+            known_hosts=tmp_path / "unused",
+            remote_root="/unused",
+            pod_reward_sha256=RL_SHA,
+            pod_dev_sha256=DEV_SHA,
+            state=tmp_path / "mac",
+            reward_timeout=600,
+            dev_timeout=300,
+            dotenv=None,
+            environ={},
+            **files,
+        )
+    with pytest.raises(ValueError, match="image_id"):
+        bridge_command.serve_command(
+            host="unused",
+            port=22,
+            identity_file=tmp_path / "unused",
+            known_hosts=tmp_path / "unused",
+            remote_root="/unused",
+            pod_reward_sha256=RL_SHA,
+            pod_dev_sha256=DEV_SHA,
+            state=tmp_path / "mac",
+            reward_timeout=600,
+            dev_timeout=300,
+            dotenv=None,
+            environ={},
+            image_id="latest",
+            **files,
+        )
+    assert not (tmp_path / "mac").exists()
+
+
+@pytest.mark.skipif(
+    __import__("os").environ.get("SCRATCHCODER_SANDBOX_TESTS") != "1",
+    reason="requires explicitly enabled disposable Docker worker",
+)
+def test_a_real_bridge_pass_under_docker_leaves_no_container() -> None:
+    """The real ``window_pass`` wiring against Docker Desktop (a fake ``ssh-add``, no agent):
+    the pinned image's ID matches, the ``/var/folders`` positive control mounts, every probe
+    is recorded, and no ``scratchcoder-*`` container is left behind. Whether the removable
+    shares are refused depends on this Mac's settings, so it is recorded, not asserted."""
+    import subprocess
+
+    from scratchcoder.sandbox.runner import IMAGE
+
+    image_id = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", IMAGE],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    record = window_pass(
+        image_id,
+        dotenv=None,
+        environ={"PATH": __import__("os").environ.get("PATH", "/usr/bin:/bin")},
+        session_socket=lambda: None,
+        run_agent=FakeAgent(),
+    )()
+    assert record["checks"]["environment"]["passed"] is True
+    assert record["checks"]["image"]["passed"] is True
+    rows = {row["share"]: row for row in record["checks"]["file_sharing"]["shares"]}
+    assert set(rows) == set(SHARES + RESIDUAL_SHARES)
+    assert rows["/var/folders"]["mounted"] is True
+    assert all(isinstance(rows[share]["mount_denied"], bool) for share in SHARES)
+    left = subprocess.run(
+        ["docker", "ps", "-a", "--filter", "name=scratchcoder", "--format", "{{.Names}}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert left == []

@@ -13,7 +13,9 @@ VM, its file shares, the engine and its image store, and possibly the SSH-agent 
    (``/run/host-services/ssh-auth.sock``) whatever the child's environment holds, so
    ``ssh-add -l`` is asked of every agent socket the Mac names: the parent shell's
    ``SSH_AUTH_SOCK`` and the login session's (``launchctl getenv SSH_AUTH_SOCK``). Each must
-   answer "no identities" (exit 1) or be unreachable (exit 2).
+   answer "no identities" (exit 1) or be unreachable (exit 2). ``tools/mac_window_check.py
+   exec`` hands its child the parent shell's socket path as ``SHELL_AGENT_SOCKET`` (a path,
+   never a key), so a child that repeats the checks (run 2's bridge) still asks it.
 3. **The pinned image:** the sandbox image (``scratchcoder.sandbox.runner.IMAGE``) is present
    locally (it is never pulled) with the image ID recorded at the window's start, so a
    tampered image store is caught before a batch runs.
@@ -22,7 +24,10 @@ VM, its file shares, the engine and its image store, and possibly the SSH-agent 
    ``/tmp``) must fail every time. The built-in ``/var/folders`` share (``RESIDUAL_SHARES``)
    cannot be removed: it is probed and recorded as a known residual (ADR 0004) but does not
    fail the window. Each container is removed whatever happens, so no ``scratchcoder-*``
-   container is left behind.
+   container is left behind. With ``residual_control`` (run 2's bridge passes) the residual
+   is a positive control: it must mount, and a removable share counts as refused only when
+   Docker says the mount was denied, so a daemon that fails every container start for
+   another reason fails the pass instead of passing it.
 
 ``tools/mac_window_check.py`` runs them before a batch; run 2's reward bridge
 (``scratchcoder rl-bridge``) runs them at its start and again before scoring a request once
@@ -76,6 +81,13 @@ LAUNCHCTL_TIMEOUT_SECONDS = 10.0
 """The bound on ``launchctl getenv SSH_AUTH_SOCK``."""
 MAX_AGENT_SOCKETS = 2
 """The shell's socket and the login session's: ``agent_sockets`` names at most these two."""
+SHELL_AGENT_SOCKET = "SCRATCHCODER_SHELL_AGENT_SOCKET"
+"""The variable through which ``mac_window_check exec`` hands its child the parent shell's
+agent socket path (``SSH_AUTH_SOCK`` itself is withheld from the child). Not an agent
+variable: no SSH client reads it, so the child holds no agent, only the path to ask."""
+MOUNT_DENIED = "mounts denied"
+"""Docker Desktop's refusal of a share it does not export (``docker run`` exits 125 with
+``Error response from daemon: mounts denied: ...``), matched case-insensitively."""
 
 Run = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
 AgentRun = Callable[[str], "subprocess.CompletedProcess[str]"]
@@ -148,9 +160,12 @@ def launchd_socket() -> str | None:
 
 
 def agent_sockets(environ: Mapping[str, str], session: str | None) -> list[str]:
-    """Every SSH agent socket the Mac names: the shell's and the login session's."""
+    """Every SSH agent socket the Mac names: the shell's (its ``SSH_AUTH_SOCK``, or the path
+    ``mac_window_check exec`` handed down as ``SHELL_AGENT_SOCKET``) and the login
+    session's."""
     sockets = []
-    for socket in (environ.get("SSH_AUTH_SOCK"), session):
+    shell = environ.get("SSH_AUTH_SOCK") or environ.get(SHELL_AGENT_SOCKET)
+    for socket in (shell, session):
         if socket and socket not in sockets:
             sockets.append(socket)
     return sockets
@@ -214,10 +229,13 @@ def check(
     docker: str = "docker",
     sockets: Sequence[str] = (),
     run_agent: AgentRun | None = None,
+    residual_control: bool = False,
 ) -> dict[str, Any]:
     """Run the four checks; return a record whose ``status`` is ``passed`` or ``failed``.
 
     ``sockets`` are the agent sockets to ask (``agent_sockets``), each through ``run_agent``.
+    With ``residual_control`` the ``/var/folders`` residual must mount (the positive control)
+    and a removable share counts as refused only on Docker's mount-denied answer.
     A call that cannot finish (a ``docker`` call past its bound, a missing binary) raises: a
     check that cannot be made is never read as passed.
     """
@@ -270,21 +288,36 @@ def check(
             )
         finally:
             run([docker, "--host", ENDPOINT, "rm", "-f", name])
-        probes.append(
-            {
-                "share": share,
-                "exit_code": mounted.returncode,
-                "refused": mounted.returncode != 0 and "mounted" not in mounted.stdout,
-                "residual": share in RESIDUAL_SHARES,
-            }
+        denied = MOUNT_DENIED in (mounted.stderr or "").lower()
+        refused = mounted.returncode != 0 and "mounted" not in mounted.stdout
+        probe = {
+            "share": share,
+            "exit_code": mounted.returncode,
+            "refused": refused and (denied or not residual_control),
+            "residual": share in RESIDUAL_SHARES,
+        }
+        if residual_control:
+            probe["mount_denied"] = denied
+            if share in RESIDUAL_SHARES:
+                probe["mounted"] = mounted.returncode == 0 and "mounted" in mounted.stdout
+        probes.append(probe)
+    passed_sharing = all(probe["refused"] for probe in probes if not probe["residual"])
+    rule = (
+        "a container from the pinned image cannot mount any removable default Docker "
+        "Desktop share; the built-in /var/folders share is recorded as a known residual"
+    )
+    if residual_control:
+        passed_sharing = passed_sharing and all(
+            probe["mounted"] for probe in probes if probe["residual"]
+        )
+        rule += (
+            "; it is also the positive control and must mount, and a removable share counts "
+            "as refused only when Docker says the mount was denied"
         )
     checks["file_sharing"] = {
-        "passed": all(probe["refused"] for probe in probes if not probe["residual"]),
+        "passed": passed_sharing,
         "shares": probes,
-        "rule": (
-            "a container from the pinned image cannot mount any removable default Docker "
-            "Desktop share; the built-in /var/folders share is recorded as a known residual"
-        ),
+        "rule": rule,
     }
     passed = all(item["passed"] for item in checks.values())
     return {

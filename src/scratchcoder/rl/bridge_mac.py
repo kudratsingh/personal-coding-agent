@@ -131,9 +131,15 @@ Desktop. At the planning rates RL sends a reward request about every 80 s (26 s 
 the Mac about 1% of its time; one before every request would add its seconds to each of RL's
 100 reward waits. A change to the Mac's sharing, agents, image or environment is caught before
 the first request scored more than 15 minutes after the last pass began. The Pod's timeouts
-hold one pass at its worst (``scratchcoder.sandbox.window.pass_seconds_bound``)."""
+hold one pass at its worst (``scratchcoder.sandbox.window.pass_seconds_bound``). It is also the
+longest interval a server accepts: a shorter one only repeats the passes more often, a longer
+one (a typed 9000 for 900) would quietly turn the repeat into a start-only check."""
 WINDOW_RECEIPTS = "window-checks"
-"""The state directory's folder of window-pass receipts, one ``pass-NNNNN.json`` per pass."""
+"""The state directory's folder of window-pass receipts, one ``pass-NNNNN.json`` per pass. A
+server restarted over the same state numbers its passes after the highest receipt there, so
+an earlier server's receipts (the failed pass that stopped it among them) are never
+overwritten."""
+WINDOW_RECEIPT = re.compile(r"pass-(\d{5,})\.json\Z")
 IMAGE_CHECK_RETRIES = 3
 """Retries of the pinned image's ``docker image inspect`` before each request, after the first
 try (4 tries, waiting 1, 2 and 4 s)."""
@@ -1163,11 +1169,15 @@ class BridgeServer:
             or not isinstance(window_check_seconds, (int, float))
             or not math.isfinite(window_check_seconds)
             or window_check_seconds <= 0
+            or window_check_seconds > WINDOW_CHECK_INTERVAL_SECONDS
         ):
-            raise ValueError("window_check_seconds must be positive and finite")
+            raise ValueError(
+                "window_check_seconds must be positive and at most "
+                f"{WINDOW_CHECK_INTERVAL_SECONDS:.0f} (the justified bound)"
+            )
         self.window_check = window_check
         self.window_check_seconds = float(window_check_seconds)
-        self._window_passes = 0
+        self._window_passes = highest_window_pass(state)
         self._window_started: float | None = None
         """When the last passed window pass began (this server's monotonic clock)."""
         self.max_request_bytes = max_request_bytes
@@ -1464,6 +1474,8 @@ class BridgeServer:
             passed, failed = False, ["error"]
         receipt = self.state / WINDOW_RECEIPTS / f"pass-{number:05d}.json"
         receipt.parent.mkdir(parents=True, exist_ok=True)
+        if receipt.exists() or receipt.is_symlink():
+            raise WindowCheckFailed(f"{receipt} already exists; a receipt is never overwritten")
         summary = {
             "pass": number,
             "reason": reason,
@@ -1630,6 +1642,19 @@ class BridgeServer:
             stop.set()
             if ticker is not None:
                 ticker.join(timeout=5)
+
+
+def highest_window_pass(state: Path) -> int:
+    """The highest pass number among the window receipts in ``state`` (0 for none)."""
+    directory = state / WINDOW_RECEIPTS
+    if not directory.is_dir():
+        return 0
+    numbers = [
+        int(match.group(1))
+        for path in directory.iterdir()
+        if (match := WINDOW_RECEIPT.fullmatch(path.name))
+    ]
+    return max(numbers, default=0)
 
 
 def _phase_tasks(tasks: Iterable[Task], split: str, kind: str) -> dict[str, Task]:

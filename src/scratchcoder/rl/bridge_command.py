@@ -9,7 +9,7 @@ at least one must exist unless ``--no-dotenv``), clears the SSH agent variables,
 Mac-side bounds on a reward request and a dev check. It never opens the sealed test or
 holdout split, whether named directly or reached through a link.
 
-With ``--image-id`` (the command line requires it) the server repeats the Mac
+With ``--image-id`` (required) the server repeats the Mac
 execution-window checks (``scratchcoder.sandbox.window``) on its own process: at its start
 and again before scoring a request once its last pass is ``--window-check-interval`` seconds
 old (900 s). A failed or errored pass stops it with exit 4 before anything more is scored.
@@ -146,14 +146,18 @@ def window_pass(
     dotenv: Path | Sequence[Path] | None,
     environ: MutableMapping[str, str],
     session_socket: Callable[[], str | None] = window.launchd_socket,
+    shell_socket: str | None = None,
     run: window.Run | None = None,
     run_agent: window.AgentRun | None = None,
 ) -> WindowCheck:
     """One full pass of the execution-window checks on the bridge's own process: its
     environment (no ``.env`` name, no secret, no SSH agent variable: the child-environment
     rule under which the Pod's R2 token may stay in ``.env``), every SSH agent the Mac names
-    (the login session's, asked afresh each pass), the pinned image's ID and Docker Desktop's
-    file sharing. ``docker`` runs in the cleaned environment, each call bounded by
+    (the shell's the bridge was started from, ``shell_socket`` or the path ``mac_window_check
+    exec`` handed down in ``window.SHELL_AGENT_SOCKET``, and the login session's, asked
+    afresh each pass), the pinned image's ID and Docker Desktop's file sharing, with the
+    ``/var/folders`` residual as its positive control (``window.check``'s
+    ``residual_control``). ``docker`` runs in the cleaned environment, each call bounded by
     ``WINDOW_DOCKER_TIMEOUT_SECONDS``. ``run`` and ``run_agent`` replace the ``docker`` and
     ``ssh-add`` calls in tests."""
     if not window.IMAGE_ID.fullmatch(image_id):
@@ -166,13 +170,17 @@ def window_pass(
         docker = run or window.runner(
             window.clean_environment(current, names), timeout=WINDOW_DOCKER_TIMEOUT_SECONDS
         )
+        named = dict(current)
+        if shell_socket and not named.get(window.SHELL_AGENT_SOCKET):
+            named[window.SHELL_AGENT_SOCKET] = shell_socket
         return window.check(
             image_id=image_id,
             environ=current,
             dotenv=names,
             run=docker,
-            sockets=window.agent_sockets(current, session_socket()),
+            sockets=window.agent_sockets(named, session_socket()),
             run_agent=run_agent or window.ssh_add_list(current),
+            residual_control=True,
         )
 
     return check
@@ -245,7 +253,7 @@ def serve_command(
     ssh_timeout: float = 120.0,
     ssh_retries: int = 4,
     dotenv: Path | Sequence[Path] | None = None,
-    image_id: str | None = None,
+    image_id: str,
     max_polls: int | None = None,
     environ: MutableMapping[str, str] = os.environ,
     transport: PodTransport | None = None,
@@ -259,9 +267,13 @@ def serve_command(
     (``docs/rl.md``): the server scores one request at a time, so a request the Pod has
     already withdrawn must not keep the next one waiting. ``dotenv`` lists the ``.env``
     files to check (``resolve_dotenv`` finds them for the command line; ``None`` skips the
-    check and says there is none). With ``image_id`` the server's window passes are
-    ``window_pass`` over this process's environment, unless ``window_check`` gives another
-    (a test's); ``window_check_seconds`` is their interval."""
+    check and says there is none). ``image_id`` (required) is the pinned sandbox image's
+    local ID, checked before each request; the server's window passes are ``window_pass``
+    over this process's environment, unless ``window_check`` gives another (a test's), so
+    the passes always run; ``window_check_seconds`` is their interval, at most
+    ``WINDOW_CHECK_INTERVAL_SECONDS``."""
+    if not isinstance(image_id, str) or not window.IMAGE_ID.fullmatch(image_id):
+        raise ValueError("image_id must be the local image ID, sha256:<64 hex digits>")
     for name, bound in (("reward_timeout", reward_timeout), ("dev_timeout", dev_timeout)):
         if isinstance(bound, bool) or not isinstance(bound, (int, float)):
             raise ValueError(f"{name} must be a number of seconds")
@@ -277,6 +289,7 @@ def serve_command(
             "unset these variables first (start the bridge in a terminal that has not "
             "sourced .env): " + ", ".join(refused)
         )
+    shell_socket = environ.get("SSH_AUTH_SOCK")  # Asked by every pass (a path, not a key).
     for name in AGENT_NAMES:
         environ.pop(name, None)  # the Docker and ssh children get no SSH agent
     rewards, dev = load_phase_tasks(train_tasks, kept, dev_tasks)
@@ -286,8 +299,10 @@ def serve_command(
     }
     inputs["counts"] = {REWARD: len(rewards), DEV: len(dev)}
     inputs["image_id"] = image_id
-    if window_check is None and image_id is not None:
-        window_check = window_pass(image_id, dotenv=dotenv, environ=environ)
+    if window_check is None:
+        window_check = window_pass(
+            image_id, dotenv=dotenv, environ=environ, shell_socket=shell_socket
+        )
     if transport is None:
         transport = SSHTransport(
             ssh_command(host, port, identity_file, known_hosts), remote_root, timeout=ssh_timeout
@@ -298,7 +313,7 @@ def serve_command(
         dev_tasks=dev,
         pod_task_sha256={REWARD: pod_reward_sha256, DEV: pod_dev_sha256},
         state=state,
-        before_scoring=None if image_id is None else image_check(image_id),
+        before_scoring=image_check(image_id),
         workers=workers,
         reward_timeout=reward_timeout,
         dev_timeout=dev_timeout,

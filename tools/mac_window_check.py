@@ -28,8 +28,10 @@ therefore checks, with this tool:
 ``exec`` (Mac)
     The same checks, then the given command (``eval-execute``, ``rl-screen`` or
     ``rl-bridge``) in an environment without any of those variables: the
-    ``child_environment`` pattern, so the executor never holds a credential. Its exit status
-    is returned.
+    ``child_environment`` pattern, so the executor never holds a credential. The parent
+    shell's agent socket path, when it has one, is handed down as
+    ``SCRATCHCODER_SHELL_AGENT_SOCKET`` (a path, which no SSH client reads), so the bridge's
+    repeated passes ask that agent too. Its exit status is returned.
 
 The checks themselves live in ``scratchcoder.sandbox.window``, where run 2's reward bridge
 repeats them while it runs. Nothing here pulls an image, contacts a network or reads a
@@ -55,6 +57,7 @@ from scratchcoder.sandbox.window import (
     SECRET_NAMES,
     SECRET_PREFIXES,
     SHARES,
+    SHELL_AGENT_SOCKET,
     AgentRun,
     Run,
     agent_check,
@@ -152,7 +155,10 @@ def main(
         return 3
     if args.command == "check":
         return 0
-    child = subprocess.run(command, env=clean, check=False)
+    child_environment = dict(clean)
+    if environment.get("SSH_AUTH_SOCK"):  # The path to ask, not an agent (window.py).
+        child_environment[SHELL_AGENT_SOCKET] = environment["SSH_AUTH_SOCK"]
+    child = subprocess.run(command, env=child_environment, check=False)
     return child.returncode
 
 

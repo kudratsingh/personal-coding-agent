@@ -8,6 +8,23 @@ from pathlib import Path
 from scratchcoder.common.smoke import run_smoke
 
 
+def _window_interval(text: str) -> float:
+    """``--window-check-interval``: positive, finite and at most the justified bound."""
+    import math
+
+    from scratchcoder.rl.bridge_mac import WINDOW_CHECK_INTERVAL_SECONDS
+
+    try:
+        value = float(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from error
+    if not math.isfinite(value) or not 0 < value <= WINDOW_CHECK_INTERVAL_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must be positive and at most {WINDOW_CHECK_INTERVAL_SECONDS:.0f} s"
+        )
+    return value
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Dispatch only implemented commands and return a process exit status."""
     parser = argparse.ArgumentParser(prog="scratchcoder")
@@ -168,10 +185,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     rl_bridge.add_argument(
         "--window-check-interval",
-        type=float,
+        type=_window_interval,
         default=900.0,
         help="repeat the Mac execution-window checks before scoring a request once the last "
-        "pass is this many seconds old (default 900)",
+        "pass is this many seconds old (default and maximum 900)",
     )
     rl_bridge.add_argument("--max-polls", type=int)
     from scratchcoder.eval import pipeline_cli
