@@ -113,6 +113,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     export.add_argument("--arc-directory", type=Path, help="arc: the pinned ARC-Easy Parquet files")
     export.add_argument("--output", type=Path, required=True, help="the new export file")
     export.add_argument("--record", type=Path, required=True, help="the new record file")
+    rl_bridge = subparsers.add_parser(
+        "rl-bridge",
+        help="serve one Pod's RL rewards and dev verdicts from the Mac over SSH",
+    )
+    rl_bridge.add_argument("--host", required=True, help="user@public-ip of the Pod")
+    rl_bridge.add_argument("--port", type=int, required=True)
+    rl_bridge.add_argument("--identity-file", type=Path, required=True)
+    rl_bridge.add_argument("--known-hosts", type=Path, required=True)
+    rl_bridge.add_argument("--remote-root", required=True, help="the Pod's bridge directory")
+    rl_bridge.add_argument("--train-tasks", type=Path, required=True, help="pool train.jsonl")
+    rl_bridge.add_argument("--kept", type=Path, required=True, help="the RL screening record")
+    rl_bridge.add_argument("--dev-tasks", type=Path, required=True, help="pool dev.jsonl")
+    rl_bridge.add_argument("--pod-reward-sha256", required=True, help="the Pod's RL task file")
+    rl_bridge.add_argument("--pod-dev-sha256", required=True, help="the Pod's dev task file")
+    rl_bridge.add_argument("--state", type=Path, required=True, help="the Mac's bridge state")
+    rl_bridge.add_argument("--workers", type=int, default=8)
+    rl_bridge.add_argument(
+        "--reward-timeout",
+        type=float,
+        required=True,
+        help="Mac-side bound on one reward request: the Pod's reward timeout less the allowance",
+    )
+    rl_bridge.add_argument(
+        "--dev-timeout",
+        type=float,
+        required=True,
+        help="Mac-side bound on one dev check: the Pod's dev timeout less the allowance",
+    )
+    rl_bridge.add_argument("--poll-seconds", type=float, default=2.0)
+    rl_bridge.add_argument("--ssh-timeout", type=float, default=120.0)
+    rl_bridge.add_argument("--ssh-retries", type=int, default=4)
+    rl_bridge.add_argument(
+        "--dotenv",
+        type=Path,
+        help="the .env file to check (default: .env in the current directory and the checkout)",
+    )
+    rl_bridge.add_argument(
+        "--no-dotenv", action="store_true", help="skip the .env check: there is no .env file"
+    )
+    rl_bridge.add_argument("--image-id", help="the pinned sandbox image's local ID, checked")
+    rl_bridge.add_argument("--max-polls", type=int)
     from scratchcoder.eval import pipeline_cli
 
     pipeline_cli.add_parsers(subparsers)
@@ -157,6 +198,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         printed = {key: record[key] for key in ("export", "output") if key in record}
         sys.stdout.write(json.dumps(printed, indent=2, sort_keys=True) + "\n")
         return 0
+    if args.command == "rl-bridge":
+        from scratchcoder.rl.bridge_command import (
+            BridgeEnvironmentError,
+            resolve_dotenv,
+            serve_command,
+        )
+        from scratchcoder.rl.bridge_mac import BridgeLeaseHeld
+
+        try:
+            dotenv = resolve_dotenv(args.dotenv, disabled=args.no_dotenv)
+            return serve_command(
+                host=args.host,
+                port=args.port,
+                identity_file=args.identity_file,
+                known_hosts=args.known_hosts,
+                remote_root=args.remote_root,
+                train_tasks=args.train_tasks,
+                kept=args.kept,
+                dev_tasks=args.dev_tasks,
+                pod_reward_sha256=args.pod_reward_sha256,
+                pod_dev_sha256=args.pod_dev_sha256,
+                state=args.state,
+                workers=args.workers,
+                reward_timeout=args.reward_timeout,
+                dev_timeout=args.dev_timeout,
+                poll_seconds=args.poll_seconds,
+                ssh_timeout=args.ssh_timeout,
+                ssh_retries=args.ssh_retries,
+                dotenv=dotenv,
+                image_id=args.image_id,
+                max_polls=args.max_polls,
+            )
+        except BridgeEnvironmentError as error:
+            sys.stderr.write(f"rl-bridge: {error}\n")
+            return 2
+        except BridgeLeaseHeld as error:
+            sys.stderr.write(f"rl-bridge: {error}\n")
+            return 3
     if args.command == "generation-benchmark":
         import json
 

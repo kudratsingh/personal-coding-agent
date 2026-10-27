@@ -27,12 +27,13 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
 from scratchcoder.eval.tasks import Task
 from scratchcoder.rl.rewards import Attempt, AttemptReward, RewardSource, check_rewards
+from scratchcoder.rl.withheld import refuse_withheld
 from scratchcoder.sandbox.reward import degenerate_baseline, is_parseable
 
 DEFAULT_THRESHOLD = 0.5
@@ -68,7 +69,12 @@ def baseline_of(task: Task) -> Baseline:
     return Baseline(True, best.reward, best.answer)
 
 
-def require_train_tasks(tasks: Sequence[Task], *, references: bool = False) -> dict[str, Baseline]:
+def require_train_tasks(
+    tasks: Sequence[Task],
+    *,
+    references: bool = False,
+    baselines: Mapping[str, Baseline] | None = None,
+) -> dict[str, Baseline]:
     """Refuse a task list RL or the control must not train on; return each task's baseline.
 
     Every task must be a train-split task (RL executes its hidden tests and the control
@@ -77,14 +83,23 @@ def require_train_tasks(tasks: Sequence[Task], *, references: bool = False) -> d
     program, so its groups would be skipped silently). With ``references`` every task must
     also carry a reference solution (the control's targets). Raises ``ValueError`` naming
     the first offender of each kind.
+
+    ``baselines`` are the facts the Mac computed from the real hidden tests
+    (``scratchcoder.rl.facts``), for a Pod that holds none: they must cover exactly these
+    tasks, and replace the tests as the source of "parseable" and of the baseline reward.
+    Without them a task whose hidden tests are withheld is refused.
     """
     problems: list[str] = []
-    baselines: dict[str, Baseline] = {}
-    for task in tasks:
-        baselines[task.id] = baseline_of(task)
+    if baselines is None:
+        refuse_withheld(tuple(tasks), "RL")
+        found = {task.id: baseline_of(task) for task in tasks}
+    else:
+        if set(baselines) != {task.id for task in tasks}:
+            raise ValueError("the baselines must cover exactly the RL tasks")
+        found = dict(baselines)
     for label, bad in (
         ("not train-split tasks", [task for task in tasks if task.split != "train"]),
-        ("unparseable by the reward channel", [t for t in tasks if not baselines[t.id].parseable]),
+        ("unparseable by the reward channel", [t for t in tasks if not found[t.id].parseable]),
         (
             "without a reference solution",
             [task for task in tasks if references and task.solution is None],
@@ -94,7 +109,7 @@ def require_train_tasks(tasks: Sequence[Task], *, references: bool = False) -> d
             problems.append(f"{len(bad)} {label}, e.g. {bad[0].id}")
     if problems:
         raise ValueError("RL tasks must be parseable train tasks: " + "; ".join(problems))
-    return baselines
+    return found
 
 
 @dataclass(frozen=True)

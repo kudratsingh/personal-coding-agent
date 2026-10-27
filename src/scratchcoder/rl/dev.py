@@ -45,6 +45,7 @@ from scratchcoder.eval.tasks import Task
 from scratchcoder.model.gpt import GPT
 from scratchcoder.rl.rollout import DEV_SEED, DEV_TOKENS, prompts_for
 from scratchcoder.rl.screening import baseline_of
+from scratchcoder.rl.withheld import refuse_withheld
 
 DEV_SUBSET_SALT = "rl-dev-subset-v1"
 DEV_SUBSET_SIZE = 200
@@ -311,14 +312,25 @@ class PoolDevEvaluator:
         batch_size: int = 256,
         precision: str | None = None,
         samples: int = DEV_SAMPLES,
+        baseline: ConstantBaseline | None = None,
     ) -> None:
-        """``precision=None`` follows the model's device: bfloat16 on CUDA, float32 otherwise."""
+        """``precision=None`` follows the model's device: bfloat16 on CUDA, float32 otherwise.
+
+        ``baseline`` is the constant baseline the Mac computed from the real hidden tests
+        (``scratchcoder.rl.facts.constant_baseline_from_facts``), for a Pod that holds none;
+        it must describe exactly these tasks. Without it the baseline is computed from the
+        tasks' hidden tests, and tasks that withhold them are refused."""
         if not tasks:
             raise ValueError("a dev evaluator needs tasks")
         self.tasks = list(tasks)
         self.encoder, self.decoder, self.execute = encoder, decoder, execute
         self.batch_size, self.precision, self.samples = batch_size, precision, samples
-        self.baseline = constant_baseline(self.tasks)
+        if baseline is None:
+            refuse_withheld(tuple(self.tasks), "the dev check's constant baseline")
+            baseline = constant_baseline(self.tasks)
+        elif baseline.tasks != len(self.tasks):
+            raise ValueError(f"the baseline covers {baseline.tasks} tasks, not {len(self.tasks)}")
+        self.baseline = baseline
 
     def evaluate(self, model: GPT, check: int) -> DevCheck:
         device = next(model.parameters()).device
