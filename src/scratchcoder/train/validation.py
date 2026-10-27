@@ -1,15 +1,16 @@
-"""Fixed held-out windows and byte-accurate per-domain validation."""
+"""Fixed held-out windows, byte-accurate per-domain validation, assistant-only dev loss."""
 
 import hashlib
 import json
 import math
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from itertools import batched
 
 import torch
 from torch import Tensor
 
+from scratchcoder.data.chat import MaskedTokens
 from scratchcoder.data.shards import TokenShard
 from scratchcoder.model.gpt import GPT
 from scratchcoder.optim.adamw import cross_entropy
@@ -245,3 +246,78 @@ def validate_batched(
         "tokens": float(tokens),
         "bytes": float(raw_bytes),
     }
+
+
+@torch.no_grad()
+def assistant_loss(
+    model: GPT,
+    rows: Iterable[MaskedTokens],
+    *,
+    batch_size: int = 16,
+    autocast_bf16: bool = False,
+    on_batch: Callable[[], None] | None = None,
+) -> dict[str, float]:
+    """Token-weighted mean loss over every assistant target of a chat-v1 dev set.
+
+    Each row is a whole conversation: inputs ``ids[:-1]`` and targets ``ids[1:]``, and
+    only targets inside the row's loss mask count. Rows are right-padded to the longest
+    in their batch. The result is the summed loss over all assistant targets divided by
+    their number, so a conversation weighs by its assistant tokens, not as one row.
+    ``rows`` may be a lazy iterable; a row longer than the model context raises.
+    """
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("validation batch size must be a positive integer")
+    if type(autocast_bf16) is not bool:
+        raise ValueError("autocast_bf16 must be a boolean")
+    device = next(model.parameters()).device
+    was_training = model.training
+    total_nll = 0.0
+    tokens = count = 0
+    model.eval()
+    try:
+        for batch in batched(rows, batch_size):
+            if any(
+                len(row.ids) - 1 > model.config.context
+                or len(row.ids) != len(row.mask)
+                or max(row.ids) >= model.config.vocab_size
+                for row in batch
+            ):
+                raise ValueError("dev row exceeds model context/vocabulary or mask length")
+            width = max(len(row.ids) for row in batch)
+            ids = torch.tensor(
+                [list(row.ids) + [0] * (width - len(row.ids)) for row in batch],
+                dtype=torch.long,
+                device=device,
+            )
+            # mask[:, i] says whether target ids[:, i + 1] is an assistant token: [B, W-1].
+            mask = torch.tensor(
+                [list(row.mask[1:]) + [False] * (width - len(row.ids)) for row in batch],
+                dtype=torch.bool,
+                device=device,
+            )
+            with torch.autocast(
+                device_type=device.type, dtype=torch.bfloat16, enabled=autocast_bf16
+            ):
+                logits = model(ids[:, :-1])
+            nll = float(_masked_nll_sum(logits, ids[:, 1:], mask))
+            if not math.isfinite(nll):
+                raise FloatingPointError("nonfinite validation loss")
+            total_nll += nll
+            tokens += int(mask.sum())
+            count += len(batch)
+            if on_batch is not None:
+                on_batch()
+    finally:
+        model.train(was_training)
+    if not tokens:
+        raise ValueError("dev rows hold no assistant targets")
+    return {"loss": total_nll / tokens, "tokens": float(tokens), "rows": float(count)}
+
+
+def token_weighted_loss(results: Iterable[Mapping[str, float]]) -> float:
+    """One mean over several ``assistant_loss`` results, weighted by their tokens."""
+    pairs = [(result["loss"], result["tokens"]) for result in results]
+    total = sum(tokens for _, tokens in pairs)
+    if not pairs or total <= 0:
+        raise ValueError("a weighted loss needs results with tokens")
+    return sum(loss * tokens for loss, tokens in pairs) / total

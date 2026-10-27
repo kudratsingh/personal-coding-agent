@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "dataset": "OpenAssistant/oasst2",
+  "revision": "179dd21fc55192153d94adb0e0ce8f69e222bf75",
+  "files": [
+    "2023-11-05_oasst2_ready.trees.jsonl.gz"
+  ],
+  "license_label": "Apache-2.0",
+  "terms_finding": "At this revision the repository lists no LICENSE file; README.md (10,606 bytes, SHA-256 52bd472cf3cae04a4b21ecd5316f929741c47d991d4763b041c3a94de072dc31) states the license only as the front-matter metadata line 2, 'license: apache-2.0'. The contributor terms of the collection portal (LAION-AI/Open-Assistant commit f1e6ed9526f5817531f3ab85441a40b3671ddccb, website/src/components/ToS.tsx, sections 2.1 and 2.2) grant no license and describe the collected text as used for scientific purposes. Intake is stopped until the owner rules under D-05; see docs/sft-data.md.",
+  "terms_reviewed_on": "2026-10-26",
+  "owner_ruling": null,
+  "owner_ruling_on": null,
+  "max_download_bytes": 54370156,
+  "max_tokens": 960
+}
