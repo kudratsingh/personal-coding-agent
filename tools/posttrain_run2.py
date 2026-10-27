@@ -23,8 +23,10 @@ the dev checks already scored, the stages that need no Mac wait continue under t
 projected-finish rule, the reserve and every limit, and the run then finalizes as
 ``stopped`` with that arm's reason. A channel stop in either arm and a margin stop in RL
 leave the control unevaluated (it needs the Mac for its dev checks); a margin stop in the
-control evaluates both arms. With no RL dev check scored there is nothing to select and the
-run ends at once. Any other stop is a result and the run goes on.
+control evaluates both arms as the projected-finish rule admits them (when both do not fit
+but RL's alone does, the control is left unevaluated and RL's is evaluated). With no RL dev
+check scored there is nothing to select and the run ends at once. Any other stop is a result
+and the run goes on.
 
 Same weights (``SAME_WEIGHTS_RULE``): when an arm's selected checkpoint holds the SFT weights
 the run loaded, compared tensor by tensor and bit for bit, the arm is not evaluated again on
@@ -83,6 +85,7 @@ from tools import posttrain_ops
 from tools.posttrain_run import (
     BRIDGE_LOST_STOP,
     CONTROL_REFERENCE,
+    PROJECTED_STOP,
     RESERVE_STOP,
     RL_REFERENCE,
     SFT_ARC,
@@ -119,8 +122,9 @@ ARM_STOP_RULE = (
     "its latest weights are uploaded, its endpoint is selected from the dev checks already "
     "scored, and the stages that need no Mac wait run under the projected-finish rule, the "
     "finalization reserve and every limit; the control is skipped after any such stop in RL, "
-    "and not evaluated after a stop of the Mac's side in the control; with no RL dev check "
-    "scored the run ends"
+    "and not evaluated after a stop of the Mac's side in the control; after a margin stop in "
+    "the control each arm is evaluated as the projected-finish rule admits it, RL's first; "
+    "with no RL dev check scored the run ends"
 )
 SELECTION_RULE = (
     "the selectable check with the highest dev-subset greedy pass@1; ties to the higher "
@@ -915,6 +919,49 @@ class Run2Worker(PosttrainWorker):
             for later in super().remaining_stages(stage)
             if self.skip_reason(later) is None
         ]
+
+    def projected_finish(self, stage: StagePlan) -> None:
+        """The projected-finish rule, admitting each arm: after a margin stop in the control
+        both arms are evaluable, and when the evaluation of both does not fit but RL's alone
+        might, the control is left unevaluated (``not-evaluated``, the reason recorded) and
+        RL's evaluation is projected again on its own. Otherwise as in run 1."""
+        try:
+            super().projected_finish(stage)
+        except PilotStop:
+            if not self.drop_control_for_rl(stage):
+                raise
+            self.stop_reason = None
+            super().projected_finish(stage)  # RL alone; raises if that does not fit either.
+
+    def drop_control_for_rl(self, stage: StagePlan) -> bool:
+        """Leave the control unevaluated so RL's evaluation may run alone; ``True`` when that
+        changed what remains (only after the control's margin stop, while both arms were
+        still to be evaluated here)."""
+        stop = self.arm_stop
+        if (
+            stop is None
+            or (stop["arm"], stop["kind"]) != (CONTROL_REFERENCE, MARGIN)
+            or CONTROL_REFERENCE in self.not_on_pod
+            or RL_REFERENCE in self.not_on_pod
+            or stage.kind not in {"arc", "eval"}
+        ):
+            return False
+        before = [later.name for later in self.remaining_stages(stage)]
+        reason = (
+            "not evaluated: after the control's margin stop the projected-finish rule did "
+            "not admit both arms' evaluation; RL's alone was projected again"
+        )
+        self.not_on_pod[CONTROL_REFERENCE] = reason
+        entry = self.report["selection"]["endpoints"].get(CONTROL_REFERENCE)
+        if isinstance(entry, dict):
+            entry.update(evaluation=NOT_EVALUATED, independent=None, reason=reason)
+        self.report["arm_stop"]["control_not_admitted"] = {
+            "at_stage": stage.name,
+            "remaining_before": before,
+            "remaining_after": [later.name for later in self.remaining_stages(stage)],
+        }
+        self.publish()
+        return True
 
     def run_stage(self, stage: StagePlan) -> None:
         """Skip a stage that does not run here (recording why); mark an arm that stopped

@@ -1296,6 +1296,74 @@ def test_no_control_update_starts_without_one_full_wait_free(
     )
 
 
+@pytest.mark.parametrize("room", ["rl alone", "neither"])
+def test_after_a_control_margin_stop_each_arm_is_admitted_by_the_projected_finish(
+    found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, room: str
+) -> None:
+    """The owner's run 2 gate rulings: a margin stop in the control evaluates both arms as the
+    projected-finish rule admits them. When both evaluations do not fit before the wall but
+    RL's alone does, the control is left unevaluated (its reason recorded) and RL's is
+    evaluated; when neither fits, the run stops on the projected finish as before."""
+    from dataclasses import replace
+
+    from tools.posttrain_run2 import MARGIN, NOT_EVALUATED
+
+    original = Run2Worker.run_more_sft
+
+    def stopped_by_the_margin(self: Run2Worker, stage: Any) -> list[dict[str, Any]]:
+        outputs = original(self, stage)
+        assert self.report["selection"]["endpoints"]["more-sft"]["evaluation"] == "pod"
+        self.stop_arm(stage, "more-sft", MARGIN, WAIT_MARGIN_STOP, "a test's margin stop")
+        arc = next(later for later in self.plan.stages if later.name == "arc-post")
+        both = planned_seconds(self.plan, self.rates, stages=self.remaining_stages(arc))
+        alone = [
+            replace(arc, settings={**arc.settings, "checkpoints": ["rl"]}),
+            next(later for later in self.plan.stages if later.name == "eval-rl"),
+        ]
+        rl = planned_seconds(self.plan, self.rates, stages=alone)
+        assert rl["total_seconds"] < both["total_seconds"]
+        left = (
+            (rl["total_seconds"] + both["total_seconds"]) / 2
+            if room == "rl alone"
+            else rl["total_seconds"] / 2
+        )
+        self.pod_end = self.clock() + left
+        return outputs
+
+    monkeypatch.setattr(Run2Worker, "run_more_sft", stopped_by_the_margin)
+    ran = execute(found, tmp_path / "run", clock=SlowClock())
+    report = ran.report
+    arc_rows = [row for row in report["projections"] if row["stage"] == "arc-post"]
+    if room == "neither":
+        assert (report["status"], report["stop_reason"]) == (
+            "stopped",
+            "projected_finish_after_deadline",
+        )
+        assert [row["fits"] for row in arc_rows] == [False, False]
+        assert not any(name.startswith(("arc-post", "eval-")) for name in labels(report))
+        return
+    assert (report["status"], report["stop_reason"]) == ("stopped", WAIT_MARGIN_STOP)
+    assert statuses(report) == {
+        "rl": "completed",
+        "more-sft": "stopped",
+        "arc-post": "completed",
+        "eval-rl": "completed",
+        "eval-more-sft": "skipped",
+    }
+    assert [row["fits"] for row in arc_rows] == [False, True]
+    entry = report["selection"]["endpoints"]["more-sft"]
+    assert entry["evaluation"] == NOT_EVALUATED and "did not admit both" in entry["reason"]
+    assert report["selection"]["endpoints"]["rl"]["evaluation"] == "pod"
+    dropped = report["arm_stop"]["control_not_admitted"]
+    assert dropped["at_stage"] == "arc-post"
+    assert "eval-more-sft" in dropped["remaining_before"]
+    assert "eval-more-sft" not in dropped["remaining_after"]
+    arc_stage = next(stage for stage in report["stages"] if stage["name"] == "arc-post")
+    assert set(arc_stage["checkpoints_not_evaluated"]) == {"more-sft"}
+    assert any(name.startswith("eval-rl-") for name in labels(report))
+    assert not any(name.startswith("eval-more-sft") for name in labels(report))
+
+
 def test_a_refusal_during_the_control_fails_the_run_after_its_weights_and_events_reach_r2(
     found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
