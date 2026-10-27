@@ -41,7 +41,7 @@ def arguments(paths: dict[str, Path], **change: str) -> list[str]:
         "--mode": "posttrain",
         "--run": "1",
         "--deadline-unix": "1800017820",
-        "--lifetime-seconds": "18000",
+        "--lifetime-seconds": "17820",
         "--idle-seconds": "900",
         "--workspace": str(paths["workspace"]),
         "--repo": str(ROOT),
@@ -65,7 +65,7 @@ def test_posttrain_arms_the_derived_lifetime_and_idle_rule_first(tmp_path: Path)
     destruct = index(lines, "pod_self_destruct.py")
     assert destruct == 0, "the self-destruct timer is the first program the bootstrap starts"
     timer = lines[destruct]
-    assert "--max-lifetime-seconds 18000" in timer and "60000" not in timer
+    assert "--max-lifetime-seconds 17820" in timer and "60000" not in timer
     assert "--idle-seconds 900" in timer and "--deadline-unix 1800017820" in timer
     assert "--activity /workspace/posttrain-run/heartbeat.json" in timer
     assert f"--activity {paths['workspace']}/setup-progress.json" in timer

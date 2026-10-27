@@ -52,6 +52,7 @@ VALUES = {
     "BINDING": "runs/posttrain-shared/binding.json",
     "BINDING_SHA256": BINDING_SHA256,
     "WALL": "18000",
+    "TIMER": "17820",
     "WATCHDOG_COST": "2.99",
     "EXPORTS": "runs/posttrain-shared/exports",
     "ORIGIN": str(ORIGIN),
@@ -224,10 +225,11 @@ def test_every_tool_command_parses_with_its_real_command_line(
 
 def test_the_derived_limits_in_the_runbook_are_the_specifications() -> None:
     derived = posttrain_ops.specification_limits(json.loads(SPEC.read_text()))
-    assert (str(derived.wall_seconds), str(derived.watchdog_cost_stop_usd)) == (
-        VALUES["WALL"],
-        VALUES["WATCHDOG_COST"],
-    )
+    assert (
+        str(derived.wall_seconds),
+        str(derived.self_destruct_seconds),
+        str(derived.watchdog_cost_stop_usd),
+    ) == (VALUES["WALL"], VALUES["TIMER"], VALUES["WATCHDOG_COST"])
     assert int(VALUES["SELF_DESTRUCT_DEADLINE"]) == derived.deadline_unix(ORIGIN)
     text = RUNBOOK.read_text()
     for phrase in ("**$3.00**", "**$2.99**", "**18,000 s**", "**17,820 s**", "**900 s**"):
@@ -303,7 +305,9 @@ def test_the_bootstrap_call_uses_only_flags_the_script_knows() -> None:
         "--archive",
     ):
         assert required in flags, required
-    assert "--lifetime-seconds 18000" in substitute(command)
+    # The timer is given its own lifetime, not the wall: it refuses any later deadline.
+    assert "--lifetime-seconds $TIMER" in command
+    assert "--lifetime-seconds 17820" in substitute(command)
     assert "--heartbeat /workspace/posttrain-run/heartbeat.json" in command
 
 

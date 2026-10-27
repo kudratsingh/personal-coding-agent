@@ -612,6 +612,7 @@ def receipt(**changes: Any) -> dict[str, Any]:
             "idle_seconds": 900,
             "activity_files": ["/workspace/posttrain-run/heartbeat.json"],
         },
+        "self_destruct_dry_run": False,
         "r2_run_prefix": posttrain_ops.run_prefix("1", "podpost01"),
     }
     value.update(changes)
@@ -662,6 +663,11 @@ def test_a_mac_clock_ahead_of_the_provider_still_arms_within_the_wall() -> None:
         ({"run": "2"}, "readiness receipt for run 1"),
         ({"binding_sha256": "d" * 64}, "binding differs"),
         ({"self_destruct_deadline_unix": CREATED - 5 + 18_100}, "ceiling-derived lifetime"),
+        # Armed at the wall, or one second past the origin plus 17,820 s: the margin holds.
+        ({"self_destruct_deadline_unix": CREATED - 5 + 18_000}, "ceiling-derived lifetime"),
+        ({"self_destruct_deadline_unix": CREATED - 5 + 17_821}, "ceiling-derived lifetime"),
+        ({"self_destruct_dry_run": True}, "dry run"),
+        ({"self_destruct_dry_run": None}, "dry run"),
         ({"self_destruct_idle": {"idle_seconds": 1_800, "activity_files": []}}, "idle limit"),
         (
             {"self_destruct_idle": {"idle_seconds": 900, "activity_files": ["/elsewhere"]}},

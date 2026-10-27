@@ -55,7 +55,7 @@ The **launch rule** (worker and readiness receipt): the lifetime left must hold 
 
 | Safeguard | Enforced in | Tested in |
 | --- | --- | --- |
-| Ceiling-derived lifetime: $3.00, $2.99, 17,820 s of 18,000 s | `posttrain_ops.ceiling_limits`; the worker (`RunLimits`), the receipt (`check_policy`, the deadline check), the policy file (`posttrain_ops limits`), the bootstrap's `--lifetime-seconds` | `test_posttrain_guards.py`, `test_posttrain_readiness.py`, `test_posttrain_runbook.py`, `test_posttrain_bootstrap.py` |
+| Ceiling-derived lifetime: $3.00, $2.99, 17,820 s of 18,000 s | `posttrain_ops.ceiling_limits`; the worker (`RunLimits`), the receipt (`check_policy`; the deadline no later than the billing origin plus 17,820 s; no dry-run timer), the policy file (`posttrain_ops limits`), the bootstrap's `--lifetime-seconds` (the 17,820 s timer lifetime) | `test_posttrain_guards.py`, `test_posttrain_readiness.py`, `test_posttrain_runbook.py`, `test_posttrain_bootstrap.py` |
 | In-Pod idle self-destruct after 900 s | `pod_self_destruct.py --idle-seconds --activity` (the worker's heartbeat, the bootstrap's progress stamps); `progress_unix` is the hook for run 2's reward waits | `test_posttrain_guards.py`, `test_posttrain_integration.py` |
 | Probe stop below the planning speeds | `PosttrainWorker.run_probe` | `test_posttrain_run.py`, `test_posttrain_integration.py` |
 | SFT speed check after 50 updates | `PosttrainWorker.sft_speed_check` | `test_posttrain_run.py` |

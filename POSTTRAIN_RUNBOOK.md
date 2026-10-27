@@ -62,10 +62,11 @@ export TOKENIZER=runs/tokenizer-freeze-65536-20261020/tokenizer.json
 export BINDING=$SHARED/binding.json
 export WALL=$(uv run --locked python -m tools.posttrain_ops limits --specification "$SPEC" --field wall_seconds)
 export WATCHDOG_COST=$(uv run --locked python -m tools.posttrain_ops limits --specification "$SPEC" --field watchdog_cost_stop_usd)
-echo "run $RUN: wall $WALL s, watchdog cost stop $WATCHDOG_COST USD"
+export TIMER=$(uv run --locked python -m tools.posttrain_ops limits --specification "$SPEC" --field self_destruct_seconds)
+echo "run $RUN: wall $WALL s, timer $TIMER s, watchdog cost stop $WATCHDOG_COST USD"
 ```
 
-The loop prints each variable's name and whether it is set, never a value. The last line must print `wall 18000 s, watchdog cost stop 2.99 USD`. `PRIVATE_REPO` must be private (the supervisor verifies it). Keep this terminal open on AC power for the whole run: a sleeping Mac stops the mirror, and the watchdog would then read a stale heartbeat and delete the Pod. The working directory must not sit under a symlinked path.
+The loop prints each variable's name and whether it is set, never a value. The last line must print `wall 18000 s, timer 17820 s, watchdog cost stop 2.99 USD`. `PRIVATE_REPO` must be private (the supervisor verifies it). Keep this terminal open on AC power for the whole run: a sleeping Mac stops the mirror, and the watchdog would then read a stale heartbeat and delete the Pod. The working directory must not sit under a symlinked path.
 
 ## 3. Quote check and projection (Mac, free)
 
@@ -285,13 +286,13 @@ The `stat` line should print `600 root` and a nonzero size. `pod-env` writes onl
 
 ## 9. Bootstrap (Pod, billable)
 
-The bootstrap arms the in-Pod timer first, with the run's ceiling-derived lifetime and the 900 s idle rule over the worker's heartbeat and its own progress stamps, then checks the shipped archive against the revision, loads the 0600 key file, records the environment, installs the project, measures an R2 round trip under `posttrain-runs/1/<pod id>/` (refused below 3.06 MB/s by the receipt), fetches and re-verifies every bound input, runs the CPU tests and the A40 preflight with its compile check. Launch it detached, refusing a second launch, and keep re-baselining the watchdog while it runs, for at most 45 minutes:
+The bootstrap arms the in-Pod timer first, with the run's ceiling-derived timer lifetime (`$TIMER`, 17,820 s: the timer refuses any deadline further away) and the 900 s idle rule over the worker's heartbeat and its own progress stamps, then checks the shipped archive against the revision, loads the 0600 key file, records the environment, installs the project, measures an R2 round trip under `posttrain-runs/1/<pod id>/` (refused below 3.06 MB/s by the receipt), fetches and re-verifies every bound input, runs the CPU tests and the A40 preflight with its compile check. Launch it detached, refusing a second launch, and keep re-baselining the watchdog while it runs, for at most 45 minutes:
 
 ```sh
 if podssh 'test -e /workspace/posttrain/bootstrap.log'; then
   echo "run $RUN: a bootstrap was launched on this Pod before; the wait below follows that one."
 else
-  podssh "test ! -e /workspace/posttrain/bootstrap.log || exit 1; cd /workspace/repo && tar xzf /workspace/repo.tar.gz || exit 1; setsid nohup bash -c 'bash tools/pilot_pod_bootstrap.sh --mode posttrain --run $RUN --deadline-unix $SELF_DESTRUCT_DEADLINE --lifetime-seconds $WALL --idle-seconds 900 --workspace /workspace/posttrain --repo /workspace/repo --revision /workspace/revision.json --archive /workspace/repo.tar.gz --r2-env /workspace/posttrain/r2-pod.env --binding /workspace/posttrain/binding.json --binding-sha256 $BINDING_SHA256 --data-root /workspace/posttrain-inputs --heartbeat /workspace/posttrain-run/heartbeat.json; echo BOOTSTRAP_EXIT=\$?' > /workspace/posttrain/bootstrap.log 2>&1 < /dev/null &"
+  podssh "test ! -e /workspace/posttrain/bootstrap.log || exit 1; cd /workspace/repo && tar xzf /workspace/repo.tar.gz || exit 1; setsid nohup bash -c 'bash tools/pilot_pod_bootstrap.sh --mode posttrain --run $RUN --deadline-unix $SELF_DESTRUCT_DEADLINE --lifetime-seconds $TIMER --idle-seconds 900 --workspace /workspace/posttrain --repo /workspace/repo --revision /workspace/revision.json --archive /workspace/repo.tar.gz --r2-env /workspace/posttrain/r2-pod.env --binding /workspace/posttrain/binding.json --binding-sha256 $BINDING_SHA256 --data-root /workspace/posttrain-inputs --heartbeat /workspace/posttrain-run/heartbeat.json; echo BOOTSTRAP_EXIT=\$?' > /workspace/posttrain/bootstrap.log 2>&1 < /dev/null &"
 fi
 GIVE_UP=$(( $(date +%s) + 2700 ))
 until podssh 'grep -q ^BOOTSTRAP_EXIT= /workspace/posttrain/bootstrap.log'; do

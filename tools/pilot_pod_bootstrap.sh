@@ -26,14 +26,15 @@
 #        --initialization-size <bytes> [--skip-tests]
 #
 # Post-training mode (one Pod per run, see POSTTRAIN_RUNBOOK.md) arms the timer with the
-# run's ceiling-derived lifetime (--lifetime-seconds, from `tools.posttrain_ops limits`; run 1:
-# 18000) and the in-Pod idle self-destruct (--idle-seconds, 900, watching the worker's
+# run's ceiling-derived timer lifetime (--lifetime-seconds, the self_destruct_seconds of
+# `tools.posttrain_ops limits`; run 1: 17820, 180 s inside its 18000 s wall: the timer refuses
+# a deadline further than that from now) and the in-Pod idle self-destruct (--idle-seconds, 900, watching the worker's
 # --heartbeat and the bootstrap's own setup-progress.json, which every step below stamps),
 # then the same revision, key and environment steps, an R2 round trip under the run's
 # posttrain-runs/ prefix, the pinned fetch and re-verification of every bound input
 # (tools.posttrain_binding), the CPU tests and the A40 preflight with its compile check:
 #   bash tools/pilot_pod_bootstrap.sh --mode posttrain --run 1 --deadline-unix <unix> \
-#        --lifetime-seconds 18000 --idle-seconds 900 --workspace /workspace/posttrain \
+#        --lifetime-seconds 17820 --idle-seconds 900 --workspace /workspace/posttrain \
 #        --repo /workspace/repo --revision /workspace/revision.json \
 #        --archive /workspace/repo.tar.gz --r2-env /workspace/posttrain/r2-pod.env \
 #        --binding /workspace/posttrain/binding.json --binding-sha256 <hex> \

@@ -8,8 +8,9 @@ is written). Besides the pretraining rehearsal's owner gates and termination che
   binding to name exactly its inputs at every pinned value;
 - a watchdog policy at least as strict as the ceiling-derived limits (mode ``posttrain``,
   wall and cost stop from ``posttrain_ops.ceiling_limits``, the 900 s transfer window);
-- a live in-Pod timer armed within the derived lifetime, with the 900 s idle rule watching
-  the worker's heartbeat (``self_destruct_idle``);
+- a live in-Pod timer, not a dry run, armed no later than the billing origin plus the
+  derived timer lifetime (17,820 s), with the 900 s idle rule watching the worker's
+  heartbeat (``self_destruct_idle``);
 - the Pod's R2 round trip under ``posttrain-runs/<run>/<pod id>/`` at the upload rate one
   weights-only label needs (``r2_round_trip_tested``);
 - the Pod's fetch receipt and re-verification of every bound input
@@ -97,6 +98,9 @@ def build_receipt(
     check_policy(watchdog, spec)
     timer = _load(self_destruct_receipt)
     deadline = self_destruct_live(timer, pod_id=pod_identity.pod_id, now=created_at)
+    if timer.get("dry_run") is not False:
+        # A dry-run timer reads "armed" too, but it never sends the delete.
+        raise ValueError("the in-Pod timer is a dry run: it would never delete the Pod")
     idle = {
         "idle_seconds": timer.get("idle_seconds"),
         "activity_files": timer.get("activity_files"),
@@ -160,6 +164,7 @@ def build_receipt(
         "self_destruct_deadline_unix": deadline,
         "self_destruct_receipt_sha256": file_sha256(self_destruct_receipt),
         "self_destruct_idle": idle,
+        "self_destruct_dry_run": False,
         "termination_guarantee": guarantee,
         "termination_evidence": (
             f"in-pod self-destruct receipt {file_sha256(self_destruct_receipt)[:16]} armed at "

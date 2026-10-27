@@ -64,7 +64,8 @@ def test_the_specification_yields_the_policy_and_the_timer_deadline(
 def test_the_self_destruct_accepts_the_smaller_lifetime_and_keeps_its_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The bootstrap passes the derived 18,000 s ceiling; 60,000 s stays the absolute cap."""
+    """The bootstrap passes the derived 17,820 s timer lifetime; 60,000 s stays the absolute
+    cap. A deadline past the lifetime it is given is refused."""
     started = time.time()
     armed: list[dict[str, Any]] = []
 
@@ -84,7 +85,7 @@ def test_the_self_destruct_accepts_the_smaller_lifetime_and_keeps_its_cap(
                 "--deadline-unix",
                 str(started + 17_820),
                 "--max-lifetime-seconds",
-                "18000",
+                "17820",
                 "--idle-seconds",
                 "900",
                 "--activity",
@@ -95,7 +96,7 @@ def test_the_self_destruct_accepts_the_smaller_lifetime_and_keeps_its_cap(
         {"deadline": started + 17_820, "idle": 900.0, "files": (str(tmp_path / "heartbeat.json"),)}
     ]
     for deadline, ceiling in (
-        (started + 18_100, "18000"),
+        (started + 17_900, "17820"),
         (started + 1, str(ABSOLUTE_DEADLINE_SECONDS + 1)),
     ):
         with pytest.raises(SystemExit):

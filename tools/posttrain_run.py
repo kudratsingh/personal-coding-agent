@@ -679,7 +679,10 @@ def check_policy(policy: Policy, spec: Specification) -> None:
 
 
 def check_self_destruct(receipt: Mapping[str, Any], spec: Specification, *, heartbeat: str) -> None:
-    """The armed timer watches the worker's heartbeat with the specification's idle limit."""
+    """The armed timer is live (not a dry run) and watches the worker's heartbeat with the
+    specification's idle limit."""
+    if receipt.get("self_destruct_dry_run") is not False:
+        raise ValueError("the in-Pod timer is a dry run (or unrecorded): it never deletes the Pod")
     idle = receipt.get("self_destruct_idle")
     if not isinstance(idle, dict):
         raise ValueError("the receipt does not record the in-Pod idle self-destruct")
@@ -727,12 +730,15 @@ def check_readiness(
     origin = policy.billing_started_at_unix
     if origin is None or not 0 < origin <= created + CLOCK_SKEW_SECONDS:
         raise ValueError("a conservative create-request billing origin is required")
+    billing = origin
     origin = min(origin, created)
     derived = spec.ceiling
     deadline = finite_number(receipt.get("self_destruct_deadline_unix"), "self-destruct deadline")
-    # The runbook arms the timer at the create request's time plus the derived timer lifetime;
-    # the provider's creation time may read a little earlier, so the bound is the wall itself.
-    if not now < deadline <= origin + derived.wall_seconds:
+    # The runbook arms the timer at the create request's time (the policy's billing origin)
+    # plus the derived timer lifetime, so that is the bound, exactly: the 180 s margin inside
+    # the wall is enforced. The origin is never later than the provider's creation time plus
+    # the clock skew, so the timer fires at most that skew past creation plus 17,820 s.
+    if not now < deadline <= billing + derived.self_destruct_seconds:
         raise ValueError("the armed in-Pod deadline lies outside the ceiling-derived lifetime")
     if receipt.get("r2_run_prefix") != posttrain_ops.run_prefix(spec.run, identity.pod_id):
         raise ValueError("the receipt's R2 prefix is not this run's Pod prefix")

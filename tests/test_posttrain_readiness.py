@@ -114,6 +114,7 @@ def evidence(tmp_path: Path, **changes: Any) -> dict[str, Any]:
             "armed_at_unix": CREATED + 60,
             "checked_at_unix": NOW - 2,
             "deadline_unix": derived.deadline_unix(origin),
+            "dry_run": False,
             "idle_seconds": 900.0,
             "activity_files": [DEFAULT_HEARTBEAT, "/workspace/posttrain/setup-progress.json"],
         },
@@ -225,6 +226,14 @@ def late_deadline(timer: dict[str, Any]) -> None:
     timer["deadline_unix"] += 600
 
 
+def at_the_wall(timer: dict[str, Any]) -> None:
+    timer["deadline_unix"] += 180  # Armed at origin + 18,000 s: the margin is gone.
+
+
+def dry_run(timer: dict[str, Any]) -> None:
+    timer["dry_run"] = True  # Reads "armed", never deletes.
+
+
 def missing_parent(copy: dict[str, Any]) -> None:
     copy["inputs"] = copy["inputs"][:2]
 
@@ -245,6 +254,8 @@ def no_compile(preflight: dict[str, Any]) -> None:
         ("self-destruct.json", no_idle, "idle limit"),
         ("self-destruct.json", no_heartbeat, "does not watch"),
         ("self-destruct.json", late_deadline, "ceiling-derived lifetime"),
+        ("self-destruct.json", at_the_wall, "ceiling-derived lifetime"),
+        ("self-destruct.json", dry_run, "dry run"),
         ("mac-copy", missing_parent, "exactly"),
         ("data-fetch", partial_fetch, "exactly"),
         ("preflight", no_compile, "compile_equivalence"),
