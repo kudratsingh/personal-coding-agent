@@ -5,7 +5,7 @@ The rest of the rehearsal continues from run B's `mixed-final` checkpoint in two
 - **Run 1:** the generation probe, ARC-Easy on run A's two finals and run B, base-B evaluation generation, SFT, ARC and evaluation generation of the SFT weights, and RL screening generation. Hard ceiling **$3.00**. Commands: the [run 1 runbook](../POSTTRAIN_RUNBOOK.md).
 - **Run 2** ([below](#run-2)): RL with the Mac computing rewards and dev verdicts through the reward bridge, the compute-matched more-SFT control, ARC-Easy and evaluation generation of both selected checkpoints. Its ceiling, about $5.80, is fixed at the owner's gate from run 1's measured rates, and it stops at the lower of that ceiling and 120% of the gate's estimate. Commands: the [run 2 runbook](../POSTTRAIN_RUN2_RUNBOOK.md).
 
-**Status (2026-10-27): pre-launch.** Both runs' workers, their safeguards, the Mac-side tools and the runbooks are written and CPU-tested, each with an end-to-end smoke replayed into the real supervisor (run 2's with the Mac's bridge server in a thread, and once with the Mac scoring in the Docker sandbox). Nothing has run on a GPU, no input has been staged to R2, and nothing has been spent. Every figure below is a projection.
+**Status (2026-10-27): run 1 to be relaunched.** Run 1's first launch stopped at its probe, as designed, below that launch's floors: it measured 4,607 generated tok/s at batch 64 against a 5,000 floor (and 9,757 at batch 256 against 10,000), for about $0.12. The generation batch and the floors were re-set from those rates ([probe](#stages)). Both runs' workers, their safeguards, the Mac-side tools and the runbooks are written and CPU-tested, each with an end-to-end smoke replayed into the real supervisor (run 2's with the Mac's bridge server in a thread, and once with the Mac scoring in the Docker sandbox). Run 2 has not run. Every figure below but the first probe's rates is a projection.
 
 ## Stages
 
@@ -23,7 +23,9 @@ The rest of the rehearsal continues from run B's `mixed-final` checkpoint in two
 
 Then `report.json` at the prefix root. The seven evaluation files of a stage are pool dev and pool test, each greedy and n = 8 (temperature 0.8, top-p 0.95, seed 0), and HumanEval, HumanEval+ (task 32 excluded) and MBPP+ greedy. Base B uses `base-pool-completion-v1` on the pool and `base-completion-rstrip-v1` on the benchmarks; the SFT weights use `chat-v1` everywhere ([evaluation](evaluation.md)).
 
-**Probe.** `benchmark_generation` at batch 1, 64, 128 and 256 on the 256 chat-v1 prompt lengths around the pool dev median (about 190 tokens), 256 new tokens each, temperature 0.8 and top-p 0.95, in bf16. Below the planning speeds, 5,000 generated tokens a second at batch 64 or 10,000 at batch 256, the run stops with `generation_below_planning_speed`, its rates in `report.json`, at most about $0.39 in (the setup allowance, the probe and the whole finalization reserve). Otherwise the batch-64 rate replaces the planning speed in every later projection.
+**Probe.** `benchmark_generation` at batch 1, 64, 128 and 256 on the 256 chat-v1 prompt lengths around the pool dev median (about 190 tokens), 256 new tokens each, temperature 0.8 and top-p 0.95, in bf16. Below the planning speeds, 8,279 generated tokens a second at batch 128 or 9,268 at batch 256, the run stops with `generation_below_planning_speed`, its rates in `report.json`, at most about $0.39 in (the setup allowance, the probe and the whole finalization reserve). Otherwise the batch-128 rate replaces the planning speed in every later projection.
+
+**Why batch 128.** The first launch's probe measured 8,715 tok/s at batch 128 and 9,757 at batch 256, but 4,607 at batch 64, below that launch's 5,000 floor, so it stopped there. Evaluation and screening now generate at batch 128 (`generation.batch_size`), and each floor is 5% under the rate measured at its batch, rounded down; the planning speeds are the floors. The batch-256 floor protects run 2's RL rollouts and dev checks, which generate at 256. Each row's completion has its own seed, so the batch changes only how rows are grouped, not which seed a row uses (its logits can still differ by float rounding between batch shapes, [evaluation](evaluation.md)). Run 2 evaluates at the same batch, so the base, SFT, RL and more-SFT evaluations share one generation protocol.
 
 **SFT.** One pass over the 3,390 rows of record (2,871 code, 519 language) in 16 x 2 rows per update: 106 updates, 3.47M token slots. Peak 6e-5, 3% warmup (3 updates), cosine to 10%, a fresh AdamW (0.9 / 0.95, weight decay 0.1, clip 1.0), bf16 with fused attention and `torch.compile`, assistant-token loss divided by each update's assistant tokens. The token-weighted assistant-token dev loss over the 2,000 code and 300 language dev conversations is measured at updates 26, 53, 80 and 106; each new lowest is saved as a weights-only checkpoint (about 541 MB), and only the lowest is kept and uploaded. After 50 updates the slot throughput over the step seconds of updates 3 to 50 must reach 90% of run B's 56,765 slots a second, or the run stops with `sft_throughput_below_limit`.
 
@@ -49,7 +51,7 @@ Every time and cost limit is derived from the ceiling and the quoted rate in one
 | Mac watchdog idle limit | 600 s |
 | Transfer window after the last GPU work | 900 s |
 
-The **launch rule** (worker and readiness receipt): the lifetime left must hold every stage at the planning rates, generation priced at every attempt's token cap, plus the 900 s finalization reserve: 10,003 s, which leaves about 130 minutes for setup. The **projected-finish rule**: at the start of every stage the remaining stages at the measured rates plus the reserve must end before the lifetime does, or the run stops with `projected_finish_after_deadline` before starting the stage. The generation rate is the probe's, or the completed evaluation files' observed rate (priced at their token caps, as the projections price them) once that is lower. The **finalization reserve**: a stage still running 900 s before the end of the lifetime stops there with `finalization_reserve`; unlike the wall and cost stops it finalizes in full, so the drain, `report.json` and `r2_final` fit before the in-Pod timer fires. Before any stage the worker checks that every evaluation file and the screening hold the tasks the specification prices.
+The **launch rule** (worker and readiness receipt): the lifetime left must hold every stage at the planning rates, generation priced at every attempt's token cap, plus the 900 s finalization reserve: 6,878 s, which leaves about 182 minutes for setup. The **projected-finish rule**: at the start of every stage the remaining stages at the measured rates plus the reserve must end before the lifetime does, or the run stops with `projected_finish_after_deadline` before starting the stage. The generation rate is the probe's, or the completed evaluation files' observed rate (priced at their token caps, as the projections price them) once that is lower. The **finalization reserve**: a stage still running 900 s before the end of the lifetime stops there with `finalization_reserve`; unlike the wall and cost stops it finalizes in full, so the drain, `report.json` and `r2_final` fit before the in-Pod timer fires. Before any stage the worker checks that every evaluation file and the screening hold the tasks the specification prices.
 
 ## Safeguards
 
@@ -71,22 +73,22 @@ The **launch rule** (worker and readiness receipt): the lifetime left must hold 
 
 ## Projected cost
 
-`python -m tools.pilot_feasibility posttrain` at the planning speeds and run B's measured training rate, with the smaller SFT set:
+`python -m tools.pilot_feasibility posttrain` at the planning speeds (8,279 tok/s at batch 128) and run B's measured training rate, with the smaller SFT set:
 
 | Stage | Hours | Dollars |
 | --- | ---: | ---: |
 | Setup (bootstrap, fetch, tests, preflight) | 0.30 | $0.18 |
 | Generation probe | 0.10 | $0.06 |
 | ARC-Easy on three parents | 0.06 | $0.04 |
-| Base-B evaluation generation (18.6M tokens at cap) | 1.07 | $0.64 |
+| Base-B evaluation generation (18.6M tokens at cap) | 0.66 | $0.40 |
 | SFT (106 updates, 4 dev-loss checks, compile) | 0.07 | $0.04 |
 | ARC-Easy on the SFT weights | 0.02 | $0.01 |
-| SFT evaluation generation (18.8M tokens at cap) | 1.08 | $0.65 |
-| RL screening generation (2.05M tokens at cap) | 0.12 | $0.07 |
+| SFT evaluation generation (18.8M tokens at cap) | 0.67 | $0.40 |
+| RL screening generation (2.05M tokens at cap) | 0.07 | $0.04 |
 | Finalization | 0.25 | $0.15 |
-| **Total** | **3.08** | **$1.85** |
+| **Total** | **2.21** | **$1.33** |
 
-At twice the planning speed the run takes about 1.98 hours and $1.19. At half the planning speed the probe stops the run after at most about $0.39. Every pool attempt is priced at its token cap, as if none stopped early.
+At twice the planning speed the run takes about 1.55 hours and $0.93. At half the planning speed the probe stops the run after at most about $0.39. Every pool attempt is priced at its token cap, as if none stopped early.
 
 ## After run 1
 
@@ -125,21 +127,22 @@ A wall or cost stop ends the run, as in run 1. A stop of the Mac's side in eithe
 
 The evaluation that follows needs no Mac wait and runs under the projected-finish rule, the finalization reserve and every limit; the projection prices only the stages and ARC entries that will run. An arm with the SFT weights is not evaluated (above). With no RL dev check scored there is nothing to select and the run finalizes at once. The run then ends `stopped` with the arm's reason, recorded in `report.json`'s `arm_stop` and the archived summary. While the evaluation runs the heartbeat reads `running`, never `awaiting_rewards`, so the watchdog's 600 s idle rule and the in-Pod 900 s rule apply as to any stage.
 
-**Can a margin stop happen?** Yes, in the control, and it grows more likely the faster run 1 measures. The margin is fixed (one full wait at its worst, 11,746.5 s), while the time the 120% stop leaves after the control is 20% of the estimate plus the evaluation, ARC and reserve that follow it. Roughly, the control's last check keeps `0.2 x estimate (in seconds at $0.60/h) + the evaluation and ARC after the control + its dev wait - 180 - 11,746.5` seconds free; when that is negative the control margin-stops, at its last check or earlier, before its budget is spent. A faster Mac lowers the estimate; a faster GPU lowers both the estimate and the evaluation after the control, so it bites hardest. RL keeps at least 1,392 s free in every case below, so RL never margin-stops at these rates. The cases, each with the estimate projected at the given rates (the planning time scaled) and the run simulated at those same rates, from a 900 s setup (and a 1,500 s one):
+**Can a margin stop happen?** Yes, and at the planning rates it does: in the control at once, and in RL too when run 1 measures faster. The margin is fixed (one full wait at its worst, 11,746.5 s), while the time the 120% stop leaves after the control is 20% of the estimate plus the evaluation, ARC and reserve that follow it. Roughly, the control's last check keeps `0.2 x estimate (in seconds at $0.60/h) + the evaluation and ARC after the control + its dev wait - 180 - 11,746.5` seconds free; when that is negative the control margin-stops before its budget is spent, and when it is more negative than the control is long, RL margin-stops before its last updates and the control is skipped. At the planning rates (generation 5% under the first launch's measured rates) it is about -3,000 s: the estimate is $3.07, the stop $3.67, and the control cannot start. A faster Mac lowers the estimate; a faster GPU lowers both the estimate and the evaluation after the control, so it bites hardest; only a Mac at least twice as slow as planned leaves the control most of its budget. The cases, each with the estimate projected at the given rates (the planning time scaled) and the run simulated at those same rates, from a 900 s setup (and a 1,500 s one):
 
 | Mac time, GPU time (x planning) | Estimate, stop | First margin stop, 900 s setup | 1,500 s setup |
 | --- | --- | --- | --- |
-| 1.0, 1.0 | $3.53, $4.23 | none (515 s free at the control's last check) | the control's last check |
-| 1.1, 1.0 | $3.67, $4.39 | none (695 s) | none (95 s) |
-| 0.9, 1.0 | $3.40, $4.07 | none (335 s) | the control at 85% of its budget |
-| 0.75, 1.0 | $3.19, $3.83 | none (65 s) | the control at 80% |
-| 0.7, 1.0 | $3.13, $3.75 | the control's last check | the control's fourth check, at 80% |
-| 0.6, 1.0 | $2.99, $3.58 | the control at 85% | the control at 60% |
-| 1.0, 0.9 | $3.35, $4.02 | the control at 80% | the control at 60% |
-| 1.0, 0.8 | $3.17, $3.80 | the control at 40% | the control at 20% |
-| 0.5, 1.0 or 0.8, 0.8 | $2.86 or $2.90 | refused at the gate (below) | refused at the gate |
+| 1.0, 1.0 | $3.07, $3.67 | the control, before its first update | RL, before update 96 |
+| 1.1, 1.0 | $3.20, $3.84 | the control at 19% of its budget | RL at its last check (update 100), unscored |
+| 1.5, 1.0 | $3.74, $4.48 | the control at 40% | the control at 23% |
+| 2.0, 1.0 | $4.42, $5.29 | the control at 74% | the control at 60% |
+| 0.9, 1.0 | $2.93, $3.51 | RL at its last check (update 100), unscored | RL, before update 90 |
+| 0.75, 1.0 | $2.73, $3.27 | RL, before update 90 | RL, before update 78 |
+| 0.7, 1.0 | $2.66, $3.19 | RL, before update 86 | RL, before update 76 |
+| 1.0, 0.9 | $2.93, $3.51 | RL, before update 93 | RL, before update 83 |
+| 1.0, 0.8 | $2.80, $3.36 | RL, before update 80 | RL at its update-75 check, unscored |
+| 0.6, 1.0 or 0.8, 0.8 | $2.53 | refused at the gate (below) | refused at the gate |
 
-A margin stop in the control is safe (the worker selects its endpoint from the checks it scored and evaluates both arms as admitted, `test_no_control_update_starts_without_one_full_wait_free`), but the control then has not spent RL's GPU-busy budget, so the comparison it makes is not compute-matched; `more_sft.within_tolerance` says so. Whether to base the margin on run 1's measured wait or to raise the stop fraction for a low estimate is the owner's decision; the code keeps the fixed margin and the 120% stop.
+A margin stop is safe (the worker selects the arm's endpoint from the checks it scored and evaluates what the projected-finish rule admits, `test_no_control_update_starts_without_one_full_wait_free`), but it costs the comparison. A control stopped early has not spent RL's GPU-busy budget, so the comparison it makes is not compute-matched (`more_sft.within_tolerance` says so); one stopped before its first update can only select its start, RL's update-0 check, which holds the SFT weights, so it reuses run 1's SFT results and there is no control at all. A margin stop in RL ends RL short of its 100 updates and skips the control. Whether to base the margin on run 1's measured wait or to raise the stop fraction for a low estimate is the owner's decision, and at these planning rates it is needed before run 2's gate; the code keeps the fixed margin and the 120% stop.
 
 ### Inputs and the gate
 
@@ -178,7 +181,7 @@ The proposal's flat 420 s is not used: 256 slow I/O attempts on 8 workers can ta
 ### Liveness while the Pod waits
 
 - **Heartbeat:** while the bridge client waits, the worker's sleep between looks at its inbox heartbeats `awaiting_rewards` with the client's `heartbeat()` fields (request ID, kind, index, count, start, age) every 5 s.
-- **Dev-check generation:** between two waits a dev check generates 1,800 programs on the GPU at batch 256 (about 92 s at the planning speed); every generation batch stamps the GPU activity and refreshes the heartbeat (`Run2Worker.dev_tick`), so neither idle rule nor the heartbeat's staleness reads it as a hung worker.
+- **Dev-check generation:** between two waits a dev check generates 1,800 programs on the GPU at batch 256 (about 99 s at the planning speed); every generation batch stamps the GPU activity and refreshes the heartbeat (`Run2Worker.dev_tick`), so neither idle rule nor the heartbeat's staleness reads it as a hung worker.
 - **Mac watchdog:** under run 2's policy an `awaiting_rewards` heartbeat naming a reward or dev request lets the GPU idle for that kind's extension, and never more, so a worker that hangs while claiming to wait is still deleted. Run 1's policy grants none. The receipt requires the policy's extensions to be exactly the derived ones.
 - **In-Pod idle rule:** the Mac's server renews `server.lease` in the Pod's bridge root, dated by the Pod's own clock, with every poll and, while it reads, scores or answers a request, every few seconds (so a slow SSH call never lets it lapse while the Mac is alive). During a wait the worker stamps `progress_unix` from a lease renewed within its 60 s; the in-Pod timer reads it through its existing `--activity` heartbeat, and a stale lease adds nothing. A dead Mac therefore lets the Pod go within 900 s of its last renewal.
 - **Lost bridge:** a wait with no lease renewal for 600 s (from the later of the wait's start and the last renewal) is given up as `bridge_lost`: the latest weights are uploaded, the arm's training ends and the evaluation that needs no Mac runs before the finalization ([an arm's stop](#an-arms-stop)), all before the in-Pod timer would fire.
@@ -186,7 +189,7 @@ The proposal's flat 420 s is not used: 256 slow I/O attempts on 8 workers can ta
 
 ### Limits of run 2
 
-Every limit derives from the cost limit, the lower of the ceiling and 120% of the gate's estimate rounded down to the cent, in one place (`ceiling_limits` with the estimate; `posttrain_ops limits` prints them). At the planned $5.80 ceiling and an estimate of $3.53 (the projection at the planning speeds) the cost limit is $4.23: the worker stops at $4.23, the watchdog at $4.22, the Pod wall is 25,380 s, the in-Pod timer 25,200 s; the in-Pod idle limit 900 s, the watchdog's 600 s outside waits, the transfer window 900 s. Only an estimate of $4.84 or more lets the $5.80 ceiling bind (34,800 s and 34,620 s). The policy file must carry exactly the derived wall and cost stop. The launch rule needs 20,288 s at the planning rates, which leaves 4,912 s of the 25,200 s for setup; a plan that does not fit is refused. The gate itself (`posttrain_approved.gate_launch_fit`) refuses limits that cannot hold the planned 900 s setup plus that need, so the refusal comes before any billing and not at the readiness receipt after the Pod has billed its setup: at a $5.80 ceiling that is an estimate below about $2.98 (a stop below $3.57), which a run 1 about twice as fast as planned on the Mac would give. The gate prints what its limits leave for setup, and the projection reports it for each scenario (`launch_at_this_estimate`). Run 2 has no probe: the projected-finish rule prices RL's later stages at RL's measured rates, and the evaluation at its batch's planning speed, lowered by slow evaluation files; a fast measurement never loosens it, as in run 1. (RL's dev checks generate at batch 256 and the evaluation at 64, so the checks' rate does not stand in for the evaluation's.)
+Every limit derives from the cost limit, the lower of the ceiling and 120% of the gate's estimate rounded down to the cent, in one place (`ceiling_limits` with the estimate; `posttrain_ops limits` prints them). At the planned $5.80 ceiling and an estimate of $3.0658 (the projection at the planning speeds, $3.07 in its table) the cost limit is $3.67: the worker stops at $3.67, the watchdog at $3.66, the Pod wall is 22,020 s, the in-Pod timer 21,840 s; the in-Pod idle limit 900 s, the watchdog's 600 s outside waits, the transfer window 900 s. Only an estimate of $4.84 or more lets the $5.80 ceiling bind (34,800 s and 34,620 s). The policy file must carry exactly the derived wall and cost stop. The launch rule needs 17,495 s at the planning rates, which leaves 4,345 s of the 21,840 s for setup; a plan that does not fit is refused. The gate itself (`posttrain_approved.gate_launch_fit`) refuses limits that cannot hold the planned 900 s setup plus that need, so the refusal comes before any billing and not at the readiness receipt after the Pod has billed its setup: at a $5.80 ceiling that is an estimate below about $2.59 (a stop below $3.10), which a Mac taking 0.6 of its planning time would give ($2.53). The gate prints what its limits leave for setup, and the projection reports it for each scenario (`launch_at_this_estimate`). Run 2 has no probe: the projected-finish rule prices RL's later stages at RL's measured rates, and the evaluation at its batch's planning speed, lowered by slow evaluation files; a fast measurement never loosens it, as in run 1. (RL's dev checks generate at batch 256 and the evaluation at 128, so the checks' rate does not stand in for the evaluation's.)
 
 ### Safeguards of run 2
 
@@ -195,6 +198,7 @@ Every limit derives from the cost limit, the lower of the ceiling and 120% of th
 | Gate values filled, the approved protocol unchanged | `Specification.from_dict`, `posttrain_approved.check_run2`, the receipt | `test_posttrain_run2.py`, `test_posttrain_run2_readiness.py` |
 | Cost limit at min(ceiling, 120% of the gate's estimate), every limit from it; the estimate from the projection's output | `posttrain_ops.estimate_limit_usd`, `ceiling_limits`, `specification_limits`; `posttrain_approved.gate_estimate`; `check_policy` | `test_posttrain_run2.py`, `test_posttrain_run2_readiness.py`, `test_posttrain_run2_guards.py`, `test_posttrain_run2_feasibility.py`, `test_posttrain_run2_runbook.py` |
 | Dev checks of both arms at one batch, 256 | `posttrain_approved.RUN2_RL`, `Run2Worker.dev_evaluator` | `test_posttrain_run2.py` |
+| Every endpoint's evaluation at one batch, 128 (base and SFT in run 1, RL and more-SFT here); run 2 planned at run 1's probe floors | `posttrain_approved.GENERATION` and `GENERATION_FLOORS`, shared by both runs; `pilot_feasibility.run1_measured_rates` refuses a run 1 report generated at another batch or without a probe rate at a batch run 2 generates at | `test_posttrain_run.py`, `test_posttrain_run2.py`, `test_posttrain_run2_feasibility.py` |
 | Same weights decided bit for bit; such an arm reuses run 1's pinned SFT results | `scratchcoder.rl.checkpoint.compare_to_loaded`, `Run2Worker.choose_endpoint`; `sft_results` (`check_sft_results`); `tools/posttrain_endpoints.py`; the unseal record; the scorecard | `test_rl_checkpoint.py`, `test_posttrain_run2.py`, `test_run2_endpoints.py`, `test_eval_executor.py`, `test_scorecard.py` |
 | An arm's stop of the Mac's side or margin stop ends that arm, not the run | `Run2Worker.stop_kind`, `stop_arm`, `skip_reason`, `remaining_stages`, `after_stages` | `test_posttrain_run2.py` |
 | The window checks repeated while the bridge runs, failing closed | `scratchcoder.sandbox.window`, `BridgeServer.window_check`, `bridge_command.window_pass` | `test_rl_bridge_window.py`, `test_mac_window_check.py` |
@@ -216,19 +220,19 @@ Every limit derives from the cost limit, the lower of the ceiling and 120% of th
 | Stage | Hours | Dollars |
 | --- | ---: | ---: |
 | Setup (bootstrap, fetch the SFT weights, tests, preflight) | 0.25 | $0.15 |
-| RL rollouts (6.55M tokens at batch 256) | 0.18 | $0.11 |
+| RL rollouts (6.55M tokens at batch 256) | 0.20 | $0.12 |
 | RL training steps (26.2M slots) | 0.13 | $0.08 |
 | RL waiting on Mac rewards (100 x 48 s) | 1.33 | $0.80 |
-| RL dev checks at batch 256: generation / Mac wait (6) | 0.15 / 0.50 | $0.39 |
-| More-SFT training (equal to RL's busy time) | 0.31 | $0.19 |
-| More-SFT dev checks at batch 256: generation / Mac wait (5) | 0.13 / 0.42 | $0.33 |
-| Evaluation generation, RL and more-SFT (37.6M tokens at cap) | 2.17 | $1.30 |
+| RL dev checks at batch 256: generation / Mac wait (6) | 0.17 / 0.50 | $0.40 |
+| More-SFT training (equal to RL's busy time) | 0.32 | $0.19 |
+| More-SFT dev checks at batch 256: generation / Mac wait (5) | 0.14 / 0.42 | $0.33 |
+| Evaluation generation, RL and more-SFT (37.6M tokens at cap, batch 128) | 1.34 | $0.80 |
 | ARC-Easy on both selected checkpoints | 0.04 | $0.02 |
 | Checkpoint loads and weights saves | 0.03 | $0.02 |
 | Finalization | 0.25 | $0.15 |
-| **Total** | **5.89** | **$3.53** |
+| **Total** | **5.11** | **$3.07** |
 
-At this estimate run 2 would stop at $4.23 (120%), a 25,380 s wall. With the Mac twice as slow on model output it is about 8.14 hours and $4.88, above that stop but under $5.80: the stop follows the estimate at run 1's measured rates, which the gate reads from the projection's output (`gate_estimate_usd`), never from this table. The ceiling is fixed at the gate.
+At this estimate run 2 would stop at $3.67 (120%), a 22,020 s wall. With the Mac twice as slow on model output it is about 7.36 hours and $4.42, above that stop but under $5.80: the stop follows the estimate at run 1's measured rates, which the gate reads from the projection's output (`gate_estimate_usd`), never from this table. The ceiling is fixed at the gate.
 
 ### After run 2
 
@@ -236,7 +240,7 @@ On the Mac, `python -m tools.posttrain_endpoints plan` records each endpoint's s
 
 ## Limitations
 
-- Generation speed has never been measured; the probe measures it first.
+- Generation speed has been measured once, by the first launch's probe on random tokens at real prompt lengths; real evaluation files may generate more slowly, and the projected-finish rule re-bases on their own rate.
 - Run 2's bridge has not crossed a real SSH link, and its bounds are worst cases of the channel's rules: a real wait is expected to take minutes, not hours. A live but stuck Mac can hold the Pod idle up to the extension before the watchdog deletes it, at most about $1.97 of a reward or dev wait.
 - The SSH rescue carries only the weights label (`checkpoint.pt` and `record.json`). Any other label R2 never verified is listed for a rescue by hand and teardown is not approved, but the watchdog and the in-Pod idle rule still delete the Pod 600 to 900 s after its last GPU work: the runbook's rescue block has about 2 to 7 minutes after the handover.
 - Termination is layered best effort: there is no provider-enforced Pod lifetime.
