@@ -41,3 +41,5 @@ Implemented: [the RL update: policy gradient with group-mean advantage](rl-updat
 Implemented: [the more-SFT control](more-sft-control.md).
 
 Implemented: [evaluation pipeline: generate, execute, seal, score](evaluation-pipeline.md).
+
+Implemented: [post-training run worker](posttrain-run.md).

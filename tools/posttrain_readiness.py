@@ -2,7 +2,7 @@
 
 Built on the Mac from the Pod's own evidence and the owner's confirmations, in exactly the
 form ``tools.posttrain_run run`` accepts (its ``check_readiness`` is applied before anything
-is written). Besides the D-35 owner gates and termination checks it requires:
+is written). Besides the pretraining rehearsal's owner gates and termination checks it requires:
 
 - the specification to be the approved run 1 (``posttrain_approved.check_run1``) and the
   binding to name exactly its inputs at every pinned value;
