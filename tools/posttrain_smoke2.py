@@ -527,7 +527,11 @@ def summary2(report: Mapping[str, Any], bucket: MemoryBucket) -> dict[str, Any]:
                 "mismatch_fraction",
             )
         },
-        selected={arm: (row.get("selected") or {}).get("label") for arm, row in selection.items()},
+        selected={
+            arm: ((selection.get(arm) or {}).get("selected") or {}).get("label")
+            for arm in ("rl", "more-sft")
+        },
+        identical_endpoints=(selection.get("identical_endpoints") or {}).get("identical"),
         bridge_waits=len((report.get("bridge") or {}).get("waits", [])),
     )
     return value

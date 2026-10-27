@@ -604,6 +604,18 @@ def test_the_archived_summary_carries_run_twos_results(completed: Ran) -> None:
     assert len(json.dumps(summary)) < 200_000
 
 
+def test_the_smoke_summary_names_each_arms_selection(completed: Ran) -> None:
+    from tools.posttrain_smoke2 import summary2
+
+    value = summary2(completed.report, completed.bucket)
+    selection = completed.report["selection"]
+    assert value["selected"] == {
+        arm: selection[arm]["selected"]["label"] for arm in ("rl", "more-sft")
+    }
+    assert value["identical_endpoints"] is False
+    assert value["bridge_waits"] == len(completed.report["bridge"]["waits"])
+
+
 def test_the_r2_report_passes_the_macs_final_verification(completed: Ran, tmp_path: Path) -> None:
     beat = json.loads((completed.worker.root / "heartbeat.json").read_text())
     store = completed.bucket.store(SMOKE_CREDENTIALS)
