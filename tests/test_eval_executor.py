@@ -875,3 +875,44 @@ def test_a_planted_baseline_for_another_task_file_is_refused(tmp_path: Path) -> 
             **options(ledger, record),
         )
     assert "baseline" not in [event["event"] for event in SealLedger(ledger).events()]
+
+
+def test_cli_test_baseline_retry_exits_zero_once_logged_and_three_otherwise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    endpoints, files, tasks_path = four_endpoints(tmp_path, ledger)
+    record = unseal_record(tmp_path / "unseal.json", endpoints)
+    arguments = [
+        "eval-test-baseline",
+        "--tasks",
+        str(tasks_path),
+        "--seal-ledger",
+        str(ledger),
+        "--unseal",
+        str(record),
+        "--workers",
+        "2",
+    ]
+    with pytest.raises(SealError, match="no completed read"):
+        main(arguments)
+    for name in endpoints:
+        execute_completions(
+            files[name],
+            tasks_path,
+            tmp_path / f"{name}.jsonl",
+            execute=constant_hostile,
+            **options(ledger, record),
+        )
+    with monkeypatch.context() as unresolved:
+        unresolved.setattr(
+            executor,
+            "run_test_baseline",
+            lambda *_, **__: {"recorded": False, "test_baseline": None},
+        )
+        assert main(arguments) == 3
+    capsys.readouterr()
+    monkeypatch.setattr(harness, "run", lambda code, tests, limits, *, mode: Result("passed"))
+    assert main(arguments) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["recorded"] is True and Path(printed["test_baseline"]).is_file()
