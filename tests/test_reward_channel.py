@@ -1256,6 +1256,33 @@ def test_admit_row_keeps_the_first_well_framed_row_per_index() -> None:
         ("import os\nos.kill(1, 2)", "os_kill"),
         ("import os as o\no.killpg(0, 9)", "os_kill"),
         ("from os import kill\nkill(1, 2)", "os_kill"),
+        # Evasions a review found: implicit concatenation, joined pieces, built code, frame
+        # walks, trace hooks, marshal and the main module.
+        ("C = type('C', (), {'__e' 'q__': lambda s, o: True})", "eq_override"),
+        ("C = type('C', (), {'\\x5f_eq__': lambda s, o: True})", "eq_override"),
+        ("import os\ngetattr(os, ''.join(['_e', 'xit']))(0)", "os_exit"),
+        ("exec(bytes.fromhex('41').decode())", "dynamic_code"),
+        ("eval(input())", "dynamic_code"),
+        ("code = compile(text, 'x', 'exec')", "dynamic_code"),
+        ("exec('import gc')", "gc"),
+        ("exec('import os\\nos._exit(0)')", "os_exit"),
+        (
+            "try:\n    1 / 0\nexcept Exception as e:\n"
+            "    g = e.__traceback__.tb_frame.f_back.f_globals",
+            "frame_access",
+        ),
+        ("import sys\nframes = sys._current_frames()", "frame_access"),
+        ("def g():\n    yield 1\nx = g().gi_frame.f_locals", "frame_access"),
+        ("import sys\nsys.settrace(lambda *a: None)", "trace_hook"),
+        ("import threading\nthreading.setprofile(print)", "trace_hook"),
+        ("import sys\nsys.addaudithook(print)", "trace_hook"),
+        ("import sys\nsys.monitoring.use_tool_id(0, 'x')", "trace_hook"),
+        ("import marshal", "marshal"),
+        ("m = __import__('mar' + 'shal')", "marshal"),
+        ("import __main__", "main_module"),
+        ("from __main__ import calls", "main_module"),
+        ("import traceback\ntraceback.walk_stack(None)", "traceback"),
+        ("import pdb", "debugger"),
     ],
 )
 def test_audit_flags_risky_patterns(code: str, flag: str) -> None:
@@ -1275,6 +1302,12 @@ def test_audit_flags_risky_patterns(code: str, flag: str) -> None:
         "import sys\ndata = sys.stdin.read()",
         "x = getattr(obj, name)",
         "import os\nprint(os.path.join('a', 'b'))",
+        # ``re.compile`` and ``str.join`` are not the code builtins; constant code is audited.
+        "import re\npattern = re.compile(r'\\d+')",
+        "print(', '.join(['a', 'b']))",
+        "value = eval('1 + 2')",
+        "frame = {'f_back_count': 1}",
+        "def evaluate(expr):\n    return expr",
     ],
 )
 def test_audit_does_not_flag_ordinary_code(code: str) -> None:

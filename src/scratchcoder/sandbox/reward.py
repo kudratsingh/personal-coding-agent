@@ -453,9 +453,19 @@ _TEXT_FLAGS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"__file__"), "dunder_file"),
     (re.compile(r"/proc(?!\w)"), "proc_path"),
     (re.compile(r"/tmp(?!\w)"), "tmp_path"),
-    # Comparison and truth overrides, however they are attached (def, assignment, type()).
+    # Comparison and truth overrides, written in the source or in any string constant
+    # (``def``, assignment, ``type()`` with a constant or constant-assembled name).
     (re.compile(r"__(?:eq|ne|bool)__"), "eq_override"),
     (re.compile(r"__builtins__"), "builtins"),
+    # Routes from a value to the frames that hold the driver's state (the call sources).
+    (
+        re.compile(
+            r"__traceback__|_current_frames"
+            r"|(?<!\w)(?:tb_frame|f_back|f_globals|f_locals|gi_frame|cr_frame|ag_frame)(?!\w)"
+        ),
+        "frame_access",
+    ),
+    (re.compile(r"(?<!\w)(?:settrace|setprofile|addaudithook)(?!\w)"), "trace_hook"),
 )
 _AUDIT_MODULES = {
     "inspect": "inspect",
@@ -464,7 +474,23 @@ _AUDIT_MODULES = {
     "ctypes": "ctypes",
     "signal": "signal",
     "builtins": "builtins",
+    "marshal": "marshal",
+    "traceback": "traceback",
+    "pdb": "debugger",
+    "bdb": "debugger",
+    "__main__": "main_module",
 }
+_FRAME_ATTRIBUTES = (
+    "__traceback__",
+    "_current_frames",
+    "tb_frame",
+    "f_back",
+    "f_globals",
+    "f_locals",
+    "gi_frame",
+    "cr_frame",
+    "ag_frame",
+)
 _ATTRIBUTE_FLAGS = {
     "_getframe": "_getframe",
     "co_consts": "co_consts",
@@ -474,13 +500,20 @@ _ATTRIBUTE_FLAGS = {
     "__ne__": "eq_override",
     "__bool__": "eq_override",
     "__file__": "dunder_file",
+    **{name: "frame_access" for name in _FRAME_ATTRIBUTES},
+    "settrace": "trace_hook",
+    "setprofile": "trace_hook",
+    "addaudithook": "trace_hook",
 }
 _ATTRIBUTE_CALLS = ("getattr", "setattr", "delattr", "hasattr")
+_CODE_BUILTINS = ("exec", "eval", "compile")
+_AUDIT_DEPTH = 3
+"""How deep constant source passed to ``exec``/``eval``/``compile`` is audited as code."""
 
 
 def _fold(node: ast.AST) -> str | None:
     """The string value of a constant string expression (``'a' + 'b'``, an f-string
-    without placeholders), or ``None``."""
+    without placeholders, ``''.join(['a', 'b'])``), or ``None``."""
     if isinstance(node, ast.Constant):
         return node.value if isinstance(node.value, str) else None
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
@@ -489,6 +522,19 @@ def _fold(node: ast.AST) -> str | None:
     if isinstance(node, ast.JoinedStr):
         parts = [_fold(value) for value in node.values]
         return None if any(part is None for part in parts) else "".join(map(str, parts))
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+    ):
+        separator = _fold(node.func.value)
+        pieces = [_fold(item) for item in node.args[0].elts]
+        if separator is None or any(piece is None for piece in pieces):
+            return None
+        return separator.join(piece for piece in pieces if piece is not None)
     return None
 
 
@@ -507,7 +553,19 @@ def _flag_module(name: str | None, flags: set[str]) -> None:
         flags.add(flag)
 
 
-def _audit_tree(tree: ast.AST, flags: set[str]) -> None:
+def _audit_source(source: str, flags: set[str], depth: int) -> None:
+    """Audit a constant source string handed to ``exec``/``eval``/``compile``."""
+    _flag_text(source, flags)
+    if depth > _AUDIT_DEPTH:
+        flags.add("dynamic_code")
+        return
+    try:
+        _audit_tree(ast.parse(source), flags, depth)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        pass
+
+
+def _audit_tree(tree: ast.AST, flags: set[str], depth: int = 0) -> None:
     sys_names = {"sys"}
     os_names = {"os", "posix"}
     importers = {"__import__", "import_module"}
@@ -540,7 +598,14 @@ def _audit_tree(tree: ast.AST, flags: set[str]) -> None:
         )
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.BinOp):
+        if isinstance(node, ast.Constant):
+            # Every string constant, so implicit concatenation (``'__e' 'q__'``) and escapes
+            # (``'\x5f_exit'``) are scanned in their final form.
+            if isinstance(node.value, str):
+                _flag_text(node.value, flags)
+            elif isinstance(node.value, bytes):
+                _flag_text(node.value.decode("latin-1"), flags)
+        elif isinstance(node, ast.BinOp):
             folded = _fold(node)
             if folded is not None:
                 _flag_text(folded, flags)
@@ -549,12 +614,25 @@ def _audit_tree(tree: ast.AST, flags: set[str]) -> None:
                 flags.add(_ATTRIBUTE_FLAGS[node.attr])
             if node.attr == "modules" and is_module(node.value, sys_names, "sys"):
                 flags.add("sys_modules")
+            if node.attr == "monitoring" and is_module(node.value, sys_names, "sys"):
+                flags.add("trace_hook")
             if node.attr in ("kill", "killpg") and is_module(node.value, os_names, "os"):
                 flags.add("os_kill")
         elif isinstance(node, ast.Name) and node.id == "builtins":
             flags.add("builtins")
         elif isinstance(node, ast.Call):
             callee = _callee(node)
+            folded = _fold(node)
+            if folded is not None:
+                _flag_text(folded, flags)
+            if isinstance(node.func, ast.Name) and node.func.id in _CODE_BUILTINS:
+                # Code built at run time is invisible to this audit; constant code is
+                # audited as code.
+                source = _fold(node.args[0]) if node.args else None
+                if source is None:
+                    flags.add("dynamic_code")
+                else:
+                    _audit_source(source, flags, depth + 1)
             if callee in importers and node.args:
                 _flag_module(_fold(node.args[0]), flags)
             elif callee in _ATTRIBUTE_CALLS and len(node.args) >= 2:
@@ -583,7 +661,13 @@ def audit_attempt(code: str) -> tuple[str, ...]:
     The text scan runs even on code that does not parse. The syntax-tree scan adds what
     text alone misses: module aliases (``import sys as s; s.modules``), dynamic imports
     (``__import__``/``importlib.import_module``, flagged ``dynamic_import`` when the name is
-    not a constant), names assembled from string pieces, and ``os.kill``."""
+    not a constant), every string constant in its final form, names assembled from constant
+    pieces (``+``, f-strings, ``''.join``), ``os.kill``, frame access (tracebacks, frame
+    attributes, ``sys._current_frames``), trace hooks, and ``exec``/``eval``/``compile``
+    (flagged ``dynamic_code`` unless the source is a constant, which is audited as code).
+
+    The audit is best-effort: a name computed at run time any other way (``chr``,
+    ``bytes.fromhex``, ``str.format``) is not seen, so a missing flag proves nothing."""
     flags: set[str] = set()
     _flag_text(code, flags)
     try:
