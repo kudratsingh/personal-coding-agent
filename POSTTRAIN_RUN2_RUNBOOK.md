@@ -174,7 +174,7 @@ The readiness receipt requires the Mac's own pinned copy of run 2's parent:
 uv run --locked python -m tools.posttrain_binding fetch --binding "$BINDING" --expected-sha256 "$BINDING_SHA256" --root runs/posttrain-parents-2 --only sft-weights --receipt "$SHARED/mac-copy.json" --key-prefix R2_
 ```
 
-**Prepare the reward bridge now, before any billing.** The bridge (step 11) runs model-written code in Docker Desktop on the Mac while the Pod is up, so the run-1 execution-window rules hold from here until step 16 ends the Pod, with one difference: the Pod's R2 token cannot be revoked yet (the worker uploads with it), so it stays in `.env`, which no container can reach. The **owner** now empties Docker Desktop's file sharing (Settings, Resources, File sharing: remove every entry, including the defaults `/Users`, `/Volumes`, `/private`, `/tmp` and `/var/folders`) and clears the SSH agent (`ssh-add -D`). Nothing in steps 7 to 16 needs either: every SSH call uses `$POD_SSH_KEY` and the pinned known-hosts file only, never the agent. Doing it here keeps it off the clock: once the Pod exists, steps 11 to 13 must run back to back (step 11 says why).
+**Prepare the reward bridge now, before any billing.** The bridge (step 11) runs model-written code in Docker Desktop on the Mac while the Pod is up, so the run-1 execution-window rules hold from here until step 16 ends the Pod, with one difference: the Pod's R2 token cannot be revoked yet (the worker uploads with it), so it stays in `.env`, which no container can reach. The **owner** now empties Docker Desktop's file sharing (Settings, Resources, File sharing: remove every entry, including the defaults `/Users`, `/Volumes`, `/private` and `/tmp`; the built-in `/var/folders` share cannot be removed and is a known residual, since the sandbox never asks for a mount) and clears the SSH agent (`ssh-add -D`). Nothing in steps 7 to 16 needs either: every SSH call uses `$POD_SSH_KEY` and the pinned known-hosts file only, never the agent. Doing it here keeps it off the clock: once the Pod exists, steps 11 to 13 must run back to back (step 11 says why).
 
 Open the third terminal and **never source `.env` in it**. Export only what the bridge needs (paste the values from the first terminal; none is a secret) and check the window:
 
@@ -191,10 +191,11 @@ export POD_DEV_SHA256=<from step 4>
 export MAC_REWARD_TIMEOUT=<from step 4>
 export MAC_DEV_TIMEOUT=<from step 4>
 export SANDBOX_IMAGE_ID=$(docker image inspect --format '{{.Id}}' python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe)
+unset SSH_AUTH_SOCK SSH_AGENT_PID
 uv run --locked python -m tools.mac_window_check check --image-id "$SANDBOX_IMAGE_ID" --dotenv .env --receipt "$SHARED/window-check-bridge.json"
 ```
 
-The window check must pass: no `.env` variable or secret in this terminal, no identity in the shell's or the login session's SSH agent, the pinned image, and none of the five default shares mountable. If it fails, fix it now; the Pod is not created until it passes. Leave this terminal open: step 11 adds the Pod's address and starts the bridge in it.
+The window check must pass: no `.env` variable or secret in this terminal, no identity in the shell's or the login session's SSH agent, the pinned image, and none of the four removable default shares mountable (it records whether `/var/folders` mounts without failing on it). macOS sets `SSH_AUTH_SOCK` in every terminal, so the block unsets it in this one; the agent check still asks the login session's agent. If it fails, fix it now; the Pod is not created until it passes. Leave this terminal open: step 11 adds the Pod's address and starts the bridge in it.
 
 ## 7. Pod creation, identity and the watchdog (Mac, BILLABLE)
 
