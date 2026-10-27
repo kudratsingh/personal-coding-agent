@@ -398,6 +398,48 @@
       "sha256": "56fd1ec0da7497b3399cb6e3f2f0900887f236eba4c9414bc4271f4702b82870"
     }
   },
+  "sft_results": {
+    "arc-sft-sft/arc.json": {
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    },
+    "eval-sft-pool-dev-greedy/completions.jsonl": {
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    },
+    "eval-sft-pool-dev-n8/completions.jsonl": {
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    },
+    "eval-sft-pool-test-greedy/completions.jsonl": {
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    },
+    "eval-sft-pool-test-n8/completions.jsonl": {
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    },
+    "eval-sft-humaneval-greedy/completions.jsonl": {
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    },
+    "eval-sft-humaneval-plus-greedy/completions.jsonl": {
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    },
+    "eval-sft-mbpp-plus-greedy/completions.jsonl": {
+      "key": null,
+      "size_bytes": null,
+      "sha256": null
+    }
+  },
   "r2": {
     "storage_cap_usd_per_month": 5.0
   }

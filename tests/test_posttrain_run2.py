@@ -32,6 +32,7 @@ from tools import posttrain_approved, posttrain_ops
 from tools.pod_self_destruct import SelfDestruct
 from tools.posttrain_run import (
     BRIDGE_LOST_STOP,
+    SFT_RESULTS,
     WAIT_MARGIN_STOP,
     Rates,
     RunLimits,
@@ -223,6 +224,9 @@ def gate_values() -> dict[str, Any]:
         "rl-dev": dict(pin),
         "rl-facts": dict(pin),
         "pool-test": dict(pin),
+        "sft-results": {
+            name: {"key": f"posttrain-runs/1/podpost01/{name}", **pin} for name in SFT_RESULTS
+        },
     }
 
 
@@ -237,6 +241,8 @@ def test_the_tracked_template_is_the_approved_run_two_with_its_gate_values_null(
     assert [stage.name for stage in spec.stages] == STAGES
     assert raw["limits"]["ceiling_usd"] is None
     assert raw["limits"]["gate_estimate_usd"] is None and raw["limits"]["cost_limit_usd"] is None
+    assert list(raw["sft_results"]) == list(SFT_RESULTS)
+    assert all(set(pin.values()) == {None} for pin in raw["sft_results"].values())
     for name in ("sft-weights", "rl-tasks", "rl-dev", "rl-facts", "pool-test"):
         assert raw["inputs"][name]["sha256"] is None, name
     assert raw["inputs"]["sft-weights"]["key"] is None
@@ -374,7 +380,17 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
                 "key": "posttrain-runs/1/podpost01/sft-weights/checkpoint.pt",
                 "sha256": "b" * 64,
                 "bytes": 541_142_400,
-            }
+            },
+            *(
+                {
+                    "label": name.split("/")[0],
+                    "name": name.split("/")[1],
+                    "key": f"posttrain-runs/1/podpost01/{name}",
+                    "sha256": f"{index:x}" * 64,
+                    "bytes": 1_000 + index,
+                }
+                for index, name in enumerate(SFT_RESULTS, 1)
+            ),
         ],
     }
     run1 = tmp_path / "report.json"
@@ -436,7 +452,30 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
     record = json.loads((found.root / "rl-pod-export" / "rl-pod-export.json").read_text())
     for name in ("rl-tasks", "rl-dev", "rl-facts"):
         assert filled["inputs"][name]["sha256"] == record["files"][name]["sha256"]
+    # Run 1's SFT evaluation artifacts, pinned from its verified report as an input is.
+    listed: dict[str, Any] = {
+        f"{row['label']}/{row['name']}": row for row in json.loads(run1.read_text())["artifacts"]
+    }
+    assert filled["sft_results"] == {
+        name: {
+            "key": listed[name]["key"],
+            "size_bytes": listed[name]["bytes"],
+            "sha256": listed[name]["sha256"],
+        }
+        for name in SFT_RESULTS
+    }
+    assert list(filled["sft_results"]) == list(SFT_RESULTS) and len(SFT_RESULTS) == 8
     posttrain_approved.check_run2(filled)
+    for name, edit in (
+        ("arc-sft-sft/arc.json", {"sha256": None}),
+        ("eval-sft-pool-test-n8/completions.jsonl", {"key": "posttrain-runs/1/other/x"}),
+    ):
+        broken = copy.deepcopy(filled)
+        broken["sft_results"][name].update(edit)
+        with pytest.raises(ValueError):
+            posttrain_approved.check_run2(broken)
+        with pytest.raises(ValueError):
+            Specification.from_dict(broken)
     import hashlib
 
     assert printed["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
@@ -588,9 +627,18 @@ def test_rl_and_the_control_record_their_seconds_selection_and_mismatch(complete
         assert chosen["check"] == best["check"] and chosen["label"] in labels(report)
     assert report["rates"]["basis"]["mac"] == "measured"
     assert report["rates"]["rl_busy_seconds"] == rl["busy_seconds"]
-    identical = report["selection"]["identical_endpoints"]
-    assert identical["identical"] is False and identical["sha256"] is None
-    assert identical["rl"] == report["selection"]["rl"]["selected"]["label"]
+    # Each arm's selected weights were compared with the SFT weights, tensor by tensor: both
+    # trained away from them, so both were evaluated here, independently.
+    endpoints = report["selection"]["endpoints"]
+    assert endpoints["rule"].startswith("an arm whose selected checkpoint holds the SFT weights")
+    for arm in ("rl", "more-sft"):
+        entry = endpoints[arm]
+        assert entry["selected"] == report["selection"][arm]["selected"]["label"]
+        assert entry["same_weights_as_sft"] is False and entry["evaluation"] == "pod"
+        assert entry["independent"] is True and entry["reuses"] is None
+        assert entry["comparison"]["first_difference"] is not None
+        assert entry["comparison"]["sft_weights_sha256"] == report["inputs"]["sft-weights"]
+    assert report["arm_stop"] is None
 
 
 def test_the_waits_heartbeat_awaiting_rewards_and_a_fresh_lease_is_progress(completed: Ran) -> None:
@@ -718,6 +766,8 @@ def test_the_archived_summary_carries_run_twos_results(completed: Ran) -> None:
     )
     assert summary["rl"] == report["rl"] and summary["more_sft"] == report["more_sft"]
     assert summary["selection"] == report["selection"]
+    assert summary["endpoints"] == report["selection"]["endpoints"]
+    assert summary["arm_stop"] is None
     bridge = summary["bridge"]
     assert "waits" not in bridge and bridge["wait_count"] == len(report["bridge"]["waits"])
     assert bridge["lost"] is None and bridge["timeouts"] == report["bridge"]["timeouts"]
@@ -736,7 +786,7 @@ def test_the_smoke_summary_names_each_arms_selection(completed: Ran) -> None:
     assert value["selected"] == {
         arm: selection[arm]["selected"]["label"] for arm in ("rl", "more-sft")
     }
-    assert value["identical_endpoints"] is False
+    assert value["evaluation"] == {"rl": "pod", "more-sft": "pod"} and value["arm_stop"] is None
     assert value["bridge_waits"] == len(completed.report["bridge"]["waits"])
 
 
@@ -755,8 +805,10 @@ def test_the_r2_report_passes_the_macs_final_verification(completed: Ran, tmp_pa
 def test_a_reward_wait_timeout_uploads_the_latest_weights_and_finalizes_in_full(
     found: Fixtures2, tmp_path: Path
 ) -> None:
-    """The Mac's own bound passes on update 2: its timeout reply stops RL with reward_wait,
-    the weights trained so far go to R2, and the run ends without the control."""
+    """The Mac's own bound passes on update 2: its timeout reply stops RL with reward_wait and
+    the weights trained so far go to R2. RL's endpoint is selected from the checks scored, only
+    check 0, which holds the SFT weights: it reuses run 1's SFT results, so nothing is
+    evaluated here, the control (which needs the Mac) is skipped, and the run finalizes."""
     ran = execute(found, tmp_path / "run", reward_source=FakeRewardSource(timeout_at=2))
     report = ran.report
     assert (report["status"], report["stop_reason"]) == ("stopped", "reward_wait")
@@ -769,10 +821,74 @@ def test_a_reward_wait_timeout_uploads_the_latest_weights_and_finalizes_in_full(
         "eval-rl": "skipped",
         "eval-more-sft": "skipped",
     }
+    stages = {stage["name"]: stage for stage in report["stages"]}
+    assert "the control's dev checks need the Mac" in stages["more-sft"]["skip_reason"]
+    assert "holds the SFT weights bit for bit" in stages["eval-rl"]["skip_reason"]
+    assert report["arm_stop"]["arm"] == "rl" and report["arm_stop"]["kind"] == "channel"
+    endpoint = report["selection"]["endpoints"]["rl"]
+    assert endpoint["selected"] == "rl-check-0000" and endpoint["same_weights_as_sft"] is True
+    assert endpoint["evaluation"] == "reuses-run-1-sft" and endpoint["independent"] is False
+    pins = ran.worker.plan.sft_results
+    assert endpoint["reuses"]["results"]["arc-post-rl/arc.json"] == {
+        "run_1": "arc-sft-sft/arc.json",
+        **pins["arc-sft-sft/arc.json"],
+    }
+    assert len(endpoint["reuses"]["results"]) == 8
+    assert not any(name.startswith(("arc-post", "eval-")) for name in labels(report))
     beat = json.loads((ran.worker.root / "heartbeat.json").read_text())
     assert beat["status"] == "stopped" and "r2_final" in beat  # The finalization ran in full.
     assert "bridge" in labels(report)
     assert [wait["outcome"] for wait in report["bridge"]["waits"]][-1] == "failed"
+
+
+def test_a_lost_mac_in_rl_still_evaluates_rls_endpoint_on_the_pod(
+    found: Fixtures2, tmp_path: Path
+) -> None:
+    """The owner's run 2 gate rulings: a stop of the Mac's side (here the Mac's timeout reply
+    on update 3) no longer ends the run at once. RL's endpoint is selected from the checks
+    already scored (0 and 2), it is not the SFT weights, so its ARC entry and its seven
+    evaluation files run here, under the projected-finish rule, and reach R2; the control and
+    its evaluation do not run. While they run the heartbeat never claims awaiting_rewards."""
+    ran = execute(found, tmp_path / "run", reward_source=FakeRewardSource(timeout_at=3))
+    report = ran.report
+    assert (report["status"], report["stop_reason"]) == ("stopped", "reward_wait")
+    assert [row["check"] for row in report["rl"]["checks"]] == [0, 2]
+    assert statuses(report) == {
+        "rl": "stopped",
+        "more-sft": "skipped",
+        "arc-post": "completed",
+        "eval-rl": "completed",
+        "eval-more-sft": "skipped",
+    }
+    endpoint = report["selection"]["endpoints"]["rl"]
+    assert endpoint["selected"] == "rl-check-0002" and endpoint["evaluation"] == "pod"
+    assert endpoint["same_weights_as_sft"] is False
+    assert report["selection"]["endpoints"].get("more-sft") is None
+    names = labels(report)
+    assert "arc-post-rl" in names and "arc-post-more-sft" not in names
+    assert len([name for name in names if name.startswith("eval-rl-")]) == 7
+    assert not any(name.startswith("eval-more-sft-") for name in names)
+    arc = {stage["name"]: stage for stage in report["stages"]}["arc-post"]
+    assert "the control did not run" in arc["checkpoints_not_evaluated"]["more-sft"]
+    # The projection before the evaluation priced only what runs: one ARC checkpoint, eval-rl.
+    projection = [row for row in report["projections"] if row["stage"] == "arc-post"][-1]
+    assert set(projection["stages"]) == {"arc-post", "eval-rl"}
+    evaluating = [beat for beat in ran.beats if beat["phase"].startswith(("arc-post", "eval-rl"))]
+    assert evaluating and all(beat["status"] == "running" for beat in evaluating)
+    after = ran.beats[ran.beats.index(evaluating[0]) :]
+    assert all(beat["status"] != "awaiting_rewards" and "awaiting" not in beat for beat in after)
+    beat = json.loads((ran.worker.root / "heartbeat.json").read_text())
+    assert beat["status"] == "stopped" and "r2_final" in beat
+    store = ran.bucket.store(SMOKE_CREDENTIALS)
+    verified = posttrain_ops.verify_final(
+        store,
+        beat["r2_final"],
+        run="2",
+        pod_id=SMOKE2_POD_ID,
+        destination=tmp_path / "check",
+        statuses=("stopped",),
+    )
+    assert verified["report_status"] == "stopped" and verified["status"] == "verified"
 
 
 def test_a_pod_side_timeout_with_a_live_mac_stops_rl_cleanly(
@@ -996,19 +1112,31 @@ class FailsInTheControl:
         return self.reference(pairs)
 
 
-def assert_the_control_ended_the_run(ran: Ran, reason: str) -> None:
-    """RL's result stands, the control stopped with ``reason``, nothing after it ran, and the
-    run finalized in full with the bridge directories kept."""
+def assert_the_control_stopped_and_rl_was_evaluated(ran: Ran, reason: str) -> None:
+    """The owner's run 2 gate rulings: the control's training stopped with ``reason``, a stop of
+    the Mac's side; RL's result stands and its endpoint is evaluated here (its ARC entry and
+    its seven files), the control's is not; then the run finalizes in full, ``stopped`` with
+    that reason and the bridge directories kept."""
     report = ran.report
     assert (report["status"], report["stop_reason"]) == ("stopped", reason)
     assert statuses(report) == {
         "rl": "completed",
         "more-sft": "stopped",
-        "arc-post": "skipped",
-        "eval-rl": "skipped",
+        "arc-post": "completed",
+        "eval-rl": "completed",
         "eval-more-sft": "skipped",
     }
-    assert {"rl", "more-sft", "bridge"} <= labels(report)
+    assert report["arm_stop"]["arm"] == "more-sft" and report["arm_stop"]["kind"] == "channel"
+    endpoints = report["selection"]["endpoints"]
+    assert endpoints["rl"]["evaluation"] == "pod"
+    assert endpoints["more-sft"]["evaluation"] == "not-evaluated"
+    assert endpoints["more-sft"]["same_weights_as_sft"] is None  # Not evaluated: not compared.
+    assert "a stop of the Mac's side" in endpoints["more-sft"]["reason"]
+    names = labels(report)
+    assert {"rl", "more-sft", "bridge", "arc-post-rl"} <= names
+    assert len([name for name in names if name.startswith("eval-rl-")]) == 7
+    assert "arc-post-more-sft" not in names
+    assert not any(name.startswith("eval-more-sft-") for name in names)
     events = {row["name"] for row in report["artifacts"] if row["label"] == "more-sft"}
     assert {"control-result.json", "control-events.jsonl"} <= events
     beat = json.loads((ran.worker.root / "heartbeat.json").read_text())
@@ -1022,7 +1150,7 @@ def assert_the_control_ended_the_run(ran: Ran, reason: str) -> None:
         (RewardHostFailure("the sandbox host failed through its retries"), "reward_host_failure"),
     ],
 )
-def test_a_channel_stop_in_the_control_ends_the_run_with_its_weights_in_r2(
+def test_a_channel_stop_in_the_control_evaluates_rl_with_the_controls_weights_in_r2(
     found: Fixtures2, tmp_path: Path, error: Exception, reason: str
 ) -> None:
     """The Mac answers the control's first own dev check with a timeout or a host failure."""
@@ -1033,7 +1161,7 @@ def test_a_channel_stop_in_the_control_ends_the_run_with_its_weights_in_r2(
             server, "dev_execute", FailsInTheControl(worker, error)
         ),
     )
-    assert_the_control_ended_the_run(ran, reason)
+    assert_the_control_stopped_and_rl_was_evaluated(ran, reason)
     control = ran.report["more_sft"]
     assert control["stop_reason"] == reason and control["checks"] == []
     assert "more-sft-stop-weights" in labels(ran.report)
@@ -1045,9 +1173,10 @@ def test_a_mac_that_dies_during_the_control_is_a_lost_bridge(
     found: Fixtures2, tmp_path: Path
 ) -> None:
     """The Mac stops renewing its lease while the control waits on a dev check: 700 s later
-    the worker gives the wait up as ``bridge_lost``, uploads the control's weights and
-    finalizes. (The Mac's lease is dated by the Pod's clock until it dies, and the Pod's clock
-    jumps the 700 s at once, so the test does not depend on the runner's speed.)"""
+    the worker gives the wait up as ``bridge_lost``, uploads the control's weights, evaluates
+    RL's endpoint and finalizes. (The Mac's lease is dated by the Pod's clock until it dies,
+    and the Pod's clock jumps the 700 s at once, so the test does not depend on the runner's
+    speed.)"""
     clock = JumpClock()
     died: list[float] = []
 
@@ -1076,7 +1205,7 @@ def test_a_mac_that_dies_during_the_control_is_a_lost_bridge(
         mac_wall=mac_wall,
         setup=lambda worker, server: setattr(server, "dev_execute", DiesInTheControl(worker)),
     )
-    assert_the_control_ended_the_run(ran, BRIDGE_LOST_STOP)
+    assert_the_control_stopped_and_rl_was_evaluated(ran, BRIDGE_LOST_STOP)
     lost = ran.report["bridge"]["lost"]
     assert lost["kind"] == "dev" and lost["silent_seconds"] >= 600
     assert lost["lease_last_renewed_unix"] <= died[0]
@@ -1088,7 +1217,10 @@ def test_no_control_update_starts_without_one_full_wait_free(
     found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """RL leaves 2,400 s of spend before the cost stop, less than one full wait (2,429.5 s
-    here): the control stops before its first update (``wait_margin``) and finalizes in full."""
+    here): the control's training stops before its first update (``wait_margin``), but not the
+    run. The control's endpoint is selected from its scored checks, only its start, RL's
+    update-0 check, which holds the SFT weights: it reuses run 1's SFT results. RL's endpoint is
+    evaluated here, and the run finalizes in full, ``stopped`` with ``wait_margin``."""
     clock = JumpClock()
     window = 10_000.0
     limits = RunLimits(
@@ -1107,7 +1239,20 @@ def test_no_control_update_starts_without_one_full_wait_free(
 
     monkeypatch.setattr(Run2Worker, "run_more_sft", after_a_long_rl)
     ran = execute(found, tmp_path / "run", clock=clock, limits=limits, pod_created=clock())
-    assert_the_control_ended_the_run(ran, WAIT_MARGIN_STOP)
+    report = ran.report
+    assert (report["status"], report["stop_reason"]) == ("stopped", WAIT_MARGIN_STOP)
+    assert statuses(report) == {
+        "rl": "completed",
+        "more-sft": "stopped",
+        "arc-post": "completed",
+        "eval-rl": "completed",
+        "eval-more-sft": "skipped",
+    }
+    assert report["arm_stop"]["arm"] == "more-sft" and report["arm_stop"]["kind"] == "margin"
+    endpoints = report["selection"]["endpoints"]
+    assert endpoints["more-sft"]["selected"] == "rl-check-0000"
+    assert endpoints["more-sft"]["evaluation"] == "reuses-run-1-sft"
+    assert endpoints["rl"]["evaluation"] == "pod"
     control = ran.report["more_sft"]
     assert control["stop_reason"] == "external" and control["updates"] == 0
     assert control["stop_detail"].startswith("wait_margin: one full wait would pass the cost")
@@ -1194,23 +1339,88 @@ class FirstCheckOnly:
         return [self.calls == 1] * len(pairs)
 
 
-def test_both_arms_selecting_the_shared_start_is_flagged_in_the_report(
+def test_both_arms_selecting_the_shared_start_reuse_run_ones_sft_results(
     found: Fixtures2, tmp_path: Path
 ) -> None:
-    """The control's start is RL's update-0 check: when neither arm beats it, both select
-    that one file. The run completes, and the report says so before anything is frozen
-    (the unseal record refuses one checkpoint under two names)."""
+    """The owner's run 2 gate rulings: the control's start is RL's update-0 check, the SFT
+    weights. When neither arm beats it, both select it; neither is evaluated again (no ARC
+    entry, no evaluation files), and the report records for each that run 1's pinned SFT
+    results stand for it, not an independent measurement. The run completes."""
     ran = execute(found, tmp_path / "run", mac_dev=FirstCheckOnly())
     report = ran.report
-    assert report["status"] == "completed"
+    assert report["status"] == "completed" and report["arm_stop"] is None
     selection = report["selection"]
     assert selection["rl"]["selected"]["label"] == "rl-check-0000"
     assert selection["more-sft"]["selected"]["label"] == "rl-check-0000"
-    identical = selection["identical_endpoints"]
-    assert identical["identical"] is True
-    assert (identical["rl"], identical["more-sft"]) == ("rl-check-0000", "rl-check-0000")
-    assert identical["sha256"] == selection["rl"]["selected"]["sha256"]
-    assert "owner rules" in identical["rule"]
+    assert statuses(report) == {
+        "rl": "completed",
+        "more-sft": "completed",
+        "arc-post": "skipped",
+        "eval-rl": "skipped",
+        "eval-more-sft": "skipped",
+    }
+    for arm in ("rl", "more-sft"):
+        entry = selection["endpoints"][arm]
+        assert entry["same_weights_as_sft"] is True and entry["independent"] is False
+        assert entry["evaluation"] == "reuses-run-1-sft" and entry["reuses"]["endpoint"] == "sft"
+        assert entry["comparison"]["first_difference"] is None
+        assert entry["comparison"]["tensors"] > 0
+    assert not any(name.startswith(("arc-post", "eval-")) for name in labels(report))
+    # Nothing was generated for either arm, so the projection before arc-post priced nothing
+    # of the evaluation: every evaluation stage was skipped before its start.
+    assert not [row for row in report["projections"] if row["stage"].startswith(("arc", "eval"))]
+
+
+def test_same_weights_are_decided_by_the_tensors_not_the_check_or_the_file(
+    found: Fixtures2, tmp_path: Path
+) -> None:
+    """At a learning rate of 1e-30 every RL step leaves each float32 weight unchanged, bit for
+    bit: RL selects its last check (ties go to the later check), a file with another SHA-256
+    and other metadata than the SFT weights, yet the same weights. It is not evaluated again."""
+
+    def no_learning(raw: dict[str, Any]) -> None:
+        raw["rl"]["learning_rate"] = 1e-30
+
+    ran = execute(found, tmp_path / "run", changes=no_learning)
+    entry = ran.report["selection"]["endpoints"]["rl"]
+    selected = ran.report["selection"]["rl"]["selected"]
+    assert selected["label"] != "rl-check-0000" and selected["optimizer_steps"] > 0
+    assert selected["sha256"] != ran.report["inputs"]["sft-weights"]
+    assert entry["same_weights_as_sft"] is True and entry["evaluation"] == "reuses-run-1-sft"
+    assert statuses(ran.report)["eval-rl"] == "skipped"
+
+
+def test_a_margin_stop_in_rl_ends_only_rls_training_and_evaluates_rl(
+    found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner's run 2 gate rulings: a margin stop (here no full wait fits before the cost
+    stop once RL's check 2 is scored) ends RL's training, not the run. The control is skipped
+    (it could not run its dev checks); RL's endpoint, check 2, is evaluated here, and the run
+    finalizes in full, ``stopped`` with ``wait_margin``."""
+    original = Run2Worker.margin_reason
+
+    def tight(self: Run2Worker, wait_seconds: float) -> str | None:
+        if self.stage_name == "rl" and len((self.report["rl"] or {}).get("checks", [])) >= 2:
+            return "cost_limit"
+        return original(self, wait_seconds)
+
+    monkeypatch.setattr(Run2Worker, "margin_reason", tight)
+    ran = execute(found, tmp_path / "run")
+    report = ran.report
+    assert (report["status"], report["stop_reason"]) == ("stopped", WAIT_MARGIN_STOP)
+    assert report["rl"]["stop_reason"] == "external" and report["arm_stop"]["kind"] == "margin"
+    assert statuses(report) == {
+        "rl": "stopped",
+        "more-sft": "skipped",
+        "arc-post": "completed",
+        "eval-rl": "completed",
+        "eval-more-sft": "skipped",
+    }
+    assert report["selection"]["endpoints"]["rl"]["selected"] == "rl-check-0002"
+    assert report["rl"]["updates"] == 2 and [row["check"] for row in report["rl"]["checks"]] == [
+        0,
+        2,
+    ]
 
 
 def test_a_refusal_by_the_mac_fails_the_run_after_the_latest_weights_reach_r2(

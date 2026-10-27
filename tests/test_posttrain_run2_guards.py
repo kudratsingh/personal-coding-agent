@@ -17,7 +17,7 @@ from scratchcoder.rl.rewards import DEFAULT_HOST_RETRIES, DEFAULT_WORKERS
 from scratchcoder.sandbox.budget import io_seconds
 from scratchcoder.sandbox.reward import HOST_SLACK_SECONDS, MAX_IO_CASES
 from tools import posttrain_approved, posttrain_ops, runpod_watchdog
-from tools.posttrain_run import Specification, check_policy
+from tools.posttrain_run import SFT_RESULTS, Specification, check_policy
 from tools.runpod_watchdog import Policy, check_once, read_heartbeat
 
 TEMPLATE = posttrain_approved.SPECIFICATION_PATH_2
@@ -36,6 +36,9 @@ def gated() -> dict[str, Any]:
             "rl-dev": dict(pin),
             "rl-facts": dict(pin),
             "pool-test": dict(pin),
+            "sft-results": {
+                name: {"key": f"posttrain-runs/1/podpost01/{name}", **pin} for name in SFT_RESULTS
+            },
         }
     )
 

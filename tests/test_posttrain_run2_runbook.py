@@ -24,7 +24,13 @@ import test_posttrain_runbook as base
 from test_rehearsal_runbook import comment_lines
 
 from tools import posttrain_approved, posttrain_ops
-from tools.posttrain_run import BRIDGE_LOST_STOP, WAIT_MARGIN_STOP, Specification, launch_fit
+from tools.posttrain_run import (
+    BRIDGE_LOST_STOP,
+    SFT_RESULTS,
+    WAIT_MARGIN_STOP,
+    Specification,
+    launch_fit,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "POSTTRAIN_RUN2_RUNBOOK.md"
@@ -146,6 +152,10 @@ def test_the_runbooks_bounds_are_the_specifications() -> None:
             **{
                 name: {"size_bytes": 1, "sha256": "a" * 64}
                 for name in ("rl-tasks", "rl-dev", "rl-facts", "pool-test")
+            },
+            "sft-results": {
+                name: {"key": f"posttrain-runs/1/p/{name}", "size_bytes": 1, "sha256": "a" * 64}
+                for name in SFT_RESULTS
             },
         }
     )

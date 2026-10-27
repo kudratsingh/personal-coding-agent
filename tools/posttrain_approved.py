@@ -2,8 +2,8 @@
 
 Run 2 (below run 1's values): ``run2_specification()`` is the tracked template
 ``configs/rehearsal-a40-s-post-2.json``, every gate value ``null`` (the ceiling, the gate's
-estimate and the cost limit it derives, run 1's selected SFT weights, the three
-``rl-pod-export`` files and the pool test export);
+estimate and the cost limit it derives, run 1's selected SFT weights and its SFT evaluation
+artifacts, the three ``rl-pod-export`` files and the pool test export);
 ``python -m tools.posttrain_approved run2-gate`` fills them from the gate's own files and writes
 the launch specification, and ``check_run2`` is what the readiness receipt applies to it. Its
 protocol is the proposal's, frozen at approval (RL, the more-SFT control, ARC-Easy and the
@@ -505,6 +505,15 @@ RUN2_INPUTS: dict[str, dict[str, Any]] = {
 GATED_INPUTS = ("sft-weights", "rl-tasks", "rl-dev", "rl-facts", "pool-test")
 
 
+def sft_results_template() -> dict[str, dict[str, Any]]:
+    """Run 2's ``sft_results``, every pin ``null`` until the gate: run 1's ARC report and seven
+    completions files of the SFT weights (``posttrain_run.SFT_RESULTS``). An arm whose selected
+    weights equal the SFT weights reuses them in place of a duplicate evaluation."""
+    from tools.posttrain_run import SFT_RESULTS
+
+    return {name: {"key": None, "size_bytes": None, "sha256": None} for name in SFT_RESULTS}
+
+
 def run2_stages() -> list[dict[str, Any]]:
     """Run 2's stages in order."""
     common = {"parent": "sft-weights", "tasks": "rl-tasks", "dev": "rl-dev", "facts": "rl-facts"}
@@ -543,6 +552,7 @@ def run2_specification(gate: Mapping[str, Any] | None = None) -> dict[str, Any]:
         "bridge": bridge_section(RUN2_BRIDGE_SETTINGS, RUN2_RL),
         "stages": run2_stages(),
         "inputs": json.loads(json.dumps(RUN2_INPUTS)),
+        "sft_results": sft_results_template(),
         "r2": {"storage_cap_usd_per_month": 5.0},
     }
     return raw if gate is None else fill_gate(raw, gate)
@@ -554,14 +564,16 @@ def _sha256_hex(value: object, name: str) -> str:
     return value
 
 
-GATE_KEYS = ("ceiling_usd", "gate_estimate_usd", *GATED_INPUTS)
-"""What the gate gives: the owner's ceiling, the projection's estimate and each gated pin."""
+GATE_KEYS = ("ceiling_usd", "gate_estimate_usd", *GATED_INPUTS, "sft-results")
+"""What the gate gives: the owner's ceiling, the projection's estimate, each gated pin and run
+1's SFT evaluation artifacts (``sft-results``)."""
 
 
 def fill_gate(raw: Mapping[str, Any], gate: Mapping[str, Any]) -> dict[str, Any]:
     """The template with the gate's values: ``ceiling_usd``, ``gate_estimate_usd`` and the
-    cost limit they derive (``posttrain_ops.estimate_limit_usd``), and for each gated input
-    its pin (``sft-weights``: key, size_bytes, sha256; the others: size_bytes, sha256)."""
+    cost limit they derive (``posttrain_ops.estimate_limit_usd``), for each gated input its pin
+    (``sft-weights``: key, size_bytes, sha256; the others: size_bytes, sha256), and
+    ``sft-results``, the pins of run 1's SFT evaluation artifacts (key, size_bytes, sha256)."""
     from tools.posttrain_ops import estimate_limit_usd
 
     if set(gate) != set(GATE_KEYS):
@@ -592,8 +604,18 @@ def fill_gate(raw: Mapping[str, Any], gate: Mapping[str, Any]) -> dict[str, Any]
             raise ValueError(f"the gate's {name} size must be a positive integer")
         _sha256_hex(pin["sha256"], f"the gate's {name} SHA-256")
         filled["inputs"][name].update(pin)
+    results = gate["sft-results"]
+    if not isinstance(results, Mapping) or set(results) != set(filled["sft_results"]):
+        raise ValueError(f"the gate's sft-results pin exactly {sorted(filled['sft_results'])}")
+    for name, pin in results.items():
+        if not isinstance(pin, Mapping) or set(pin) != {"key", "size_bytes", "sha256"}:
+            raise ValueError(f"the gate's sft-results {name} gives key, size_bytes and sha256")
+        _sha256_hex(pin["sha256"], f"the gate's sft-results {name} SHA-256")
+        filled["sft_results"][name] = dict(pin)
     from tools.posttrain_ops import specification_limits
+    from tools.posttrain_run import check_sft_results
 
+    check_sft_results(filled)  # Each pin is run 1's artifact beside its SFT weights.
     specification_limits(filled)  # The limits the cost limit derives must exist.
     return filled
 
@@ -618,7 +640,7 @@ def check_run2(raw: Mapping[str, Any]) -> None:
     estimate must be a positive, finite number of dollars and the written cost limit exactly
     the lower of the ceiling and 120% of it (``posttrain_ops.specification_limits``)."""
     from tools.posttrain_ops import RUN2_GATE_LIMITS, specification_limits
-    from tools.posttrain_run import gate_nulls
+    from tools.posttrain_run import check_sft_results, gate_nulls
 
     approved = run2_specification()
     if raw.get("run") != "2" or raw.get("kind") != approved["kind"]:
@@ -643,6 +665,7 @@ def check_run2(raw: Mapping[str, Any]) -> None:
     if differ:
         raise ValueError(f"the specification differs from the approved run 2 in {differ}")
     specification_limits(raw)
+    check_sft_results(raw)
 
 
 def write_specification_2(path: Path = SPECIFICATION_PATH_2) -> None:
@@ -674,6 +697,29 @@ def run1_sft_weights(report_path: Path) -> dict[str, Any]:
         raise ValueError("run 1's report lists no single sft-weights/checkpoint.pt")
     row = rows[0]
     return {"key": row["key"], "size_bytes": row["bytes"], "sha256": row["sha256"]}
+
+
+def run1_sft_results(report_path: Path) -> dict[str, dict[str, Any]]:
+    """The pins of run 1's SFT evaluation artifacts from its verified ``report.json``: the R2
+    key, size and SHA-256 of each ``posttrain_run.SFT_RESULTS`` artifact (``arc-sft-sft`` and
+    the seven ``eval-sft-<file>`` labels)."""
+    from tools.posttrain_ops import report_artifacts, run_prefix
+    from tools.posttrain_run import SFT_RESULTS
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    prefix = run_prefix("1", str(report.get("pod_id")))
+    rows = {f"{row['label']}/{row['name']}": row for row in report_artifacts(report, prefix=prefix)}
+    missing = [name for name in SFT_RESULTS if name not in rows]
+    if missing:
+        raise ValueError(f"run 1's report lists none of {missing}")
+    return {
+        name: {
+            "key": rows[name]["key"],
+            "size_bytes": rows[name]["bytes"],
+            "sha256": rows[name]["sha256"],
+        }
+        for name in SFT_RESULTS
+    }
 
 
 def pod_export_pins(directory: Path) -> dict[str, dict[str, Any]]:
@@ -748,8 +794,8 @@ def gate_values(
     pool_test_export: Path,
 ) -> dict[str, Any]:
     """Every run-2 gate value from the gate's own files: the owner's ceiling, the run 2
-    projection's estimate, run 1's verified report, the ``rl-pod-export`` directory and the
-    pool test export."""
+    projection's estimate, run 1's verified report (its SFT weights and its SFT evaluation
+    artifacts), the ``rl-pod-export`` directory and the pool test export."""
     from scratchcoder.data.shards import file_sha256
     from tools.posttrain_binding import require_export
 
@@ -765,6 +811,7 @@ def gate_values(
             "size_bytes": pool_test_export.stat().st_size,
             "sha256": file_sha256(pool_test_export),
         },
+        "sft-results": run1_sft_results(run1_report),
     }
 
 

@@ -805,16 +805,22 @@ def run_summary(
 
 
 def run2_results(report: Mapping[str, Any]) -> dict[str, Any]:
-    """Run 2's results for its summary: the arms, the selection and the bridge."""
+    """Run 2's results for its summary: the arms, an arm's early stop, the selection with
+    each arm's endpoint (evaluated on the Pod, reusing run 1's SFT results because its weights
+    are the SFT weights, or not evaluated) and the bridge."""
     bridge = report.get("bridge")
     if isinstance(bridge, Mapping):
         waits = bridge.get("waits")
         bridge = {key: value for key, value in bridge.items() if key != "waits"}
         bridge["wait_count"] = len(waits) if isinstance(waits, list) else None
+    selection = report.get("selection")
+    endpoints = selection.get("endpoints") if isinstance(selection, Mapping) else None
     return {
         "rl": report.get("rl"),
         "more_sft": report.get("more_sft"),
-        "selection": report.get("selection"),
+        "arm_stop": report.get("arm_stop"),
+        "selection": selection,
+        "endpoints": endpoints,
         "bridge": bridge,
     }
 

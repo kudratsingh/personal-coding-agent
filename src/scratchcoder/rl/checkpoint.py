@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -92,6 +92,46 @@ def read_weights(path: Path, *, expected_sha256: str | None = None) -> dict[str,
     if not isinstance(state, dict) or not {"config", "tokenizer_hash", "model"} <= set(state):
         raise ValueError("not a model checkpoint")
     return state
+
+
+@dataclass(frozen=True)
+class WeightsComparison:
+    """Whether two checkpoints hold the same model weights, tensor by tensor."""
+
+    same: bool
+    tensors: int
+    """How many tensors were compared (those of the first checkpoint)."""
+    first_difference: str | None
+    """The first tensor name, in sorted order, that is missing, shaped, typed or valued
+    differently; ``None`` when the weights are the same."""
+
+
+def _tensor_bytes(value: torch.Tensor) -> torch.Tensor:
+    """A tensor's raw bytes as a flat ``uint8`` view: NaN, -0.0 and every bit pattern compare
+    as stored, which ``torch.equal`` on the values would not."""
+    return value.detach().reshape(-1).contiguous().view(torch.uint8)
+
+
+def compare_weights(first: Path, second: Path) -> WeightsComparison:
+    """Compare the model tensors of two checkpoints bit for bit, on the CPU.
+
+    The same weights saved twice are two files with two SHA-256s (each file also records its
+    run ID, step and metadata), so a file hash cannot say whether two endpoints are one model.
+    This loads both (``read_weights``) and compares every tensor's name, dtype, shape and
+    bytes. It reads both files whole: about 1.1 GB of memory for two 541 MB S checkpoints."""
+    a = read_weights(first)["model"]
+    b = read_weights(second)["model"]
+    for name in sorted(set(a) | set(b)):
+        x, y = a.get(name), b.get(name)
+        if (
+            x is None
+            or y is None
+            or x.dtype != y.dtype
+            or x.shape != y.shape
+            or not torch.equal(_tensor_bytes(x), _tensor_bytes(y))
+        ):
+            return WeightsComparison(False, len(a), name)
+    return WeightsComparison(True, len(a), None)
 
 
 def load_weights(

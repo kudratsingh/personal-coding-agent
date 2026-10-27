@@ -14,7 +14,7 @@ from scratchcoder.common.records import atomic_json
 from tools import posttrain_approved, posttrain_ops
 from tools.posttrain_binding import _serialized, binding_sha256, staged_key
 from tools.posttrain_readiness import DEFAULT_HEARTBEAT, build_receipt
-from tools.posttrain_run import Specification, check_readiness
+from tools.posttrain_run import SFT_RESULTS, Specification, check_readiness
 
 PIN = {"size_bytes": 4_000_000, "sha256": "7" * 64}
 FILES = {
@@ -40,6 +40,9 @@ def gated() -> dict[str, Any]:
             "rl-dev": dict(PIN),
             "rl-facts": dict(PIN),
             "pool-test": dict(PIN),
+            "sft-results": {
+                name: {"key": f"posttrain-runs/1/{POD}/{name}", **PIN} for name in SFT_RESULTS
+            },
         }
     )
 
