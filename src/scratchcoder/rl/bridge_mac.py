@@ -48,7 +48,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Protocol
 
 from scratchcoder.common.logging import EventLogger
@@ -91,10 +91,12 @@ from scratchcoder.rl.rewards import (
     RewardTimeout,
     check_rewards,
 )
+from scratchcoder.sandbox.runner import Result
 
 PROGRESS_FORMAT = "rl-bridge-progress-v1"
 EXIT_TOO_LARGE = 3
 EXIT_MISSING = 4
+EXIT_REFUSED = 5
 MAX_LISTING_BYTES = 4 * 1024 * 1024
 PHASES = {REWARD: "kept screening list", DEV: "dev subset"}
 
@@ -109,6 +111,11 @@ class RequestMissing(Exception):
 
 class RequestTooLarge(Exception):
     """The request is larger than the read bound."""
+
+
+class BridgeRemoteError(BridgeError):
+    """The Pod's program refused its input (exit 5): a wrong bridge root or name. It would
+    refuse again, so it is raised at once instead of being retried as an outage."""
 
 
 @dataclass(frozen=True)
@@ -322,6 +329,13 @@ def write(root, name, encoded):
     return 0
 
 def main():
+    try:
+        return serve()
+    except ValueError as error:
+        sys.stderr.write('refused: ' + str(error)[:200])
+        return 5
+
+def serve():
     request = json.load(sys.stdin)
     if not isinstance(request, dict):
         raise ValueError('invalid request')
@@ -349,7 +363,8 @@ sys.exit(main())
 root, the action, a file name, a bound, a base64 reply) arrive as JSON on stdin. It lists
 only regular files with bridge request names, reads only from ``outbox/`` and writes only to
 ``inbox/``, opening every path component without following symlinks. Exit 3 means the
-request is over the bound, exit 4 that it is gone."""
+request is over the bound, exit 4 that it is gone, exit 5 that the program refused its input
+(an unsafe root or name, a bad bound): a defect of the call, not an outage, so never retried."""
 
 
 # ------------------------------------------------------------------------------- SSH
@@ -399,8 +414,13 @@ def validate_local_file(path: Path, name: str) -> Path:
 def validate_remote_root(root: object) -> str:
     if not isinstance(root, str) or not root.startswith("/") or "\x00" in root:
         raise ValueError("the bridge root must be an absolute POSIX path")
-    if any(part in (".", "..") for part in PurePosixPath(root).parts):
-        raise ValueError("the bridge root contains an unsafe path component")
+    # The remote program's rule, exactly: no empty (a trailing or doubled slash), "." or ".."
+    # component. A root it would refuse would otherwise look like an SSH outage.
+    if any(part in ("", ".", "..") for part in root.split("/")[1:]):
+        raise ValueError(
+            "the bridge root must be a normalised path: no trailing or doubled slash and "
+            "no . or .. component"
+        )
     return root
 
 
@@ -465,17 +485,22 @@ def dotenv_names(path: Path) -> set[str]:
     return names
 
 
-def environment_refusals(environ: Mapping[str, str], dotenv: Path | None = None) -> list[str]:
+def environment_refusals(
+    environ: Mapping[str, str], dotenv: Path | Iterable[Path] | None = None
+) -> list[str]:
     """Names (never values) of set variables the bridge must not run with: any ``R2_``
-    variable, the Runpod key, and every name ``dotenv`` defines. Docker and ssh children
-    inherit the bridge's environment, so it is refused rather than filtered."""
+    variable, the Runpod key, and every name the ``dotenv`` file or files define. Docker and
+    ssh children inherit the bridge's environment, so it is refused rather than filtered.
+    A ``dotenv`` file that does not exist raises ``FileNotFoundError``: a check that finds
+    nothing to read must not pass silently."""
     names = {
         key
         for key, value in environ.items()
         if value and (key in SECRET_NAMES or key.startswith(SECRET_PREFIXES))
     }
-    if dotenv is not None and dotenv.exists():
-        names |= {key for key in dotenv_names(dotenv) if environ.get(key)}
+    files = [dotenv] if isinstance(dotenv, Path) else list(dotenv or ())
+    for path in files:
+        names |= {key for key in dotenv_names(path) if environ.get(key)}
     return sorted(names)
 
 
@@ -538,6 +563,11 @@ class SSHTransport:
             raise RequestTooLarge(str(request.get("name")))
         if result.returncode == EXIT_MISSING:
             raise RequestMissing(str(request.get("name")))
+        if result.returncode == EXIT_REFUSED:
+            tail = (result.stderr or b"")[-300:].decode("utf-8", errors="replace").strip()
+            raise BridgeRemoteError(
+                f"the Pod's bridge program refused the {request['action']}: {tail}"
+            )
         if result.returncode != 0:
             tail = (result.stderr or b"")[-300:].decode("utf-8", errors="replace").strip()
             raise BridgeTransportError(
@@ -589,6 +619,20 @@ class SSHTransport:
 # ----------------------------------------------------------------------- Mac scoring
 
 
+class _PastDeadline(Exception):
+    """Raised inside the dev executor's workers once the check's deadline has passed."""
+
+
+def _encodable(code: str) -> bool:
+    """Whether the sandbox can be sent ``code``: an unpaired surrogate cannot be written as
+    UTF-8, so the runner would raise instead of running it."""
+    try:
+        code.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 class SandboxDevExecutor:
     """Dev verdicts on the Mac: each ``(task, program)`` runs with the task's hidden tests
     through the evaluation runner (``isolated_execution``, one fresh container per call),
@@ -596,7 +640,15 @@ class SandboxDevExecutor:
     unresolved makes the whole check a host failure (``RewardHostFailure``): a dev verdict
     is never guessed. After ``max_consecutive_unresolved`` unresolved calls in a row (the
     sandbox host looks down) no further call starts, so a dead Docker fails the check in
-    seconds rather than after every program's retries."""
+    seconds rather than after every program's retries.
+
+    A program that cannot be written as UTF-8 (an unpaired surrogate) fails without running,
+    as the reward channel scores it ``invalid_source``: it is the candidate's failure, not
+    the host's. ``timeout`` (seconds, ``None`` for none) bounds one check: once it has
+    passed no further call or retry starts and ``RewardTimeout`` is raised, after the calls
+    already running finish at the runner's own deadlines. Without it a check the Pod has
+    already given up on would keep the single-threaded server busy while the next request
+    waits behind it."""
 
     def __init__(
         self,
@@ -606,33 +658,62 @@ class SandboxDevExecutor:
         execute: Execute = isolated_execution,
         sleep: Callable[[float], None] = time.sleep,
         max_consecutive_unresolved: int | None = 16,
+        timeout: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if type(workers) is not int or workers < 1:
             raise ValueError("workers must be a positive integer")
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be positive seconds or None")
         self.workers, self.retries, self.execute, self.sleep = workers, retries, execute, sleep
         self.max_consecutive_unresolved = max_consecutive_unresolved
+        self.timeout = None if timeout is None else float(timeout)
+        self.clock = clock
 
     def __call__(self, pairs: Sequence[tuple[Task, str]]) -> list[bool]:
+        deadline = None if self.timeout is None else self.clock() + self.timeout
         outcomes: dict[int, Outcome] = {}
+        unrunnable = {position for position, (_, code) in enumerate(pairs) if not _encodable(code)}
 
         def keep(outcome: Outcome) -> None:
             assert isinstance(outcome.key, int)
             outcomes[outcome.key] = outcome
 
+        def execute(code: str, tests: str, mode: str) -> Result:
+            if deadline is not None and self.clock() >= deadline:
+                raise _PastDeadline
+            return self.execute(code, tests, mode)
+
+        def sleep(seconds: float) -> None:
+            if deadline is not None and self.clock() + seconds > deadline:
+                raise _PastDeadline
+            self.sleep(seconds)
+
         calls = (
             Call(position, code, task.hidden_tests, task.mode)
             for position, (task, code) in enumerate(pairs)
+            if position not in unrunnable
         )
         try:
             run_calls(
                 calls,
-                self.execute,
+                execute,
                 on_outcome=keep,
                 workers=self.workers,
                 retries=self.retries,
-                sleep=self.sleep,
+                sleep=sleep,
                 max_consecutive_unresolved=self.max_consecutive_unresolved,
             )
+        except _PastDeadline as error:
+            raise RewardTimeout(
+                f"{len(outcomes)} of {len(pairs) - len(unrunnable)} dev programs ran within "
+                f"{self.timeout:g} s"
+            ) from error
         except HostUnavailableError as error:
             raise RewardHostFailure(f"the sandbox host looks down: {error}") from error
         unresolved = [outcome for outcome in outcomes.values() if not outcome.resolved]
@@ -641,7 +722,10 @@ class SandboxDevExecutor:
                 f"{len(unresolved)} of {len(pairs)} dev programs stayed unresolved after "
                 f"{self.retries} retries (last status {unresolved[0].status})"
             )
-        return [outcomes[position].passed for position in range(len(pairs))]
+        return [
+            False if position in unrunnable else outcomes[position].passed
+            for position in range(len(pairs))
+        ]
 
 
 # ------------------------------------------------------------------------ Mac state
@@ -755,10 +839,14 @@ class BridgeServer:
     allowed list. ``pod_task_sha256`` maps ``reward`` and ``dev`` to the SHA-256 of the
     Pod's task file for that phase. ``reward_source`` defaults to a ``LocalRewardSource``
     over ``reward_tasks`` with ``workers`` threads and ``reward_timeout``; ``dev_execute``
-    to a ``SandboxDevExecutor``. ``before_scoring`` runs before each request is scored (for
-    example a check of the sandbox image); if it raises, the request gets a
-    ``host_failure`` reply and nothing runs. State lives under ``state``: ``replies/``,
-    ``progress.json``, ``events.jsonl`` and an exclusive ``server.lock``.
+    to a ``SandboxDevExecutor`` with ``dev_timeout``. Both timeouts are Mac-side bounds on
+    one request (``None`` for none); the single-threaded server scores one request at a
+    time, so without them a request the Pod has withdrawn keeps the next one waiting. Set
+    them to the Pod's timeout less the bridge's allowance (``docs/rl.md``). ``before_scoring``
+    runs before each request is scored (for example a check of the sandbox image); if it
+    raises, the request gets a ``host_failure`` reply and nothing runs. State lives under
+    ``state``: ``replies/``, ``progress.json``, ``events.jsonl`` and an exclusive
+    ``server.lock``.
     """
 
     def __init__(
@@ -774,6 +862,7 @@ class BridgeServer:
         before_scoring: Callable[[BridgeRequest], None] | None = None,
         workers: int = DEFAULT_WORKERS,
         reward_timeout: float | None = None,
+        dev_timeout: float | None = None,
         max_request_bytes: int = MAX_REQUEST_BYTES,
         transport_retries: int = 4,
         backoff_seconds: float = 1.0,
@@ -805,7 +894,9 @@ class BridgeServer:
         self.reward_source: RewardSource = reward_source or LocalRewardSource(
             self.reward_tasks.values(), timeout=reward_timeout, workers=workers
         )
-        self.dev_execute: DevExecutor = dev_execute or SandboxDevExecutor(workers=workers)
+        self.dev_execute: DevExecutor = dev_execute or SandboxDevExecutor(
+            workers=workers, timeout=dev_timeout
+        )
         self.before_scoring = before_scoring
         self.max_request_bytes = max_request_bytes
         self.transport_retries = transport_retries

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -41,8 +42,8 @@ from scratchcoder.data.chat import PYTHON_END, PYTHON_START
 from scratchcoder.engine.generation import Completion
 from scratchcoder.eval.tasks import Task, save_tasks
 from scratchcoder.model.gpt import GPT
+from scratchcoder.rl import bridge_command, loop
 from scratchcoder.rl import dev as dev_module
-from scratchcoder.rl import loop
 from scratchcoder.rl.bridge import (
     BridgeClient,
     BridgeDevEvaluator,
@@ -53,6 +54,7 @@ from scratchcoder.rl.bridge_command import (
     BridgeEnvironmentError,
     image_check,
     load_phase_tasks,
+    resolve_dotenv,
     serve_command,
 )
 from scratchcoder.rl.bridge_mac import (
@@ -60,6 +62,7 @@ from scratchcoder.rl.bridge_mac import (
     BridgeServer,
     DirectoryTransport,
     SSHTransport,
+    environment_refusals,
     ssh_child_environment,
 )
 from scratchcoder.rl.checkpoint import save_weights
@@ -471,6 +474,8 @@ def test_the_command_serves_with_the_kept_list_and_the_dev_subset(tmp_path: Path
         pod_reward_sha256=RL_SHA,
         pod_dev_sha256=DEV_SHA,
         state=tmp_path / "mac",
+        reward_timeout=600,
+        dev_timeout=300,
         poll_seconds=0.0,
         dotenv=None,
         max_polls=2,
@@ -497,6 +502,8 @@ def test_the_command_refuses_secrets_sealed_files_and_bad_records(tmp_path: Path
         "pod_reward_sha256": RL_SHA,
         "pod_dev_sha256": DEV_SHA,
         "state": tmp_path / "mac",
+        "reward_timeout": 600,
+        "dev_timeout": 300,
         "max_polls": 1,
         "transport": DirectoryTransport(tmp_path / "pod"),
     }
@@ -510,6 +517,18 @@ def test_the_command_refuses_secrets_sealed_files_and_bad_records(tmp_path: Path
     with pytest.raises(ValueError, match="sealed"):
         serve_command(**options, **sealed, environ={}, dotenv=None)
     assert not (tmp_path / "pool" / "test.jsonl").exists()  # refused by name, never opened
+    # A link under an innocent name is refused by the name it resolves to. The targets do
+    # not exist, so a refusal that came after an open would be a FileNotFoundError instead.
+    for target in ("test.jsonl", "holdout.jsonl"):
+        link = tmp_path / "pool" / f"alias-{target}"
+        link.symlink_to(tmp_path / "pool" / target)
+        for field in ("dev_tasks", "train_tasks"):
+            with pytest.raises(ValueError, match="sealed"):
+                serve_command(**options, **{**files, field: link}, environ={}, dotenv=None)
+    chain = tmp_path / "pool" / "chain.jsonl"
+    chain.symlink_to(tmp_path / "pool" / "alias-test.jsonl")
+    with pytest.raises(ValueError, match="sealed"):
+        serve_command(**options, **{**files, "dev_tasks": chain}, environ={}, dotenv=None)
     files["kept"].write_text(json.dumps({"format": "rl-screening-v1", "outcome": "floor"}))
     with pytest.raises(ValueError, match="kept RL screening record"):
         serve_command(**options, **files, environ={}, dotenv=None)
@@ -519,11 +538,8 @@ def test_the_command_refuses_secrets_sealed_files_and_bad_records(tmp_path: Path
         serve_command(**options, **files, environ={}, dotenv=None)
 
 
-def test_the_cli_exits_2_when_a_secret_is_set(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setenv("R2_ACCESS_KEY_ID", "do-not-print")
-    arguments = [
+def cli_arguments(tmp_path: Path) -> list[str]:
+    return [
         "rl-bridge",
         "--host=root@203.0.113.7",
         "--port=22",
@@ -536,25 +552,176 @@ def test_the_cli_exits_2_when_a_secret_is_set(
         f"--pod-reward-sha256={RL_SHA}",
         f"--pod-dev-sha256={DEV_SHA}",
         f"--state={tmp_path / 'mac'}",
-        f"--dotenv={tmp_path / 'missing.env'}",
+        "--reward-timeout=800",
+        "--dev-timeout=400",
     ]
+
+
+def test_the_cli_exits_2_when_a_secret_is_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("R2_ACCESS_KEY_ID", "do-not-print")
+    (tmp_path / "empty.env").write_text("")
+    arguments = [*cli_arguments(tmp_path), f"--dotenv={tmp_path / 'empty.env'}"]
     assert main(arguments) == 2
     error = capsys.readouterr().err
     assert "R2_ACCESS_KEY_ID" in error and "do-not-print" not in error
     assert not (tmp_path / "mac").exists()
 
 
+def test_the_cli_exits_2_when_the_dotenv_check_would_find_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missing ``.env`` must not pass the check silently, whatever the working directory."""
+    arguments = cli_arguments(tmp_path)
+    assert main([*arguments, f"--dotenv={tmp_path / 'missing.env'}"]) == 2
+    assert "does not exist" in capsys.readouterr().err
+    (tmp_path / "present.env").write_text("")
+    assert main([*arguments, "--no-dotenv", f"--dotenv={tmp_path / 'present.env'}"]) == 2
+    assert "exclude each other" in capsys.readouterr().err
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bridge_command, "REPOSITORY_ROOT", tmp_path / "elsewhere")
+    assert main(arguments) == 2  # no --dotenv, and no .env anywhere
+    assert "--no-dotenv" in capsys.readouterr().err
+    assert not (tmp_path / "mac").exists()
+
+
+def test_the_dotenv_defaults_are_the_working_directory_and_the_checkout(tmp_path: Path) -> None:
+    cwd, root = tmp_path / "cwd", tmp_path / "root"
+    cwd.mkdir()
+    root.mkdir()
+    assert resolve_dotenv(None, disabled=True, cwd=cwd, root=root) is None
+    with pytest.raises(BridgeEnvironmentError, match="no .env file found"):
+        resolve_dotenv(None, cwd=cwd, root=root)
+    (root / ".env").write_text("A=1\n")
+    assert resolve_dotenv(None, cwd=cwd, root=root) == [root / ".env"]
+    (cwd / ".env").write_text("B=1\n")
+    assert resolve_dotenv(None, cwd=cwd, root=root) == [cwd / ".env", root / ".env"]
+    assert resolve_dotenv(None, cwd=root, root=root) == [root / ".env"]  # listed once
+    explicit = tmp_path / "chosen.env"
+    explicit.write_text("C=1\n")
+    assert resolve_dotenv(explicit, cwd=cwd, root=root) == [explicit]
+    with pytest.raises(BridgeEnvironmentError, match="does not exist"):
+        resolve_dotenv(tmp_path / "none.env", cwd=cwd, root=root)
+    # Names from every file are refused, not only the first.
+    assert environment_refusals({"A": "x", "B": "y", "Z": "z"}, [cwd / ".env", root / ".env"]) == [
+        "A",
+        "B",
+    ]
+    with pytest.raises(FileNotFoundError):
+        environment_refusals({}, tmp_path / "none.env")
+
+
+def test_the_command_refuses_a_missing_dotenv_and_a_bad_root_or_timeout(tmp_path: Path) -> None:
+    files = command_files(tmp_path)
+    options: dict[str, Any] = {
+        "host": "unused",
+        "port": 22,
+        "identity_file": tmp_path / "unused",
+        "known_hosts": tmp_path / "unused",
+        "remote_root": "/unused",
+        "pod_reward_sha256": RL_SHA,
+        "pod_dev_sha256": DEV_SHA,
+        "state": tmp_path / "mac",
+        "reward_timeout": 600,
+        "dev_timeout": 300,
+        "max_polls": 1,
+        "environ": {},
+        "transport": DirectoryTransport(tmp_path / "pod"),
+    }
+    with pytest.raises(BridgeEnvironmentError, match="does not exist"):
+        serve_command(**{**options, **files}, dotenv=tmp_path / "missing.env")
+    for root in ("/x/", "//x", "/x//y", "/x/./y", "/x/..", "/", "relative"):
+        with pytest.raises(ValueError, match="bridge root"):
+            serve_command(**{**options, **files, "remote_root": root}, dotenv=None)
+    for name in ("reward_timeout", "dev_timeout"):
+        for bad in (0, -5, math.inf, math.nan, None, True):
+            with pytest.raises(ValueError, match=name):
+                serve_command(**{**options, **files, name: bad}, dotenv=None)
+    assert not (tmp_path / "mac").exists()
+    for flag in ("--reward-timeout=800", "--dev-timeout=400"):
+        arguments = [argument for argument in cli_arguments(tmp_path) if argument != flag]
+        with pytest.raises(SystemExit):  # both bounds are required on the command line
+            main([*arguments, "--no-dotenv"])
+
+
+def inspect_runner(*outcomes: tuple[int, bytes] | BaseException) -> tuple[Any, list[list[str]]]:
+    """A ``docker image inspect`` stand-in: each outcome is a ``(code, stdout)`` pair or an
+    exception to raise; the last one repeats."""
+    queue = list(outcomes)
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **options: Any) -> subprocess.CompletedProcess[bytes]:
+        assert command[-1].startswith("python@sha256:") and "inspect" in command
+        calls.append(command)
+        outcome = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        code, stdout = outcome
+        return subprocess.CompletedProcess(command, code, stdout, b"")
+
+    return runner, calls
+
+
 def test_the_image_check_compares_the_local_image_id() -> None:
-    def run(stdout: bytes, code: int = 0) -> Any:
-        def runner(command: list[str], **options: Any) -> subprocess.CompletedProcess[bytes]:
-            assert command[-1].startswith("python@sha256:") and "inspect" in command
-            return subprocess.CompletedProcess(command, code, stdout, b"")
+    expected = "sha256:" + "d" * 64
+    good = (0, expected.encode() + b"\n")
+    request: Any = None
+    runner, calls = inspect_runner(good)
+    image_check(expected, run=runner, sleep=lambda s: None)(request)
+    assert len(calls) == 1
+    # A successful inspect that names another image is final: no retry can change it.
+    runner, calls = inspect_runner((0, b"sha256:" + b"e" * 64))
+    with pytest.raises(RuntimeError, match="pinned sandbox image is not"):
+        image_check(expected, run=runner, sleep=lambda s: None)(request)
+    assert len(calls) == 1
 
-        return runner
 
+def test_the_image_check_retries_a_transient_docker_failure() -> None:
+    """One slow or failed ``docker image inspect`` (Docker Desktop busy) is not a verdict."""
     expected = "sha256:" + "d" * 64
     request: Any = None
-    image_check(expected, run=run(expected.encode() + b"\n"))(request)
-    for stdout, code in ((b"sha256:" + b"e" * 64, 0), (expected.encode(), 1)):
-        with pytest.raises(RuntimeError, match="pinned sandbox image"):
-            image_check(expected, run=run(stdout, code))(request)
+    sleeps: list[float] = []
+    runner, calls = inspect_runner(
+        subprocess.TimeoutExpired(["docker"], 30),
+        (1, b""),
+        OSError("docker not started"),
+        (0, expected.encode()),
+    )
+    image_check(expected, run=runner, sleep=sleeps.append)(request)
+    assert len(calls) == 4 and sleeps == [1.0, 2.0, 4.0]
+    # A failure that persists through the retries is raised, naming the last problem.
+    runner, calls = inspect_runner((1, b""))
+    sleeps.clear()
+    with pytest.raises(RuntimeError, match="could not be checked: docker image inspect exited 1"):
+        image_check(expected, run=runner, sleep=sleeps.append)(request)
+    assert len(calls) == 4 and sleeps == [1.0, 2.0, 4.0]
+    runner, calls = inspect_runner(subprocess.TimeoutExpired(["docker"], 30))
+    with pytest.raises(RuntimeError, match="did not finish"):
+        image_check(expected, run=runner, sleep=lambda s: None, retries=1)(request)
+    assert len(calls) == 2
+    with pytest.raises(ValueError, match="retries"):
+        image_check(expected, retries=-1)
+
+
+def test_a_flaky_image_inspect_does_not_end_the_run(tmp_path: Path) -> None:
+    """Through the server: the first inspect times out, the retry succeeds, the request is
+    scored (not stored as a host failure)."""
+    expected = "sha256:" + "d" * 64
+    runner, calls = inspect_runner(
+        subprocess.TimeoutExpired(["docker"], 30), (0, expected.encode())
+    )
+    pod = tmp_path / "pod"
+    rewards = CountingRewards()
+    with pod_client(pod, poll_seconds=0.01) as client:
+        server = mac_server(
+            pod,
+            tmp_path / "mac",
+            rewards=rewards,
+            before_scoring=image_check(expected, run=runner, sleep=lambda s: None),
+        )
+        with mac_thread(server):
+            source = BridgeRewardSource(client, task_file_sha256=RL_SHA, timeout=60)
+            batch = attempts(("t0", "t1"), group=4)
+            assert source.rewards(1, batch) == FakeRewardSource().rewards(1, batch)
+    assert len(calls) == 2 and len(rewards.calls) == 1

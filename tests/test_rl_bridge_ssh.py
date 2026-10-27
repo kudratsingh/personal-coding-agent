@@ -18,7 +18,9 @@ from bridge_fixtures import RL_SHA, SESSION, attempts, mac_server
 
 from scratchcoder.rl.bridge import REWARD, BridgeRequest, RequestName
 from scratchcoder.rl.bridge_mac import (
+    EXIT_REFUSED,
     REMOTE_SCRIPT,
+    BridgeRemoteError,
     BridgeTransportError,
     DirectoryTransport,
     RequestMissing,
@@ -81,7 +83,9 @@ def test_no_secret_reaches_an_ssh_child(tmp_path: Path) -> None:
     refused = environment_refusals(environ, dotenv)
     assert refused == ["FROM_DOTENV", "R2_ENDPOINT", "R2_POD_SECRET_ACCESS_KEY", "RUNPOD_API_KEY"]
     assert not {"s1", "s2", "s4"} & set(refused)  # names only, never values
-    assert environment_refusals({"PATH": "/usr/bin"}, tmp_path / "missing.env") == []
+    assert environment_refusals({"PATH": "/usr/bin"}, None) == []
+    with pytest.raises(FileNotFoundError):  # a check with nothing to read must not pass
+        environment_refusals({"PATH": "/usr/bin"}, tmp_path / "missing.env")
     with pytest.raises(ValueError, match="must not hold"):
         SSHTransport(["ssh"], "/workspace/bridge", environment={"SSH_AUTH_SOCK": "x"})
 
@@ -205,6 +209,45 @@ def test_the_remote_program_refuses_unsafe_roots_and_names(tmp_path: Path) -> No
     assert result.returncode != 0
     assert direct.listing().requests == {}
     assert os.listdir(real / "inbox") == []
+
+
+def test_a_root_the_remote_program_would_refuse_is_refused_before_any_ssh_call() -> None:
+    """A trailing or doubled slash passed the Mac's check but failed every remote call, which
+    looked like an SSH outage for 30 polls."""
+    for root in ("/x/", "//x", "/x//y", "/x/./y", "/x/../y", "/", "x", "", "/x\x00y"):
+        with pytest.raises(ValueError, match="bridge root"):
+            SSHTransport(["ssh"], root)
+    for root in ("/x", "/workspace/rl-bridge", "/a/b.c/d-e_f"):
+        assert SSHTransport(["ssh"], root, environment={}).root == root
+
+
+def test_a_refusal_by_the_remote_program_is_raised_at_once_not_retried(tmp_path: Path) -> None:
+    root = tmp_path.resolve() / "bridge"
+    for box in ("outbox", "inbox"):
+        (root / box).mkdir(parents=True)
+    command = [sys.executable, "-I", "-c", REMOTE_SCRIPT]
+    transport = SSHTransport(command, str(root), environment=ssh_child_environment())
+    transport.root = str(root) + "/"  # past the local check, as a remote-only rule would be
+    with pytest.raises(BridgeRemoteError, match="unsafe component"):
+        transport.listing()
+    transport.root = str(root)
+    payload = json.dumps({"root": str(root), "action": "read", "name": "../x", "max_bytes": 1})
+    result = subprocess.run(command, input=payload.encode(), capture_output=True, check=False)
+    assert result.returncode == EXIT_REFUSED  # a refused input is not an outage (exit 1)
+    # The server does not retry it: one call, then the error ends the poll.
+    calls: list[int] = []
+
+    class Counting(SSHTransport):
+        def _call(self, request: dict[str, Any], *, timeout: float, limit: int) -> bytes:
+            calls.append(1)
+            return super()._call(request, timeout=timeout, limit=limit)
+
+    broken = Counting(command, str(root), environment=ssh_child_environment())
+    broken.root = str(root) + "//"
+    with mac_server(tmp_path / "pod", tmp_path / "mac", transport=broken) as server:
+        with pytest.raises(BridgeRemoteError):
+            server.poll_once()
+    assert calls == [1]
 
 
 def test_a_pod_without_a_bridge_root_yet_is_not_ready(tmp_path: Path) -> None:

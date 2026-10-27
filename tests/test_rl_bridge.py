@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from bridge_fixtures import (
 )
 
 from scratchcoder.eval.parallel import Execute
+from scratchcoder.eval.tasks import Task
 from scratchcoder.rl.bridge import (
     AWAITING_REWARDS,
     DEV,
@@ -68,9 +70,11 @@ from scratchcoder.rl.rewards import (
     NO_PROGRAM,
     Attempt,
     AttemptReward,
+    LocalRewardSource,
     RewardHostFailure,
     RewardTimeout,
 )
+from scratchcoder.sandbox.reward import RewardResult
 from scratchcoder.sandbox.runner import Result
 
 NAME = RequestName(SESSION, 1, REWARD, 3)
@@ -830,6 +834,143 @@ def test_a_dead_sandbox_fails_a_dev_check_without_running_every_program() -> Non
     with pytest.raises(RewardHostFailure, match="looks down"):
         executor([(task, f"p{index}") for index in range(50)])
     assert len(calls) < 10  # stopped after two unresolved calls, not 50 x 2 tries
+
+
+def test_an_unencodable_dev_program_fails_without_running_or_crashing() -> None:
+    """An unpaired surrogate cannot be written as UTF-8: the runner would raise
+    ``UnicodeEncodeError`` (a ``ValueError``), which no retry or restart could clear."""
+    task = DEV_TASKS[0]
+    ran: list[str] = []
+
+    def execute(code: str, tests: str, mode: str) -> Result:
+        ran.append(code)
+        code.encode()  # the real runner's first step
+        return Result("passed")
+
+    executor = SandboxDevExecutor(workers=2, execute=execute, sleep=lambda s: None)
+    pairs = [(task, "ok"), (task, "print(1)\ud800"), (task, "fine")]
+    assert executor(pairs) == [True, False, True]
+    assert sorted(ran) == ["fine", "ok"]
+    assert executor([(task, "\udfff")]) == [False] and len(ran) == 2
+
+
+def test_a_surrogate_dev_request_is_answered_and_survives_a_restart(tmp_path: Path) -> None:
+    pod = tmp_path / "pod"
+    items = [DevItem("d0", "print(1)\ud800"), DevItem("d1", "ab")]
+    request = BridgeRequest.build(
+        RequestName(SESSION, 1, DEV, 4), items, task_file_sha256=DEV_SHA, created_unix=0.0
+    )
+    write_request(pod, request)
+    seen: list[str] = []
+
+    def execute(code: str, tests: str, mode: str) -> Result:
+        seen.append(code)
+        return Result("passed")
+
+    server = mac_server(pod, tmp_path / "mac", dev=SandboxDevExecutor(workers=1, execute=execute))
+    with server:
+        assert server.poll_once() == [request.request_id]
+    reply = reply_for(pod, request.name)
+    assert reply.outcome == SCORED and reply.passed == (False, True)
+    assert seen == ["ab"]
+
+
+class SteppingClock:
+    """A monotonic clock that moves only when a fake execution takes time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_the_dev_executor_stops_starting_work_after_its_deadline() -> None:
+    task = DEV_TASKS[0]
+    clock = SteppingClock()
+    calls: list[str] = []
+
+    def slow(code: str, tests: str, mode: str) -> Result:
+        calls.append(code)
+        clock.now += 4.0
+        return Result("passed")
+
+    executor = SandboxDevExecutor(
+        workers=1, execute=slow, sleep=lambda s: None, timeout=10.0, clock=clock
+    )
+    with pytest.raises(RewardTimeout, match="within 10 s"):
+        executor([(task, f"p{index}") for index in range(20)])
+    assert len(calls) == 3  # the 4th found the deadline passed and never ran
+    calls.clear()
+    clock.now = 0.0
+    quick = SandboxDevExecutor(
+        workers=1, execute=slow, sleep=lambda s: None, timeout=100.0, clock=clock
+    )
+    assert quick([(task, "a"), (task, "b")]) == [True, True] and len(calls) == 2
+    for bad in (0, -1, math.inf, math.nan, True):
+        with pytest.raises(ValueError, match="timeout"):
+            SandboxDevExecutor(timeout=bad)
+
+
+def test_no_retry_starts_past_the_dev_deadline() -> None:
+    task = DEV_TASKS[0]
+    clock = SteppingClock()
+    waits: list[float] = []
+
+    def stalled(code: str, tests: str, mode: str) -> Result:
+        clock.now += 1.0
+        return Result("timeout", host_stalled=True)
+
+    def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        clock.now += seconds
+
+    executor = SandboxDevExecutor(
+        workers=1, retries=5, execute=stalled, sleep=sleep, timeout=5.0, clock=clock
+    )
+    with pytest.raises(RewardTimeout):
+        executor([(task, "x")])
+    assert clock.now < 5.0  # it did not sleep through the retries past the deadline
+
+
+def test_the_mac_timeouts_bound_a_request_so_a_withdrawn_one_does_not_block_the_next(
+    tmp_path: Path,
+) -> None:
+    """With a Mac-side bound below the Pod's, a reward request the Pod has given up on ends
+    in a ``timeout`` reply after the bound, not after the scoring work, so the dev check
+    behind it is served at once."""
+    pod = tmp_path / "pod"
+
+    def slow_score(task: Task, code: str) -> RewardResult:
+        time.sleep(0.6)
+        return RewardResult("completed", 1.0)
+
+    slow = LocalRewardSource(TRAIN, timeout=0.2, workers=2, score=slow_score)
+    reward = reward_request()
+    write_request(pod, reward)
+    with mac_server(pod, tmp_path / "mac", rewards=slow, dev=CountingDev()) as server:
+        started = time.monotonic()
+        server.poll_once()
+        assert time.monotonic() - started < 1.0  # 6 attempts x 0.6 s on 2 workers is 1.8 s
+        assert reply_for(pod, reward.name).outcome == TIMEOUT
+        dev = dev_request(index=2, seq=2)
+        write_request(pod, dev)
+        server.poll_once()
+        assert reply_for(pod, dev.name).outcome == SCORED
+    default = BridgeServer(
+        DirectoryTransport(pod),
+        reward_tasks=TRAIN,
+        dev_tasks=DEV_TASKS,
+        pod_task_sha256={"reward": RL_SHA, "dev": DEV_SHA},
+        state=tmp_path / "other",
+        reward_timeout=30,
+        dev_timeout=20,
+    )
+    with default:
+        assert isinstance(default.reward_source, LocalRewardSource)
+        assert default.reward_source.timeout == 30
+        assert isinstance(default.dev_execute, SandboxDevExecutor)
+        assert default.dev_execute.timeout == 20
 
 
 def test_the_client_carries_one_request_at_a_time(tmp_path: Path) -> None:

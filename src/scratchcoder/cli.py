@@ -129,11 +129,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     rl_bridge.add_argument("--pod-dev-sha256", required=True, help="the Pod's dev task file")
     rl_bridge.add_argument("--state", type=Path, required=True, help="the Mac's bridge state")
     rl_bridge.add_argument("--workers", type=int, default=8)
-    rl_bridge.add_argument("--reward-timeout", type=float, help="Mac-side bound per request")
+    rl_bridge.add_argument(
+        "--reward-timeout",
+        type=float,
+        required=True,
+        help="Mac-side bound on one reward request: the Pod's reward timeout less the allowance",
+    )
+    rl_bridge.add_argument(
+        "--dev-timeout",
+        type=float,
+        required=True,
+        help="Mac-side bound on one dev check: the Pod's dev timeout less the allowance",
+    )
     rl_bridge.add_argument("--poll-seconds", type=float, default=2.0)
     rl_bridge.add_argument("--ssh-timeout", type=float, default=120.0)
     rl_bridge.add_argument("--ssh-retries", type=int, default=4)
-    rl_bridge.add_argument("--dotenv", type=Path, default=Path(".env"))
+    rl_bridge.add_argument(
+        "--dotenv",
+        type=Path,
+        help="the .env file to check (default: .env in the current directory and the checkout)",
+    )
+    rl_bridge.add_argument(
+        "--no-dotenv", action="store_true", help="skip the .env check: there is no .env file"
+    )
     rl_bridge.add_argument("--image-id", help="the pinned sandbox image's local ID, checked")
     rl_bridge.add_argument("--max-polls", type=int)
     from scratchcoder.eval import pipeline_cli
@@ -181,9 +199,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.write(json.dumps(printed, indent=2, sort_keys=True) + "\n")
         return 0
     if args.command == "rl-bridge":
-        from scratchcoder.rl.bridge_command import BridgeEnvironmentError, serve_command
+        from scratchcoder.rl.bridge_command import (
+            BridgeEnvironmentError,
+            resolve_dotenv,
+            serve_command,
+        )
 
         try:
+            dotenv = resolve_dotenv(args.dotenv, disabled=args.no_dotenv)
             return serve_command(
                 host=args.host,
                 port=args.port,
@@ -198,10 +221,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 state=args.state,
                 workers=args.workers,
                 reward_timeout=args.reward_timeout,
+                dev_timeout=args.dev_timeout,
                 poll_seconds=args.poll_seconds,
                 ssh_timeout=args.ssh_timeout,
                 ssh_retries=args.ssh_retries,
-                dotenv=args.dotenv,
+                dotenv=dotenv,
                 image_id=args.image_id,
                 max_polls=args.max_polls,
             )
