@@ -345,7 +345,9 @@ def generate_batch(
 
     Row ``r`` has its own seed ``seeds[r]`` (required when sampling), its own stop
     token set ``stops[r]`` and its own budget ``min(max_new_tokens, context -
-    len(prompts[r]))``, so its output does not depend on the other rows.
+    len(prompts[r]))``, so its output does not depend on the other rows apart
+    from float rounding: the batch shape and the prefill chunk size (which
+    depends on the batch size and capacity) can change logits by rounding.
     ``precision="bfloat16"`` runs the transformer under bfloat16 autocast; the
     vocabulary projection and the sampler stay in float32/float64.
     """
