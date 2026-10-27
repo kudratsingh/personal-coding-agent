@@ -101,16 +101,21 @@ class KVCache:
         cosine, sine = rotary_table(
             config.width // config.heads, 0, config.context, device=pad.device
         )
-        self.cosine, self.sine = cosine[positions], sine[positions]  # [B, capacity, D/2]
+        # Per-row angles [B, capacity, D/2], cast once per activation dtype.
+        self.angles = {torch.float32: (cosine[positions], sine[positions])}
         self.padding = slots[None, :] < pad[:, None]  # [B, capacity]
         self.future = slots[None, :] > slots[:, None]  # [capacity, capacity]
         self.keys: list[Tensor | None] = [None] * config.layers
         self.values: list[Tensor | None] = [None] * config.layers
 
-    def rotation(self, time: int) -> tuple[Tensor, Tensor]:
-        """Angles [B,1,T,D/2] of the next ``time`` slots."""
+    def rotation(self, time: int, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        """Cosine and sine [B,1,T,D/2] of the next ``time`` slots, in ``dtype``."""
+        if dtype not in self.angles:
+            cosine, sine = self.angles[torch.float32]
+            self.angles[dtype] = cosine.to(dtype), sine.to(dtype)
+        cosine, sine = self.angles[dtype]
         stop = self.length + time
-        return self.cosine[:, None, self.length : stop], self.sine[:, None, self.length : stop]
+        return cosine[:, None, self.length : stop], sine[:, None, self.length : stop]
 
     def hidden(self, time: int) -> Tensor:
         """Keys that the next ``time`` query slots must not see, as [B,1,T,S]."""
@@ -181,9 +186,8 @@ class Attention(nn.Module):
         k = k.view(batch, time, self.heads, width // self.heads).transpose(1, 2)
         if self.q_norm is not None and self.k_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
-        cosine, sine = cache.rotation(time)
-        q = apply_rotary(q, cosine.to(q.dtype), sine.to(q.dtype))
-        k = apply_rotary(k, cosine.to(k.dtype), sine.to(k.dtype))
+        q = apply_rotary(q, *cache.rotation(time, q.dtype))
+        k = apply_rotary(k, *cache.rotation(time, k.dtype))
         v = v.view(batch, time, self.heads, width // self.heads).transpose(1, 2)
         keys, values = cache.store(layer, k, v)
         mixed = masked_attention(q, keys, values, cache.hidden(time))

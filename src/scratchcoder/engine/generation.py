@@ -13,7 +13,8 @@ SAMPLER_VERSION = "philox4x32-10-inverse-cdf-v1"
 """Names the seeded sampler below; record it with every sampled result."""
 
 PRECISIONS = ("float32", "bfloat16")
-# Temperatures this small scale in float64: (logit - max) / T stays exact there.
+# Below this temperature, scaling runs in float64, where T stays far from float32's
+# subnormal range and (logit - max) / T cannot collapse to 0 / 0.
 TINY_TEMPERATURE = 2.0**-100
 # Prefill chunks keep each layer's attention scores below this many elements.
 PREFILL_SCORE_ELEMENTS = 2**27
@@ -203,20 +204,17 @@ def sample(
     _check_logits(logits)
     if type(step) is not int or not 0 <= step < 2**32:
         raise ValueError("step must be an integer in [0, 2^32)")
-    rows = 1 if logits.ndim == 1 else logits.shape[0]
     if isinstance(seed, bool):
         raise ValueError("seed must be an integer or one integer per row")
+    if temperature == 0:
+        return logits.argmax(dim=-1, keepdim=True)
+    rows = 1 if logits.ndim == 1 else logits.shape[0]
     seeds = [seed + row for row in range(rows)] if isinstance(seed, int) else list(seed)
     if len(seeds) != rows:
         raise ValueError("sampling needs one seed per row")
     uniform = sampling_uniforms(_seed_tensor(seeds, logits.device), 1, first=step)[:, 0]
     token, _ = _choose(
-        logits,
-        temperature,
-        top_k,
-        top_p,
-        uniform[0] if logits.ndim == 1 else uniform,
-        False,
+        logits, temperature, top_k, top_p, uniform[0] if logits.ndim == 1 else uniform, False
     )
     return token
 
