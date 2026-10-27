@@ -1228,7 +1228,7 @@ def ticking_generate(
     The batches are ``generate_many``'s exactly: prompts sorted longest first (ties by
     input index), cut into batches of ``batch_size``, each one ``generate_batch`` call, so
     every row gets the same completion; ``tick`` keeps the heartbeat and the limits live
-    during an hour of generation.
+    through an evaluation stage's generation.
     """
 
     def generate(

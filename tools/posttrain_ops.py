@@ -96,8 +96,9 @@ so no post-training label carries optimizer state (the pretraining rehearsal's l
 REQUIRED_UPLOAD_BYTES_PER_SECOND = S_WEIGHTS_LABEL_BYTES / DRAIN_SECONDS * 2
 """About 3.06 MB/s: one weights-only label inside the 360 s final drain with a factor-2
 margin, re-derived as the pretraining rehearsal derived 9.17 MB/s for 1.65 GB. One label is
-the worst case for run 1: its only weights label (the selected SFT checkpoint) is uploaded an
-hour before the final drain, and every other artifact is a small JSON or JSON Lines file."""
+the worst case for run 1: its only weights label (the selected SFT checkpoint) is uploaded
+about 45 minutes before the final drain (arc-sft, eval-sft and screening at the planning
+rates), and every other artifact is a small JSON or JSON Lines file."""
 ROUND_TRIP_PROBE_BYTES = rehearsal_ops.ROUND_TRIP_PROBE_BYTES
 UPLOADING_STATUS = rehearsal_ops.UPLOADING_STATUS
 AWAITING_REWARDS_STATUS = "awaiting_rewards"
