@@ -567,6 +567,12 @@ for name in eval-rl-humaneval-greedy eval-rl-humaneval-plus-greedy eval-rl-mbpp-
 done
 ```
 
+Before the owner freezes anything, check that the two arms selected different weights. The control starts from RL's update-0 check, so when neither arm beats it both select that one file; the report then reads `identical True`, and the owner must rule how the RL and more-SFT rows are reported before the freeze (the unseal record below refuses one checkpoint under two names, and so does the scorecard):
+
+```sh
+python3 -c 'import json,sys; s=json.load(open(sys.argv[1]))["selection"]; i=s["identical_endpoints"]; print("rl", s["rl"]["selected"]["label"], "more-sft", s["more-sft"]["selected"]["label"], "identical", i["identical"])' "$CTRL/supervisor/final/report.json"
+```
+
 **Only after the owner freezes all four endpoints** (base B, SFT, RL and more-SFT, from the dev and benchmark results), write the unseal record from the two verified reports: each endpoint's checkpoint SHA-256 and its two test completions files' SHA-256s.
 
 ```sh
@@ -596,6 +602,11 @@ endpoints = {
     "rl": (run2["selection"]["rl"]["selected"]["sha256"], completions(run2, "eval-rl")),
     "more-sft": (run2["selection"]["more-sft"]["selected"]["sha256"], completions(run2, "eval-more-sft")),
 }
+named = {}
+for name, (checkpoint, _) in endpoints.items():
+    if checkpoint in named:
+        sys.exit(f"endpoints {named[checkpoint]} and {name} are one checkpoint ({checkpoint[:12]}): the unseal record needs four different checkpoints; ask the owner for a rule first")
+    named[checkpoint] = name
 record = {
     "kind": "unseal",
     "schema_version": 1,

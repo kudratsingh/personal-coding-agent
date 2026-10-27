@@ -80,6 +80,7 @@ def execute(
     *,
     mac: bool = True,
     reward_source: Any = None,
+    mac_dev: Any = None,
     mac_wall: Callable[[], float] | None = None,
     pod_task_sha256: dict[str, str] | None = None,
     raises: type[BaseException] | None = None,
@@ -114,6 +115,8 @@ def execute(
             )
             if pod_task_sha256 is not None:
                 server.pod_task_sha256 = pod_task_sha256
+            if mac_dev is not None:
+                server.dev_execute = mac_dev
             with mac_thread(server):
                 error = run(worker, raises)
         else:
@@ -441,6 +444,9 @@ def test_rl_and_the_control_record_their_seconds_selection_and_mismatch(complete
         assert chosen["check"] == best["check"] and chosen["label"] in labels(report)
     assert report["rates"]["basis"]["mac"] == "measured"
     assert report["rates"]["rl_busy_seconds"] == rl["busy_seconds"]
+    identical = report["selection"]["identical_endpoints"]
+    assert identical["identical"] is False and identical["sha256"] is None
+    assert identical["rl"] == report["selection"]["rl"]["selected"]["label"]
 
 
 def test_the_waits_heartbeat_awaiting_rewards_and_a_fresh_lease_is_progress(completed: Ran) -> None:
@@ -746,6 +752,37 @@ def test_an_rl_early_stop_is_a_result_and_the_control_runs(
     assert [row["check"] for row in report["rl"]["checks"]] == [0, 1]  # The stop-time check.
     assert report["more_sft"]["stop_reason"] in {"budget", "passes_exhausted"}
     assert report["selection"]["rl"]["selected"]["check"] in {0, 1}
+
+
+class FirstCheckOnly:
+    """The Mac's dev verdicts: every program passes at the first dev check (RL's update 0),
+    none after, so neither arm beats the start."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, pairs: Any) -> list[bool]:
+        self.calls += 1
+        return [self.calls == 1] * len(pairs)
+
+
+def test_both_arms_selecting_the_shared_start_is_flagged_in_the_report(
+    found: Fixtures2, tmp_path: Path
+) -> None:
+    """The control's start is RL's update-0 check: when neither arm beats it, both select
+    that one file. The run completes, and the report says so before anything is frozen
+    (the unseal record refuses one checkpoint under two names)."""
+    ran = execute(found, tmp_path / "run", mac_dev=FirstCheckOnly())
+    report = ran.report
+    assert report["status"] == "completed"
+    selection = report["selection"]
+    assert selection["rl"]["selected"]["label"] == "rl-check-0000"
+    assert selection["more-sft"]["selected"]["label"] == "rl-check-0000"
+    identical = selection["identical_endpoints"]
+    assert identical["identical"] is True
+    assert (identical["rl"], identical["more-sft"]) == ("rl-check-0000", "rl-check-0000")
+    assert identical["sha256"] == selection["rl"]["selected"]["sha256"]
+    assert "owner rules" in identical["rule"]
 
 
 def test_a_refusal_by_the_mac_fails_the_run_after_the_latest_weights_reach_r2(

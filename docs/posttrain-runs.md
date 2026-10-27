@@ -109,7 +109,7 @@ Then run 1's finalization, after the bridge directories (`outbox/`, `inbox/`, `d
 
 **The control** runs `run_more_sft` from the same SFT weights on the kept tasks' reference solutions (chat-v1, assistant-only loss), SFT's optimizer at a constant 6e-5 after 10 warmup updates, 16 x 2 rows an update, its GPU-busy budget RL's measured busy seconds within 5%, RL's attention kernel, its start RL's update-0 check. `report.json` records the measured mismatch. The same stops end the run.
 
-**Selection.** Each arm reports the selectable check with the highest dev-subset greedy pass@1, ties to the higher 8-sample mean, then to the later check; `report.json`'s `selection` lists every check's scores and the winner's label, and the ARC and evaluation stages read the two winners.
+**Selection.** Each arm reports the selectable check with the highest dev-subset greedy pass@1, ties to the higher 8-sample mean, then to the later check; `report.json`'s `selection` lists every check's scores and the winner's label, and the ARC and evaluation stages read the two winners. The control starts from RL's update-0 check, so when neither arm beats it both select that one file: `selection.identical_endpoints` then reads `identical: true`, both evaluation stages still run, and the owner rules how the two rows are reported before the endpoints are frozen (the unseal record and the scorecard refuse one checkpoint under two names).
 
 ### Inputs and the gate
 

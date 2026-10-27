@@ -421,6 +421,32 @@ def test_the_unseal_record_names_all_four_endpoints_from_the_verified_reports(
     assert swapped.returncode != 0 and "in that order" in swapped.stderr
 
 
+def test_the_unseal_record_refuses_one_checkpoint_under_two_endpoints(tmp_path: Path) -> None:
+    """Both arms may select the control's start, RL's update-0 check: the record is refused
+    before it is written, with the reason, so the owner rules first."""
+    run1 = report(
+        "1", "p1", inputs={"b-mixed-final": "base-sha"}, sft={"selected": {"sha256": "sft-sha"}}
+    )
+    shared = {"selected": {"sha256": "rl-check-0-sha"}}
+    run2 = report("2", "p2", selection={"rl": shared, "more-sft": shared})
+    paths = [tmp_path / "r1.json", tmp_path / "r2.json", tmp_path / "unseal.json"]
+    paths[0].write_text(json.dumps(run1))
+    paths[1].write_text(json.dumps(run2))
+    result = subprocess.run(
+        ["python3", "-", *map(str, paths)],
+        input=unseal_script(),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0
+    assert "endpoints rl and more-sft are one checkpoint" in result.stderr
+    assert not paths[2].exists()
+    text = RUNBOOK.read_text()
+    check = text.index('i=s["identical_endpoints"]')
+    assert check < text.index("**Only after the owner freezes all four endpoints**")
+
+
 def test_no_block_holds_a_comment() -> None:
     found = {line for block in base.blocks() for line in comment_lines(block)}
     assert not found, sorted(found)

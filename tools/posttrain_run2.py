@@ -92,6 +92,11 @@ SELECTION_RULE = (
     "the selectable check with the highest dev-subset greedy pass@1; ties to the higher "
     "8-sample mean pass rate, then to the later check"
 )
+IDENTICAL_ENDPOINTS_RULE = (
+    "both arms selected the same weights (the control's start is RL's update-0 check); the "
+    "unseal record and the scorecard need a different checkpoint for each endpoint, so the "
+    "owner rules on how to report them before the endpoints are frozen"
+)
 BRIDGE_FILES = ("server.lease", "server.lease.lock", "client.lock")
 BRIDGE_BOXES = ("outbox", "inbox", "done", "withdrawn", "rejected")
 MAX_BRIDGE_TAR_BYTES = 512 * 1024 * 1024
@@ -676,6 +681,25 @@ class Run2Worker(PosttrainWorker):
             chosen = check_summary(selected, labels.get(selected.dev.check, ""))
         return {"rule": SELECTION_RULE, "selected": chosen, "checks": rows}
 
+    def identical_endpoints(self) -> dict[str, Any]:
+        """Whether both arms selected the same weights. The control's start is RL's
+        update-0 check, so when neither arm beats it both select that one file; the
+        evaluation stages still run for both (the owner's rule decides how they are
+        reported), and the flag says so before anything is frozen."""
+        chosen = {
+            arm: (self.report["selection"].get(arm) or {}).get("selected")
+            for arm in ("rl", "more-sft")
+        }
+        rl, control = chosen["rl"], chosen["more-sft"]
+        identical = rl is not None and control is not None and rl["sha256"] == control["sha256"]
+        return {
+            "identical": identical,
+            "rl": None if rl is None else rl["label"],
+            "more-sft": None if control is None else control["label"],
+            "sha256": rl["sha256"] if identical and rl is not None else None,
+            "rule": IDENTICAL_ENDPOINTS_RULE if identical else None,
+        }
+
     # The control stage ------------------------------------------------------------------
 
     def run_more_sft(self, stage: StagePlan) -> list[dict[str, Any]]:
@@ -768,6 +792,7 @@ class Run2Worker(PosttrainWorker):
         self.report["selection"]["more-sft"] = self.selection(
             result.checks, result.selected, labels
         )
+        self.report["selection"]["identical_endpoints"] = self.identical_endpoints()
         outputs += self.export_label(
             stage.name,
             [
