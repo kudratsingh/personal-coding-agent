@@ -265,6 +265,7 @@ def message(identifier: str, role: str, text: str, **fields: Any) -> dict[str, A
         "text": text,
         "lang": "en",
         "synthetic": False,
+        "model_name": None,
         "deleted": False,
         "review_result": True,
         "rank": None,
@@ -402,6 +403,77 @@ def test_adapter_follows_the_best_eligible_path_and_counts_every_filter() -> Non
         "trees_seen": 8,
     }
     assert conversation_from_json(json.loads(json.dumps(conversation_json(kept[0])))) == kept[0]
+
+
+@pytest.mark.parametrize(
+    ("fields", "reason"),
+    [
+        ({"model_name": "oasst-sft-0_3000,max_new_tokens=400 (..)"}, "model_written"),
+        ({"model_name": " "}, "model_written"),
+        ({"model_name": 7}, "model_written"),
+        ({"model_name": ""}, None),
+        ({"model_name": None}, None),
+        # Both marks: the first reason is counted, so the message is counted once.
+        ({"synthetic": True, "model_name": "oasst-sft-0"}, "synthetic"),
+        ({"synthetic": None}, "synthetic"),
+    ],
+)
+def test_only_human_written_messages_are_eligible(
+    fields: dict[str, object], reason: str | None
+) -> None:
+    assert message_reason(message("a", "assistant", "Hi.", **fields)) == reason
+
+
+@pytest.mark.parametrize("key", ["synthetic", "model_name"])
+def test_a_message_without_either_authorship_field_is_missing_metadata(key: str) -> None:
+    raw = message("a", "assistant", "Hi.")
+    del raw[key]
+    assert message_reason(raw) == "missing_metadata"
+
+
+def test_the_walk_skips_a_best_ranked_model_written_reply() -> None:
+    written = {"model_name": "oasst-sft-0_3000"}
+    trees = [
+        # The rank-0 reply is model-written, so the walk takes the rank-1 human reply,
+        # and a model-written prompter turn below it ends the walk there.
+        tree(
+            "next",
+            message(
+                "p1",
+                "prompter",
+                "Name a prime.",
+                replies=[
+                    message("a1", "assistant", "Seven.", rank=0, **written),
+                    message(
+                        "a2",
+                        "assistant",
+                        "Two.",
+                        rank=1,
+                        replies=[message("p2", "prompter", "Another?", **written)],
+                    ),
+                ],
+            ),
+        ),
+        # The only reply is model-written: no eligible reply, so the tree is dropped.
+        tree(
+            "ends",
+            message(
+                "p3",
+                "prompter",
+                "Hi",
+                replies=[message("a3", "assistant", "Hello.", rank=0, **written)],
+            ),
+        ),
+        # A model-written root drops the whole tree.
+        tree("root", message("p4", "prompter", "Hi", **written)),
+    ]
+    kept, counts = adapt_trees(trees, TOKENIZER)
+    assert [(item.id, item.message_ids) for item in kept] == [("next", ("p1", "a2"))]
+    assert [m.text for m in kept[0].messages] == ["Name a prime.", "Two."]
+    assert counts["message:model_written"] == 4
+    assert counts["tree:no_eligible_reply"] == 1
+    assert counts["tree:root_model_written"] == 1
+    assert counts["tree:kept"] == 1
 
 
 def test_adapter_fails_closed_on_missing_metadata_and_duplicate_trees() -> None:

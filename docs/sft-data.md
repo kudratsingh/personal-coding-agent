@@ -95,14 +95,15 @@ No license or contributor grant beyond the metadata label was found, and the por
 **Eligible messages.** A message can appear in a conversation only if all of these hold:
 
 - its language is `en`;
-- `synthetic` is false and `deleted` is false;
+- it is human-written: `synthetic` is false (else `synthetic`), and `model_name` is null or empty (else `model_written`);
+- `deleted` is false;
 - `review_result` is true;
 - its `pii` label value, if present, is zero;
 - its text is not empty.
 
-A message missing any of these fields counts as `missing_metadata`. Labels must be the README's mapping form: each label name maps to an object with a numeric `value`. Labels in any other shape, such as lists or columnar `{"name": [...], "value": [...]}` objects, also count as `missing_metadata`. A message with no labels, or no `pii` label, stays eligible, as the owner's condition filters on the PII labels. Such messages are counted: `message:eligible_no_pii_label` over all eligible messages, and `kept_messages_no_pii_label` and `tree:kept_with_no_pii_label` over the kept conversations. The manual sample scan should cover them.
+A message missing any of these fields counts as `missing_metadata`. That includes `synthetic` and `model_name`: every message of the pinned export carries both, so a message without either is not trusted to be human-written. A message with both marks counts once, as `synthetic`. Labels must be the README's mapping form: each label name maps to an object with a numeric `value`. Labels in any other shape, such as lists or columnar `{"name": [...], "value": [...]}` objects, also count as `missing_metadata`. A message with no labels, or no `pii` label, stays eligible, as the owner's condition filters on the PII labels. Such messages are counted: `message:eligible_no_pii_label` over all eligible messages, and `kept_messages_no_pii_label` and `tree:kept_with_no_pii_label` over the kept conversations. The manual sample scan should cover them.
 
-**Choosing a conversation.** Only trees in `ready_for_export` state with an eligible English prompter root are used. From each tree the adapter follows the best-ranked eligible reply at every turn: rank 0 first, unranked replies last, message ID breaking ties. A chosen path therefore never contains an ineligible message. The conversation is the longest prefix of that path that ends on an assistant turn and renders to at most 960 chat-v1 tokens. A tree whose first exchange is over 960 tokens is dropped. One conversation comes from each tree.
+**Choosing a conversation.** Only trees in `ready_for_export` state with an eligible English prompter root are used. From each tree the adapter follows the best-ranked eligible reply at every turn: rank 0 first, unranked replies last, message ID breaking ties. A chosen path therefore never contains an ineligible message: if the best-ranked reply is model-written, the walk takes the next eligible reply, and with none it ends. The conversation is the longest prefix of that path that ends on an assistant turn and renders to at most 960 chat-v1 tokens. A tree whose first exchange is over 960 tokens is dropped. One conversation comes from each tree.
 
 **Screens, in order:**
 
