@@ -1439,21 +1439,339 @@ def posttrain_main(argv: Sequence[str]) -> int:
     parser.add_argument("--quoted-gpu-hourly", type=float)
     parser.add_argument("--speed-factor", type=float, action="append", help="generation speed x")
     parser.add_argument("--output", type=Path, help="optional JSON report path")
+    run2 = parser.add_argument_group("run 2 (a specification with run 2)")
+    run2.add_argument(
+        "--ceiling-usd", type=float, help="the ceiling to price against (the template's is null)"
+    )
+    run2.add_argument("--run1-report", type=Path, help="run 1's verified report.json")
+    run2.add_argument("--screening", type=Path, help="run 1's RL screening record (rl-screen)")
+    run2.add_argument(
+        "--dev-results",
+        type=Path,
+        action="append",
+        default=[],
+        help="an eval-execute results file of run 1's SFT dev completions; repeat",
+    )
     args = parser.parse_args(argv)
     try:
-        report = posttrain_report(
-            args.specification,
-            quoted_gpu_hourly=args.quoted_gpu_hourly,
-            speed_factors=tuple(args.speed_factor or (0.5, 1.0, 2.0)),
-        )
+        raw = json.loads(args.specification.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and raw.get("run") == "2":
+            measured = None
+            if args.run1_report is not None or args.screening is not None:
+                if args.run1_report is None or args.screening is None:
+                    raise ValueError("measured rates need both --run1-report and --screening")
+                measured = run1_measured_rates(
+                    args.run1_report, args.screening, dev_results=args.dev_results
+                )
+            report = posttrain2_report(
+                args.specification,
+                quoted_gpu_hourly=args.quoted_gpu_hourly,
+                ceiling_usd=args.ceiling_usd,
+                measured=measured,
+            )
+            text = render_posttrain2_markdown(report)
+        else:
+            report = posttrain_report(
+                args.specification,
+                quoted_gpu_hourly=args.quoted_gpu_hourly,
+                speed_factors=tuple(args.speed_factor or (0.5, 1.0, 2.0)),
+            )
+            text = render_posttrain_markdown(report)
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         parser.error(str(error))
     if args.output is not None:
         args.output.write_text(
             json.dumps(report, indent=2, allow_nan=False, sort_keys=True) + "\n", encoding="utf-8"
         )
-    print(render_posttrain_markdown(report), end="")
+    print(text, end="")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Post-training run 2: the proposal's table at the planning speeds and at run 1's rates
+
+POSTTRAIN2_DISCLAIMER = (
+    "Run 2 figures are projections: generation priced at every attempt's token cap, RL "
+    "training at whole-context slots, the Mac's reward and dev-check time per request at the "
+    "planning values or at run 1's measured per-attempt scoring time, and the control's budget "
+    "equal to RL's busy seconds; nothing here is a run-2 measurement"
+)
+POSTTRAIN2_STORAGE_BYTES = 8_000_000_000
+"""Run 2's artifacts in R2: about 13 weights-only labels of 0.55 GB (RL's six checks and its
+stop weights, the control's five checks and its stop weights), 14 completions files, the
+bridge directories and the records."""
+BRIDGE_ROUND_TRIP_SECONDS = 5.5
+"""A request's bridge time in normal operation: one Mac poll (2 s), a listing, a read and a
+write over SSH of about a second each, and one Pod poll (0.5 s)."""
+RUN2_ROWS = (
+    ("setup", "Setup (bootstrap, fetch the SFT weights, tests, preflight)"),
+    ("rl_rollouts", "RL rollouts"),
+    ("rl_training", "RL training steps"),
+    ("rl_reward_waits", "RL waiting on Mac rewards"),
+    ("rl_dev_checks", "RL dev checks: generation / Mac wait"),
+    ("control_training", "More-SFT training (equal to RL's busy time)"),
+    ("control_dev_checks", "More-SFT dev checks: generation / Mac wait"),
+    ("evaluation", "Evaluation generation, RL and more-SFT"),
+    ("arc", "ARC-Easy on both selected checkpoints"),
+    ("loads_saves", "Checkpoint loads and weights saves"),
+    ("finalization", "Finalization"),
+)
+
+
+def run2_rows(spec: Any, rates: Any) -> dict[str, Any]:
+    """Run 2's stages at ``rates`` in the proposal's rows (seconds; dev checks as pairs)."""
+    from tools.posttrain_run import control_parts, rl_parts, stage_seconds
+
+    rl = rl_parts(spec, rates)
+    control = control_parts(spec, rates)
+    evaluation = math.fsum(
+        stage_seconds(spec, stage, rates) for stage in spec.stages if stage.kind == "eval"
+    )
+    arc = math.fsum(
+        stage_seconds(spec, stage, rates) for stage in spec.stages if stage.kind == "arc"
+    )
+    tokens = sum(
+        entry.planned_tokens
+        for stage in spec.stages
+        if stage.kind == "eval"
+        for entry in stage.files
+    )
+    return {
+        "setup": float(spec.limits["startup_seconds"]),
+        "rl_rollouts": rl["rollouts"],
+        "rl_training": rl["training"],
+        "rl_reward_waits": rl["reward_waits"],
+        "rl_dev_checks": (rl["dev_generation"], rl["dev_waits"]),
+        "control_training": control["training"],
+        "control_dev_checks": (control["dev_generation"], control["dev_waits"]),
+        "evaluation": evaluation,
+        "arc": arc,
+        "loads_saves": rl["load"] + rl["saves"] + control["load"] + control["saves"],
+        "finalization": spec.finalization_reserve_seconds,
+        "evaluation_tokens": tokens,
+    }
+
+
+def run1_measured_rates(
+    report_path: Path,
+    screening_path: Path,
+    *,
+    dev_results: Sequence[Path] = (),
+    workers: int = 8,
+    attempts_per_update: int = 256,
+    dev_programs: int = 1_800,
+) -> dict[str, Any]:
+    """Run 2's rates from run 1's records: generation (the probe's, slowed by the evaluation
+    files' observed rate when lower), SFT's slot rate and ARC's seconds from the verified
+    report; the Mac's time per reward request (``attempts_per_update`` attempts on
+    ``workers``) from the screening record's per-attempt scoring seconds, and per dev check
+    from the SFT dev results' per-attempt seconds (the screening's when none are given), each
+    with one normal bridge round trip."""
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if not isinstance(report, dict) or report.get("kind") != "posttrain-run-report":
+        raise ValueError(f"{report_path} is not a post-training run report")
+    if report.get("run") != "1":
+        raise ValueError("the measured rates come from run 1's report")
+    probe = (report.get("probe") or {}).get("measured_tokens_per_second") or {}
+    rates = report.get("rates") or {}
+    if "64" not in probe or "256" not in probe:
+        raise ValueError("run 1's report has no probe rates at batch 64 and 256")
+    observed64 = float(rates.get("generation_tokens_per_second") or probe["64"])
+    slowdown = min(1.0, observed64 / float(probe["64"]))
+    screening = json.loads(screening_path.read_text(encoding="utf-8"))
+    rows = screening.get("rewards") if isinstance(screening, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(f"{screening_path} holds no scored screening attempts")
+    reward_mean = math.fsum(float(row["seconds"]) for row in rows) / len(rows)
+    dev_seconds: list[float] = []
+    for path in dev_results:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            if isinstance(row, dict) and row.get("kind") == "attempt":
+                dev_seconds.append(float(row["elapsed_seconds"]))
+    dev_mean = math.fsum(dev_seconds) / len(dev_seconds) if dev_seconds else reward_mean
+    sft = report.get("sft") or {}
+    return {
+        "generation_tokens_per_second": {
+            "64": observed64,
+            "256": float(probe["256"]) * slowdown,
+        },
+        "training_slots_per_second": float(sft.get("slots_per_second") or 56_765.0),
+        "arc_seconds_per_checkpoint": float(rates.get("arc_seconds_per_checkpoint") or 54),
+        "reward_wait_seconds_per_update": attempts_per_update * reward_mean / workers
+        + BRIDGE_ROUND_TRIP_SECONDS,
+        "dev_wait_seconds_per_check": dev_programs * dev_mean / workers + BRIDGE_ROUND_TRIP_SECONDS,
+        "sources": {
+            "report_sha256": _sha256_file(report_path),
+            "screening_sha256": _sha256_file(screening_path),
+            "dev_results": [_sha256_file(path) for path in dev_results],
+            "screening_attempts": len(rows),
+            "mean_reward_attempt_seconds": reward_mean,
+            "dev_attempts": len(dev_seconds),
+            "mean_dev_attempt_seconds": dev_mean,
+        },
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def posttrain2_report(
+    specification: Path,
+    *,
+    quoted_gpu_hourly: float | None = None,
+    ceiling_usd: float | None = None,
+    measured: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run 2 in the proposal's table form at the planning speeds, with the Mac twice as slow,
+    and (with ``measured``) at run 1's measured rates, each against the ceiling."""
+    from tools.posttrain_run import Rates, Specification
+
+    raw = json.loads(specification.read_text(encoding="utf-8"))
+    if ceiling_usd is not None:
+        raw["limits"]["ceiling_usd"] = float(ceiling_usd)
+    elif raw["limits"]["ceiling_usd"] is None:
+        raise ValueError("the run-2 template has no ceiling yet: give --ceiling-usd")
+    spec = Specification.from_dict(raw, allow_gate_nulls=True)
+    derived = spec.ceiling
+    gpu = (
+        float(spec.limits["quoted_gpu_hourly"]) if quoted_gpu_hourly is None else quoted_gpu_hourly
+    )
+    hourly = max(derived.quoted_total_hourly, rehearsal_total_hourly(gpu, d35.CONTAINER_DISK_GB))
+    planning = Rates.planning(spec)
+    scenarios: dict[str, Any] = {
+        "planning speeds": planning,
+        "planning speeds, Mac twice as slow": replace(
+            planning,
+            reward_wait_seconds_per_update=2 * float(planning.reward_wait_seconds_per_update or 0),
+            dev_wait_seconds_per_check=2 * float(planning.dev_wait_seconds_per_check or 0),
+        ),
+    }
+    if measured is not None:
+        generation = measured["generation_tokens_per_second"]
+        scenarios["run 1's measured rates"] = replace(
+            planning,
+            generation_tokens_per_second=float(generation[str(spec.generation_batch)]),
+            rollout_tokens_per_second=float(generation[str(spec.rl["generation_batch"])]),
+            dev_generation_tokens_per_second=float(generation[str(spec.rl["dev_batch_size"])]),
+            training_slots_per_second=float(measured["training_slots_per_second"]),
+            arc_seconds_per_checkpoint=float(measured["arc_seconds_per_checkpoint"]),
+            reward_wait_seconds_per_update=float(measured["reward_wait_seconds_per_update"]),
+            dev_wait_seconds_per_check=float(measured["dev_wait_seconds_per_check"]),
+        )
+    rendered: dict[str, Any] = {}
+    for name, rates in scenarios.items():
+        rows = run2_rows(spec, rates)
+        seconds = {
+            key: math.fsum(value) if isinstance(value, tuple) else value
+            for key, value in rows.items()
+            if key != "evaluation_tokens"
+        }
+        total = math.fsum(seconds.values())
+        usd = total / 3600 * hourly
+        rendered[name] = {
+            "rows": {
+                key: (
+                    {
+                        "seconds": list(value),
+                        "hours": [part / 3600 for part in value],
+                        "usd": [part / 3600 * hourly for part in value],
+                    }
+                    if isinstance(value, tuple)
+                    else {"seconds": value, "hours": value / 3600, "usd": value / 3600 * hourly}
+                )
+                for key, value in rows.items()
+                if key != "evaluation_tokens"
+            },
+            "evaluation_tokens": rows["evaluation_tokens"],
+            "rates": rates.recorded(),
+            "total_seconds": total,
+            "total_hours": total / 3600,
+            "total_usd": usd,
+            "stop_at_120_percent_usd": 1.2 * usd,
+            "fits_lifetime": total <= derived.self_destruct_seconds,
+            "fits_ceiling": usd < derived.worker_cost_stop_usd,
+            "ceiling_over_estimate": derived.ceiling_usd / usd,
+        }
+    bridge = spec.bridge_timeouts
+    assert bridge is not None
+    return {
+        "schema_version": 1,
+        "kind": "posttrain-feasibility",
+        "run": "2",
+        "source": str(specification),
+        "quoted_gpu_hourly": gpu,
+        "quoted_total_hourly": hourly,
+        "limits": asdict(derived),
+        "bridge_timeouts": asdict(bridge),
+        "wait_margin_usd": bridge.wait_margin_seconds / 3600 * hourly,
+        "scenarios": rendered,
+        "measured": None if measured is None else dict(measured),
+        "r2_storage": {
+            "bytes": POSTTRAIN2_STORAGE_BYTES,
+            "monthly_usd": _monthly_storage(POSTTRAIN2_STORAGE_BYTES),
+        },
+        "disclaimer": POSTTRAIN2_DISCLAIMER,
+    }
+
+
+def _monthly_storage(size: int) -> float:
+    from tools.r2_store import monthly_storage_usd
+
+    return float(monthly_storage_usd(size))
+
+
+def render_posttrain2_markdown(report: Mapping[str, Any]) -> str:
+    limits = report["limits"]
+    lines = [
+        "# Post-training run 2 feasibility",
+        "",
+        f"Quote ${report['quoted_gpu_hourly']:.2f}/h GPU, ${report['quoted_total_hourly']:.2f}/h "
+        f"with the container disk. Ceiling ${limits['ceiling_usd']:.2f}: the worker stops at "
+        f"${limits['worker_cost_stop_usd']:.2f}, the watchdog at "
+        f"${limits['watchdog_cost_stop_usd']:.2f}, the in-Pod timer at "
+        f"{limits['self_destruct_seconds']:,} s of a {limits['wall_seconds']:,} s wall. One full "
+        f"bridge wait, the margin the worker keeps free during RL and the control: "
+        f"{report['bridge_timeouts']['wait_margin_seconds']:,.1f} s, "
+        f"${report['wait_margin_usd']:.2f}.",
+        "",
+    ]
+    labels = dict(RUN2_ROWS)
+    for name, scenario in report["scenarios"].items():
+        tokens = scenario["evaluation_tokens"]
+        lines += [f"## {name}", "", "| Stage | Hours | Dollars |", "| --- | ---: | ---: |"]
+        for key, row in scenario["rows"].items():
+            label = labels[key]
+            if key == "evaluation":
+                label = f"{label} ({tokens / 1e6:.1f}M tokens at cap)"
+            if isinstance(row["hours"], list):
+                hours = " / ".join(f"{value:.2f}" for value in row["hours"])
+                usd = " / ".join(f"${value:.2f}" for value in row["usd"])
+            else:
+                hours, usd = f"{row['hours']:.2f}", f"${row['usd']:.2f}"
+            lines.append(f"| {label} | {hours} | {usd} |")
+        lines += [
+            f"| **Total** | **{scenario['total_hours']:.2f}** | **${scenario['total_usd']:.2f}** |",
+            "",
+            f"Within the timer's lifetime: {'yes' if scenario['fits_lifetime'] else '**no**'}; "
+            f"below the ${limits['ceiling_usd']:.2f} ceiling: "
+            f"{'yes' if scenario['fits_ceiling'] else '**no**'} "
+            f"({scenario['ceiling_over_estimate']:.2f}x the estimate); 120% of the estimate: "
+            f"${scenario['stop_at_120_percent_usd']:.2f}.",
+            "",
+        ]
+    lines += [
+        f"R2 storage about {report['r2_storage']['bytes'] / GB:.0f} GB, "
+        f"${report['r2_storage']['monthly_usd']:.2f}/month.",
+        "",
+        f"**{report['disclaimer']}.**",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
