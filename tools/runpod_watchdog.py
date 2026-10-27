@@ -611,6 +611,38 @@ def _transfer_in_progress(heartbeat: Heartbeat, policy: Policy, now: float) -> b
     )
 
 
+POLICY_FILE_FIELDS = (
+    "mode",
+    "max_wall_seconds",
+    "max_cost_usd",
+    "max_idle_seconds",
+    "quoted_total_hourly",
+    "max_transfer_seconds",
+    "billing_started_at_unix",
+)
+"""The limits a ``--policy`` file pins. ``idle_baseline_unix`` is left out: the runbook's
+helper re-baselines it on every restart."""
+
+
+def check_policy_file(policy: Policy, path: Path) -> None:
+    """Refuse a watchdog whose flags give other limits than the policy file the readiness
+    receipt checked, so a mistyped shell variable can never start a weaker watchdog."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read the policy file: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError("the policy file must hold a JSON object")
+    missing = [name for name in POLICY_FILE_FIELDS if name not in value]
+    if missing:
+        raise ValueError(f"the policy file lacks {', '.join(missing)}")
+    differ = [name for name in POLICY_FILE_FIELDS if getattr(policy, name) != value[name]]
+    if value.get("starting_cost_usd", 0.0) != policy.starting_cost_usd:
+        differ.append("starting_cost_usd")
+    if differ:
+        raise ValueError("the watchdog's flags differ from the policy file in " + ", ".join(differ))
+
+
 def _load_identity(path: Path) -> PodIdentity:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -659,6 +691,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="write this process's PID here, so one Pod's watchdog can be restarted alone",
     )
+    parser.add_argument(
+        "--policy",
+        type=Path,
+        help="refuse to start unless the flags give exactly this policy file's limits",
+    )
     return parser
 
 
@@ -689,6 +726,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         identity = _load_identity(args.identity)
         policy = policy_from_args(args)
+        if args.policy is not None:
+            check_policy_file(policy, args.policy)
     except ValueError as error:
         parser.error(str(error))
     client = RunpodClient(token, UrllibTransport())

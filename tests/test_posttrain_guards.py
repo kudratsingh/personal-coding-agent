@@ -6,6 +6,7 @@ import json
 import math
 import os
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -278,6 +279,77 @@ def test_the_watchdog_reads_post_training_heartbeats_under_its_own_mode(tmp_path
     assert runpod_watchdog.MODE_WALL_SECONDS["posttrain"] == ABSOLUTE_DEADLINE_SECONDS
     with pytest.raises(ValueError, match="ceiling"):
         Policy(60_001, 2.99, 600, 0.6, mode="posttrain")
+
+
+def test_the_watchdog_refuses_flags_other_than_its_policy_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mistyped $WALL or $WATCHDOG_COST can never start a weaker watchdog than the policy
+    the readiness receipt checked."""
+    origin = 1_800_000_000.0
+    limits = posttrain_ops.ceiling_limits(3.00, 0.60)
+    written = posttrain_ops.watchdog_policy(limits, origin=origin, idle_baseline=origin)
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(written))
+    flags = Policy(
+        18_000,
+        2.99,
+        600,
+        0.6,
+        origin,
+        max_transfer_seconds=900,
+        idle_baseline_unix=origin + 300,  # Re-baselined on a restart: not pinned.
+        mode="posttrain",
+    )
+    runpod_watchdog.check_policy_file(flags, path)
+    for change in (
+        {"max_wall_seconds": 60_000},
+        {"max_cost_usd": 9.99},
+        {"billing_started_at_unix": origin + 600},
+        {"mode": "rehearsal"},
+    ):
+        weaker = Policy(**{**asdict(flags), **change})
+        with pytest.raises(ValueError, match="differ from the policy file"):
+            runpod_watchdog.check_policy_file(weaker, path)
+    identity = tmp_path / "identity.json"
+    identity.write_text(
+        json.dumps(
+            {
+                "id": "podpost01",
+                "name": "posttrain-a40-s-1",
+                "gpuId": "NVIDIA A40",
+                "gpuCount": 1,
+                "dataCenterId": "test",
+                "createdAt": "2027-01-15T08:00:00+00:00",
+            }
+        )
+    )
+    monkeypatch.setenv("RUNPOD_API_KEY", "placeholder-not-a-key")
+    argv = [
+        "--mode",
+        "posttrain",
+        "--identity",
+        str(identity),
+        "--heartbeat",
+        str(tmp_path / "heartbeat.json"),
+        "--receipt",
+        str(tmp_path / "receipt.json"),
+        "--max-wall-seconds",
+        "60000",  # A wrong shell variable.
+        "--max-cost-usd",
+        "2.99",
+        "--quoted-total-hourly",
+        "0.60",
+        "--billing-started-at-unix",
+        str(origin),
+        "--max-transfer-seconds",
+        "900",
+        "--policy",
+        str(path),
+    ]
+    with pytest.raises(SystemExit):  # Refused before any API call is made.
+        runpod_watchdog.main(argv)
+    assert not (tmp_path / "receipt.json").exists()
 
 
 def test_reward_waits_get_no_idle_extension_in_run_one(tmp_path: Path) -> None:
