@@ -354,15 +354,35 @@ def test_the_cost_limit_is_the_lower_of_the_ceiling_and_120_percent_of_the_estim
             Specification.from_dict(changed)
     # The launch rule still refuses a plan that does not fit at the planning rates: at a $2.00
     # estimate the limit is $2.40, a 14,220 s timer, short of the 20,288 s the plan needs.
-    low = Specification.from_dict(
-        posttrain_approved.run2_specification({**gate_values(), "gate_estimate_usd": 2.00})
-    )
-    assert low.ceiling.self_destruct_seconds == 14_220
-    fit = launch_fit(low, remaining_seconds=low.ceiling.self_destruct_seconds)
+    low = posttrain_approved.run2_specification(gate_values())
+    low["limits"].update(gate_estimate_usd=2.00, cost_limit_usd=2.40)
+    low_spec = Specification.from_dict(low)
+    assert low_spec.ceiling.self_destruct_seconds == 14_220
+    fit = launch_fit(low_spec, remaining_seconds=low_spec.ceiling.self_destruct_seconds)
     assert fit["fits_at_planning"] is False
     run1 = Specification.load(posttrain_approved.SPECIFICATION_PATH)
     assert type(run1.ceiling) is posttrain_ops.CeilingLimits
     assert run1.ceiling == posttrain_ops.ceiling_limits(3.0, 0.60)
+
+
+def test_the_gate_refuses_limits_that_leave_no_room_for_the_planned_setup() -> None:
+    """A fast run 1 gives a low estimate, and 120% of it may not hold the planned 900 s setup
+    plus the 20,288 s the launch rule needs at the planning rates: the readiness receipt would
+    then refuse only after the Pod had billed its setup. The gate refuses it first, and says
+    what the limits leave for setup."""
+    accepted = posttrain_approved.run2_specification({**gate_values(), "gate_estimate_usd": 3.20})
+    fit = posttrain_approved.gate_launch_fit(accepted)
+    assert fit["fits"] and fit["limit_usd"] == 3.84
+    assert fit["lifetime_seconds"] == 22_860 and fit["startup_seconds"] == 900
+    assert fit["planning_seconds_needed"] == pytest.approx(20_288, abs=1)
+    assert fit["setup_allowance_seconds"] == pytest.approx(2_572, abs=1)
+    for estimate, left in ((2.97, "892"), (2.86, "112"), (2.00, "-6,068")):
+        with pytest.raises(ValueError, match=f"leaves {left} s for setup") as caught:
+            posttrain_approved.run2_specification({**gate_values(), "gate_estimate_usd": estimate})
+        assert "planned 900 s" in str(caught.value)
+    # A ceiling below the estimate binds the same way.
+    with pytest.raises(ValueError, match="for setup"):
+        posttrain_approved.run2_specification({**gate_values(), "ceiling_usd": 3.40})
 
 
 def test_the_gate_command_takes_its_values_from_the_gates_own_files(
@@ -451,6 +471,10 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
     assert filled["limits"]["cost_limit_usd"] == posttrain_ops.estimate_limit_usd(
         5.8, estimate["total_usd"]
     )
+    # It prints what the derived limits leave for setup after the launch rule's need.
+    fit = posttrain_approved.gate_launch_fit(filled)
+    assert printed["setup_allowance_seconds"] == round(fit["setup_allowance_seconds"]) > 900
+    assert printed["planning_seconds_needed"] == round(fit["planning_seconds_needed"])
     assert filled["inputs"]["sft-weights"] == {
         "kind": "checkpoint",
         "key": "posttrain-runs/1/podpost01/sft-weights/checkpoint.pt",

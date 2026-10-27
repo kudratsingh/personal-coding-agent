@@ -617,7 +617,50 @@ def fill_gate(raw: Mapping[str, Any], gate: Mapping[str, Any]) -> dict[str, Any]
 
     check_sft_results(filled)  # Each pin is run 1's artifact beside its SFT weights.
     specification_limits(filled)  # The limits the cost limit derives must exist.
+    fit = gate_launch_fit(filled)
+    if not fit["fits"]:
+        raise ValueError(
+            f"the gate's cost limit of ${fit['limit_usd']:.2f} gives a "
+            f"{fit['lifetime_seconds']:,.0f} s lifetime, which leaves "
+            f"{fit['setup_allowance_seconds']:,.0f} s for setup after the "
+            f"{fit['planning_seconds_needed']:,.0f} s the launch rule needs at the planning "
+            f"rates, less than the planned {fit['startup_seconds']:,.0f} s: the readiness "
+            "receipt would refuse the launch after the Pod has billed its setup; run 2 needs "
+            "the owner's ruling (a higher ceiling or another stop) before this gate"
+        )
     return filled
+
+
+LAUNCH_AT_GATE_RULE = (
+    "the gate's derived limits must hold the planned setup (limits.startup_seconds) plus the "
+    "whole run at the planning rates (the launch rule's need), so a gate the readiness "
+    "receipt would refuse after the Pod has billed its setup is refused before any billing"
+)
+
+
+def gate_launch_fit(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """The launch rule at the gate: the lifetime the filled specification's limits give
+    (``posttrain_ops.lifetime_seconds``) less the planned setup, against the run at the
+    planning rates (``posttrain_run.launch_fit``). ``setup_allowance_seconds`` is what the
+    limits leave for setup once the planning need is held."""
+    from tools.posttrain_ops import lifetime_seconds
+    from tools.posttrain_run import Specification, launch_fit
+
+    spec = Specification.from_dict(raw)
+    limits = spec.ceiling
+    lifetime = lifetime_seconds(limits)
+    startup = float(spec.limits["startup_seconds"])
+    fit = launch_fit(spec, remaining_seconds=lifetime - startup)
+    needed = float(fit["planning_seconds_needed"])
+    return {
+        "rule": LAUNCH_AT_GATE_RULE,
+        "limit_usd": float(getattr(limits, "limit_usd", limits.worker_cost_stop_usd)),
+        "lifetime_seconds": lifetime,
+        "startup_seconds": startup,
+        "planning_seconds_needed": needed,
+        "setup_allowance_seconds": lifetime - needed,
+        "fits": bool(fit["fits_at_planning"]),
+    }
 
 
 RUN2_APPROVED_SECTIONS = (
@@ -863,10 +906,15 @@ def main(argv: list[str] | None = None) -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(data)
     limits = filled["limits"]
+    fit = gate_launch_fit(filled)
     printed = {
         "specification": str(args.output),
         "sha256": hashlib.sha256(data).hexdigest(),
         **{key: limits[key] for key in ("ceiling_usd", "gate_estimate_usd", "cost_limit_usd")},
+        **{
+            key: round(fit[key])
+            for key in ("lifetime_seconds", "planning_seconds_needed", "setup_allowance_seconds")
+        },
     }
     print(json.dumps(printed))
     return 0

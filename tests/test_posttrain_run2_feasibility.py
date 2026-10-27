@@ -103,6 +103,15 @@ def test_run_ones_records_give_the_measured_rates(tmp_path: Path) -> None:
     assert stopped["ceiling_usd"] == 5.80 and stopped["gate_estimate_usd"] == measured["total_usd"]
     assert measured["fits_lifetime_at_this_estimate"]
     assert posttrain2_report(TEMPLATE, ceiling_usd=5.80)["gate_estimate_usd"] is None
+    # The launch rule prices the planning rates whatever run 1 measured: a fast Mac lowers the
+    # estimate, and so the stop, below what the planning-rate need and the setup fit in.
+    fast = dict(rates, reward_wait_seconds_per_update=24.0, dev_wait_seconds_per_check=150.0)
+    quick = posttrain2_report(TEMPLATE, ceiling_usd=5.80, measured=fast)
+    launch = quick["scenarios"]["run 1's measured rates"]["launch_at_this_estimate"]
+    assert launch["planning_seconds_needed"] == pytest.approx(20_288, abs=1)
+    assert launch["setup_allowance_seconds"] < launch["startup_seconds"] == 900
+    assert launch["fits"] is False
+    assert "**the gate refuses it**" in render_posttrain2_markdown(quick)
 
 
 def test_the_projection_names_the_template_it_priced() -> None:
@@ -114,6 +123,9 @@ def test_the_projection_names_the_template_it_priced() -> None:
     # At the planning speeds the estimate would be $3.53 and the stop $4.23, a 25,380 s wall.
     assert planned["limits_at_this_estimate"]["limit_usd"] == 4.23
     assert planned["limits_at_this_estimate"]["wall_seconds"] == 25_380
+    launch = planned["launch_at_this_estimate"]
+    assert launch["lifetime_seconds"] == 25_200 and launch["fits"] is True
+    assert launch["setup_allowance_seconds"] == pytest.approx(25_200 - 20_288, abs=1)
     assert report["limits"]["ceiling_usd"] == 5.80 and report["limits"]["wall_seconds"] == 34_800
 
 

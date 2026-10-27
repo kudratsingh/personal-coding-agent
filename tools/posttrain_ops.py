@@ -244,6 +244,19 @@ def ceiling_limits(
     )
 
 
+def lifetime_seconds(limits: CeilingLimits) -> float:
+    """The longest a Pod under ``limits`` can live from its billing origin: the first of the
+    wall, the in-Pod timer and the worker's and the watchdog's cost stops at the quoted rate
+    (``rehearsal_run.lifetime_end`` with nothing yet spent)."""
+    hourly = limits.quoted_total_hourly
+    return min(
+        float(limits.wall_seconds),
+        float(limits.self_destruct_seconds),
+        limits.worker_cost_stop_usd / hourly * 3600,
+        limits.watchdog_cost_stop_usd / hourly * 3600,
+    )
+
+
 RUN2_GATE_LIMITS = ("ceiling_usd", "gate_estimate_usd", "cost_limit_usd")
 """Run 2's limits fixed at the owner's gate, ``null`` in the tracked template."""
 

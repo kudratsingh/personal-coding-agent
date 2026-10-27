@@ -110,7 +110,7 @@ uv run --locked python -m tools.pilot_feasibility posttrain --specification "$SP
   --output "$SHARED/feasibility.json"
 ```
 
-Replace `0.59` with the console's price; above $0.59, stop and ask the owner (the gate step refuses such a projection). The projection prints **the gate's estimate**, its total at run 1's measured rates, and the stop 120% of it gives; the gate step reads both from `$SHARED/feasibility.json`. The owner fixes the ceiling (about $5.80, about 1.6 times the estimate) and gives the go or not. Record the ceiling:
+Replace `0.59` with the console's price; above $0.59, stop and ask the owner (the gate step refuses such a projection). The projection prints **the gate's estimate**, its total at run 1's measured rates, the stop 120% of it gives and what that stop leaves for setup after the launch rule's need at the planning rates (`the gate refuses it` when less than the 900 s setup); the gate step reads the estimate from `$SHARED/feasibility.json`. The owner fixes the ceiling (about $5.80, about 1.6 times the estimate) and gives the go or not. Record the ceiling:
 
 ```sh
 export CEILING=<the owner's ceiling in dollars>
@@ -131,7 +131,7 @@ uv run --locked python -m tools.posttrain_approved run2-gate --ceiling-usd "$CEI
 uv run --locked python -m tools.posttrain_binding check-exports --specification "$SPEC" --input pool-dev="$RUN1_SHARED/exports/dev-export.jsonl" --input pool-test="$RUN1_SHARED/exports/test-export.jsonl"
 ```
 
-The first prints the launch specification's SHA-256, the ceiling, the estimate and the cost limit; the owner reviews the file. It refuses a projection of another template, of another run 1 report or above the $0.59 quote. `check-exports` must print `{"exports": {"pool-dev": 2000, "pool-test": 2000}, "hidden_tests": 0}`. Then read the limits and the bridge's bounds off it:
+The first prints the launch specification's SHA-256, the ceiling, the estimate, the cost limit and what the derived limits leave for setup (`setup_allowance_seconds`: the lifetime less the 20,288 s the launch rule needs at the planning rates); the owner reviews the file. It refuses a projection of another template, of another run 1 report or above the $0.59 quote, and limits that leave less than the planned 900 s for setup (at a $5.80 ceiling, an estimate below about $2.98): the readiness receipt would refuse such a launch only after the Pod had billed its setup, so it goes back to the owner now. `check-exports` must print `{"exports": {"pool-dev": 2000, "pool-test": 2000}, "hidden_tests": 0}`. Then read the limits and the bridge's bounds off it:
 
 ```sh
 export COST_LIMIT=$(uv run --locked python -m tools.posttrain_ops limits --specification "$SPEC" --field limit_usd)
