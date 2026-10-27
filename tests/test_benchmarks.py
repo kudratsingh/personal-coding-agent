@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from scratchcoder.eval.benchmarks import (
     score_benchmark,
 )
 from scratchcoder.eval.completions import read_completions
+from scratchcoder.eval.parallel import INPUT_LIMIT
 from scratchcoder.sandbox.reward import FUNCTION_DEGENERATE_ANSWERS
 from scratchcoder.sandbox.runner import Limits, Result, Runtime
 from tools import benchmark_score
@@ -130,6 +132,42 @@ def test_stored_base_protocol_programs_must_match_the_text(
     forged.write_text("\n".join([lines[0], json.dumps(row), *lines[2:]]) + "\n")
     with pytest.raises(ValueError, match="extraction"):
         score_benchmark(read_completions(forged), tasks, execute=fake_suite)
+
+
+def test_evalplus_tests_above_the_default_input_limit_are_scored_under_the_suite_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    padding = "\n#" + "x" * INPUT_LIMIT
+    tasks = [replace(task, hidden_tests=task.hidden_tests + padding) for task in benchmark_tasks()]
+    monkeypatch.setattr(protocols, "read_release", lambda path, specification: tasks)
+    path, release = write_benchmark_completions(
+        tmp_path,
+        tasks,
+        {task.id: "\n    return x  # good\n" for task in tasks},
+        suite="mbpp-plus",
+    )
+    seen: list[Limits] = []
+
+    def run(code: str, tests: str, limits: Limits, *, mode: str, runtime: Runtime) -> Result:
+        seen.append(limits)
+        return fake_suite(code, tests, mode)
+
+    monkeypatch.setattr(benchmark_score, "run", run)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    arguments = ["--suite", "mbpp-plus", "--completions", str(path), "--sha256", digest]
+    arguments += ["--request-id", "f" * 32, "--release-path", str(release)]
+    arguments += ["--image-id", "sha256:" + "a" * 64, "--output", str(tmp_path / "out")]
+    assert benchmark_score.main(arguments) == 0
+    saved = json.loads((tmp_path / "out" / results_filename("mbpp-plus", digest)).read_text())
+    assert saved["canonical"]["passed"] == 3 and saved["summary"]["passed_attempts"] == 3
+    assert seen and set(seen) == {EVALPLUS_LIMITS}
+    completions = read_completions(path)
+    with pytest.raises(ValueError, match="alone exceed"):
+        score_benchmark(completions, tasks, execute=fake_suite)
+    report = score_benchmark(
+        completions, tasks, execute=fake_suite, input_limit=EVALPLUS_LIMITS.input_bytes
+    )
+    assert report["status"] == "completed" and report["canonical"]["passed"] == 3
 
 
 def test_suite_execution_settings_and_names() -> None:

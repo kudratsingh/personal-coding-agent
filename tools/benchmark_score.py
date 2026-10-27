@@ -60,6 +60,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         execute=execute,
         workers=args.workers,
         constant_baseline=not args.no_constant_baseline,
+        input_limit=limits.input_bytes,
     )
     report["request_id"] = args.request_id
     report["execution"] = execution_record(runtime, limits)

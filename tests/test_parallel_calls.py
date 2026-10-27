@@ -70,6 +70,33 @@ def test_a_program_too_large_to_send_is_the_candidates_failure() -> None:
     assert fits.passed and calls == ["run"]
 
 
+def test_the_size_check_uses_the_input_limit_the_calls_run_under() -> None:
+    calls: list[str] = []
+
+    def runs(*_: str) -> Result:
+        calls.append("run")
+        return Result("passed")
+
+    limit = 2 * 1024 * 1024
+    tests = "assert True\n" + "#" * INPUT_LIMIT
+    fits = resolve_call(Call("k", "x = 1", tests, "function"), runs, input_limit=limit)
+    assert fits.passed and calls == ["run"]
+    huge = "x = 1\n" * (limit // 6 + 1)
+    refused = resolve_call(Call("k", huge, tests, "function"), runs, input_limit=limit)
+    assert refused.status == OVERSIZED and calls == ["run"]
+    with pytest.raises(ValueError, match="alone exceed"):
+        resolve_call(Call("k", "c", "t" * (limit + 1), "function"), runs, input_limit=limit)
+    seen: list[Outcome] = []
+    run_calls(
+        [Call(0, "x = 1", tests, "function")],
+        runs,
+        on_outcome=seen.append,
+        workers=1,
+        input_limit=limit,
+    )
+    assert [outcome.passed for outcome in seen] == [True] and calls == ["run", "run"]
+
+
 def test_a_task_side_value_error_is_not_scored_against_the_candidate() -> None:
     def broken_task(*_: str) -> Result:
         raise json.JSONDecodeError("tests are not JSON", "", 0)
