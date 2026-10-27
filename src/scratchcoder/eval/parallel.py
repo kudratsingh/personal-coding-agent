@@ -8,10 +8,12 @@ else is retried up to ``retries`` times with :func:`~scratchcoder.eval.harness.h
 a call still failing then is *unresolved*: reported as such, never as a pass or a fail.
 
 The only input the runner refuses on the candidate's account is a program too large to
-send with its tests, which is checked here explicitly and scored ``oversized``. Any other
-``ValueError`` from ``execute`` (tests that are not valid JSON, more than 100 I/O cases,
-a missing test file) is a defect of the task and propagates, so it is never mistaken for a
-candidate failure.
+send with its tests, which is checked here explicitly and scored ``oversized``. The check
+uses ``input_limit``, which must be the input limit of the :class:`Limits` the calls run
+under: by default the runner's (:data:`INPUT_LIMIT`); HumanEval+ and MBPP+ pass their
+2 MiB. Any other ``ValueError`` from ``execute`` (tests that are not valid JSON, more than
+100 I/O cases, a missing test file) is a defect of the task and propagates, so it is never
+mistaken for a candidate failure.
 """
 
 import time
@@ -67,9 +69,10 @@ def resolve_call(
     *,
     retries: int = HOST_RETRIES,
     sleep: Callable[[float], None] = time.sleep,
+    input_limit: int = INPUT_LIMIT,
 ) -> Outcome:
-    if _size(call.code + call.tests) > INPUT_LIMIT:
-        if _size(call.tests) > INPUT_LIMIT:
+    if _size(call.code + call.tests) > input_limit:
+        if _size(call.tests) > input_limit:
             raise ValueError(f"the tests of {call.key!r} alone exceed the sandbox input limit")
         return Outcome(call.key, True, OVERSIZED, False, "", 0.0, 0)
     failures, elapsed = 0, 0.0
@@ -96,13 +99,15 @@ def run_calls(
     retries: int = HOST_RETRIES,
     sleep: Callable[[float], None] = time.sleep,
     max_consecutive_unresolved: int | None = None,
+    input_limit: int = INPUT_LIMIT,
 ) -> int:
     """Execute ``calls`` on ``workers`` threads and hand each outcome to ``on_outcome`` on
     the calling thread, as it completes. Returns the number of outcomes delivered.
 
     At most ``2 * workers`` calls are in flight. If ``max_consecutive_unresolved`` outcomes
     in a row are unresolved, no further call starts; the calls already running finish and
-    are delivered, then :class:`HostUnavailableError` is raised.
+    are delivered, then :class:`HostUnavailableError` is raised. ``input_limit`` is the
+    input limit of the limits ``execute`` runs under (see the module docstring).
     """
     if type(workers) is not int or workers < 1:
         raise ValueError("workers must be a positive integer")
@@ -116,7 +121,16 @@ def run_calls(
                 call = next(pending, None)
                 if call is None:
                     return
-                running.add(pool.submit(resolve_call, call, execute, retries=retries, sleep=sleep))
+                running.add(
+                    pool.submit(
+                        resolve_call,
+                        call,
+                        execute,
+                        retries=retries,
+                        sleep=sleep,
+                        input_limit=input_limit,
+                    )
+                )
 
         refill()
         while running:

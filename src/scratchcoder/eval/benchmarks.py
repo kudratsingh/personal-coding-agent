@@ -32,7 +32,7 @@ from scratchcoder.eval.baseline import DEFINITION, benchmark_constant_programs
 from scratchcoder.eval.completions import Completions
 from scratchcoder.eval.executor import CONTEXT_LIMIT, NO_PROGRAM, program_sha256
 from scratchcoder.eval.harness import HOST_RETRIES
-from scratchcoder.eval.parallel import Call, Execute, Outcome, run_calls
+from scratchcoder.eval.parallel import INPUT_LIMIT, Call, Execute, Outcome, run_calls
 from scratchcoder.eval.protocols import BASE_BENCHMARK, BENCHMARK_SUITES, HUMANEVAL, protocol_for
 from scratchcoder.eval.tasks import Task
 from scratchcoder.sandbox.reward import audit_attempt
@@ -101,8 +101,12 @@ def score_benchmark(
     retries: int = HOST_RETRIES,
     sleep: Callable[[float], None] = time.sleep,
     constant_baseline: bool = True,
+    input_limit: int = INPUT_LIMIT,
 ) -> dict[str, Any]:
-    """Canonical preflight, then the completions, then the constant answers."""
+    """Canonical preflight, then the completions, then the constant answers.
+
+    ``input_limit`` is the input limit of the limits ``execute`` runs under (for HumanEval+
+    and MBPP+, ``EVALPLUS_LIMITS.input_bytes``); every call is sized against it."""
     header = completions.header
     if header.suite not in BENCHMARK_SUITES:
         raise ValueError("only HumanEval, HumanEval+ and MBPP+ completions are scored here")
@@ -142,6 +146,7 @@ def score_benchmark(
         workers=workers,
         retries=retries,
         sleep=sleep,
+        input_limit=input_limit,
     )
     failed = sorted(task_id for task_id, outcome in canonical.items() if not outcome.passed)
     report["canonical"] = {
@@ -197,7 +202,13 @@ def score_benchmark(
         attempts[key] = entry(key, status, outcome)
 
     run_calls(
-        calls, execute, on_outcome=keep_attempt, workers=workers, retries=retries, sleep=sleep
+        calls,
+        execute,
+        on_outcome=keep_attempt,
+        workers=workers,
+        retries=retries,
+        sleep=sleep,
+        input_limit=input_limit,
     )
     ordered = [attempts[row.key] for row in completions.rows]
     resolved = [item for item in ordered if item["resolved"]]
@@ -212,7 +223,13 @@ def score_benchmark(
     }
     if constant_baseline:
         report["constant_baseline"], extra = _constant_baseline(
-            tasks, header.suite, execute=execute, workers=workers, retries=retries, sleep=sleep
+            tasks,
+            header.suite,
+            execute=execute,
+            workers=workers,
+            retries=retries,
+            sleep=sleep,
+            input_limit=input_limit,
         )
         seconds += extra
     report.update(status="completed", sandbox_seconds=seconds)
@@ -228,6 +245,7 @@ def _constant_baseline(
     workers: int,
     retries: int,
     sleep: Callable[[float], None],
+    input_limit: int,
 ) -> tuple[dict[str, Any], float]:
     """Per task, whether any constant answer passes the suite's tests (pass/fail scoring)."""
     programs = {task.id: benchmark_constant_programs(task, suite) for task in tasks}
@@ -253,6 +271,7 @@ def _constant_baseline(
         workers=workers,
         retries=retries,
         sleep=sleep,
+        input_limit=input_limit,
     )
     rows: list[dict[str, Any]] = []
     for task_id, entries in sorted(programs.items()):
