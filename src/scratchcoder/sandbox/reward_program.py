@@ -21,7 +21,7 @@ solution would. The supervisor's jobs are framing and containment:
 - **Hardening.** PID 1 ignores the catchable signals a same-user candidate could send
   (a pid-namespace init never receives signals it has no handler for) and marks itself
   non-dumpable, so a candidate cannot open ``/proc/1/fd``, ``/proc/1/mem`` or
-  ``/proc/1/oom_score_adj``.
+  ``/proc/1/environ``, and cannot write ``/proc/1/oom_score_adj``.
 - **Bounds.** Every buffer is bounded, and every wait ends at the per-attempt wall budget
   (and, in function mode, the per-call limit) or within ``OVERRUN_SECONDS`` after it, far
   inside the host's stall slack; report values travel base64-encoded so the report size is
@@ -36,7 +36,10 @@ ends with the same ``print(marker)`` (a random marker of the same length), and t
 reads the candidate's output to the end of file, counts the marker toward the output cap and
 reports whether the output ended with it and whether the stream was still open when the
 budget ended; the host fails every check on any of those. The results themselves travel on a
-separate pipe, so a candidate cannot forge them through its own output.
+separate pipe, so a candidate cannot forge them through its own output. The marker lives in
+the driver's process, which the candidate shares, so a candidate that inspects its frames can
+read it and print it again; the end-of-output check holds only against a candidate that does
+not.
 
 I/O cases run from a fork server: a clean interpreter is started once per attempt, and each
 case runs in a fresh fork of it, so a case costs a fork instead of an interpreter start and

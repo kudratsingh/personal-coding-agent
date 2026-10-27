@@ -133,7 +133,8 @@ container start included, against the 15 s slack. Under heavy host load the dock
 still stall, which is retried. The supervisor also removes the ways a same-user candidate could
 reach it: PID 1 handles the catchable signals with a no-op (a pid-namespace init never receives
 the signals it has no handler for), and it marks itself non-dumpable, so the candidate cannot
-open `/proc/1/fd`, `/proc/1/mem`, `/proc/1/environ` or `/proc/1/oom_score_adj`. After the run,
+open `/proc/1/fd`, `/proc/1/mem` or `/proc/1/environ`, and cannot write
+`/proc/1/oom_score_adj` (reading it shows only the default 0). After the run,
 and after every I/O case, it kills every other process in the container, so no straggler holds
 the pid limit or a pipe into the next case.
 
@@ -204,8 +205,12 @@ are out of scope here.
   the echo baseline covers); only 34 checks (0.04%, in 2 tasks) write it where only the call
   source shows it (`assert f(1) - 2.5 == 0`). The expected value appears somewhere among the
   task's calls in 18.0% of those checks, which shows a reader values the task uses but not
-  which one a given check expects. The static audit flags the common introspection routes, but
-  it is a best-effort signal, not a complete check.
+  which one a given check expects. The same inspection reads the driver's completion marker,
+  so a candidate can print it again after stray output and pass the end-of-output check that
+  evaluation would fail it on: that check catches an ordinary noisy shutdown (an `atexit` print),
+  not a candidate that inspects its own process. It gains nothing on values, which travel on a
+  separate pipe. The static audit flags the common introspection routes, but it is a
+  best-effort signal, not a complete check.
 - **Predicate-only checks.** `assert not CALL` and `assert CALL is None/True/False` have a
   passing outcome known in advance (falsy, or one singleton), so a candidate can satisfy them
   without solving anything; what protects them is only that the candidate never sees which

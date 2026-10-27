@@ -85,7 +85,9 @@ host: classify the invocation from the frames → validate and decode each row i
   does not end with the marker plus whitespace (an `atexit` print, a destructor's complaint
   on stderr, `sys.stdout.close()`, a replaced `sys.stdout`). A process the budget ends before
   every call reported keeps the calls that did, which the evaluation program does not do (it
-  fails a timeout whole). The source is compiled as UTF-8 bytes, as the file is read, so a
+  fails a timeout whole). The marker shares the candidate's process, so a candidate that
+  inspects its frames can read it and print it again after stray output; the ADR lists this
+  with the call sources as a residual. The source is compiled as UTF-8 bytes, as the file is read, so a
   byte-order mark is dropped and an encoding line is honoured or rejected as it is there.
 - **I/O mode.** `parse_io_cases` returns the inputs and the expected outputs. Only the inputs
   enter the container. The supervisor starts one clean interpreter per attempt as a fork
