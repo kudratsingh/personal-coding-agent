@@ -911,9 +911,30 @@ def test_the_supervisors_own_overrun_stays_far_inside_the_host_slack() -> None:
     [
         ("assert f(1) is None\nassert f(2) is None\nassert f(3) == 4", "", 2 / 3, "constant None"),
         ("assert not f(1)\nassert f(2) == 0\nassert f(3) == []", "", 2 / 3, "constant False"),
-        ("assert f(1) == 7\nassert f(2) == 8", "assert f(0) == 7", 0.5, "public example 7"),
+        ("assert f(1) == 17\nassert f(2) == 18", "assert f(0) == 17", 0.5, "public example 17"),
         ("assert f([1]) == [1]\nassert f([2, 1]) == [1, 2]", "", 0.5, "echo"),
-        ("assert f(1) == 2.0\nassert f(2) == 2", "assert f(5) == 2", 1.0, "public example 2"),
+        ("assert f(1) == 12.0\nassert f(2) == 12", "assert f(5) == 12", 1.0, "public example 12"),
+        # Constants a policy can print without reading the task, up to the small integers.
+        ("assert f(1) == set()\nassert f(2) == set()", "", 1.0, "constant set()"),
+        ("assert f(1) == b''\nassert f(2) == b''", "", 1.0, "constant b''"),
+        ("assert f(1) == [0]\nassert f(2) == [0]", "", 1.0, "constant [0]"),
+        ("assert f(1) == 10\nassert f(2) == 10\nassert f(3) == 11", "", 2 / 3, "constant 10"),
+        ("assert f(1) == 11\nassert f(2) == 11", "", 0.0, "none"),
+        # Echoes of the arguments: the second, the last, all of them as a tuple or a list.
+        ("assert f(5, 1) == 1\nassert f(6, 2) == 2", "", 1.0, "echo argument 2"),
+        (
+            "assert f(1, 2, 3) == 3\nassert f(4, 5, 6) == 6\nassert f(7) == 7",
+            "",
+            1.0,
+            "echo last argument",
+        ),
+        ("assert f(1, 2) == (1, 2)\nassert f(3) == (3,)", "", 1.0, "echo all arguments as a tuple"),
+        ("assert f(1, 2) == [1, 2]\nassert f(3) == [3]", "", 1.0, "echo all arguments as a list"),
+        # A ``*args`` that hides where an argument is leaves that echo unknown.
+        ("assert f(*xs, 55) == 55\nassert f(*xs, 66) == 66", "", 0.0, "none"),
+        ("assert f(55, *xs) == 55\nassert f(66, *xs) == 66", "", 1.0, "echo"),
+        # The answer is assumed to define the names the tests use (``products`` here).
+        ("assert f(products) == 5\nassert f(products, 1) == 5", "", 1.0, "constant 5"),
         # Only direct calls of a candidate function take the answer: ``len(f(3))`` needs the
         # candidate's value, and ``floor`` is the tests' own import.
         ("assert len(f(3)) == 0\nassert f(1) == -1", "", 0.5, "constant -1"),
@@ -948,6 +969,16 @@ def test_degenerate_baseline_for_io_tasks() -> None:
     echo += [{"input": "q\n", "output": "q"}]
     echoed = degenerate_baseline(io_task(echo))
     assert echoed is not None and echoed.answer == "echo" and echoed.passed == 2
+    # A line or a token of the input: the first or the last.
+    for label, inputs, outputs in [
+        ("echo first line", ["a b\nc d\n", "e f\ng h\n", "z\n"], ["a b", "e f", "z"]),
+        ("echo last line", ["a b\nc d\n", "e f\ng h\n", "z\n"], ["c d", "g h", "z"]),
+        ("echo first token", ["7 8 9\n", "6 5\n", "4\n"], ["7", "6", "4"]),
+        ("echo last token", ["7 8 9\n", "6 5\n", "4\n"], ["9", "5", "4"]),
+    ]:
+        shape = [{"input": text, "output": out} for text, out in zip(inputs, outputs, strict=True)]
+        picked = degenerate_baseline(io_task(shape))
+        assert picked is not None and picked.answer == label and picked.reward == 1.0, label
     hidden = io_task([{"input": "1\n", "output": "424242"}])
     unshown = dataclasses.replace(hidden, public_tests=json.dumps([{"input": "", "output": "7"}]))
     solved = degenerate_baseline(unshown)
@@ -1953,6 +1984,60 @@ def test_live_source_text_is_read_as_the_evaluation_program_reads_it() -> None:
         for code, rewarded, evaluated, expected in pool.map(verdicts, LIVE_SOURCE_FORMS):
             assert evaluated is expected, code
             assert rewarded == (1.0 if expected else 0.0), code
+
+
+# (hidden tests, a program that realises the baseline's best answer): the reward the channel
+# gives the program is the baseline the host computed without running anything.
+LIVE_BASELINE_FUNCTION: list[tuple[str, str]] = [
+    ("assert f(1) is None\nassert f(2) is None\nassert f(3) == 4", "def f(*a):\n    return None"),
+    ("assert f(1) == 10\nassert f(2) == 10\nassert f(3) == 11", "def f(*a):\n    return 10"),
+    ("assert f(1) == set()\nassert f(2) == {1}", "def f(*a):\n    return set()"),
+    ("assert f(1) == b''\nassert f(2) == b'x'", "def f(*a):\n    return b''"),
+    ("assert f(5, 1) == 1\nassert f(6, 2) == 2\nassert f(7) == 3", "def f(*a):\n    return a[1]"),
+    ("assert f(1, 2, 3) == 3\nassert f(4, 5, 6) == 6\nassert f(7) == 7", "f = lambda *a: a[-1]"),
+    ("assert f(1, 2) == (1, 2)\nassert f(3) == (3,)\nassert f(4) == 4", "f = lambda *a: a"),
+    ("assert f(1, 2) == [1, 2]\nassert f(3) == [3]\nassert f(4) == 4", "f = lambda *a: list(a)"),
+    # The answer must define the names the tests use for the baseline to be reached.
+    (
+        "assert f(products) == 5\nassert f(products, 1) == 5",
+        "products = []\ndef f(*a):\n    return 5",
+    ),
+]
+LIVE_BASELINE_IO: list[tuple[list[dict[str, str]], str]] = [
+    (
+        [{"input": "3\n", "output": "YES"}, {"input": "1\n", "output": "YES"}],
+        "print('YES')",
+    ),
+    (
+        [{"input": "a b\nc d\n", "output": "a b"}, {"input": "e f\ng h\n", "output": "e f"}],
+        "print(input())",
+    ),
+    (
+        [{"input": "7 8 9\n", "output": "9"}, {"input": "6 5\n", "output": "5"}],
+        "import sys\nprint(sys.stdin.read().split()[-1])",
+    ),
+]
+
+
+@integration
+def test_live_a_program_realising_the_baseline_earns_the_baseline_reward() -> None:
+    tasks = [(function_task(hidden), code) for hidden, code in LIVE_BASELINE_FUNCTION]
+    tasks += [(io_task(cases), code) for cases, code in LIVE_BASELINE_IO]
+
+    def rewards(item: tuple[Task, str]) -> tuple[Task, float, float | None]:
+        task, code = item
+        baseline = degenerate_baseline(task)
+        assert baseline is not None
+        return task, baseline.reward, live(task, code).reward
+
+    with ThreadPoolExecutor(4) as pool:
+        for task, predicted, earned in pool.map(rewards, tasks):
+            assert predicted > 0.0, task.hidden_tests
+            assert earned == pytest.approx(predicted), task.hidden_tests
+    # Without the names the tests use, the same answer earns less than the baseline says.
+    hidden = "assert f(products) == 5\nassert f(products, 1) == 5"
+    undefined = live(function_task(hidden), "def f(*a):\n    return 5")
+    assert undefined.reward == 0.0
 
 
 @integration

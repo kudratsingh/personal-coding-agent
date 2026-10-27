@@ -161,12 +161,16 @@ are out of scope here.
   guesses the correct output by other means. Many hidden tests share a few expected values
   (booleans, small integers, empty lists), so an answer that needs no solution earns real
   reward on many tasks. `degenerate_baseline(task)` computes, on the host and without running
-  code, the best reward of a fixed return value or output, a value copied from the public
-  tests, or echoing the first argument or the input (a lower bound for function tasks: only
-  direct calls of a candidate function take the answer). On the task pool's train split such
-  an answer earns at least 0.5 on 15.4% of AceCode, 35.0% of MBPP, 17.4% of OpenCodeInstruct and
-  24.9% of TACO tasks, and 1.0 on 5.4%, 6.0%, 7.8% and 3.0% (mean best reward 0.205, 0.209,
-  0.283 and 0.272). Because the advantage is a reward minus its group's mean, such tasks pay a
+  code, the best reward of a fixed return value or output (the singletons, the integers from
+  -1 to 10, the empty values and `[0]`; a few common words), a value copied from the public
+  tests, or echoing an argument, all the arguments, or the input (or its first or last line
+  or token). It is a lower bound for function tasks: only direct calls of a candidate
+  function take the answer, and the answer's program is assumed to define any names the tests
+  use (a reference's module data, or `os` without an import in the tests), so a program that
+  does not earns less on those checks. On the task pool's train split such an answer earns at
+  least 0.5 on 16.8% of the parseable AceCode tasks (731 of 4,357), 51.1% of MBPP (136 of
+  266), 17.9% of OpenCodeInstruct (349 of 1,946) and 27.0% of TACO (409 of 1,514), and 1.0 on
+  5.9%, 7.1%, 7.8% and 3.2% of them (mean best reward 0.217, 0.296, 0.292 and 0.297). Because the advantage is a reward minus its group's mean, such tasks pay a
   policy for answering without solving; RL screening should record the baseline per task and
   drop tasks above a threshold, a choice for the RL screening step. Weak tests remain a
   task-quality concern.

@@ -472,9 +472,13 @@ FUNCTION_DEGENERATE_ANSWERS: tuple[object, ...] = (
     [],
     {},
     (),
+    *range(2, 11),
+    b"",
+    set(),
+    [0],
 )
-"""Return values a policy can give without reading a task: the singletons, small integers and
-empty values that many hidden assertions expect."""
+"""Return values a policy can give without reading a task: the singletons, the integers from
+-1 to 10, and the empty values (and ``[0]``) that many hidden assertions expect."""
 IO_DEGENERATE_ANSWERS: tuple[str, ...] = (
     "",
     "0",
@@ -498,7 +502,8 @@ class DegenerateBaseline:
     """The best reward that one answer needing no solution earns on a task. ``answer`` names
     it: ``constant <value>`` (one fixed return value or printed output), ``public example
     <value>`` (a value copied from the task's public tests, which the policy sees), or
-    ``echo`` (return the first argument, or print the input)."""
+    ``echo ...`` (return an argument or all of them, or print all of the input or one of its
+    lines or tokens). A tie goes to the first answer tried, in that order."""
 
     reward: float
     passed: int
@@ -534,10 +539,55 @@ def _always(value: object) -> Callable[[ast.Call], tuple[bool, object]]:
     return answer
 
 
-def _first_argument(call: ast.Call) -> tuple[bool, object]:
-    if not call.args or isinstance(call.args[0], ast.Starred):
-        return False, None
-    return _safe_literal(call.args[0])
+def _argument(index: int) -> Callable[[ast.Call], tuple[bool, object]]:
+    """The answer that returns the call's positional argument ``index`` (negative counts from
+    the end); unknown when the call has no such argument or a ``*args`` hides where it is."""
+
+    def answer(call: ast.Call) -> tuple[bool, object]:
+        arguments = call.args
+        if not -len(arguments) <= index < len(arguments):
+            return False, None
+        position = index % len(arguments)
+        if any(isinstance(item, ast.Starred) for item in arguments[: position + 1]):
+            return False, None
+        return _safe_literal(arguments[position])
+
+    return answer
+
+
+def _all_arguments(
+    container: Callable[[list[object]], object],
+) -> Callable[[ast.Call], tuple[bool, object]]:
+    """The answer that returns every positional argument as one ``tuple`` or ``list``."""
+
+    def answer(call: ast.Call) -> tuple[bool, object]:
+        if not call.args or any(isinstance(item, ast.Starred) for item in call.args):
+            return False, None
+        values: list[object] = []
+        for item in call.args:
+            known, value = _safe_literal(item)
+            if not known:
+                return False, None
+            values.append(value)
+        return True, container(values)
+
+    return answer
+
+
+_ARGUMENT_ECHOES: tuple[tuple[str, Callable[[ast.Call], tuple[bool, object]]], ...] = (
+    ("echo", _argument(0)),
+    ("echo argument 2", _argument(1)),
+    ("echo last argument", _argument(-1)),
+    ("echo all arguments as a tuple", _all_arguments(tuple)),
+    ("echo all arguments as a list", _all_arguments(list)),
+)
+_INPUT_ECHOES: tuple[tuple[str, Callable[[str], str]], ...] = (
+    ("echo", lambda text: text),
+    ("echo first line", lambda text: (text.strip().splitlines() or [""])[0]),
+    ("echo last line", lambda text: (text.strip().splitlines() or [""])[-1]),
+    ("echo first token", lambda text: (text.split() or [""])[0]),
+    ("echo last token", lambda text: (text.split() or [""])[-1]),
+)
 
 
 def _public_values(task: Task) -> list[object]:
@@ -575,7 +625,7 @@ def _function_baseline(task: Task, parsed: FunctionChecks) -> DegenerateBaseline
     calls = [_direct_call(check.call, foreign) for check in parsed.checks]
     answers = [(f"constant {value!r}", _always(value)) for value in FUNCTION_DEGENERATE_ANSWERS]
     answers += [(f"public example {value!r:.60}", _always(value)) for value in _public_values(task)]
-    answers.append(("echo", _first_argument))
+    answers += list(_ARGUMENT_ECHOES)
     best = DegenerateBaseline(0.0, 0, parsed.total, "none")
     for label, answer_for in answers:
         passed = 0
@@ -603,28 +653,34 @@ def _io_baseline(task: Task, parsed: IoCases) -> DegenerateBaseline:
         passed = sum(text.strip() == expected.strip() for expected in parsed.expected)
         if passed > best.passed:
             best = DegenerateBaseline(passed / parsed.total, passed, parsed.total, label)
-    echoed = sum(
-        given.strip() == expected.strip()
-        for given, expected in zip(parsed.inputs, parsed.expected, strict=True)
-    )
-    if echoed > best.passed:
-        best = DegenerateBaseline(echoed / parsed.total, echoed, parsed.total, "echo")
+    for label, echo in _INPUT_ECHOES:
+        echoed = sum(
+            echo(given).strip() == expected.strip()
+            for given, expected in zip(parsed.inputs, parsed.expected, strict=True)
+        )
+        if echoed > best.passed:
+            best = DegenerateBaseline(echoed / parsed.total, echoed, parsed.total, label)
     return best
 
 
 def degenerate_baseline(task: Task, *, limits: Limits | None = None) -> DegenerateBaseline | None:
     """The best reward the reward channel would give an answer that needs no solution: a
     fixed return value or output (``FUNCTION_DEGENERATE_ANSWERS``,
-    ``IO_DEGENERATE_ANSWERS``), a value copied from the task's public tests, or echoing the
-    first argument or the input. ``None`` when the task is not parseable.
+    ``IO_DEGENERATE_ANSWERS``), a value copied from the task's public tests, or echoing an
+    argument, all the arguments, or the input (or a line or token of it). ``None`` when the
+    task is not parseable.
 
     It is computed on the host from the parsed hidden tests with the channel's own
     comparison, and runs no code. For a function task an answer is applied only to checks
     whose call is a direct call of a function the candidate defines (``f(1, 2)``, not
     ``len(f(1))`` or ``Stack().pop()``); other checks count as failed, so the value is a
-    lower bound. RL screening can record it per task and drop tasks it rewards too well:
-    because the advantage is a reward minus its group's mean, such a task pays a policy for
-    answering without solving."""
+    lower bound, and a policy that reads the task can do better than any answer here. A
+    check whose call uses a name the tests' reference defines (module data such as
+    ``f(products)``, or ``os`` without an import in the tests) is counted as the answer
+    would pass it: the answer's program is assumed to define the names the tests use, and one
+    that does not earns less. RL screening can record it per task and drop tasks it rewards
+    too well: because the advantage is a reward minus its group's mean, such a task pays a
+    policy for answering without solving."""
     parsed = parse_task(task, limits=limits)
     if parsed is None:
         return None

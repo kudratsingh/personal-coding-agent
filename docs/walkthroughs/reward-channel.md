@@ -151,10 +151,14 @@ host: classify the invocation from the frames → validate and decode each row i
 - **Degenerate-answer baseline.** `degenerate_baseline(task)` returns the best reward that
   one answer needing no solution would earn: a fixed return value or printed line
   (`FUNCTION_DEGENERATE_ANSWERS`, `IO_DEGENERATE_ANSWERS`), a value copied from the public
-  tests, or echoing the first argument or the input. It runs no code: it applies the
-  channel's own comparison to the parsed hidden tests. For a function task only checks whose
-  call is a direct call of a candidate function (`f(1)`, not `len(f(1))`) take the answer, so
-  the value is a lower bound.
+  tests, or echoing an argument (the first, the second, the last), all the arguments (as a
+  tuple or a list), or the input (all of it, or its first or last line or token). It runs no
+  code: it applies the channel's own comparison to the parsed hidden tests. For a function
+  task only checks whose call is a direct call of a candidate function (`f(1)`, not
+  `len(f(1))`) take the answer, so the value is a lower bound. The answer is assumed to
+  define the names the tests use (module data such as `f(products)`): a program that does not
+  gets a `NameError` there and earns less. The list of answers is still finite, so a policy
+  that reads the task can do better than the baseline says.
 
 ## Design choices and common mistakes
 
