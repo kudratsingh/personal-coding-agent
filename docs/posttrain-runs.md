@@ -179,9 +179,9 @@ At the planned $5.80 and $0.60 an hour (`ceiling_limits`): the worker stops at $
 | RL rollouts (6.55M tokens at batch 256) | 0.18 | $0.11 |
 | RL training steps (26.2M slots) | 0.13 | $0.08 |
 | RL waiting on Mac rewards (100 x 48 s) | 1.33 | $0.80 |
-| RL dev checks: generation / Mac wait (6) | 0.31 / 0.50 | $0.18 / $0.30 |
+| RL dev checks: generation / Mac wait (6) | 0.31 / 0.50 | $0.48 |
 | More-SFT training (equal to RL's busy time) | 0.31 | $0.19 |
-| More-SFT dev checks: generation / Mac wait (5) | 0.26 / 0.42 | $0.15 / $0.25 |
+| More-SFT dev checks: generation / Mac wait (5) | 0.26 / 0.42 | $0.40 |
 | Evaluation generation, RL and more-SFT (37.6M tokens at cap) | 2.17 | $1.30 |
 | ARC-Easy on both selected checkpoints | 0.04 | $0.02 |
 | Checkpoint loads and weights saves | 0.03 | $0.02 |
