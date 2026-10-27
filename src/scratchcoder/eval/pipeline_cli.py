@@ -82,9 +82,14 @@ def add_parsers(subparsers: Any) -> None:
     score.add_argument(
         "--checkpoint",
         action="append",
-        required=True,
+        default=[],
         metavar="NAME=SHA256",
         help="name a checkpoint, e.g. sft=<sha256>; repeat for each",
+    )
+    score.add_argument(
+        "--inputs",
+        type=Path,
+        help="a scorecard-inputs file: the names, the reuses and every input, recorded once",
     )
     score.add_argument("--results", type=Path, action="append", default=[])
     score.add_argument("--benchmark", type=Path, action="append", default=[])
@@ -185,30 +190,48 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         for path in (args.output, args.markdown):
             if path is not None and path.exists():
                 parser.error(f"{path} already exists")
+        from scratchcoder.eval.scorecard import load_inputs
+
         checkpoints: dict[str, str] = {}
+        reuses: dict[str, str] = {}
+        reasons: dict[str, str] = {}
+        results, benchmarks, arcs = list(args.results), list(args.benchmark), list(args.arc)
+        if args.inputs is not None:
+            recorded = load_inputs(args.inputs)
+            checkpoints.update(recorded.checkpoints)
+            reuses.update(recorded.reuses)
+            reasons.update(recorded.reasons)
+            results += recorded.results
+            benchmarks += recorded.benchmarks
+            arcs += recorded.arc_reports
         for item in args.checkpoint:
             name, _, digest = item.partition("=")
             if not name or not digest or name in checkpoints:
                 parser.error("--checkpoint takes NAME=SHA256, each name once")
             checkpoints[name] = digest
+        if not checkpoints:
+            parser.error("name the checkpoints with --checkpoint or --inputs")
         pairs = None
         if args.pair:
             pairs = []
             for item in args.pair:
                 first, _, second = item.partition(":")
-                if first not in checkpoints or second not in checkpoints:
+                named = {*checkpoints, *reuses}
+                if first not in named or second not in named:
                     parser.error("--pair takes FIRST:SECOND of named checkpoints")
                 pairs.append((first, second))
         card = build_scorecard(
             checkpoints=checkpoints,
-            results=args.results,
-            benchmarks=args.benchmark,
-            arc_reports=args.arc,
+            results=results,
+            benchmarks=benchmarks,
+            arc_reports=arcs,
             arc_tasks=args.arc_tasks,
             pool_baselines=args.pool_baseline,
             pairs=pairs,
             bootstrap_samples=args.bootstrap_samples,
             bootstrap_seed=args.bootstrap_seed,
+            reuses=reuses,
+            reuse_reasons=reasons,
         )
         atomic_json(args.output, card)
         if args.markdown is not None:

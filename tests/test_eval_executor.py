@@ -384,6 +384,75 @@ def test_malformed_unseal_records_are_refused(tmp_path: Path, change: Any) -> No
         UnsealRecord.load(unseal_record(tmp_path / "unseal.json", endpoints))
 
 
+def test_an_arm_with_the_sft_weights_reuses_its_reads_and_one_checkpoint_executes_once(
+    tmp_path: Path,
+) -> None:
+    """Run 2: an arm whose selected weights equal the SFT weights bit for bit was not
+    evaluated again. The unseal record maps it to ``sft``: the SFT file executes once, its
+    read names the arm, and the arm has no completions of its own to read. An arm the run never
+    evaluated is recorded as such."""
+    ledger = tmp_path / "ledger.jsonl"
+    endpoints, files, tasks_path = four_endpoints(tmp_path, ledger)
+    endpoints["rl"] = {"reuses": "sft", "selected_checkpoint_sha256": "e" * 64}
+    record = UnsealRecord.load(unseal_record(tmp_path / "unseal.json", endpoints))
+    assert [endpoint.name for endpoint in record.endpoints] == ["base", "sft", "more-sft"]
+    assert record.reused_by("sft") == ["rl"] and record.reused_by("base") == []
+    summary = execute_completions(
+        files["sft"],
+        tasks_path,
+        tmp_path / "sft-results.jsonl",
+        tokenizer=TOKENIZER,
+        execute=FakeSandbox(),
+        seal_ledger=ledger,
+        unseal=tmp_path / "unseal.json",
+    )
+    assert summary["scored"] == 2
+    (opened,) = [event for event in SealLedger(ledger).events() if event["event"] == "opened"]
+    assert opened["endpoint"] == "sft" and opened["reused_by"] == ["rl"]
+    with pytest.raises(SealError, match="does not list"):  # rl's own file is never read.
+        execute_completions(
+            files["rl"],
+            tasks_path,
+            tmp_path / "rl-results.jsonl",
+            tokenizer=TOKENIZER,
+            execute=FakeSandbox(),
+            seal_ledger=ledger,
+            unseal=tmp_path / "unseal.json",
+        )
+    absent = {**endpoints, "more-sft": {"not_evaluated": "the Mac was lost during the control"}}
+    loaded = UnsealRecord.load(unseal_record(tmp_path / "absent.json", absent))
+    assert loaded.not_evaluated == (("more-sft", "the Mac was lost during the control"),)
+    assert [endpoint.name for endpoint in loaded.endpoints] == ["base", "sft"]
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        (lambda e: e.update(base={"reuses": "sft", "selected_checkpoint_sha256": "e" * 64}), ""),
+        (lambda e: e.update(rl={"reuses": "rl", "selected_checkpoint_sha256": "e" * 64}), ""),
+        (lambda e: e.update(rl={"reuses": "sft"}), "selected checkpoint"),
+        (lambda e: e.update(rl={"reuses": "sft", "selected_checkpoint_sha256": "x"}), ""),
+        (
+            lambda e: e.update(
+                rl={"reuses": "more-sft", "selected_checkpoint_sha256": "e" * 64},
+                **{"more-sft": {"not_evaluated": "lost"}},
+            ),
+            "not read itself",
+        ),
+        (lambda e: e.update(rl={"not_evaluated": ""}), "reason"),
+        (lambda e: e.update(sft={"not_evaluated": "no"}), ""),
+    ],
+)
+def test_a_reuse_names_an_executing_endpoint_and_only_an_arm_reuses(
+    tmp_path: Path, change: Any, message: str
+) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    endpoints, _, _ = four_endpoints(tmp_path, ledger)
+    change(endpoints)
+    with pytest.raises(SealError, match=message or None):
+        UnsealRecord.load(unseal_record(tmp_path / "unseal.json", endpoints))
+
+
 def test_the_unseal_record_must_list_the_file_under_its_checkpoint(tmp_path: Path) -> None:
     ledger = tmp_path / "ledger.jsonl"
     endpoints, files, tasks_path = four_endpoints(tmp_path, ledger)

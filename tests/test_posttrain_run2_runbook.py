@@ -17,13 +17,12 @@ import subprocess
 from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
 
 import pytest
 import test_posttrain_runbook as base
 from test_rehearsal_runbook import comment_lines
 
-from tools import posttrain_approved, posttrain_ops
+from tools import posttrain_approved, posttrain_endpoints, posttrain_ops
 from tools.posttrain_run import (
     BRIDGE_LOST_STOP,
     SFT_RESULTS,
@@ -55,6 +54,7 @@ VALUES = {
     "BRIDGE_STATE": "runs/posttrain-shared-2/bridge-state",
     "LEDGER": "runs/posttrain-shared/seal/ledger.jsonl",
     "ART": "runs/posttrain-shared-2/artifacts",
+    "RUN2_REPORT": "runs/posttrain-controller/2/podpost02/supervisor/final/report.json",
     "CEILING": "5.80",
     "COST_LIMIT": str(LIMITS.worker_cost_stop_usd),
     "WALL": str(LIMITS.wall_seconds),
@@ -231,8 +231,18 @@ def test_the_bridge_runs_in_the_window_with_the_derived_mac_bounds(
         "same `--state`",
         "`--no-dotenv`",
         "never source `.env`",
+        # The owner's run 2 gate rulings: the window checks repeat while the bridge runs, and
+        # the Pod's R2 token stays in .env under the child-environment rule.
+        "**exit 4**",
+        "$BRIDGE_STATE/window-checks/",
+        "stays in `.env` during the bridge window under the child-environment rule",
+        "only through `mac_window_check exec`",
     ):
         assert phrase in text, phrase
+    from scratchcoder.rl.bridge_mac import WINDOW_CHECK_INTERVAL_SECONDS
+
+    assert values["--window-check-interval"] == "900"
+    assert namespace.window_check_interval == WINDOW_CHECK_INTERVAL_SECONDS == 900.0
 
 
 def test_the_bridge_and_the_supervisor_start_before_the_watchdogs_idle_clock_runs_out() -> None:
@@ -322,38 +332,44 @@ def test_the_pod_and_mac_commands_name_run_twos_paths_and_limits(
     ):
         assert field in fields, field
     lines = base.logical_lines()
-    loops = {}
+    loops: dict[str, str] = {}
     for index, line in enumerate(lines):
         match = re.match(r"for name in (.*?); do$", line)
         if match:
-            loops[lines[index + 1]] = match.group(1).split()
+            loops[lines[index + 1]] = match.group(1)
+    # Run 2's files come from the endpoints plan: only an arm evaluated on the Pod has any.
+    listing = 'tools.posttrain_endpoints list --plan "$SHARED/endpoints.json" --list'
     sealed = [names for body, names in loops.items() if "eval-seal" in body]
-    assert sealed == [
-        [f"eval-{arm}-pool-test-{d}" for arm in ("rl", "more-sft") for d in ("greedy", "n8")]
-    ]
+    assert sealed == [f"$(uv run --locked python -m {listing} run2-pool-test)"]
     dev = [names for body, names in loops.items() if "eval-execute" in body and "dev.jsonl" in body]
-    assert dev == [
-        [f"eval-{arm}-pool-dev-{d}" for arm in ("rl", "more-sft") for d in ("greedy", "n8")]
-    ]
+    assert dev == [f"$(uv run --locked python -m {listing} run2-pool-dev)"]
+    benchmarks = [names for body, names in loops.items() if body.startswith("SUITE=")]
+    assert benchmarks == [f"$(uv run --locked python -m {listing} run2-benchmarks)"]
     test = [
         names for body, names in loops.items() if "eval-execute" in body and "test.jsonl" in body
     ]
-    assert sorted(name for names in test for name in names) == sorted(
-        f"eval-{arm}-pool-test-{d}"
-        for arm in ("base", "sft", "rl", "more-sft")
-        for d in ("greedy", "n8")
+    assert sorted(test) == sorted(
+        [
+            " ".join(
+                f"eval-{arm}-pool-test-{d}" for arm in ("base", "sft") for d in ("greedy", "n8")
+            ),
+            f"$(uv run --locked python -m {listing} run2-pool-test)",
+        ]
     )
     for body in loops:
         if "test.jsonl" in body:
             assert "--seal-ledger" in body and '--unseal "$SHARED/unseal.json"' in body
+    for kind in ("run2-pool-dev", "run2-pool-test", "run2-benchmarks"):
+        assert kind in posttrain_endpoints.LISTS
+    (plan,) = base.by("tools.posttrain_endpoints", "plan")
+    assert options(plan)["--specification"] == VALUES["SPEC"]
+    assert options(plan)["--run1-artifacts"] == "runs/posttrain-shared/artifacts"
+    (unseal,) = base.by("tools.posttrain_endpoints", "unseal")
+    assert options(unseal)["--output"] == "runs/posttrain-shared-2/unseal.json"
+    (inputs,) = base.by("tools.posttrain_endpoints", "scorecard-inputs")
     (card,) = base.by("scratchcoder.cli", "scorecard")
-    names = [token for token in card if token.startswith(("base=", "sft=", "rl=", "more-sft="))]
-    assert [name.split("=")[0] for name in names] == ["base", "sft", "rl", "more-sft"]
-    assert (
-        card.count("--results") == 16
-        and card.count("--benchmark") == 12
-        and card.count("--arc") == 4
-    )
+    assert options(card)["--inputs"] == options(inputs)["--output"]
+    assert "--checkpoint" not in card and "--results" not in card
 
 
 def test_the_bootstrap_call_uses_only_flags_the_script_knows() -> None:
@@ -369,114 +385,31 @@ def test_the_bootstrap_call_uses_only_flags_the_script_knows() -> None:
     )
 
 
-def unseal_script() -> str:
-    (block,) = [block for block in base.blocks() if "unseal.json" in block and "<<'PY'" in block]
-    return block[block.index("<<'PY'\n") + len("<<'PY'\n") : block.index("\nPY\n")]
-
-
-def report(run: str, pod: str, **extra: Any) -> dict[str, Any]:
-    stages = {"1": ("eval-base", "eval-sft"), "2": ("eval-rl", "eval-more-sft")}[run]
-    artifacts = [
-        {
-            "label": f"{stage}-pool-test-{decoding}",
-            "name": "completions.jsonl",
-            "key": f"posttrain-runs/{run}/{pod}/{stage}-pool-test-{decoding}/completions.jsonl",
-            "sha256": f"{stage}-{decoding}",
-            "bytes": 10,
-        }
-        for stage in stages
-        for decoding in ("greedy", "n8")
-    ]
-    return {"run": run, "pod_id": pod, "artifacts": artifacts, **extra}
-
-
-def test_the_unseal_record_names_all_four_endpoints_from_the_verified_reports(
-    tmp_path: Path,
-) -> None:
-    run1 = report(
-        "1", "p1", inputs={"b-mixed-final": "base-sha"}, sft={"selected": {"sha256": "sft-sha"}}
-    )
-    run2 = report(
-        "2",
-        "p2",
-        selection={
-            "rl": {"selected": {"sha256": "rl-sha"}},
-            "more-sft": {"selected": {"sha256": "ctl-sha"}},
-        },
-    )
-    paths = [tmp_path / "r1.json", tmp_path / "r2.json", tmp_path / "unseal.json"]
-    paths[0].write_text(json.dumps(run1))
-    paths[1].write_text(json.dumps(run2))
-    result = subprocess.run(
-        ["python3", "-", *map(str, paths)],
-        input=unseal_script(),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stderr
-    record = json.loads(paths[2].read_text())
-    assert record["kind"] == "unseal" and record["schema_version"] == 1 and record["frozen_at"]
-    assert record["endpoints"] == {
-        "base": {
-            "checkpoint_sha256": "base-sha",
-            "completions_sha256": ["eval-base-greedy", "eval-base-n8"],
-        },
-        "sft": {
-            "checkpoint_sha256": "sft-sha",
-            "completions_sha256": ["eval-sft-greedy", "eval-sft-n8"],
-        },
-        "rl": {
-            "checkpoint_sha256": "rl-sha",
-            "completions_sha256": ["eval-rl-greedy", "eval-rl-n8"],
-        },
-        "more-sft": {
-            "checkpoint_sha256": "ctl-sha",
-            "completions_sha256": ["eval-more-sft-greedy", "eval-more-sft-n8"],
-        },
-    }
-    again = subprocess.run(
-        ["python3", "-", *map(str, paths)],
-        input=unseal_script(),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert again.returncode != 0  # The record is never rewritten.
-    swapped = subprocess.run(
-        ["python3", "-", str(paths[1]), str(paths[0]), str(tmp_path / "other.json")],
-        input=unseal_script(),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert swapped.returncode != 0 and "in that order" in swapped.stderr
-
-
-def test_the_unseal_record_refuses_one_checkpoint_under_two_endpoints(tmp_path: Path) -> None:
-    """Both arms may select the control's start, RL's update-0 check: the record is refused
-    before it is written, with the reason, so the owner rules first."""
-    run1 = report(
-        "1", "p1", inputs={"b-mixed-final": "base-sha"}, sft={"selected": {"sha256": "sft-sha"}}
-    )
-    shared = {"selected": {"sha256": "rl-check-0-sha"}}
-    run2 = report("2", "p2", selection={"rl": shared, "more-sft": shared})
-    paths = [tmp_path / "r1.json", tmp_path / "r2.json", tmp_path / "unseal.json"]
-    paths[0].write_text(json.dumps(run1))
-    paths[1].write_text(json.dumps(run2))
-    result = subprocess.run(
-        ["python3", "-", *map(str, paths)],
-        input=unseal_script(),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert result.returncode != 0
-    assert "endpoints rl and more-sft are one checkpoint" in result.stderr
-    assert not paths[2].exists()
+def test_the_unseal_record_and_the_scorecard_come_from_the_endpoints_plan() -> None:
+    """The plan is written before anything of run 2 executes; the unseal record only after the
+    owner froze the endpoints, from the plan, so one checkpoint is executed once and an arm
+    with the SFT weights is mapped to SFT; the scorecard's inputs come from the same plan.
+    The reuse itself is tested in test_run2_endpoints.py."""
     text = RUNBOOK.read_text()
-    check = text.index('i=s["identical_endpoints"]')
-    assert check < text.index("**Only after the owner freezes all four endpoints**")
+    step = text[text.index("## 18. ") : text.index("## 19. ")]
+    order = [
+        step.index("tools.posttrain_endpoints plan"),
+        step.index("--list run2-pool-dev"),
+        step.index("**Only after the owner freezes all four endpoints**"),
+        step.index("tools.posttrain_endpoints unseal"),
+        step.index('--unseal "$SHARED/unseal.json"'),
+        step.index("tools.posttrain_endpoints scorecard-inputs"),
+        step.index("scratchcoder scorecard --inputs"),
+    ]
+    assert order == sorted(order)
+    for phrase in (
+        "reuses-run-1-sft",
+        "never as a measurement of its own",
+        "`reused_by`",
+        "not independent",
+    ):
+        assert phrase in step, phrase
+    assert "identical_endpoints" not in text
 
 
 def test_no_block_holds_a_comment() -> None:

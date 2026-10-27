@@ -2,12 +2,16 @@
 
 Operational sequence for post-training run 2 of the 135M-parameter S rehearsal model, on one Runpod A40 Pod, from run 1's selected SFT weights. Run 1's [runbook](POSTTRAIN_RUNBOOK.md) is the base: the Pod creation, the bootstrap, the receipt, the supervisor, the teardown and the billing reads are its steps with run 2's values, and this page says so where they are. The worker (`tools/posttrain_run.py`, run 2's stages in `tools/posttrain_run2.py`) runs five stages in order and uploads every artifact to R2 under `posttrain-runs/2/<pod id>/` as soon as it exists:
 
-1. **rl:** 100 updates of 32 kept tasks x 8 samples at temperature 1.0 and top-p 1.0, at most min(256, 1,024 - prompt) new tokens, a fresh AdamW at 3e-6 after 5 warmup updates, no KL; dev checks at updates 0, 12, 25, 50, 75 and 100 on the fixed 200-task dev subset. Rewards and dev verdicts come from the Mac through the reward bridge (step 11); each check's weights are uploaded at once as `rl-check-<update>`.
-2. **more-sft:** the compute-matched control from the same SFT weights on the kept tasks' references, its GPU-busy budget RL's measured busy seconds, checks after 1, 2, 4 and 8 passes and at the budget's end, through the bridge; each check's weights uploaded as `more-sft-check-<step>`.
+1. **rl:** 100 updates of 32 kept tasks x 8 samples at temperature 1.0 and top-p 1.0, at most min(256, 1,024 - prompt) new tokens, a fresh AdamW at 3e-6 after 5 warmup updates, no KL; dev checks at updates 0, 12, 25, 50, 75 and 100 on the fixed 200-task dev subset, each generated at batch 256. Rewards and dev verdicts come from the Mac through the reward bridge (step 11); each check's weights are uploaded at once as `rl-check-<update>`.
+2. **more-sft:** the compute-matched control from the same SFT weights on the kept tasks' references, its GPU-busy budget RL's measured busy seconds, checks after 1, 2, 4 and 8 passes and at the budget's end (batch 256, as RL's), through the bridge; each check's weights uploaded as `more-sft-check-<step>`.
 3. **arc-post:** ARC-Easy (base protocol) on the RL-selected and the control-selected checkpoints.
 4. **eval-rl**, **eval-more-sft:** the seven completions files of each selected checkpoint under `chat-v1`, as run 1's `eval-sft`.
 
-Then run 1's finalization, with the bridge directories uploaded as one label (`bridge`) first, so a late reply is kept. A reward-wait timeout, a lost bridge, a margin stop or a limit during RL or the control ends the run after the latest weights reach R2: the control and the evaluation cannot run without the bridge. Any other RL stop (completed, collapse, dev patience, leakage, non-finite) is a result, and the control runs.
+Then run 1's finalization, with the bridge directories uploaded as one label (`bridge`) first, so a late reply is kept. Any RL stop that is a result (completed, collapse, dev patience, leakage, non-finite) lets the control run.
+
+**Same weights.** When an arm's selected checkpoint holds the SFT weights the run loaded, every tensor compared bit for bit (a file's SHA-256 differs between two saves of one model), the arm is not evaluated again: no `arc-post-<arm>` report and no `eval-<arm>` files. The control starts from RL's update-0 check, the SFT weights, so this is what happens when neither arm beats its start. `report.json`'s `selection.endpoints.<arm>` records the comparison and that run 1's SFT results stand for the arm, each pinned in the launch specification's `sft_results` (R2 key, size and SHA-256, fixed at the gate). Step 18 executes each distinct checkpoint once and maps the arm to SFT's results; the scorecard marks its rows as not an independent measurement.
+
+**An arm's stop is not the run's.** A wall or cost stop ends the run. A stop of the Mac's side in either arm (`reward_wait`, a timeout on either side; `reward_host_failure`; `bridge_lost`) and a margin stop (`wait_margin`) end only that arm's training, after its latest weights reach R2: its endpoint is selected from the dev checks already scored, and the stages that need no Mac wait run under the projected-finish rule, the finalization reserve and every limit. After such a stop in RL the control is skipped (its dev checks need the Mac) and RL's endpoint is evaluated; after a stop of the Mac's side in the control the control is not evaluated and RL's is; after a margin stop in the control both are. With no RL dev check scored there is nothing to select and the run finalizes at once. The run then ends `stopped` with the arm's reason (`report.json` `arm_stop`). While that evaluation runs the heartbeat reads `running`, never `awaiting_rewards`, so the watchdog's 600 s idle rule and the in-Pod 900 s rule apply as to any stage.
 
 Commands marked **Mac** run on the owner's Mac inside the repository checkout; **Pod** commands run inside the rented Pod over SSH. One terminal drives the run, a second runs the supervisor (step 13), and a third, prepared in step 6 before the Pod exists, runs the reward bridge (step 11) in a terminal where `.env` has never been sourced. Nothing in steps 1 to 6 starts a Pod; step 5 stores inputs in R2 (cents a month). Step 7 creates the Pod and starts billing: do not execute it without the owner's explicit go for run 2 at the gate. Runpod offers no provider-enforced Pod lifetime: termination is layered best effort.
 
@@ -120,7 +124,7 @@ uv run --locked scratchcoder rl-pod-export --train-tasks "$POOL/train.jsonl" --k
 
 It prints each file's name, SHA-256 and size; the same inputs always give the same bytes.
 
-**The launch specification.** Fill the template's gate values from the gate's own files: the ceiling, the projection's estimate and the cost limit they give, run 1's selected SFT weights (key, size and SHA-256 of the `sft-weights` label in run 1's verified report), the three files just written (hashed from their bytes, cross-checked with their record) and run 1's pool test export:
+**The launch specification.** Fill the template's gate values from the gate's own files: the ceiling, the projection's estimate and the cost limit they give, run 1's selected SFT weights (key, size and SHA-256 of the `sft-weights` label in run 1's verified report), run 1's SFT evaluation artifacts (`sft_results`: the key, size and SHA-256 of its `arc-sft-sft` report and its seven `eval-sft-<file>` completions files, which an arm with the SFT weights reuses), the three files just written (hashed from their bytes, cross-checked with their record) and run 1's pool test export:
 
 ```sh
 uv run --locked python -m tools.posttrain_approved run2-gate --ceiling-usd "$CEILING" --feasibility "$SHARED/feasibility.json" --run1-report "$RUN1_REPORT" --rl-pod-export "$RL_EXPORT" --pool-test-export "$RUN1_SHARED/exports/test-export.jsonl" --output "$SPEC"
@@ -176,7 +180,7 @@ The readiness receipt requires the Mac's own pinned copy of run 2's parent:
 uv run --locked python -m tools.posttrain_binding fetch --binding "$BINDING" --expected-sha256 "$BINDING_SHA256" --root runs/posttrain-parents-2 --only sft-weights --receipt "$SHARED/mac-copy.json" --key-prefix R2_
 ```
 
-**Prepare the reward bridge now, before any billing.** The bridge (step 11) runs model-written code in Docker Desktop on the Mac while the Pod is up, so the run-1 execution-window rules hold from here until step 16 ends the Pod, with one difference: the Pod's R2 token cannot be revoked yet (the worker uploads with it), so it stays in `.env`, which no container can reach. The **owner** now empties Docker Desktop's file sharing (Settings, Resources, File sharing: remove every entry, including the defaults `/Users`, `/Volumes`, `/private` and `/tmp`; the built-in `/var/folders` share cannot be removed and is a known residual, since the sandbox never asks for a mount) and clears the SSH agent (`ssh-add -D`). Nothing in steps 7 to 16 needs either: every SSH call uses `$POD_SSH_KEY` and the pinned known-hosts file only, never the agent. Doing it here keeps it off the clock: once the Pod exists, steps 11 to 13 must run back to back (step 11 says why).
+**Prepare the reward bridge now, before any billing.** The bridge (step 11) runs model-written code in Docker Desktop on the Mac while the Pod is up, so the run-1 execution-window rules hold from here until step 16 ends the Pod, with one difference, an accepted rule: the Pod's R2 token cannot be revoked yet (the worker uploads with it), so it stays in `.env` during the bridge window under the child-environment rule. The bridge runs only through `mac_window_check exec`, in an environment without any `.env` variable, and its own repeated checks (step 11) refuse to score anything once a `.env` name, a secret or an SSH agent variable appears in its environment; no container can reach `.env` itself. The **owner** now empties Docker Desktop's file sharing (Settings, Resources, File sharing: remove every entry, including the defaults `/Users`, `/Volumes`, `/private` and `/tmp`; the built-in `/var/folders` share cannot be removed and is a known residual, since the sandbox never asks for a mount) and clears the SSH agent (`ssh-add -D`). Nothing in steps 7 to 16 needs either: every SSH call uses `$POD_SSH_KEY` and the pinned known-hosts file only, never the agent. Doing it here keeps it off the clock: once the Pod exists, steps 11 to 13 must run back to back (step 11 says why).
 
 Open the third terminal and **never source `.env` in it**. Export only what the bridge needs (paste the values from the first terminal; none is a secret) and check the window:
 
@@ -424,13 +428,14 @@ uv run --locked python -m tools.mac_window_check exec --image-id "$SANDBOX_IMAGE
   --remote-root /workspace/posttrain-bridge --train-tasks "$POOL/train.jsonl" --kept "$RUN1_SHARED/screening.json" \
   --dev-tasks "$POOL/dev.jsonl" --pod-reward-sha256 "$POD_REWARD_SHA256" --pod-dev-sha256 "$POD_DEV_SHA256" \
   --state "$BRIDGE_STATE" --reward-timeout "$MAC_REWARD_TIMEOUT" --dev-timeout "$MAC_DEV_TIMEOUT" \
-  --image-id "$SANDBOX_IMAGE_ID" --dotenv .env
+  --image-id "$SANDBOX_IMAGE_ID" --window-check-interval 900 --dotenv .env
 ```
 
 - **The timeouts** are the Mac's bounds, the Pod's less the bridge allowance and the Mac's checks: 5,600 s for a reward request and 9,492 s for a dev check. A request that runs past its bound gets a `timeout` reply the Pod can still read.
+- **The window, repeated.** The bridge runs the window checks itself, on its own process: at its start, and again before scoring a request once its last pass began `--window-check-interval` (900 s) ago or more. Each pass checks its environment (no `.env` name, secret or SSH agent variable), every SSH agent the Mac names (the login session's, asked afresh), the pinned image's ID and the four removable default shares (`/var/folders` recorded as the known residual), and leaves a receipt in `$BRIDGE_STATE/window-checks/`. A pass takes seconds; at its worst, 730 s, it and the image check are inside the Pod's timeouts (the 857 s row above), and the bridge keeps its lease renewed meanwhile. A failed or errored pass stops the bridge with **exit 4** before anything more is scored, its reason in `progress.json` and the receipt; the Pod then sees a lost bridge 600 s later and evaluates what it can (above). Fix the window, then start the same command again (below) if the Pod still waits.
 - **`.env`:** `--dotenv .env` names the file whose variable names the bridge refuses to run with; it refuses to start when no `.env` can be found, so give `--no-dotenv` only if the Mac has none. Exit **2** means it refused to start (a secret in its environment, a missing `.env`, a sealed split or a bad record): read its message, fix the terminal, start it again.
 - **Exit 3** means another bridge server holds this Pod's lease. Stop that one (only one server may score a Pod: two would score each request twice), or wait for its lease to lapse 60 s after its last renewal.
-- **A dead bridge** (the Mac slept, the process crashed, an SSH outage outlasted its retries): start the same command again with the same `--state` at once. A restart over the same state is the same server and takes its lease back at once; every reply it sent is stored there, so nothing is scored twice. It must be back within 600 s of its last lease renewal, or the worker gives the wait up as `bridge_lost` and ends the run; the in-Pod timer would delete the Pod 900 s after that renewal.
+- **A dead bridge** (the Mac slept, the process crashed, an SSH outage outlasted its retries, a failed window pass): start the same command again with the same `--state` at once. A restart over the same state is the same server and takes its lease back at once; every reply it sent is stored there, so nothing is scored twice. Its start pass takes seconds. It must be back within 600 s of its last lease renewal, or the worker gives the wait up as `bridge_lost`, ends that arm's training and evaluates what needs no Mac; the in-Pod timer would delete the Pod 900 s after that renewal if the worker could not.
 
 Leave the bridge running until step 16 ends the Pod; then stop it with Ctrl-C (exit 0). Go back to the first terminal for step 12 at once.
 
@@ -488,7 +493,7 @@ podssh 'tail -n 2 /workspace/posttrain/run.log; python3 -c "import json; r=json.
 tail -n 3 "$CTRL/watchdog.log"; cat "$CTRL/watchdog-receipt.json"
 ```
 
-Expect `running` and `awaiting_rewards` alternating through RL and the control (the `awaiting` object names each request's kind and index, and `progress_unix` follows the Mac's lease), `running` through ARC and the evaluation, and `uploading` only at the very end. Each dev check's weights appear in R2 as `rl-check-<update>/checkpoint.pt` or `more-sft-check-<step>/checkpoint.pt` as soon as the check ends.
+Expect `running` and `awaiting_rewards` alternating through RL and the control (the `awaiting` object names each request's kind and index, and `progress_unix` follows the Mac's lease), `running` through ARC and the evaluation, and `uploading` only at the very end. In the third terminal `$BRIDGE_STATE/progress.json`'s `window_check` names the last pass and its time. Each dev check's weights appear in R2 as `rl-check-<update>/checkpoint.pt` or `more-sft-check-<step>/checkpoint.pt` as soon as the check ends.
 
 ## 15. Completion and verification (Mac, automatic)
 
@@ -529,7 +534,7 @@ Once the Pod is gone, stop the bridge (Ctrl-C in the third terminal). The **owne
 ## 17. If the run fails
 
 - **Bootstrap or receipt fails:** as run 1: read the log or the message, terminate the Pod (step 16), report; a new Pod is a new launch, after the owner.
-- **RL or the control ends the run** (`reward_wait`: a timeout on either side; `reward_host_failure`: the Mac's sandbox could not resolve a host failure; `bridge_lost`: no Mac lease for 600 s; `wait_margin`: no time or money left for one full wait), or another stop (the projected finish, the reserve, the cost, wall or idle limit): the latest weights are in R2 (`rl-stop-weights`, `more-sft-stop-weights`, or the last check's label), the heartbeat shows `stopped` with `r2_final`, and the supervisor verifies and archives as in step 15. Report the stop, the measured rates and the bridge's `progress.json` and `events.jsonl`; do not relaunch without the owner.
+- **An arm stopped early** (`reward_wait`: a timeout on either side; `reward_host_failure`: the Mac's sandbox could not resolve a host failure; `bridge_lost`: no Mac lease for 600 s; `wait_margin`: no time or money left for one full wait): the latest weights are in R2 (`rl-stop-weights`, `more-sft-stop-weights`, or the last check's label), the evaluation that needs no Mac ran (top of this page), and the heartbeat shows `stopped` with `r2_final`; the supervisor verifies and archives as in step 15. Step 18 then executes what was evaluated. Another stop (the projected finish, the reserve, the cost, wall or idle limit) ends the run as it stands. Report the stop, the measured rates, `arm_stop` and the bridge's `progress.json`, `events.jsonl` and window receipts; do not relaunch without the owner.
 - **The Mac refuses a request** (`BridgeRefused`: a wrong task-file SHA-256, a task outside the kept list or the dev subset) or the worker fails otherwise: the run ends `failed`, its latest weights uploaded as `rl-latest-weights` or `more-sft-latest-weights` first; the configuration needs a person.
 - **A label never reached R2:** run 1's step 16 rescue rules and block apply, with this run's `$CTRL`; the weights labels are pulled over SSH by the supervisor.
 
@@ -539,137 +544,72 @@ With the Pod gone and its token revoked, fetch the run's artifacts pinned to the
 
 ```sh
 export ART=$SHARED/artifacts
-uv run --locked python -m tools.posttrain_ops fetch-artifacts --report "$CTRL/supervisor/final/report.json" --output "$ART" --receipt "$SHARED/artifacts-fetch.json"
+export RUN2_REPORT=$CTRL/supervisor/final/report.json
+uv run --locked python -m tools.posttrain_ops fetch-artifacts --report "$RUN2_REPORT" --output "$ART" --receipt "$SHARED/artifacts-fetch.json"
 uv run --locked python -m tools.mac_window_check check --image-id "$SANDBOX_IMAGE_ID" --dotenv .env --receipt "$SHARED/window-check.json"
 ```
 
-Execute both checkpoints' dev completions (about 36,000 calls, about 1.7 hours):
+**Each endpoint's source, recorded once.** An arm is `pod` (evaluated on run 2's Pod), `reuses-run-1-sft` (its selected weights were the SFT weights, so run 1's SFT results stand for it) or `not-evaluated` (the run stopped before it was evaluated), as the verified report's `selection.endpoints` records. The plan checks a reuse three ways before anything executes: run 2's record of the run 1 artifacts it stands on equals the launch specification's `sft_results` pins, those pins equal run 1's verified report, and the copies run 1's step 17 fetched to `$RUN1_SHARED/artifacts` have the pinned size and SHA-256. Every later command reads this plan, so a reused arm is executed once, as SFT, and never as a measurement of its own:
+
+```sh
+uv run --locked python -m tools.posttrain_endpoints plan --specification "$SPEC" --run1-report "$RUN1_REPORT" --run2-report "$RUN2_REPORT" --run1-artifacts "$RUN1_SHARED/artifacts" --output "$SHARED/endpoints.json"
+```
+
+It prints each endpoint's source, for example `{"base": "run 1", "sft": "run 1", "rl": "pod", "more-sft": "reuses-run-1-sft (sft)"}`. The plan is never rewritten.
+
+Execute the dev completions of the arms evaluated on the Pod (about 18,000 calls, about 0.85 hours, per arm):
 
 ```sh
 mkdir -p "$SHARED/results"
-for name in eval-rl-pool-dev-greedy eval-rl-pool-dev-n8 eval-more-sft-pool-dev-greedy eval-more-sft-pool-dev-n8; do
+for name in $(uv run --locked python -m tools.posttrain_endpoints list --plan "$SHARED/endpoints.json" --list run2-pool-dev); do
   uv run --locked python -m tools.mac_window_check exec --image-id "$SANDBOX_IMAGE_ID" --dotenv .env -- uv run --locked scratchcoder eval-execute --completions "$ART/$name/completions.jsonl" --tasks "$POOL/dev.jsonl" --results "$SHARED/results/$name.jsonl" --tokenizer "$TOKENIZER" --workers 8
 done
 ```
 
-Seal both checkpoints' test completions in run 1's ledger, beside run 1's four:
+Seal their test completions in run 1's ledger, beside run 1's four:
 
 ```sh
-for name in eval-rl-pool-test-greedy eval-rl-pool-test-n8 eval-more-sft-pool-test-greedy eval-more-sft-pool-test-n8; do
+for name in $(uv run --locked python -m tools.posttrain_endpoints list --plan "$SHARED/endpoints.json" --list run2-pool-test); do
   uv run --locked scratchcoder eval-seal --completions "$ART/$name/completions.jsonl" --ledger "$LEDGER"
 done
 ```
 
-Score the six public-benchmark files on GitHub Actions:
+Score their benchmark files on GitHub Actions:
 
 ```sh
 mkdir -p "$SHARED/benchmarks-results"
-for name in eval-rl-humaneval-greedy eval-rl-humaneval-plus-greedy eval-rl-mbpp-plus-greedy eval-more-sft-humaneval-greedy eval-more-sft-humaneval-plus-greedy eval-more-sft-mbpp-plus-greedy; do
+for name in $(uv run --locked python -m tools.posttrain_endpoints list --plan "$SHARED/endpoints.json" --list run2-benchmarks); do
   SUITE=$(printf '%s' "$name" | sed -e 's/^eval-rl-//' -e 's/^eval-more-sft-//' -e 's/-greedy$//')
   uv run --locked python -m tools.benchmark_dispatch --completions "$ART/$name/completions.jsonl" --suite "$SUITE" --key "posttrain-runs/2/$POD_ID/$name/completions.jsonl" --repo "$PUBLIC_REPO" --output "$SHARED/benchmarks-results/$name"
 done
 ```
 
-Before the owner freezes anything, check that the two arms selected different weights. The control starts from RL's update-0 check, so when neither arm beats it both select that one file; the report then reads `identical True`, and the owner must rule how the RL and more-SFT rows are reported before the freeze (the unseal record below refuses one checkpoint under two names, and so does the scorecard):
+**Only after the owner freezes all four endpoints** (base B, SFT, RL and more-SFT, from the dev and benchmark results), write the unseal record from the plan: each endpoint evaluated on a Pod with its checkpoint SHA-256 and its two test completions files' SHA-256s, an arm that reuses SFT as `{"reuses": "sft", ...}`, an arm never evaluated as `{"not_evaluated": ...}`. One checkpoint is never listed under two names, and the record is never rewritten:
 
 ```sh
-python3 -c 'import json,sys; s=json.load(open(sys.argv[1]))["selection"]; i=s["identical_endpoints"]; print("rl", s["rl"]["selected"]["label"], "more-sft", s["more-sft"]["selected"]["label"], "identical", i["identical"])' "$CTRL/supervisor/final/report.json"
+uv run --locked python -m tools.posttrain_endpoints unseal --plan "$SHARED/endpoints.json" --output "$SHARED/unseal.json"
 ```
 
-**Only after the owner freezes all four endpoints** (base B, SFT, RL and more-SFT, from the dev and benchmark results), write the unseal record from the two verified reports: each endpoint's checkpoint SHA-256 and its two test completions files' SHA-256s.
-
-```sh
-python3 - "$RUN1_REPORT" "$CTRL/supervisor/final/report.json" "$SHARED/unseal.json" <<'PY'
-import json, sys
-from datetime import datetime, timezone
-
-run1, run2 = (json.load(open(path)) for path in sys.argv[1:3])
-if (run1.get("run"), run2.get("run")) != ("1", "2"):
-    sys.exit("give run 1's and run 2's verified reports, in that order")
-
-
-def completions(report, stage):
-    found = {}
-    for row in report["artifacts"]:
-        for decoding in ("greedy", "n8"):
-            if row["label"] == f"{stage}-pool-test-{decoding}" and row["name"] == "completions.jsonl":
-                found[decoding] = row["sha256"]
-    if set(found) != {"greedy", "n8"}:
-        sys.exit(f"the report lists no pool-test greedy and n8 completions for {stage}")
-    return [found["greedy"], found["n8"]]
-
-
-endpoints = {
-    "base": (run1["inputs"]["b-mixed-final"], completions(run1, "eval-base")),
-    "sft": (run1["sft"]["selected"]["sha256"], completions(run1, "eval-sft")),
-    "rl": (run2["selection"]["rl"]["selected"]["sha256"], completions(run2, "eval-rl")),
-    "more-sft": (run2["selection"]["more-sft"]["selected"]["sha256"], completions(run2, "eval-more-sft")),
-}
-named = {}
-for name, (checkpoint, _) in endpoints.items():
-    if checkpoint in named:
-        sys.exit(f"endpoints {named[checkpoint]} and {name} are one checkpoint ({checkpoint[:12]}): the unseal record needs four different checkpoints; ask the owner for a rule first")
-    named[checkpoint] = name
-record = {
-    "kind": "unseal",
-    "schema_version": 1,
-    "frozen_at": datetime.now(timezone.utc).isoformat(),
-    "endpoints": {
-        name: {"checkpoint_sha256": checkpoint, "completions_sha256": files}
-        for name, (checkpoint, files) in endpoints.items()
-    },
-}
-with open(sys.argv[3], "x") as stream:
-    json.dump(record, stream, indent=2, sort_keys=True)
-print(json.dumps({name: value["checkpoint_sha256"][:12] for name, value in record["endpoints"].items()}))
-PY
-```
-
-Then execute all four checkpoints' test completions, one logged read each, in the window (about 72,000 calls, about 3.4 hours). This is the one read of the sealed test split; each `eval-execute` exits 3 while an attempt is unresolved, and running the same line again continues its read:
+Then execute the test completions of every endpoint that executes, one logged read each, in the window (about 18,000 calls, about 0.85 hours, per endpoint). This is the one read of the sealed test split; a read of SFT's file stands for an arm that reuses it, and the ledger's `opened` event names that arm (`reused_by`). Each `eval-execute` exits 3 while an attempt is unresolved, and running the same line again continues its read:
 
 ```sh
 for name in eval-base-pool-test-greedy eval-base-pool-test-n8 eval-sft-pool-test-greedy eval-sft-pool-test-n8; do
   uv run --locked python -m tools.mac_window_check exec --image-id "$SANDBOX_IMAGE_ID" --dotenv .env -- uv run --locked scratchcoder eval-execute --completions "$RUN1_SHARED/artifacts/$name/completions.jsonl" --tasks "$POOL/test.jsonl" --results "$SHARED/results/$name.jsonl" --tokenizer "$TOKENIZER" --workers 8 --seal-ledger "$LEDGER" --unseal "$SHARED/unseal.json"
 done
-for name in eval-rl-pool-test-greedy eval-rl-pool-test-n8 eval-more-sft-pool-test-greedy eval-more-sft-pool-test-n8; do
+for name in $(uv run --locked python -m tools.posttrain_endpoints list --plan "$SHARED/endpoints.json" --list run2-pool-test); do
   uv run --locked python -m tools.mac_window_check exec --image-id "$SANDBOX_IMAGE_ID" --dotenv .env -- uv run --locked scratchcoder eval-execute --completions "$ART/$name/completions.jsonl" --tasks "$POOL/test.jsonl" --results "$SHARED/results/$name.jsonl" --tokenizer "$TOKENIZER" --workers 8 --seal-ledger "$LEDGER" --unseal "$SHARED/unseal.json"
 done
 ```
 
-Build the scorecard from every results file, benchmark artifact and ARC report of both runs and the pool dev baseline, each checkpoint named by its SHA-256 from the unseal record. Each benchmark dispatch wrote one `benchmark-<suite>-<completions sha256>.json` into its directory; copy each to a name the scorecard command can give:
+Build the scorecard. Its inputs file records the names, each reuse with its reason, and every results file, benchmark artifact and ARC report of both runs, each checked to exist (each benchmark dispatch wrote one `benchmark-<suite>-<completions sha256>.json` into its directory, which the file names directly):
 
 ```sh
-for name in eval-base-humaneval-greedy eval-base-humaneval-plus-greedy eval-base-mbpp-plus-greedy eval-sft-humaneval-greedy eval-sft-humaneval-plus-greedy eval-sft-mbpp-plus-greedy; do
-  cp "$RUN1_SHARED/benchmarks-results/$name"/benchmark-*.json "$SHARED/benchmarks-results/$name.json"
-done
-for name in eval-rl-humaneval-greedy eval-rl-humaneval-plus-greedy eval-rl-mbpp-plus-greedy eval-more-sft-humaneval-greedy eval-more-sft-humaneval-plus-greedy eval-more-sft-mbpp-plus-greedy; do
-  cp "$SHARED/benchmarks-results/$name"/benchmark-*.json "$SHARED/benchmarks-results/$name.json"
-done
-export BASE_SHA256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["endpoints"]["base"]["checkpoint_sha256"])' "$SHARED/unseal.json")
-export SFT_SHA256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["endpoints"]["sft"]["checkpoint_sha256"])' "$SHARED/unseal.json")
-export RL_SHA256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["endpoints"]["rl"]["checkpoint_sha256"])' "$SHARED/unseal.json")
-export CONTROL_SHA256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["endpoints"]["more-sft"]["checkpoint_sha256"])' "$SHARED/unseal.json")
-uv run --locked scratchcoder scorecard --checkpoint base="$BASE_SHA256" --checkpoint sft="$SFT_SHA256" --checkpoint rl="$RL_SHA256" --checkpoint more-sft="$CONTROL_SHA256" \
-  --results "$RUN1_SHARED/results/eval-base-pool-dev-greedy.jsonl" --results "$RUN1_SHARED/results/eval-base-pool-dev-n8.jsonl" \
-  --results "$RUN1_SHARED/results/eval-sft-pool-dev-greedy.jsonl" --results "$RUN1_SHARED/results/eval-sft-pool-dev-n8.jsonl" \
-  --results "$SHARED/results/eval-rl-pool-dev-greedy.jsonl" --results "$SHARED/results/eval-rl-pool-dev-n8.jsonl" \
-  --results "$SHARED/results/eval-more-sft-pool-dev-greedy.jsonl" --results "$SHARED/results/eval-more-sft-pool-dev-n8.jsonl" \
-  --results "$SHARED/results/eval-base-pool-test-greedy.jsonl" --results "$SHARED/results/eval-base-pool-test-n8.jsonl" \
-  --results "$SHARED/results/eval-sft-pool-test-greedy.jsonl" --results "$SHARED/results/eval-sft-pool-test-n8.jsonl" \
-  --results "$SHARED/results/eval-rl-pool-test-greedy.jsonl" --results "$SHARED/results/eval-rl-pool-test-n8.jsonl" \
-  --results "$SHARED/results/eval-more-sft-pool-test-greedy.jsonl" --results "$SHARED/results/eval-more-sft-pool-test-n8.jsonl" \
-  --benchmark "$SHARED/benchmarks-results/eval-base-humaneval-greedy.json" --benchmark "$SHARED/benchmarks-results/eval-base-humaneval-plus-greedy.json" \
-  --benchmark "$SHARED/benchmarks-results/eval-base-mbpp-plus-greedy.json" --benchmark "$SHARED/benchmarks-results/eval-sft-humaneval-greedy.json" \
-  --benchmark "$SHARED/benchmarks-results/eval-sft-humaneval-plus-greedy.json" --benchmark "$SHARED/benchmarks-results/eval-sft-mbpp-plus-greedy.json" \
-  --benchmark "$SHARED/benchmarks-results/eval-rl-humaneval-greedy.json" --benchmark "$SHARED/benchmarks-results/eval-rl-humaneval-plus-greedy.json" \
-  --benchmark "$SHARED/benchmarks-results/eval-rl-mbpp-plus-greedy.json" --benchmark "$SHARED/benchmarks-results/eval-more-sft-humaneval-greedy.json" \
-  --benchmark "$SHARED/benchmarks-results/eval-more-sft-humaneval-plus-greedy.json" --benchmark "$SHARED/benchmarks-results/eval-more-sft-mbpp-plus-greedy.json" \
-  --arc "$RUN1_SHARED/artifacts/arc-base-b-mixed-final/arc.json" --arc "$RUN1_SHARED/artifacts/arc-sft-sft/arc.json" \
-  --arc "$ART/arc-post-rl/arc.json" --arc "$ART/arc-post-more-sft/arc.json" --arc-tasks "$RUN1_SHARED/exports/arc-easy-test.jsonl" \
+uv run --locked python -m tools.posttrain_endpoints scorecard-inputs --plan "$SHARED/endpoints.json" --run1-shared "$RUN1_SHARED" --shared "$SHARED" --artifacts "$ART" --output "$SHARED/scorecard-inputs.json"
+uv run --locked scratchcoder scorecard --inputs "$SHARED/scorecard-inputs.json" --arc-tasks "$RUN1_SHARED/exports/arc-easy-test.jsonl" \
   --pool-baseline "$RUN1_SHARED/results/pool-dev-baseline.json" --output "$SHARED/scorecard.json" --markdown "$SHARED/scorecard.md"
 ```
 
-The scorecard reports every row beside its constant-answer baseline, the paired comparisons (SFT against base, RL against SFT, more-SFT against SFT, RL against more-SFT) and the HumanEval leak flag. After this last window the owner resets Docker Desktop's VM data.
+The scorecard reports every row beside its constant-answer baseline, the paired comparisons (SFT against base, RL against SFT, more-SFT against SFT, RL against more-SFT) and the HumanEval leak flag. An arm that reuses SFT has SFT's rows under its name, marked `reuses sft: not independent`, no comparison with SFT (one checkpoint), and its comparison with the other arm says it is SFT's results. After this last window the owner resets Docker Desktop's VM data.
 
 ## 19. Final billing verification (Mac)
 
