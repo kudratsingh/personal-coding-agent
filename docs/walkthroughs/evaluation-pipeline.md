@@ -59,7 +59,7 @@ Budgets are `min(512, context − prompt)` for chat-v1 and the base pool protoco
   - each `window` and `window_end` (counts and sandbox seconds);
   - one `attempt` per scored attempt, with its status (`passed`, `failed`, `timeout`, `output_limit`, `resource_limit`, `oversized`, `no_program` or `context_limit`);
   - an `unresolved` record for an attempt whose host failures outlasted the retries.
-- **Resuming:** a later run skips scored attempts and retries unresolved ones. An interruption can leave a torn last line, which the next run drops before appending.
+- **Resuming:** a later run skips scored attempts and retries unresolved ones. An interruption can leave a torn last line, which the next run drops before appending. A run holds an exclusive lock on the file, so two runs never append to it at once.
 
 **Seal ledger** (`scratchcoder.eval.seal`): hash-chained JSON Lines events `sealed`, `opened`, `resumed`, `completed` and `baseline`. Each event names the SHA-256 of the line before it.
 

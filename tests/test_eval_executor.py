@@ -1,5 +1,6 @@
 """The Mac executor and the test seal, with fake execution (no generated code runs here)."""
 
+import fcntl
 import hashlib
 import json
 import threading
@@ -488,3 +489,19 @@ def test_greedy_and_sampled_files_share_one_task_file(tmp_path: Path) -> None:
     assert summary["attempts"] == 12 and summary["passed"] == 6
     header = read_results(tmp_path / "sampled-results.jsonl").completions_header
     assert header.sampling.samples == 4
+
+
+def test_two_runs_never_append_to_one_results_file(tmp_path: Path) -> None:
+    completions, tasks_path, _ = dev_fixture(tmp_path)
+    results = tmp_path / "results.jsonl"
+    sandbox = FakeSandbox(down=lambda code: code == BAD)
+    execute_completions(
+        completions, tasks_path, results, tokenizer=TOKENIZER, execute=sandbox, sleep=no_sleep
+    )
+    with results.open("ab") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(RuntimeError, match="another eval-execute"):
+            execute_completions(
+                completions, tasks_path, results, tokenizer=TOKENIZER, execute=FakeSandbox()
+            )
+    assert len(read_results(results).unresolved) == 1

@@ -16,11 +16,13 @@ passing attempt also records the reward channel's static audit
 The results file is append-only JSON Lines keyed by (task ID, sample). Its header names
 the completions file's SHA-256; running again with the same results path continues where
 an interrupted run stopped. The only rewrite ever made is dropping a torn last line that an
-interruption left half-written.
+interruption left half-written. A run holds an exclusive lock on its results file, so two
+runs can never append to the same file at once.
 
 The pool test split is sealed: see :mod:`scratchcoder.eval.seal`.
 """
 
+import fcntl
 import hashlib
 import json
 import os
@@ -307,14 +309,19 @@ def execute_completions(
             if created:
                 results_path.unlink()
             raise
-    if previous.torn_bytes:
-        with results_path.open("r+b") as torn:
-            torn.truncate(results_path.stat().st_size - previous.torn_bytes)
     started, sandbox_seconds = time.monotonic(), 0.0
     resolved = unresolved = passed = flagged = 0
     commit, dirty = git_state()
-    pending = [row for row in completions.rows if row.key not in previous.attempts]
     with results_path.open("ab") as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("another eval-execute is writing this results file") from error
+        previous = read_results(results_path)
+        if previous.torn_bytes:
+            with results_path.open("r+b") as torn:
+                torn.truncate(results_path.stat().st_size - previous.torn_bytes)
+        pending = [row for row in completions.rows if row.key not in previous.attempts]
         out = _Appender(stream)
         out.write(
             {
