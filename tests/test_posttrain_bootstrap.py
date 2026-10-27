@@ -86,6 +86,9 @@ def test_posttrain_arms_the_derived_lifetime_and_idle_rule_first(tmp_path: Path)
         line = lines[index(lines, fragment)]
         assert "--key-prefix R2_POD_" in line
         assert lines[index(lines, fragment) + 1] == "  (pod key in environment)"
+    # The fetch stamps the idle rule's progress file after each input it brings.
+    fetch_line = lines[index(lines, "posttrain_binding fetch")]
+    assert f"--progress-file {paths['workspace']}/setup-progress.json" in fetch_line
     assert f"--pod-id {POD}" in lines[index(lines, "round-trip")]
     stamps = [
         line.split("--source bootstrap:")[1] for line in lines if "--source bootstrap:" in line

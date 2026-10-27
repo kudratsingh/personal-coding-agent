@@ -4,12 +4,13 @@ The smoke's fixtures stand in for the inputs and an in-memory bucket for R2."""
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tools import posttrain_binding
+from tools import pod_progress, posttrain_binding
 from tools.posttrain_binding import (
     binding_sha256,
     build_binding,
@@ -147,6 +148,35 @@ def test_the_pod_fetches_and_verifies_every_input_pinned(found: Fixtures, tmp_pa
         )
     with pytest.raises(ValueError, match="differs"):
         verify(binding, root)
+
+
+def test_the_pod_fetch_stamps_progress_after_every_input(
+    found: Fixtures, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tools.pod_self_destruct import activity_unix
+
+    binding, _ = built(found, tmp_path)
+    bucket = r2_with_parents(found)
+    stage(binding, bucket.store(), cap_usd=5.0, receipt=tmp_path / "stage.json")
+    progress = tmp_path / "setup-progress.json"
+    stamps: list[str] = []
+    original = pod_progress.stamp
+
+    def keep(path: str, source: str) -> dict[str, object]:
+        stamps.append(source)
+        return original(path, source)
+
+    monkeypatch.setattr(pod_progress, "stamp", keep)
+    fetch(
+        binding,
+        tmp_path / "pod",
+        bucket.store(),
+        receipt=tmp_path / "fetch.json",
+        progress=lambda _: None,
+        progress_file=progress,
+    )
+    assert stamps == [f"fetch:{name}" for name in sorted(binding["inputs"])]
+    assert activity_unix(str(progress), now=time.time()) is not None
 
 
 def test_the_macs_parent_copies_are_a_partial_fetch_its_receipt_names(

@@ -287,7 +287,7 @@ The `stat` line should print `600 root` and a nonzero size. `pod-env` writes onl
 
 ## 9. Bootstrap (Pod, billable)
 
-The bootstrap arms the in-Pod timer first, with the run's ceiling-derived timer lifetime (`$TIMER`, 17,820 s: the timer refuses any deadline further away) and the 900 s idle rule over the worker's heartbeat and its own progress stamps, then checks the shipped archive against the revision, loads the 0600 key file, records the environment, installs the project, measures an R2 round trip under `posttrain-runs/1/<pod id>/` (refused below 3.06 MB/s by the receipt), fetches and re-verifies every bound input, runs the CPU tests and the A40 preflight with its compile check. Launch it detached, refusing a second launch, and keep re-baselining the watchdog while it runs, for at most 45 minutes:
+The bootstrap arms the in-Pod timer first, with the run's ceiling-derived timer lifetime (`$TIMER`, 17,820 s: the timer refuses any deadline further away) and the 900 s idle rule over the worker's heartbeat and its own progress stamps, then checks the shipped archive against the revision, loads the 0600 key file, records the environment, installs the project, measures an R2 round trip under `posttrain-runs/1/<pod id>/` (refused below 3.06 MB/s by the receipt), fetches every bound input (stamping its progress file after each one, so a live 1.6 GB download is never idle) and re-verifies them, runs the CPU tests and the A40 preflight with its compile check. Launch it detached, refusing a second launch, and keep re-baselining the watchdog while it runs, for at most 45 minutes:
 
 ```sh
 if podssh 'test -e /workspace/posttrain/bootstrap.log'; then

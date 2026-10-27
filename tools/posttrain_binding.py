@@ -21,6 +21,9 @@ public benchmark releases and the ARC-Easy test questions.
     existing input: its stored SHA-256 and size must be the binding's.
 ``fetch`` (Pod; also the Mac's copy of the parent checkpoints)
     Download inputs pinned to their size and SHA-256 into a root; ``--only`` selects some.
+    On the Pod ``--progress-file`` stamps the in-Pod idle rule's progress file after each
+    input, so a long fetch of live downloads is never idle (each 1.6 GB checkpoint must
+    arrive within the 900 s idle limit: 1.8 MB/s).
 ``verify`` (Pod or Mac)
     Re-hash every input under a root against the binding.
 
@@ -49,6 +52,7 @@ from scratchcoder.common.records import atomic_json, git_state, utc_now
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.export import is_exported
 from scratchcoder.eval.tasks import load_tasks
+from tools import pod_progress
 from tools.r2_store import Store, upload
 from tools.rehearsal_binding import (
     _hex,
@@ -376,8 +380,11 @@ def fetch(
     receipt: Path,
     only: Sequence[str] = (),
     progress: Callable[[str], None] = print,
+    progress_file: Path | None = None,
 ) -> dict[str, Any]:
-    """Download the inputs (``only`` some) into ``root``, each pinned; write a receipt."""
+    """Download the inputs (``only`` some) into ``root``, each pinned; write a receipt.
+
+    With ``progress_file``, stamp it (``tools/pod_progress.py``) after each input."""
     checked = check_binding(binding)
     names = list(only) or sorted(checked["inputs"])
     unknown = sorted(set(names) - set(checked["inputs"]))
@@ -408,6 +415,8 @@ def fetch(
             }
         rows.append({**row, **{k: entry[k] for k in ("key", "path", "size_bytes", "sha256")}})
         progress(f"{row['method']} {entry['path']} ({entry['size_bytes']:,} bytes)")
+        if progress_file is not None:
+            pod_progress.stamp(str(progress_file), f"fetch:{name}"[:64])
     record = {
         "schema_version": SCHEMA_VERSION,
         "kind": "posttrain-input-fetch",
@@ -539,6 +548,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         command.add_argument("--only", action="append", default=[], help="one input name")
     fetch_command.add_argument("--receipt", type=Path, required=True)
     fetch_command.add_argument("--key-prefix", default="R2_", help="e.g. R2_POD_ on the Pod")
+    fetch_command.add_argument(
+        "--progress-file", type=Path, help="stamp this idle-rule progress file after each input"
+    )
     args = parser.parse_args(argv)
     if args.command == "build":
         binding = build_binding(args.specification, _local(args.input), args.output, run=args.run)
@@ -562,7 +574,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     elif args.command == "fetch":
         store = Store(r2_credentials(key_prefix=args.key_prefix))
-        record = fetch(binding, args.root, store, receipt=args.receipt, only=args.only)
+        record = fetch(
+            binding,
+            args.root,
+            store,
+            receipt=args.receipt,
+            only=args.only,
+            progress_file=args.progress_file,
+        )
         result = verify(binding, args.root, only=args.only)
         print(json.dumps({"bytes_transferred": record["bytes_transferred"], **result}, indent=1))
     else:

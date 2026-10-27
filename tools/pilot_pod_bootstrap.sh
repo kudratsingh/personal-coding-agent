@@ -361,7 +361,7 @@ if [[ "$MODE" == "posttrain" ]]; then
   stamp round-trip
   python3 -m tools.posttrain_binding fetch --binding "$BINDING" --expected-sha256 "$BINDING_SHA256" \
     --root "$DATA_ROOT" --receipt "$WORKSPACE/data-fetch.json" --key-prefix R2_POD_ \
-    > "$WORKSPACE/data-fetch.log"
+    --progress-file "$PROGRESS" > "$WORKSPACE/data-fetch.log"
   stamp fetch
   python3 -m tools.posttrain_binding verify --binding "$BINDING" --expected-sha256 "$BINDING_SHA256" \
     --root "$DATA_ROOT" > "$WORKSPACE/data-verification.json"
