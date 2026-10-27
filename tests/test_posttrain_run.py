@@ -529,8 +529,11 @@ class SteppingClock:
 
 @pytest.mark.parametrize("limit", ["cost_limit", "pod_wall_limit"])
 def test_wall_and_cost_stops_end_the_run_without_waiting_for_uploads(
-    found: Fixtures, tmp_path: Path, limit: str
+    found: Fixtures, tmp_path: Path, limit: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The probe and the evaluation files re-base the projection on this host's measured
+    # speed, so on a slow runner it could stop the run first; it has its own tests.
+    monkeypatch.setattr(PosttrainWorker, "projected_finish", lambda self, stage: None)
     clock = SteppingClock(1.0)
     spec = Specification.load(SPEC)
     limits = RunLimits.of(spec)

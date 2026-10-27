@@ -4,12 +4,13 @@ limits, in exactly the form the run-1 worker accepts. Authored evidence; no Pod,
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from scratchcoder.common.records import atomic_json
-from tools import pilot_readiness_receipt, posttrain_ops
+from tools import pilot_readiness_receipt, posttrain_ops, posttrain_readiness
 from tools.posttrain_approved import PARENTS, run1_specification
 from tools.posttrain_binding import _serialized, binding_sha256, staged_key
 from tools.posttrain_readiness import DEFAULT_HEARTBEAT, build_receipt
@@ -279,7 +280,12 @@ def test_a_specification_other_than_the_approved_run_is_refused(tmp_path: Path) 
         build_receipt(**{**arguments, "specification": other}, now=NOW)
 
 
-def test_the_cli_writes_the_receipt(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_the_cli_writes_the_receipt(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The evidence is dated at import; on a slow runner the suite can pass the receipt's
+    # 60 s freshness window before this test runs, so the CLI reads the same clock.
+    monkeypatch.setattr(posttrain_readiness, "time", SimpleNamespace(time=lambda: NOW))
     arguments = evidence(tmp_path)
     output = tmp_path / "readiness-receipt.json"
     argv = ["posttrain"]
