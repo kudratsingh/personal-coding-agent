@@ -14,6 +14,18 @@ An explicit dependency profile can instead use an owner-controlled locally built
 
 The default input cap remains 128,000 bytes. Larger benchmark scripts require an explicit bounded `Limits.input_bytes` (maximum 8 MiB); the file bound follows that declaration. Reports using another runtime or limits must record them and cannot claim identical upstream timing/memory policy merely because the same tests run. Dedicated NumPy CI builds the pinned image and exercises both functionality and isolation before benchmark use.
 
+## Reward channel for reinforcement learning
+
+Reinforcement-learning rewards and RL candidate screening use a separate grading path in `scratchcoder.sandbox.reward` that never sends the expected test values into the container. Evaluation scoring of record is unchanged and still runs hidden tests in-process through the runner above.
+
+- **Function tasks.** The host parses each supported hidden assertion — `assert CALL == LITERAL`, `assert LITERAL == CALL`, `assert CALL is None/True/False`, and `assert not CALL`, where `LITERAL` is any `ast.literal_eval` value — and keeps the expected literal. Only `CALL`'s source enters the container with the candidate. The container's trusted supervisor runs the candidate in a child process, evaluates each `CALL`, and reports a type-preserving encoding of the value; the host decodes it and compares type and value against the kept literal. Any assertion outside the supported forms makes the whole task "not parseable" for this channel (`is_parseable` is `False`), and such tasks are screened out of RL rather than graded in-process.
+- **I/O tasks.** Only the inputs enter the container. Every case runs under a per-case deadline and an overall per-attempt wall budget (default 8 s), with no stop at the first failure; the container returns each case's bounded stdout, and the host compares with expected outputs it never shared. Cases that do not run count as failed.
+- **Reward.** `passed / total`, with the denominator taken from the task file. A value that cannot be encoded (an always-equal object, a live handle, a function) is a failure; forging the reported value earns nothing, because the candidate never learns which value would pass.
+- **Host statuses.** A host stall or a docker CLI that never returns is `host_timeout`, a missing daemon or absent image is `unavailable`, and unparseable supervisor framing is `host_error`. These are retried up to a cap and are never scored as a reward, not even zero. A resource/OOM kill of the container is a distinct status scored as a failed `0.0`, separate from a candidate timeout.
+- **Static audit.** `audit_attempt` scans an attempt for risky identifiers and patterns (frame and code-object introspection, `inspect`, `excepthook`, `atexit`, `os._exit`, `__eq__` overrides, builtins tampering, `/proc`, `__file__`, `sys.modules`, `gc`, `ctypes`, `signal`, and `open` of a `/tmp` path) and returns the flags for monitoring; it is a signal, not a verdict.
+
+This path reuses every isolation flag of the development runner unchanged; it adds grading integrity, not a stronger isolation boundary. See the [reward-channel walkthrough](walkthroughs/reward-channel.md) and the [sandbox ADR](adr/0004-development-sandbox.md) amendment for the guarantees, limits and residual risks.
+
 ## Local readiness observation (2026-10-20)
 
 The local Docker daemon was already reachable; the missing pinned stdlib image

@@ -33,3 +33,5 @@ Implemented: [rehearsal run worker](rehearsal-run.md).
 Implemented: [chat-v1 conversations, loss masks and code extraction](chat-format.md).
 
 Implemented: [SFT batching, assistant-token normalization and dev loss](sft-batching.md).
+
+Implemented: [reinforcement-learning reward channel](reward-channel.md).

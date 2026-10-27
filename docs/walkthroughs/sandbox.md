@@ -8,4 +8,6 @@ For an infinite loop, the supervisor reaches the wall deadline and kills the chi
 
 See [ADR 0004](../adr/0004-development-sandbox.md) for the threat boundary and grading limitations. Integration tests run only when explicitly enabled on a disposable Docker worker; absence of the daemon is not a passed security test.
 
+Reinforcement-learning rewards use a different supervisor through the same hardened command, described in the [reward-channel walkthrough](reward-channel.md): the host keeps the expected values and sends only each hidden assertion's call (or each I/O case's input) into the container, so a candidate cannot forge a pass, and host failures are reported distinctly from candidate outcomes so they are retried rather than scored. That path leaves this one, the evaluation path of record, unchanged.
+
 Questions: why no bind mounts (deny host files); why fixed local daemon (avoid remote paid resources); why bound capture twice (protect supervisor and host); why kill the container (contain surviving descendants); why refuse a host fallback (preserve the isolation contract).
