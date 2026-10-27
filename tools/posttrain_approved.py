@@ -72,8 +72,9 @@ LIMITS = {
 }
 GENERATION_FLOORS = {"128": 8_279.0, "256": 9_268.0}
 """The probe's floors and the planning generation speeds of both runs: 5% under the rates run
-1's first launch measured, rounded down (8,714.9 tok/s at batch 128 and 9,756.7 at batch 256;
-it measured 4,607 at batch 64, below that launch's 5,000 floor, and nothing generates at 64)."""
+1's first launch measured, rounded down (8,714.9 tok/s at batch 128 and 9,756.7 at batch 256).
+That launch stopped below both of its floors, 4,607 against 5,000 at batch 64 and 9,756.7
+against 10,000 at batch 256; nothing generates at 64 any more."""
 PLANNING = {
     "generation_tokens_per_second": dict(GENERATION_FLOORS),
     "training_slots_per_second": 56_765.0,
