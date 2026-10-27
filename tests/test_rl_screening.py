@@ -35,7 +35,7 @@ def task(
     )
 
 
-ELIGIBLE = "assert f(1) == 7\nassert f(2) == 9"  # no constant, echo or public value passes
+ELIGIBLE = "assert f(6) == 17\nassert f(7) == 19"  # no constant, echo or public value passes
 CONSTANT = "assert f(1) == 0\nassert f(2) == 0\nassert f(5) == 15"  # constant 0 earns 2/3
 UNPARSEABLE = "x = f(1)\nassert x == 7"  # a statement other than assert or import
 

@@ -33,7 +33,7 @@ from scratchcoder.tokenizer.bpe import ByteBPE
 TOKENIZER = ByteBPE()
 
 
-def dev_task(identifier: str, hidden: str = "assert f(1) == 7", split: str = "dev") -> Task:
+def dev_task(identifier: str, hidden: str = "assert f(6) == 17", split: str = "dev") -> Task:
     return Task(
         id=identifier,
         prompt="Compute f.",
@@ -68,9 +68,9 @@ def test_dev_subset_is_the_smallest_id_hashes_in_order() -> None:
 def test_constant_baseline_counts_unparseable_tasks_as_zero() -> None:
     tasks = [
         dev_task("a", "assert f(1) == 0\nassert f(2) == 0"),  # constant 0 earns 1.0
-        dev_task("b", "assert f(1) == 7\nassert f(2) == 0"),  # 0.5
+        dev_task("b", "assert f(6) == 17\nassert f(2) == 0"),  # 0.5
         dev_task("c", "y = f(1)\nassert y == 2"),  # unparseable: 0
-        dev_task("d", "assert f(1) == 7"),  # 0
+        dev_task("d", "assert f(6) == 17"),  # 0
     ]
     baseline = constant_baseline(tasks)
     assert baseline.mean == pytest.approx(1.5 / 4)

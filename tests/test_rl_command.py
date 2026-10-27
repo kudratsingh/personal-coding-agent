@@ -30,7 +30,7 @@ def task(identifier: str, hidden: str, *, split: str = "train", source: str = "s
 
 
 TASKS = [
-    task("a", "assert f(1) == 7\nassert f(2) == 9"),
+    task("a", "assert f(6) == 17\nassert f(7) == 19"),
     task("b", "assert f(1) == 0\nassert f(2) == 0", source="s2"),
     task("c", "x = f(1)\nassert x == 7", source="s2"),
 ]
@@ -53,7 +53,7 @@ def test_read_candidates_checks_split_source_and_presence(tmp_path: Path) -> Non
         with pytest.raises(ValueError):
             read_candidates(tasks_path, candidates_path)
     tasks_path, candidates_path = write(
-        tmp_path, [task("d", "assert f(1) == 7", split="dev")], [("d", "s1")]
+        tmp_path, [task("d", "assert f(6) == 17", split="dev")], [("d", "s1")]
     )
     with pytest.raises(ValueError, match="not a train task"):
         read_candidates(tasks_path, candidates_path)

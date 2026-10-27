@@ -7,7 +7,7 @@ The rehearsal's short reinforcement-learning run trains the SFT checkpoint on co
 Screening runs after SFT. It samples 8 programs per RL candidate from the SFT checkpoint, scores them through the [reward channel](walkthroughs/reward-channel.md), and keeps a candidate only if:
 
 1. **Parseable:** every hidden test is in a form the reward channel can score (`is_parseable`);
-2. **No cheap answer:** the best constant answer earns less than **0.5** (a setting). A constant answer is a fixed return value or printed line, a value copied from the task's public tests, or echoing the first argument or the input (`degenerate_baseline`; no code runs). An advantage is a reward minus its group's mean, so a task that pays a constant answer well pays the policy for answering without solving. The owner set this threshold;
+2. **No cheap answer:** the best constant answer earns less than **0.5** (a setting). A constant answer is a fixed return value or printed line (singletons, the integers −1 to 10, empty values and `[0]`; for I/O also lines such as `YES` and `NO`), a value copied from the task's public tests, or an echo: of the first, second or last argument, of all arguments, or of the input or its first or last line or token (`degenerate_baseline`; no code runs). An advantage is a reward minus its group's mean, so a task that pays a constant answer well pays the policy for answering without solving. The owner set this threshold;
 3. **Something to learn from:** its 8 rewards are not all equal. An all-equal group has zero advantage and adds no gradient;
 4. **Within the cap:** it is among the first 1,000 eligible tasks in ID-hash order, `sha256("rl-candidate-v1|" + task ID)`.
 
@@ -17,12 +17,12 @@ If fewer than **320** tasks are kept (enough for 10 updates of 32 without reuse)
 
 | Source | Candidates | Parseable | Constant answer ≥ 0.5 | Eligible before rule 3 |
 | --- | ---: | ---: | ---: | ---: |
-| OpenCodeInstruct | 540 | 500 | 80 | 420 |
-| TACO | 391 | 391 | 81 | 310 |
-| MBPP | 69 | 69 | 28 | 41 |
-| **All** | **1,000** | **960** | **189** | **771** |
+| OpenCodeInstruct | 540 | 500 | 84 | 416 |
+| TACO | 391 | 391 | 89 | 302 |
+| MBPP | 69 | 69 | 43 | 26 |
+| **All** | **1,000** | **960** | **216** | **744** |
 
-Under the rehearsal tokenizer, all 771 chat-v1 prompts fit the 1,024-token context. 764 of them leave room for the full 256 new tokens. Rule 3 needs the SFT checkpoint's samples, so the kept count is not yet known.
+Under the rehearsal tokenizer, every eligible chat-v1 prompt fits the 1,024-token context, and at most 7 leave less room than the full 256 new tokens. Rule 3 needs the SFT checkpoint's samples, so the kept count is not yet known.
 
 ## The run
 

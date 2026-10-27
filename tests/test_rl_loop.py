@@ -43,8 +43,8 @@ def task(identifier: str) -> Task:
     return Task(
         id=identifier,
         prompt="Add one.",
-        public_tests="assert f(1) == 2",
-        hidden_tests="assert f(2) == 3\nassert f(5) == 6",
+        public_tests="assert f(11) == 12",
+        hidden_tests="assert f(12) == 13\nassert f(15) == 16",
         source="synthetic",
         license="fixture",
         written_by="human",

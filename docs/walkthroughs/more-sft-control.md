@@ -13,14 +13,14 @@ RL starts from the SFT checkpoint and spends GPU time. If the RL checkpoint scor
 
 It stops at exactly 5.0 s, a mismatch of 0. With 1 s updates against a 2.6 s budget it stops after 3 updates. At 2 updates, 2 + 0.5 < 2.6, so it trains a third and ends at 3.0 s. That is 0.4 s or 15.4% over, outside the ±5% tolerance, and the result says so (`within_tolerance: false`). The rule takes one more update only when it would land closer to the budget than stopping now, if the next update takes the mean time.
 
-**The checks.** With 771 kept tasks and 16 × 2 = 32 rows per update, pass `p` is complete after update `ceil(p × 771 / 32)`:
+**The checks.** With 744 kept tasks (every eligible task, before rule 3) and 16 × 2 = 32 rows per update, pass `p` is complete after update `ceil(p × 744 / 32)`:
 
 | Passes | Update |
 | ---: | ---: |
-| 1 | 25 |
-| 2 | 49 |
-| 4 | 97 |
-| 8 | 193 |
+| 1 | 24 |
+| 2 | 47 |
+| 4 | 93 |
+| 8 | 186 |
 
 A check follows each of those updates that the budget reaches, and one more at the budget end. The start check is RL's update-0 check, the same SFT weights, reused rather than repeated.
 
