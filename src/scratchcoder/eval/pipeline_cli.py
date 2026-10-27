@@ -6,7 +6,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
-COMMANDS = ("eval-generate", "eval-execute", "eval-seal", "eval-baseline", "scorecard")
+COMMANDS = (
+    "eval-generate",
+    "eval-execute",
+    "eval-seal",
+    "eval-baseline",
+    "eval-test-baseline",
+    "scorecard",
+)
 
 
 def _print(value: dict[str, Any]) -> None:
@@ -42,7 +49,9 @@ def add_parsers(subparsers: Any) -> None:
     execute.add_argument("--completions", type=Path, required=True)
     execute.add_argument("--tasks", type=Path, required=True, help="the pool task file")
     execute.add_argument("--results", type=Path, required=True, help="created, or continued")
-    execute.add_argument("--tokenizer", type=Path, help="required for chat-v1 completions")
+    execute.add_argument(
+        "--tokenizer", type=Path, help="required for chat-v1 completions and the test split"
+    )
     execute.add_argument("--workers", type=int, default=8)
     execute.add_argument("--seal-ledger", type=Path, help="test split only")
     execute.add_argument("--unseal", type=Path, help="test split only: the unseal record")
@@ -58,6 +67,14 @@ def add_parsers(subparsers: Any) -> None:
     baseline.add_argument("--tasks", type=Path, required=True, help="pool dev JSONL")
     baseline.add_argument("--output", type=Path, required=True, help="new JSON file")
     baseline.add_argument("--workers", type=int, default=8)
+    test_baseline = subparsers.add_parser(
+        "eval-test-baseline",
+        help="retry the logged test-split baseline after every unsealed read has finished",
+    )
+    test_baseline.add_argument("--tasks", type=Path, required=True, help="the pool test JSONL")
+    test_baseline.add_argument("--seal-ledger", type=Path, required=True)
+    test_baseline.add_argument("--unseal", type=Path, required=True, help="the unseal record")
+    test_baseline.add_argument("--workers", type=int, default=8)
     score = subparsers.add_parser(
         "scorecard",
         help="build the scorecard from results files, benchmark artifacts and ARC reports",
@@ -155,6 +172,12 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         save_baseline(args.output, report)
         _print({"baseline": str(args.output), **report["summary"]})
         return 0
+    if args.command == "eval-test-baseline":
+        from scratchcoder.eval.executor import run_test_baseline
+
+        outcome = run_test_baseline(args.tasks, args.seal_ledger, args.unseal, workers=args.workers)
+        _print(outcome)
+        return 0 if outcome["recorded"] else 3
     if args.command == "scorecard":
         from scratchcoder.common.records import atomic_json
         from scratchcoder.eval.scorecard import build_scorecard, render_markdown

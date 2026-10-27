@@ -22,6 +22,20 @@ once all four endpoints (``base``, ``sft``, ``rl``, ``more-sft``) are frozen::
 Execution is refused unless the file is sealed, every completions file the record lists
 is sealed, the file is listed under the endpoint whose checkpoint generated it, and no
 other read of it was ever opened. A second execution of the same completions is refused.
+
+A second read cannot be had by regenerating. One unseal record governs a ledger: once any
+read has opened, no file can be sealed and every later read must present the same record.
+The record may not list two files of one checkpoint, protocol and decoding kind (greedy or
+sampled), because the second would be a second look at the same endpoint.
+
+A hash chain alone cannot show that its *last* lines were removed, so a *head record*,
+``<ledger>.head``, beside the ledger names the event count and the hash of the last event
+after every append. A ledger shorter than its head record, a head record whose hash is not
+in the chain, a missing head record beside a non-empty ledger, and a head record with no
+ledger are all refused. The head record is written after the ledger line is synced, so a
+crash between the two leaves a ledger longer than its head record, which is accepted and
+repaired by the next append. The two files travel together; this guards against accidents
+and casual edits, not against someone who rewrites both.
 """
 
 import fcntl
@@ -32,6 +46,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import IO, Any
 
 from scratchcoder.common.records import utc_now
@@ -42,6 +57,13 @@ UNSEAL_KIND = "unseal"
 LEDGER_FORMAT = "scratchcoder-seal-ledger"
 GENESIS = "0" * 64
 EVENTS = ("sealed", "opened", "resumed", "completed", "baseline")
+HEAD_FORMAT = "scratchcoder-seal-ledger-head"
+HEAD_SUFFIX = ".head"
+
+
+def decoding_kind(sealed: dict[str, Any]) -> str:
+    """``greedy`` or ``sampled``, from a ``sealed`` event: the kind of decoding a file holds."""
+    return "greedy" if sealed["temperature"] == 0 else "sampled"
 
 
 class SealError(PermissionError):
@@ -114,8 +136,11 @@ class UnsealRecord:
         return None
 
 
-def _parse(data: bytes) -> list[dict[str, Any]]:
+def _parse(data: bytes) -> tuple[list[dict[str, Any]], list[str]]:
+    """The ledger's events and the SHA-256 of each line, or :class:`SealError` if the chain
+    is broken."""
     events: list[dict[str, Any]] = []
+    hashes: list[str] = []
     previous = GENESIS
     if data and not data.endswith(b"\n"):
         raise SealError("the seal ledger ends with a torn line")
@@ -133,8 +158,9 @@ def _parse(data: bytes) -> list[dict[str, Any]]:
         if event.get("previous_sha256") != previous:
             raise SealError(f"seal ledger chain broken at line {number}")
         previous = hashlib.sha256(line).hexdigest()
+        hashes.append(previous)
         events.append(event)
-    return events
+    return events, hashes
 
 
 class SealLedger:
@@ -143,6 +169,56 @@ class SealLedger:
     def __init__(self, path: Path) -> None:
         self.path = path
 
+    @property
+    def head_path(self) -> Path:
+        return self.path.with_name(self.path.name + HEAD_SUFFIX)
+
+    def _verify_head(self, hashes: list[str]) -> None:
+        """Refuse a ledger that lost its last events (or all of them, or its head record)."""
+        if not self.head_path.exists():
+            if hashes:
+                raise SealError(
+                    f"the seal ledger has no head record ({self.head_path.name}); "
+                    "keep the two files together"
+                )
+            return
+        try:
+            head = json.loads(self.head_path.read_text(encoding="utf-8"))
+            count, digest = head["events"], head["head_sha256"]
+            valid = (
+                head["format"] == HEAD_FORMAT
+                and type(count) is int
+                and count >= 1
+                and isinstance(digest, str)
+                and bool(SHA256.fullmatch(digest))
+            )
+        except (ValueError, KeyError, TypeError) as error:
+            raise SealError("the seal ledger's head record is unreadable") from error
+        if not valid:
+            raise SealError("the seal ledger's head record is malformed")
+        if len(hashes) < count:
+            raise SealError(
+                f"the seal ledger has {len(hashes)} events but its head record names {count}: "
+                "events were removed"
+            )
+        if hashes[count - 1] != digest:
+            raise SealError("the seal ledger does not match its head record")
+
+    def _write_head(self, count: int, digest: str) -> None:
+        record = {"format": HEAD_FORMAT, "events": count, "head_sha256": digest}
+        with NamedTemporaryFile(
+            mode="w", dir=self.head_path.parent, encoding="utf-8", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            try:
+                stream.write(json.dumps(record, sort_keys=True) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
+        os.replace(temporary, self.head_path)
+
     @contextmanager
     def _locked(self) -> Iterator[tuple[list[dict[str, Any]], IO[bytes]]]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -150,19 +226,34 @@ class SealLedger:
             fcntl.flock(handle, fcntl.LOCK_EX)
             try:
                 handle.seek(0)
-                yield _parse(handle.read()), handle
+                events, hashes = _parse(handle.read())
+                self._verify_head(hashes)
+                yield events, handle
             finally:
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
     def events(self) -> list[dict[str, Any]]:
         if not self.path.exists():
+            if self.head_path.exists():
+                raise SealError("the seal ledger is missing but its head record exists")
             return []
         with self._locked() as (events, _):
             return events
 
-    @staticmethod
+    def head(self) -> dict[str, Any]:
+        """The ledger's current event count and last-event hash (what the head record holds)."""
+        if not self.path.exists():
+            return {"events": 0, "head_sha256": GENESIS}
+        with self._locked() as (events, handle):
+            handle.seek(0)
+            lines = handle.read().splitlines(keepends=True)
+            return {
+                "events": len(events),
+                "head_sha256": hashlib.sha256(lines[-1]).hexdigest() if lines else GENESIS,
+            }
+
     def _append(
-        events: list[dict[str, Any]], handle: IO[bytes], event: str, **fields: Any
+        self, events: list[dict[str, Any]], handle: IO[bytes], event: str, **fields: Any
     ) -> dict[str, Any]:
         handle.seek(0)
         data = handle.read()
@@ -176,14 +267,20 @@ class SealLedger:
             "previous_sha256": previous,
             **fields,
         }
-        handle.write(json.dumps(record, sort_keys=True, allow_nan=False).encode() + b"\n")
+        line = json.dumps(record, sort_keys=True, allow_nan=False).encode() + b"\n"
+        handle.write(line)
         handle.flush()
         os.fsync(handle.fileno())
         events.append(record)
+        self._write_head(len(events), hashlib.sha256(line).hexdigest())
         return record
 
     def seal(self, completions: Completions) -> dict[str, Any]:
-        """Record a pool-test completions file; sealing the same file again is a no-op."""
+        """Record a pool-test completions file; sealing the same file again is a no-op.
+
+        Once any read has opened, no new file can be sealed: the unseal record that opened it
+        fixed the set of files, and a regenerated file would be a second look.
+        """
         header = completions.header
         if header.suite != "pool" or header.split != "test":
             raise SealError("only pool test-split completions are sealed")
@@ -191,6 +288,10 @@ class SealLedger:
             for event in events:
                 if event["event"] == "sealed" and event["completions_sha256"] == completions.sha256:
                     return event
+            if any(event["event"] == "opened" for event in events):
+                raise SealError(
+                    "a read of the test split has already opened; no new completions can be sealed"
+                )
             return self._append(
                 events,
                 handle,
@@ -206,6 +307,83 @@ class SealLedger:
                 path=str(completions.path) if completions.path else None,
             )
 
+    @staticmethod
+    def _sealed(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        return {
+            event["completions_sha256"]: event for event in events if event["event"] == "sealed"
+        }
+
+    @classmethod
+    def _check_record(
+        cls, events: list[dict[str, Any]], unseal: UnsealRecord
+    ) -> dict[str, dict[str, Any]]:
+        """Checks that depend on the unseal record and the sealed files, not on one read."""
+        sealed = cls._sealed(events)
+        missing = [
+            listed
+            for endpoint in unseal.endpoints
+            for listed in endpoint.completions_sha256
+            if listed not in sealed
+        ]
+        if missing:
+            raise SealError(
+                f"{len(missing)} completions listed in the unseal record are not sealed"
+            )
+        if any(
+            event["unseal_sha256"] != unseal.sha256
+            for event in events
+            if event["event"] == "opened"
+        ):
+            raise SealError(
+                "a read of this ledger opened under another unseal record; "
+                "every read must use the one record"
+            )
+        for endpoint in unseal.endpoints:
+            kinds: dict[tuple[str, str], int] = {}
+            for listed in endpoint.completions_sha256:
+                key = (sealed[listed]["protocol_sha256"], decoding_kind(sealed[listed]))
+                kinds[key] = kinds.get(key, 0) + 1
+            if any(count > 1 for count in kinds.values()):
+                raise SealError(
+                    f"endpoint {endpoint.name}: the unseal record lists two completions files "
+                    "of one protocol and decoding kind; only one may be read"
+                )
+        return sealed
+
+    @classmethod
+    def _check_read(
+        cls, events: list[dict[str, Any]], completions: Completions, unseal: UnsealRecord
+    ) -> tuple[Endpoint, list[dict[str, Any]]]:
+        digest = completions.sha256
+        if digest not in cls._sealed(events):
+            raise SealError("these test completions were never sealed in this ledger")
+        cls._check_record(events, unseal)
+        endpoint = unseal.endpoint_for(digest)
+        if endpoint is None:
+            raise SealError("the unseal record does not list these completions")
+        if endpoint.checkpoint_sha256 != completions.header.checkpoint_sha256:
+            raise SealError("the unseal record lists these completions under another checkpoint")
+        reads = [
+            event
+            for event in events
+            if event["event"] in ("opened", "completed") and event["completions_sha256"] == digest
+        ]
+        return endpoint, reads
+
+    def check_read(self, completions: Completions, unseal: UnsealRecord) -> None:
+        """Raise :class:`SealError` if :meth:`open_read` would refuse, logging nothing.
+
+        The executor calls this before it opens the task file, so a refused read never
+        touches the sealed split. A resumption still passes (only a second, different read
+        or a completed one is refused by :meth:`open_read`).
+        """
+        with self._locked() as (events, _):
+            _, reads = self._check_read(events, completions, unseal)
+            if any(event["event"] == "completed" for event in reads):
+                raise SealError(
+                    "these test completions were already executed; a second read is refused"
+                )
+
     def open_read(
         self, completions: Completions, unseal: UnsealRecord, *, results_id: str, results_path: Path
     ) -> dict[str, Any]:
@@ -215,32 +393,7 @@ class SealLedger:
         """
         digest = completions.sha256
         with self._locked() as (events, handle):
-            sealed = {event["completions_sha256"] for event in events if event["event"] == "sealed"}
-            if digest not in sealed:
-                raise SealError("these test completions were never sealed in this ledger")
-            missing = [
-                listed
-                for endpoint in unseal.endpoints
-                for listed in endpoint.completions_sha256
-                if listed not in sealed
-            ]
-            if missing:
-                raise SealError(
-                    f"{len(missing)} completions listed in the unseal record are not sealed"
-                )
-            endpoint = unseal.endpoint_for(digest)
-            if endpoint is None:
-                raise SealError("the unseal record does not list these completions")
-            if endpoint.checkpoint_sha256 != completions.header.checkpoint_sha256:
-                raise SealError(
-                    "the unseal record lists these completions under another checkpoint"
-                )
-            reads = [
-                event
-                for event in events
-                if event["event"] in ("opened", "completed")
-                and event["completions_sha256"] == digest
-            ]
+            endpoint, reads = self._check_read(events, completions, unseal)
             fields = {
                 "completions_sha256": digest,
                 "checkpoint_sha256": endpoint.checkpoint_sha256,
@@ -292,6 +445,31 @@ class SealLedger:
                 sha256=sha256,
                 results_id=results_id,
             )
+
+    def finished_unseal(self, unseal: UnsealRecord) -> dict[str, Any]:
+        """The sealed event's task file and the last results ID, once every file the unseal
+        record lists has a completed read. Raises :class:`SealError` before that.
+
+        The test split's baseline retry is allowed only through this gate."""
+        with self._locked() as (events, _):
+            sealed = self._check_record(events, unseal)
+            done = {
+                event["completions_sha256"] for event in events if event["event"] == "completed"
+            }
+            listed = [
+                digest for endpoint in unseal.endpoints for digest in endpoint.completions_sha256
+            ]
+            pending = [digest for digest in listed if digest not in done]
+            if pending:
+                raise SealError(
+                    f"{len(pending)} of {len(listed)} listed test completions have no completed "
+                    "read; the baseline is computed after every read finished"
+                )
+            task_files = {sealed[digest]["task_file_sha256"] for digest in listed}
+            if len(task_files) != 1:
+                raise SealError("the listed test completions name different task files")
+            last = [event for event in events if event["event"] == "completed"][-1]
+            return {"task_file_sha256": task_files.pop(), "results_id": last["results_id"]}
 
 
 def seal_completions(completions_path: Path, ledger_path: Path) -> dict[str, Any]:
