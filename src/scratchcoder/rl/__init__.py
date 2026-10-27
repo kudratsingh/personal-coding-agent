@@ -9,5 +9,9 @@
 - ``loop``: the RL run with its stops.
 - ``control``: the compute-matched more-SFT control.
 - ``checkpoint``: weights-only checkpoints.
+- ``bridge``: the reward bridge's schemas and its Pod side (rewards and dev verdicts from
+  the Mac, through files).
+- ``bridge_mac``: the bridge's Mac side: polling the Pod over SSH, scoring, replying.
+- ``bridge_command``: ``scratchcoder rl-bridge``.
 - ``fakes``: deterministic stand-ins for tests and smokes.
 """
