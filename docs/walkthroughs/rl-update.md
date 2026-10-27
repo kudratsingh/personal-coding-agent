@@ -71,7 +71,8 @@ A descent step therefore raises `θ₂` (token 2 appeared in the above-average a
 - the schedule;
 - the 25,600 rehearsal rollout seeds being distinct and disjoint from screening and dev seeds;
 - the rollout protocol (prompts, temperature, top-p, token cap, stops, seeds, no sampler log probabilities);
-- the warmup schedule, skipped updates, every stop and the monitoring fields.
+- the warmup schedule, skipped updates, every stop and the monitoring fields;
+- the stop-time check (skipped after a `should_stop` stop by default, never selected after a leakage stop), patience at the final update, the saved weights on an unexpected error, `on_check` and the refusal of non-train or unparseable tasks.
 
 `tests/test_rl_control.py` runs three RL updates end to end on a tiny CPU model with a fake reward source.
 

@@ -53,15 +53,27 @@ Each check saves the weights. Every update's log also carries the mean constant-
 | `external` | the caller's `should_stop`, read between updates, asks to stop (cost, wall or idle); its text is the stop detail |
 | `completed` | all 100 updates ran |
 
-A stop whose weights changed since the last check takes one more check, unless the stop came from the execution side. An update whose groups are all skipped takes no optimizer step and is listed in the result. The reward timeout has no built-in value. The caller derives it from the per-attempt budgets (8 s for a function task; 2 s plus 0.25 s per case, at most 60 s, for an I/O task) and the number of execution workers.
+**The stop-time check.** A stop whose weights changed since the last check takes one more check, so the last weights are scored, except:
+
+- a stop from the execution side (`reward_wait`, `reward_host_failure`), because the check needs that side;
+- a `should_stop` stop, unless `check_at_external_stop` is set, because a cost, wall or idle stop exists to stop spending and the check is about 1,800 generations and a Mac round trip;
+- either kind of stop when its flag is off (`check_at_stop` for the run's own stops, `check_at_external_stop` for `should_stop`).
+
+Weights that no check covers are saved and listed as the result's `stop_checkpoint`. The check taken at a `leakage` stop is recorded (`selectable: false`) but never selected: those weights were trained into a reward exploit. Dev patience reached at the final update is a `completed` run with the patience noted in the stop detail, since no update is left to cut short.
+
+**Failures.** An unexpected error anywhere (a lost bridge, an out-of-memory error, an `on_check` that raises), including in the stop-time check, saves the latest weights, logs `rl_failed` and propagates, with no result file. The caller can pass `on_check`, called with each check's record once its checkpoint file exists, to upload the weights at once. `run_rl` and `run_more_sft` refuse a task that is not a train-split task or whose hidden tests the reward channel cannot parse, and the control also a task without a reference solution.
+
+An update whose groups are all skipped takes no optimizer step and is listed in the result.
+
+**The reward timeout** has no built-in value. The caller derives it from the per-attempt budgets (8 s for a function task; 2 s plus 0.25 s per case, at most 60 s, for an I/O task), the 15 s of host slack the channel adds to a try, the number of execution workers, and the tries. `LocalRewardSource` retries a host failure 3 times after the first try (4 tries, waiting 1, 2 and 4 s), where the channel's own helper `score_with_host_retries` counts 3 tries in all. A worst case without retries is `ceil(attempts / workers)` times the longest budget: 256 I/O attempts at the 26.75 s budget of a 99-case task on 8 workers is about 856 s before slack, so a fixed value such as 420 s would stop a run that is merely slow.
 
 ## Selection
 
-Each arm reports the check with the highest dev-subset greedy pass@1. Ties go to the higher 8-sample mean, then to the later check.
+Each arm reports the check with the highest dev-subset greedy pass@1 among its selectable checks. Ties go to the higher 8-sample mean, then to the later check.
 
 **The control's checks:** the start (RL's update-0 check of the same weights), after 1, 2, 4 and 8 passes over the references, and at the end of its budget.
 
-**The control's budget:** GPU-busy time equal to RL's measured rollout-generation plus training-step seconds, within ±5%. Compile, dev checks and execution waits are excluded in both arms. The measured mismatch is reported.
+**The control's budget:** GPU-busy time equal to RL's measured rollout-generation plus training-step seconds, within ±5%. Compile, dev checks and execution waits are excluded in both arms. The measured mismatch is reported. Neither arm compiles, so the control has no `compile` setting (its compile time could not be separated from the budget). Its attention kernel and optimizer path are settings (`attention`, `optimizer_foreach`): they should match the RL model (`RLResult.attention`) and the SFT stage, or the same seconds buy fewer control updates than they would on that path.
 
 ## Commands
 

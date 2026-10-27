@@ -40,7 +40,8 @@ A check follows each of those updates that the budget reaches, and one more at t
 - **Report the mismatch; do not hide it.** The stop rule keeps the mismatch within half an update in the usual case, but the result always carries the measured difference and its fraction.
 - **Geometric check spacing.** Training on a few hundred references overfits within a few passes. Checks evenly spaced over about 60 passes would see only the overfit end and make the control look worse than it is. Checks after 1, 2, 4 and 8 passes catch its best point. This is the one place the control's selection differs from RL's, whose checks are evenly spaced.
 - **The start is shared.** RL's update-0 check is the same weights and the same dev subset, so it is reused. Both arms then select from a set that includes the SFT starting point.
-- **External stops.** `should_stop` (cost, wall or idle) is read once per update, as in RL. A dev check that times out stops the control with `reward_wait` and saves its unchecked weights.
+- **External stops.** `should_stop` (cost, wall or idle) is read once per update, as in RL. A dev check that times out stops the control with `reward_wait` and saves its unchecked weights. After a `should_stop` stop no end check is taken (unless `check_at_external_stop`), so a stop meant to cap spend spends nothing more; the unchecked weights are saved as the stop checkpoint. An unexpected error, in the end check too, saves the latest weights before it propagates.
+- **Same kernels as the arm it is compared with.** `attention` and `optimizer_foreach` are settings so the control can run the same attention kernel and optimizer path as the RL model and the SFT stage. A control on a slower path would fit fewer updates into the same seconds, which would favour RL. There is no `compile` setting: neither arm compiles.
 
 ## Verification
 

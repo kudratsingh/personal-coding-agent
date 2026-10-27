@@ -201,13 +201,17 @@ class LocalRewardSource:
     Each attempt runs ``score_attempt(task, code)`` with the channel's default budget
     (``budget=None``: 8 s for a function task, 2 s plus 0.25 s per case up to 60 s for an
     I/O task) in a pool of ``workers`` threads. A host failure is retried up to
-    ``host_retries`` times after the first try, waiting ``backoff_seconds``, then twice
-    that, and so on, never more than ``max_backoff_seconds``; if it persists the call
-    raises ``RewardHostFailure``. ``timeout`` bounds one ``rewards`` call in seconds
+    ``host_retries`` times after the first try (so 3 retries are 4 tries; the channel's
+    ``score_with_host_retries(attempts=3)`` counts tries, 3 in all), waiting
+    ``backoff_seconds``, then twice that, and so on, never more than
+    ``max_backoff_seconds``; if it persists the call raises ``RewardHostFailure``.
+    ``timeout`` bounds one ``rewards`` call in seconds
     (``None`` for no bound): when it passes, attempts not yet started are cancelled and
     ``RewardTimeout`` is raised. Attempts already running finish inside the channel's own
     deadline and remove their containers. There is no default timeout: the caller derives
-    it from the budgets and the worker count.
+    it from the budgets, the channel's 15 s host slack per try, the tries and the worker
+    count (``docs/rl.md`` gives the worst case: 256 attempts at the 26.75 s budget on 8
+    workers wait about 856 s before slack).
 
     ``score``, ``sleep`` and ``clock`` are injectable for tests.
     """
