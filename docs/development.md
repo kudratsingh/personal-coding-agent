@@ -19,7 +19,7 @@ For individual local commands, use `uv run --locked scratchcoder --help` or `mak
 
 Training accepts `--device cpu`, `--device cuda`, or `--device cuda:N`; the default is CPU. Unsupported devices, unavailable CUDA, and invalid CUDA ordinals are rejected before a run is created. There is no fallback to another device and no resource provisioning. The run record stores the resolved device in `hardware.training_device`, with CUDA represented by an explicit ordinal. The Linux `uv.lock` environment installs CPU PyTorch; installing a CUDA-enabled PyTorch build is a separate environment setup step. CPU and mocked-device tests check selection and timing behavior, but do not establish GPU correctness, performance, or launch readiness.
 
-`scratchcoder eval` evaluates code-task JSONL through isolation; `scratchcoder eval-choice` scores local choice-task JSONL without executing code; `scratchcoder eval-validation` reports held-out domain loss/bits per byte from local shards. All require explicit checkpoint/tokenizer/input/output paths and record local reports/scorecards. `scratchcoder generation-benchmark` prints generation throughput as JSON for a checkpoint or a configuration with random weights. See [evaluation](evaluation.md). Serving and paid commands remain explicit unavailable placeholders; no paid compute is authorized without permission for the specific run.
+`scratchcoder rl-prescreen` counts RL candidates by the screening rules that need no model and runs no code; `scratchcoder rl-screen` scores screening attempts in the local Docker sandbox and writes the keep-rule record ([rehearsal RL](rl.md)). `scratchcoder eval` evaluates code-task JSONL through isolation; `scratchcoder eval-choice` scores local choice-task JSONL without executing code; `scratchcoder eval-validation` reports held-out domain loss/bits per byte from local shards. All require explicit checkpoint/tokenizer/input/output paths and record local reports/scorecards. `scratchcoder generation-benchmark` prints generation throughput as JSON for a checkpoint or a configuration with random weights. See [evaluation](evaluation.md). Serving and paid commands remain explicit unavailable placeholders; no paid compute is authorized without permission for the specific run.
 
 The optional independent tokenizer reference runs with `uv run --locked --extra baseline pytest tests/test_tokenizer_external.py`. It trains only on synthetic fixtures, never downloads a pretrained model or corpus, and does not become part of the core path. A dedicated CI job runs it; the base environment explicitly skips it when the extra is absent.
 
@@ -38,7 +38,7 @@ docs/          public documentation
 private/       ignored owner-only material
 ```
 
-Tokenizer, data, model, optimizer, training, engine, evaluation, and development sandbox modules are implemented. Agent repair-loop, serving, and RL namespaces remain future work. Consult [status](status.md) for acceptance gaps rather than inferring completion from a package name.
+Tokenizer, data, model, optimizer, training, engine, evaluation, development sandbox and RL modules are implemented; the RL run and its more-SFT control are CPU-tested but have not run on a GPU ([rehearsal RL](rl.md)). Agent repair-loop and serving namespaces remain future work. Consult [status](status.md) for acceptance gaps rather than inferring completion from a package name.
 
 ## Reproducibility expectations
 
