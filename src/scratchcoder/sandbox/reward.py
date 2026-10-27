@@ -21,22 +21,36 @@ because the candidate never learns which value would pass; a value that cannot b
 from the task file, never from the container. For I/O tasks every case runs under its own
 deadline and the per-attempt budget; the container returns bounded stdout and the host compares
 with expected outputs it never shared.
+
+Host failures are separated from candidate failures by framing: the supervisor writes a
+``started`` frame tagged with a random per-invocation nonce before any candidate process
+exists. A problem before that frame (no docker binary, an unreachable daemon, an absent
+image, a hung CLI) is a host failure that is retried and never scored. Once ``started`` has
+arrived, a lost, malformed or oversized report is attributed to the candidate and scores
+0.0, so a candidate cannot convert its own failure into a skipped attempt.
 """
 
 import ast
+import base64
 import math
+import os
+import re
+import secrets
+import selectors
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from json import JSONDecodeError, dumps, loads
+from json import dumps, loads
 from pathlib import Path
 from tempfile import TemporaryFile
 from typing import Any
 from uuid import uuid4
 
 from scratchcoder.eval.tasks import Task
+from scratchcoder.sandbox.reward_program import LineSplitter
 from scratchcoder.sandbox.runner import ENDPOINT, Limits, Runtime, command
 
 # Per-attempt and per-call defaults (seconds). The proposal fixes the per-attempt budget at 8 s.
@@ -45,29 +59,49 @@ DEFAULT_PER_CALL_SECONDS = 4.0
 HOST_SLACK_SECONDS = 15.0
 """Extra wall time the host waits past the budget before declaring a host stall, covering
 amd64 emulation startup. The container supervisor enforces the budget well within this."""
+MAX_IO_CASES = 100
+"""The same case-count bound the evaluation runner enforces."""
 
 # Attempt statuses the caller sees.
 COMPLETED = "completed"
 """The container ran; ``reward`` is the fraction of the task file's tests that passed."""
 RESOURCE_KILL = "resource_kill"
-"""The container was killed for resource use (OOM); the attempt scores ``reward`` 0.0."""
+"""The candidate hit a resource limit: the container's out-of-memory killer fired during
+the attempt (calls or cases it killed count as failed), or the container exited 137 after
+the candidate started and before it reported (the attempt scores 0.0)."""
+MALFORMED_REPORT = "malformed_report"
+"""The candidate started but the report was lost or malformed (for example the candidate
+disrupted the supervisor). Attributed to the candidate: the attempt scores 0.0."""
 NOT_PARSEABLE = "not_parseable"
 """The task's hidden tests are outside the supported forms; ``reward`` is ``None``."""
 HOST_TIMEOUT = "host_timeout"
 """The docker CLI or the host reader never returned in time; a host failure to retry."""
 UNAVAILABLE = "unavailable"
-"""Docker is missing, the daemon is down or the pinned image is absent; a host failure."""
+"""Docker is missing, the daemon is unreachable or the pinned image is absent; a host
+failure."""
 HOST_ERROR = "host_error"
-"""The supervisor produced no parseable framing; a host failure to retry."""
+"""The container never reported that the candidate started; a host failure to retry."""
 
 HOST_FAILURES = frozenset({HOST_TIMEOUT, UNAVAILABLE, HOST_ERROR})
 """Statuses that must be retried and never scored as a reward (not even 0.0)."""
+
+_DAEMON_UNREACHABLE = (
+    "cannot connect to the docker daemon",
+    "failed to connect to the docker api",
+    "error during connect",
+    "is the docker daemon running",
+)
 
 
 @dataclass(frozen=True)
 class RewardResult:
     """The outcome of one scored attempt. ``reward`` is ``None`` exactly for host failures
-    and unparseable tasks, so a host failure can never be mistaken for a zero reward."""
+    and unparseable tasks, so a host failure can never be mistaken for a zero reward.
+
+    ``unfinished`` counts calls or cases that produced no result in time (a per-call or
+    per-case timeout, or the per-attempt budget running out); a correct solution with a
+    nonzero ``unfinished`` was under-scored by the budget. ``outcomes`` holds one pass flag
+    per hidden check, in task-file order."""
 
     status: str
     reward: float | None
@@ -76,6 +110,8 @@ class RewardResult:
     audit_flags: tuple[str, ...] = ()
     elapsed_seconds: float = 0.0
     detail: str = ""
+    unfinished: int = 0
+    outcomes: tuple[bool, ...] = ()
 
     @property
     def is_host_failure(self) -> bool:
@@ -121,13 +157,23 @@ def _safe_literal(node: ast.expr) -> tuple[bool, object]:
     """Return ``(True, value)`` when ``node`` is a safe literal of a representable type."""
     try:
         value = ast.literal_eval(node)
-    except (ValueError, SyntaxError, TypeError):
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
         return False, None
     try:
         _canonical_from_value(value)
     except TypeError:
         return False, None
     return True, value
+
+
+def _call_is_safe(node: ast.expr) -> bool:
+    """A ``CALL`` must not compare anything itself: a comparison inside it would carry the
+    expected value into the container and be judged there by candidate objects."""
+    if isinstance(node, (ast.BoolOp, ast.Constant)):
+        return False
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return False
+    return not any(isinstance(sub, ast.Compare) for sub in ast.walk(node))
 
 
 def _parse_predicate(test: ast.expr) -> Check | None:
@@ -139,35 +185,46 @@ def _parse_predicate(test: ast.expr) -> Check | None:
         if isinstance(operator, ast.Eq):
             left_ok, left_value = _safe_literal(left)
             right_ok, right_value = _safe_literal(right)
-            if right_ok and not left_ok:
+            if right_ok and not left_ok and _call_is_safe(left):
                 return Check(ast.unparse(left), "eq", right_value)
-            if left_ok and not right_ok:
+            if left_ok and not right_ok and _call_is_safe(right):
                 return Check(ast.unparse(right), "eq", left_value)
             return None
         if isinstance(operator, ast.Is):
             for expression, other in ((left, right), (right, left)):
+                # Identity, not equality: ``0 in (None, True, False)`` would accept ``is 0``.
                 if (
                     isinstance(other, ast.Constant)
-                    and other.value in (None, True, False)
-                    and not isinstance(expression, ast.Constant)
+                    and (other.value is None or other.value is True or other.value is False)
+                    and _call_is_safe(expression)
                 ):
                     return Check(ast.unparse(expression), "eq", other.value)
             return None
         return None
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-        if isinstance(test.operand, ast.Constant):
+        if not _call_is_safe(test.operand):
             return None
         return Check(ast.unparse(test.operand), "falsy")
     return None
 
 
-def parse_function_checks(hidden_tests: str) -> FunctionChecks | None:
+def _size(text: str) -> int:
+    return len(text.encode("utf-8", errors="surrogatepass"))
+
+
+def parse_function_checks(
+    hidden_tests: str, *, limits: Limits | None = None
+) -> FunctionChecks | None:
     """Parse a function task's hidden assertions; ``None`` means the task is not parseable
     for the reward channel. Any top-level statement other than an import or a supported
-    ``assert`` makes the whole task unparseable, so a partial parse never over-rewards."""
+    ``assert`` makes the whole task unparseable, so a partial parse never over-rewards. So
+    does an expected value too large to be reported within one result row, or call sources
+    larger than the sandbox input limit."""
+    limits = limits or Limits()
+    row_bytes = limits.output_bytes
     try:
         tree = ast.parse(hidden_tests)
-    except SyntaxError:
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
         return None
     setup_lines: list[str] = []
     checks: list[Check] = []
@@ -180,29 +237,59 @@ def parse_function_checks(hidden_tests: str) -> FunctionChecks | None:
         check = _parse_predicate(node.test)
         if check is None:
             return None
+        if check.predicate == "eq" and _honest_row_bytes(len(checks), check.expected) > row_bytes:
+            return None
         checks.append(check)
     if not checks:
         return None
-    return FunctionChecks("\n".join(setup_lines), tuple(checks))
+    setup = "\n".join(setup_lines)
+    if _size(setup) + sum(_size(check.call) for check in checks) > limits.input_bytes:
+        return None
+    return FunctionChecks(setup, tuple(checks))
 
 
-def parse_io_cases(hidden_tests: str) -> IoCases:
-    cases = loads(hidden_tests)
-    return IoCases(tuple(case["input"] for case in cases), tuple(case["output"] for case in cases))
+def parse_io_cases(hidden_tests: str, *, limits: Limits | None = None) -> IoCases | None:
+    """Parse an I/O task's cases; ``None`` when the cases are malformed, more than the
+    evaluation runner allows, an input is larger than the sandbox input limit, or an expected
+    output is larger than the per-case output cap (no stdout could ever match it). Expected
+    outputs never enter the container, so their total size is not limited."""
+    limits = limits or Limits()
+    try:
+        cases = loads(hidden_tests)
+    except ValueError:
+        return None
+    if not isinstance(cases, list) or not 1 <= len(cases) <= MAX_IO_CASES:
+        return None
+    inputs: list[str] = []
+    expected: list[str] = []
+    for case in cases:
+        if (
+            not isinstance(case, dict)
+            or not isinstance(case.get("input"), str)
+            or not isinstance(case.get("output"), str)
+        ):
+            return None
+        if _size(case["input"]) > limits.input_bytes:
+            return None
+        if _size(case["output"].strip()) > limits.output_bytes:
+            return None
+        inputs.append(case["input"])
+        expected.append(case["output"])
+    return IoCases(tuple(inputs), tuple(expected))
 
 
-def parse_task(task: Task) -> FunctionChecks | IoCases | None:
+def parse_task(task: Task, *, limits: Limits | None = None) -> FunctionChecks | IoCases | None:
     """The parsed hidden tests of a task, or ``None`` if unparseable for this mode."""
     if task.mode == "io":
-        return parse_io_cases(task.hidden_tests)
-    return parse_function_checks(task.hidden_tests)
+        return parse_io_cases(task.hidden_tests, limits=limits)
+    return parse_function_checks(task.hidden_tests, limits=limits)
 
 
-def is_parseable(task: Task) -> bool:
+def is_parseable(task: Task, *, limits: Limits | None = None) -> bool:
     """Whether the reward channel can score ``task``. RL screening keeps only parseable
-    tasks (I/O tasks always are; a function task is parseable iff every hidden assertion is
-    a supported form)."""
-    return parse_task(task) is not None
+    tasks: a function task is parseable iff every hidden assertion is a supported form; an
+    I/O task iff its cases are well formed and every expected output fits the output cap."""
+    return parse_task(task, limits=limits) is not None
 
 
 # --------------------------------------------------------------------------------------
@@ -246,78 +333,108 @@ def _canonical_from_value(value: object, depth: int = 0) -> object:
     raise TypeError("unsupported value type")
 
 
-def _canonical_from_wire(node: object, depth: int = 0) -> object:
-    """The same canonical form, rebuilt from the container's type-tagged encoding."""
-    if depth > 64 or not isinstance(node, list) or not node or not isinstance(node[0], str):
-        raise ValueError("malformed encoded value")
-    kind = node[0]
-    if kind == "none":
-        return ("none",)
-    if kind == "bool":
-        return ("bool", bool(node[1]))
-    if kind == "int":
-        if not isinstance(node[1], int) or isinstance(node[1], bool):
-            raise ValueError("malformed int")
-        return ("int", node[1])
-    if kind == "float":
-        if not isinstance(node[1], (int, float)) or isinstance(node[1], bool):
-            raise ValueError("malformed float")
-        return ("float", float(node[1]))
-    if kind == "float_s":
-        return ("float", {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}[node[1]])
-    if kind == "str":
-        if not isinstance(node[1], str):
-            raise ValueError("malformed str")
-        return ("str", node[1])
-    if kind == "bytes":
-        return ("bytes", bytes(node[1]))
-    if kind == "list":
-        return ("list", tuple(_canonical_from_wire(item, depth + 1) for item in node[1]))
-    if kind == "tuple":
-        return ("tuple", tuple(_canonical_from_wire(item, depth + 1) for item in node[1]))
-    if kind == "set":
-        return ("set", frozenset(_canonical_from_wire(item, depth + 1) for item in node[1]))
-    if kind == "frozenset":
-        return ("frozenset", frozenset(_canonical_from_wire(item, depth + 1) for item in node[1]))
-    if kind == "dict":
-        return (
-            "dict",
-            frozenset(
-                (_canonical_from_wire(pair[0], depth + 1), _canonical_from_wire(pair[1], depth + 1))
-                for pair in node[1]
-            ),
-        )
-    raise ValueError("unknown encoded kind")
+def _wire_from_value(value: object) -> object:
+    """The encoding the honest driver would report for ``value`` (used to size rows)."""
+    if value is None:
+        return ["none"]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, int):
+        return ["int", value]
+    if isinstance(value, float):
+        if math.isnan(value):
+            return ["float_s", "nan"]
+        if math.isinf(value):
+            return ["float_s", "inf" if value > 0 else "-inf"]
+        return ["float", value]
+    if isinstance(value, str):
+        return ["str", value]
+    if isinstance(value, bytes):
+        return ["bytes", list(value)]
+    if isinstance(value, dict):
+        return ["dict", [[_wire_from_value(k), _wire_from_value(v)] for k, v in value.items()]]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [type(value).__name__, [_wire_from_value(item) for item in value]]
+    raise TypeError("unsupported value type")
 
 
-def _wire_truthy(node: object) -> bool:
-    """Truthiness of an encoded value, for the ``assert not CALL`` form."""
-    if not isinstance(node, list) or not node:
-        raise ValueError("malformed encoded value")
-    kind = node[0]
-    if kind == "none":
-        return False
-    if kind in ("bool", "int", "str"):
-        return bool(node[1])
-    if kind == "float":
-        return float(node[1]) != 0.0
-    if kind == "float_s":
-        return True
-    if kind in ("bytes", "list", "tuple", "set", "frozenset", "dict"):
-        return bool(node[1])
-    raise ValueError("unknown encoded kind")
-
-
-def check_passes(check: Check, reported: dict[str, Any]) -> bool:
-    """Whether one reported call result satisfies its check. Any malformed, errored or
-    unserialisable report is a failure; equality is strict in type and value."""
-    if not reported.get("ok"):
-        return False
+def _honest_row_bytes(index: int, value: object) -> int:
+    """The length of the result row an honest driver writes for ``value``; too large to
+    report (or to encode at all) is ``sys.maxsize``."""
     try:
+        return len(dumps({"i": index, "ok": True, "v": _wire_from_value(value)}))
+    except (ValueError, TypeError, RecursionError):
+        return sys.maxsize
+
+
+_SCALAR_TYPES: dict[str, type] = {"bool": bool, "int": int, "float": float, "str": str}
+_SPECIAL_FLOATS = {"nan": math.nan, "inf": math.inf, "-inf": -math.inf}
+
+
+def _canonical_from_wire(node: object, depth: int = 0) -> object:
+    """The same canonical form, rebuilt from the container's type-tagged encoding. The
+    encoding is untrusted: every node's shape, length and payload type is checked, and any
+    deviation raises ``ValueError``."""
+    if depth > 64 or type(node) is not list or not node or type(node[0]) is not str:
+        raise ValueError("malformed encoded value")
+    kind = node[0]
+    if kind == "none":
+        if len(node) != 1:
+            raise ValueError("malformed none")
+        return ("none",)
+    if len(node) != 2:
+        raise ValueError("malformed encoded value")
+    payload = node[1]
+    if kind in _SCALAR_TYPES:
+        if type(payload) is not _SCALAR_TYPES[kind]:
+            raise ValueError("malformed scalar")
+        return (kind, payload)
+    if kind == "float_s":
+        if type(payload) is not str or payload not in _SPECIAL_FLOATS:
+            raise ValueError("malformed special float")
+        return ("float", _SPECIAL_FLOATS[payload])
+    if type(payload) is not list:
+        raise ValueError("malformed container")
+    if kind == "bytes":
+        if any(type(item) is not int or not 0 <= item <= 255 for item in payload):
+            raise ValueError("malformed bytes")
+        return ("bytes", bytes(payload))
+    if kind in ("list", "tuple"):
+        return (kind, tuple(_canonical_from_wire(item, depth + 1) for item in payload))
+    if kind in ("set", "frozenset"):
+        return (kind, frozenset(_canonical_from_wire(item, depth + 1) for item in payload))
+    if kind == "dict":
+        pairs = []
+        for pair in payload:
+            if type(pair) is not list or len(pair) != 2:
+                raise ValueError("malformed dict item")
+            pairs.append(
+                (_canonical_from_wire(pair[0], depth + 1), _canonical_from_wire(pair[1], depth + 1))
+            )
+        return ("dict", frozenset(pairs))
+    raise ValueError("unknown encoded kind")
+
+
+def _truthy(canonical: object) -> bool:
+    """Truthiness of a canonical value, for the ``assert not CALL`` form."""
+    assert isinstance(canonical, tuple)
+    if canonical[0] == "none":
+        return False
+    return bool(canonical[1])
+
+
+def check_passes(check: Check, reported: object) -> bool:
+    """Whether one reported call result satisfies its check. Any malformed, errored or
+    unserialisable report is a failure, whatever exception decoding it raises; equality is
+    strict in type and value."""
+    try:
+        if not isinstance(reported, dict) or reported.get("ok") is not True:
+            return False
+        canonical = _canonical_from_wire(reported.get("v"))
         if check.predicate == "falsy":
-            return not _wire_truthy(reported["v"])
-        return _canonical_from_wire(reported["v"]) == _canonical_from_value(check.expected)
-    except (ValueError, KeyError, TypeError):
+            return not _truthy(canonical)
+        return canonical == _canonical_from_value(check.expected)
+    except Exception:
         return False
 
 
@@ -325,13 +442,18 @@ def check_passes(check: Check, reported: dict[str, Any]) -> bool:
 # Static audit (pure, no execution).
 # --------------------------------------------------------------------------------------
 
-_AUDIT_SUBSTRINGS: tuple[tuple[str, str], ...] = (
-    ("_getframe", "_getframe"),
-    ("co_consts", "co_consts"),
-    ("excepthook", "excepthook"),
-    ("_exit", "os_exit"),
-    ("__file__", "dunder_file"),
-    ("/proc", "proc_path"),
+_TEXT_FLAGS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"_getframe"), "_getframe"),
+    (re.compile(r"co_consts"), "co_consts"),
+    (re.compile(r"excepthook"), "excepthook"),
+    # ``os._exit`` or ``from os import _exit``, not ``__exit__`` or ``can_exit``.
+    (re.compile(r"(?<!\w)_exit(?!\w)"), "os_exit"),
+    (re.compile(r"__file__"), "dunder_file"),
+    (re.compile(r"/proc(?!\w)"), "proc_path"),
+    (re.compile(r"/tmp(?!\w)"), "tmp_path"),
+    # Comparison and truth overrides, however they are attached (def, assignment, type()).
+    (re.compile(r"__(?:eq|ne|bool)__"), "eq_override"),
+    (re.compile(r"__builtins__"), "builtins"),
 )
 _AUDIT_MODULES = {
     "inspect": "inspect",
@@ -340,53 +462,133 @@ _AUDIT_MODULES = {
     "ctypes": "ctypes",
     "signal": "signal",
     "builtins": "builtins",
-    "sys": None,
 }
+_ATTRIBUTE_FLAGS = {
+    "_getframe": "_getframe",
+    "co_consts": "co_consts",
+    "excepthook": "excepthook",
+    "_exit": "os_exit",
+    "__eq__": "eq_override",
+    "__ne__": "eq_override",
+    "__bool__": "eq_override",
+    "__file__": "dunder_file",
+}
+_ATTRIBUTE_CALLS = ("getattr", "setattr", "delattr", "hasattr")
+
+
+def _fold(node: ast.AST) -> str | None:
+    """The string value of a constant string expression (``'a' + 'b'``, an f-string
+    without placeholders), or ``None``."""
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _fold(node.left), _fold(node.right)
+        return left + right if left is not None and right is not None else None
+    if isinstance(node, ast.JoinedStr):
+        parts = [_fold(value) for value in node.values]
+        return None if any(part is None for part in parts) else "".join(map(str, parts))
+    return None
+
+
+def _flag_text(text: str, flags: set[str]) -> None:
+    for pattern, flag in _TEXT_FLAGS:
+        if pattern.search(text):
+            flags.add(flag)
+
+
+def _flag_module(name: str | None, flags: set[str]) -> None:
+    if name is None:
+        flags.add("dynamic_import")
+        return
+    flag = _AUDIT_MODULES.get(name.split(".")[0])
+    if flag is not None:
+        flags.add(flag)
+
+
+def _audit_tree(tree: ast.AST, flags: set[str]) -> None:
+    sys_names = {"sys"}
+    os_names = {"os", "posix"}
+    importers = {"__import__", "import_module"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                _flag_module(alias.name, flags)
+                if alias.name == "sys":
+                    sys_names.add(alias.asname or "sys")
+                elif alias.name in ("os", "posix"):
+                    os_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            _flag_module(node.module, flags)
+            for alias in node.names:
+                if node.module == "sys" and alias.name == "modules":
+                    flags.add("sys_modules")
+                elif node.module in ("os", "posix") and alias.name in ("kill", "killpg"):
+                    flags.add("os_kill")
+                elif node.module == "importlib" and alias.name == "import_module":
+                    importers.add(alias.asname or alias.name)
+
+    def is_module(node: ast.AST, names: set[str], module: str) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in names
+        return (
+            isinstance(node, ast.Call)
+            and _callee(node) in importers
+            and bool(node.args)
+            and _fold(node.args[0]) == module
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp):
+            folded = _fold(node)
+            if folded is not None:
+                _flag_text(folded, flags)
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _ATTRIBUTE_FLAGS:
+                flags.add(_ATTRIBUTE_FLAGS[node.attr])
+            if node.attr == "modules" and is_module(node.value, sys_names, "sys"):
+                flags.add("sys_modules")
+            if node.attr in ("kill", "killpg") and is_module(node.value, os_names, "os"):
+                flags.add("os_kill")
+        elif isinstance(node, ast.Name) and node.id == "builtins":
+            flags.add("builtins")
+        elif isinstance(node, ast.Call):
+            callee = _callee(node)
+            if callee in importers and node.args:
+                _flag_module(_fold(node.args[0]), flags)
+            elif callee in _ATTRIBUTE_CALLS and len(node.args) >= 2:
+                name = _fold(node.args[1])
+                if name in _ATTRIBUTE_FLAGS:
+                    flags.add(_ATTRIBUTE_FLAGS[name])
+                if name == "modules" and is_module(node.args[0], sys_names, "sys"):
+                    flags.add("sys_modules")
+                if name in ("kill", "killpg") and is_module(node.args[0], os_names, "os"):
+                    flags.add("os_kill")
+
+
+def _callee(node: ast.Call) -> str | None:
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return None
 
 
 def audit_attempt(code: str) -> tuple[str, ...]:
     """Flag risky identifiers and patterns in an attempt without running it. Returns the
     sorted distinct flags; an empty tuple means nothing flagged. These feed the RL
-    per-update audit count and the leakage stop; a flag is a signal, not a verdict."""
+    per-update audit count and the leakage stop; a flag is a signal, not a verdict.
+
+    The text scan runs even on code that does not parse. The syntax-tree scan adds what
+    text alone misses: module aliases (``import sys as s; s.modules``), dynamic imports
+    (``__import__``/``importlib.import_module``, flagged ``dynamic_import`` when the name is
+    not a constant), names assembled from string pieces, and ``os.kill``."""
     flags: set[str] = set()
-    for needle, flag in _AUDIT_SUBSTRINGS:
-        if needle in code:
-            flags.add(flag)
+    _flag_text(code, flags)
     try:
-        tree: ast.AST | None = ast.parse(code)
-    except SyntaxError:
-        tree = None
-    if tree is not None:
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                names = (
-                    [node.module or ""]
-                    if isinstance(node, ast.ImportFrom)
-                    else [alias.name for alias in node.names]
-                )
-                for name in names:
-                    root = name.split(".")[0]
-                    if root in _AUDIT_MODULES and _AUDIT_MODULES[root] is not None:
-                        flags.add(str(_AUDIT_MODULES[root]))
-            elif isinstance(node, ast.Attribute):
-                if node.attr in ("_getframe", "co_consts", "excepthook", "_exit"):
-                    flags.add({"_exit": "os_exit"}.get(node.attr, node.attr))
-                if node.attr == "modules" and _is_name(node.value, "sys"):
-                    flags.add("sys_modules")
-            elif isinstance(node, ast.Name) and node.id in ("__builtins__", "builtins"):
-                flags.add("builtins")
-            elif isinstance(node, ast.FunctionDef) and node.name == "__eq__":
-                flags.add("eq_override")
-            elif isinstance(node, ast.Call) and _is_name(node.func, "open"):
-                if node.args and isinstance(node.args[0], ast.Constant):
-                    target = node.args[0].value
-                    if isinstance(target, str) and target.startswith("/tmp"):
-                        flags.add("open_tmp")
+        _audit_tree(ast.parse(code), flags)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        pass
     return tuple(sorted(flags))
-
-
-def _is_name(node: ast.expr, name: str) -> bool:
-    return isinstance(node, ast.Name) and node.id == name
 
 
 # --------------------------------------------------------------------------------------
@@ -404,9 +606,54 @@ class ContainerOutcome:
     report: dict[str, Any] | None
     exit_code: int | None = None
     elapsed_seconds: float = 0.0
+    detail: str = ""
 
 
 REWARD_SUPERVISOR = Path(__file__).with_name("reward_program.py").read_text(encoding="utf-8")
+
+
+def _max_frame_bytes(payload: dict[str, Any]) -> int:
+    """The largest final frame the supervisor can legitimately write for ``payload``: every
+    value is base64 of a bounded byte string, so this is fixed before the run starts."""
+    if payload["mode"] == "function":
+        count, item_bytes, overhead = len(payload["calls"]), int(payload["row_bytes"]), 16
+    else:
+        count, item_bytes, overhead = len(payload["cases"]), int(payload["output_bytes"]), 96
+    return count * (4 * math.ceil(item_bytes / 3) + overhead) + 65536
+
+
+class _FrameReader:
+    """Collect the supervisor's nonce-tagged frames from the container's output; any other
+    text (docker CLI messages, junk) is kept only as a short diagnostic prefix."""
+
+    def __init__(self, nonce: str, max_line: int) -> None:
+        self.nonce = nonce
+        self.token = nonce.encode()
+        self.started = False
+        self.final: dict[str, Any] | None = None
+        self.text = bytearray()
+        self.lines = LineSplitter(max_line, self._line)
+
+    def _line(self, line: bytes) -> None:
+        if self.token in line:
+            try:
+                frame = loads(line)
+            except Exception:
+                frame = None
+            if isinstance(frame, dict) and frame.get("nonce") == self.nonce:
+                if frame.get("frame") == "started":
+                    self.started = True
+                elif frame.get("frame") == "final" and self.started and self.final is None:
+                    report = frame.get("report")
+                    self.final = report if isinstance(report, dict) else {}
+                return
+        if len(self.text) < 4096:
+            self.text.extend(line[: 4096 - len(self.text)] + b"\n")
+
+    @property
+    def daemon_unreachable(self) -> bool:
+        text = self.text.decode("utf-8", errors="replace").lower()
+        return any(marker in text for marker in _DAEMON_UNREACHABLE)
 
 
 def run_reward_container(
@@ -418,23 +665,30 @@ def run_reward_container(
 ) -> ContainerOutcome:
     """Run the reward supervisor in the hardened container and classify the host outcome.
 
-    Host failures (``unavailable``, ``host_timeout``, ``host_error``) are reported distinctly
-    from candidate outcomes, and an exit 137 with no report is a resource kill (OOM), not a
-    candidate timeout. Every invocation removes its own randomly named container.
+    - No docker binary, exit 125 or an unreachable daemon before the candidate started:
+      ``unavailable``. Any other failure before the ``started`` frame: ``host_error``. A CLI
+      that has not finished ``budget + HOST_SLACK_SECONDS`` after launch: ``host_timeout``.
+      These are host failures.
+    - After ``started``: a valid final frame is ``completed``; exit 137 without one is
+      ``resource_kill``; anything else is ``malformed_report``. These are scored.
+
+    Output is read without blocking under the deadline, and every invocation removes its own
+    randomly named container.
     """
     runtime = runtime or Runtime()
     resolved = docker or shutil.which("docker")
     if resolved is None:
-        return ContainerOutcome(UNAVAILABLE, None)
+        return ContainerOutcome(UNAVAILABLE, None, detail="docker binary not found")
+    nonce = secrets.token_hex(16)
     name = "scratchcoder-reward-" + uuid4().hex
-    budget = float(payload["budget"])
-    encoded = dumps(payload).encode()
+    deadline = float(payload["budget"]) + HOST_SLACK_SECONDS
+    reader = _FrameReader(nonce, _max_frame_bytes(payload))
     started = time.monotonic()
-    captured = bytearray()
     process: subprocess.Popen[bytes] | None = None
+    stalled = False
     try:
         with TemporaryFile() as input_stream:
-            input_stream.write(encoded)
+            input_stream.write(dumps({**payload, "nonce": nonce}).encode())
             input_stream.seek(0)
             arguments = command(
                 name, limits, docker=resolved, runtime=runtime, supervisor=REWARD_SUPERVISOR
@@ -446,43 +700,57 @@ def run_reward_container(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-            assert process.stdout is not None
-            deadline = budget + HOST_SLACK_SECONDS
-            host_stalled = False
-            while True:
-                if time.monotonic() - started > deadline:
-                    host_stalled = True
-                    process.kill()
+        assert process.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        try:
+            while selector.get_map():
+                remaining = deadline - (time.monotonic() - started)
+                if remaining <= 0:
+                    stalled = True
                     break
-                chunk = process.stdout.read(4096)
-                if not chunk:
-                    break
-                if len(captured) < limits.output_bytes * 4 + 262144:
-                    captured.extend(chunk)
-            process.wait(timeout=5)
-            process.stdout.close()
-        elapsed = time.monotonic() - started
-        if host_stalled:
-            return ContainerOutcome(HOST_TIMEOUT, None, process.returncode, elapsed)
-        if process.returncode == 125:
-            return ContainerOutcome(UNAVAILABLE, None, 125, elapsed)
-        if process.returncode == 0:
+                for key, _ in selector.select(timeout=min(0.05, remaining)):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    else:
+                        reader.lines.feed(chunk)
+        finally:
+            selector.close()
+        if not stalled:
             try:
-                report = loads(bytes(captured))
-            except (JSONDecodeError, ValueError):
-                return ContainerOutcome(HOST_ERROR, None, 0, elapsed)
-            if not isinstance(report, dict) or report.get("status") != "ran":
-                return ContainerOutcome(HOST_ERROR, None, 0, elapsed)
-            return ContainerOutcome(COMPLETED, report, 0, elapsed)
-        if process.returncode == 137:
-            return ContainerOutcome(RESOURCE_KILL, None, 137, elapsed)
-        return ContainerOutcome(HOST_ERROR, None, process.returncode, elapsed)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return ContainerOutcome(HOST_ERROR, None, None, time.monotonic() - started)
+                process.wait(timeout=max(0.0, deadline - (time.monotonic() - started)))
+            except subprocess.TimeoutExpired:
+                stalled = True
+        reader.lines.finish()
+        elapsed = time.monotonic() - started
+        code = process.returncode
+        if stalled:
+            return ContainerOutcome(HOST_TIMEOUT, None, code, elapsed, "host deadline passed")
+        if not reader.started:
+            if code == 125 or reader.daemon_unreachable:
+                return ContainerOutcome(UNAVAILABLE, None, code, elapsed, "docker unavailable")
+            return ContainerOutcome(HOST_ERROR, None, code, elapsed, "candidate never started")
+        if reader.final is not None and reader.final.get("status") == "ran":
+            return ContainerOutcome(COMPLETED, reader.final, code, elapsed)
+        if code == 137:
+            return ContainerOutcome(RESOURCE_KILL, None, code, elapsed, "container killed")
+        detail = "no final report" if reader.final is None else "supervisor failed"
+        return ContainerOutcome(MALFORMED_REPORT, None, code, elapsed, detail)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return ContainerOutcome(
+            HOST_ERROR, None, None, time.monotonic() - started, type(error).__name__
+        )
     finally:
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait(timeout=2)
+        if process is not None:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.poll() is None:
+                process.kill()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
         try:
             subprocess.run(
                 [resolved, "--host", ENDPOINT, "rm", "-f", name],
@@ -511,6 +779,7 @@ def _function_payload(
         "per_call": per_call,
         "budget": budget,
         "output_bytes": limits.output_bytes,
+        "row_bytes": limits.output_bytes,
         "site_packages": False,
     }
 
@@ -529,35 +798,57 @@ def _io_payload(
     }
 
 
-def _score_function(checks: FunctionChecks, report: dict[str, Any]) -> int:
-    rows = report.get("calls")
-    if not isinstance(rows, list):
-        return 0
-    by_index = {
-        row["i"]: row for row in rows if isinstance(row, dict) and isinstance(row.get("i"), int)
-    }
-    passed = 0
-    for index, check in enumerate(checks.checks):
-        row = by_index.get(index)
-        if isinstance(row, dict) and check_passes(check, row):
-            passed += 1
-    return passed
+def _decode_row(raw: object, index: int) -> dict[str, Any] | None:
+    if type(raw) is not str:
+        return None
+    try:
+        row = loads(base64.b64decode(raw, validate=True))
+    except Exception:
+        return None
+    if not isinstance(row, dict) or type(row.get("i")) is not int or row["i"] != index:
+        return None
+    return row
 
 
-def _score_io(cases: IoCases, report: dict[str, Any]) -> int:
+def _score_function(checks: FunctionChecks, report: dict[str, Any]) -> tuple[list[bool], int]:
+    rows = report.get("rows")
+    if type(rows) is not list or len(rows) != checks.total:
+        return [False] * checks.total, 0
+    outcomes: list[bool] = []
+    unfinished = 0
+    for index, (check, raw) in enumerate(zip(checks.checks, rows, strict=True)):
+        row = _decode_row(raw, index)
+        if row is None:
+            unfinished += raw is None
+            outcomes.append(False)
+            continue
+        unfinished += row.get("e") == "call_timeout"
+        outcomes.append(check_passes(check, row))
+    return outcomes, unfinished
+
+
+def _score_io(cases: IoCases, report: dict[str, Any]) -> tuple[list[bool], int]:
     rows = report.get("cases")
-    if not isinstance(rows, list) or len(rows) != len(cases.inputs):
-        return 0
-    passed = 0
+    if type(rows) is not list or len(rows) != cases.total:
+        return [False] * cases.total, 0
+    outcomes: list[bool] = []
+    unfinished = 0
     for row, expected in zip(rows, cases.expected, strict=True):
-        if (
-            isinstance(row, dict)
-            and row.get("ran") is True
-            and isinstance(row.get("stdout"), str)
-            and row["stdout"].strip() == expected.strip()
-        ):
-            passed += 1
-    return passed
+        if not isinstance(row, dict):
+            outcomes.append(False)
+            continue
+        unfinished += row.get("e") in ("case_timeout", "budget")
+        out = row.get("out")
+        if row.get("ran") is not True or type(out) is not str:
+            outcomes.append(False)
+            continue
+        try:
+            stdout = base64.b64decode(out, validate=True).decode("utf-8", errors="replace")
+        except Exception:
+            outcomes.append(False)
+            continue
+        outcomes.append(stdout.strip() == expected.strip())
+    return outcomes, unfinished
 
 
 def score_attempt(
@@ -572,10 +863,11 @@ def score_attempt(
     """Score one candidate completion for ``task``. The reward is ``passed / total`` with
     ``total`` taken from the task file. Unparseable tasks and host failures return a reward
     of ``None`` (never 0.0), so the RL loop can skip or retry instead of optimising against a
-    host problem. A resource kill counts as a failed attempt (reward 0.0)."""
+    host problem. Everything that happens after the candidate started is scored: a resource
+    kill or a disrupted report counts as a failed attempt."""
     limits = limits or Limits(timeout_seconds=min(60.0, max(1.0, budget)))
     flags = audit_attempt(code)
-    parsed = parse_task(task)
+    parsed = parse_task(task, limits=limits)
     if parsed is None:
         return RewardResult(NOT_PARSEABLE, None, audit_flags=flags)
     total = parsed.total
@@ -589,21 +881,42 @@ def score_attempt(
     else:
         payload = _io_payload(code, parsed, budget=budget, per_case=per_call, limits=limits)
     outcome = runner(payload)
+    elapsed = outcome.elapsed_seconds
     if outcome.host_status in HOST_FAILURES:
         return RewardResult(
-            outcome.host_status, None, 0, total, flags, outcome.elapsed_seconds, "host failure"
+            outcome.host_status, None, 0, total, flags, elapsed, outcome.detail or "host failure"
         )
-    if outcome.host_status == RESOURCE_KILL or outcome.report is None:
+    failed = (False,) * total
+    if outcome.report is None:
+        status = outcome.host_status
+        if status not in (RESOURCE_KILL, MALFORMED_REPORT):
+            status = MALFORMED_REPORT
+        return RewardResult(status, 0.0, 0, total, flags, elapsed, outcome.detail, 0, failed)
+    try:
+        if isinstance(parsed, FunctionChecks):
+            outcomes, unfinished = _score_function(parsed, outcome.report)
+        else:
+            outcomes, unfinished = _score_io(parsed, outcome.report)
+    except Exception:
         return RewardResult(
-            RESOURCE_KILL, 0.0, 0, total, flags, outcome.elapsed_seconds, "resource kill"
+            MALFORMED_REPORT, 0.0, 0, total, flags, elapsed, "bad report", 0, failed
         )
-    if isinstance(parsed, FunctionChecks):
-        passed = _score_function(parsed, outcome.report)
-    else:
-        passed = _score_io(parsed, outcome.report)
-    passed = max(0, min(passed, total))
-    reward = passed / total if total else 0.0
-    return RewardResult(COMPLETED, reward, passed, total, flags, outcome.elapsed_seconds)
+    passed = sum(outcomes)
+    # A complete report is labelled a resource kill only on in-container evidence (the
+    # container's out-of-memory kill count rose during the attempt).
+    oom_kills = outcome.report.get("oom_kills")
+    killed = type(oom_kills) is int and oom_kills > 0
+    return RewardResult(
+        RESOURCE_KILL if killed else COMPLETED,
+        passed / total,
+        passed,
+        total,
+        flags,
+        elapsed,
+        "out-of-memory kill" if killed else "",
+        unfinished,
+        tuple(outcomes),
+    )
 
 
 def score_with_host_retries(
@@ -630,19 +943,37 @@ def score_with_host_retries(
 
 @dataclass
 class AuditTally:
-    """Running counts for the RL per-update monitoring and the leakage stop."""
+    """Running counts for the RL per-update monitoring and the leakage stop.
+
+    The leakage stop is defined over *rewarded* attempts (reward above zero), so the tally
+    keeps that denominator separately: ``rewarded_rate`` is the stop's rate, ``rate`` the
+    share over every observed attempt."""
 
     attempts: int = 0
     flagged: int = 0
+    rewarded: int = 0
+    rewarded_flagged: int = 0
     flag_counts: dict[str, int] = field(default_factory=dict)
 
-    def observe(self, flags: Sequence[str]) -> None:
+    def observe(self, flags: Sequence[str], *, rewarded: bool = False) -> None:
         self.attempts += 1
         if flags:
             self.flagged += 1
+        if rewarded:
+            self.rewarded += 1
+            if flags:
+                self.rewarded_flagged += 1
         for flag in flags:
             self.flag_counts[flag] = self.flag_counts.get(flag, 0) + 1
+
+    def observe_result(self, result: RewardResult) -> None:
+        """Observe a scored attempt; it counts as rewarded when its reward is above zero."""
+        self.observe(result.audit_flags, rewarded=result.reward is not None and result.reward > 0)
 
     @property
     def rate(self) -> float:
         return self.flagged / self.attempts if self.attempts else 0.0
+
+    @property
+    def rewarded_rate(self) -> float:
+        return self.rewarded_flagged / self.rewarded if self.rewarded else 0.0

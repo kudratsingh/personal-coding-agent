@@ -15,6 +15,9 @@ from uuid import uuid4
 
 IMAGE = "python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe"
 ENDPOINT = "unix:///var/run/docker.sock"
+HOST_WATCHDOG_SECONDS = 10.0
+"""How long past the candidate deadline the host waits for the container before giving up.
+The supervisor enforces the candidate deadline itself, so reaching this is a host stall."""
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,10 @@ class Result:
     stdout: str = ""
     exit_code: int | None = None
     elapsed_seconds: float = 0.0
+    host_stalled: bool = False
+    """True when the host watchdog, not the supervisor, ended the call. The status stays
+    ``timeout`` (evaluation scoring is unchanged); callers that must not count a host stall
+    against a candidate, such as RL dev checks, retry on this flag."""
 
     @property
     def passed(self) -> bool:
@@ -170,6 +177,7 @@ def run(
     status = "infrastructure_error"
     captured = bytearray()
     process: subprocess.Popen[bytes] | None = None
+    host_stalled = False
     try:
         with TemporaryFile() as input_stream:
             input_stream.write(payload)
@@ -186,8 +194,9 @@ def run(
             selector.register(process.stdout, selectors.EVENT_READ)
             try:
                 while selector.get_map():
-                    if time.monotonic() - started > limits.timeout_seconds + 10:
+                    if time.monotonic() - started > limits.timeout_seconds + HOST_WATCHDOG_SECONDS:
                         status = "timeout"
+                        host_stalled = True
                         break
                     for key, _ in selector.select(timeout=0.05):
                         chunk = os.read(key.fd, 4096)
@@ -220,7 +229,10 @@ def run(
             elif process.returncode == 137:
                 status = "resource_limit"
             return Result(
-                status, exit_code=process.returncode, elapsed_seconds=time.monotonic() - started
+                status,
+                exit_code=process.returncode,
+                elapsed_seconds=time.monotonic() - started,
+                host_stalled=host_stalled,
             )
     except (OSError, ValueError, subprocess.SubprocessError):
         return Result("infrastructure_error", elapsed_seconds=time.monotonic() - started)
