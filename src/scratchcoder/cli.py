@@ -204,6 +204,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             resolve_dotenv,
             serve_command,
         )
+        from scratchcoder.rl.bridge_mac import BridgeLeaseHeld
 
         try:
             dotenv = resolve_dotenv(args.dotenv, disabled=args.no_dotenv)
@@ -232,6 +233,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         except BridgeEnvironmentError as error:
             sys.stderr.write(f"rl-bridge: {error}\n")
             return 2
+        except BridgeLeaseHeld as error:
+            sys.stderr.write(f"rl-bridge: {error}\n")
+            return 3
     if args.command == "generation-benchmark":
         import json
 

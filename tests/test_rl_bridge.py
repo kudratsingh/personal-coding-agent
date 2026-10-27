@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -59,11 +61,13 @@ from scratchcoder.rl.bridge import (
     verify_reply,
 )
 from scratchcoder.rl.bridge_mac import (
+    BridgeLeaseHeld,
     BridgeServer,
     BridgeTransportError,
     DirectoryTransport,
     PodListing,
     SandboxDevExecutor,
+    server_identity,
 )
 from scratchcoder.rl.fakes import FakeRewardSource
 from scratchcoder.rl.rewards import (
@@ -971,6 +975,180 @@ def test_the_mac_timeouts_bound_a_request_so_a_withdrawn_one_does_not_block_the_
         assert default.reward_source.timeout == 30
         assert isinstance(default.dev_execute, SandboxDevExecutor)
         assert default.dev_execute.timeout == 20
+
+
+def lease_file(pod: Path) -> dict[str, Any]:
+    value: dict[str, Any] = json.loads((pod / "server.lease").read_text())
+    return value
+
+
+def test_a_second_server_on_one_pod_is_refused_and_scores_nothing(tmp_path: Path) -> None:
+    """Two Macs on one Pod would score a request twice, possibly to different rewards."""
+    pod = tmp_path / "pod"
+    request = reward_request()
+    write_request(pod, request)
+    first_rewards, second_rewards = CountingRewards(), CountingRewards()
+    with mac_server(pod, tmp_path / "mac-a", rewards=first_rewards) as first:
+        assert first.poll_once() == [request.request_id]
+        held = lease_file(pod)
+        assert held["server"] == first.server_id and held["seconds"] == 60.0
+        (pod / "inbox" / request.name.file_name).unlink()  # the Pod set the reply aside
+        with mac_server(pod, tmp_path / "mac-b", rewards=second_rewards) as second:
+            assert second.server_id != first.server_id
+            with pytest.raises(BridgeLeaseHeld, match="another bridge server"):
+                second.poll_once()
+            with pytest.raises(BridgeLeaseHeld):
+                second.serve(poll_seconds=0, max_polls=3, progress_seconds=None)
+            progress = json.loads((tmp_path / "mac-b" / "progress.json").read_bytes())
+            assert (
+                progress["state"] == "failed" and "another bridge server" in progress["last_error"]
+            )
+        assert second_rewards.calls == [] and not (pod / "inbox" / request.name.file_name).exists()
+        assert not list((tmp_path / "mac-b" / "replies").iterdir())
+        assert lease_file(pod)["server"] == first.server_id
+        assert first.poll_once() == [request.request_id]  # the holder goes on, replaying
+    assert first_rewards.calls == [(3, 8)]
+
+
+def test_a_lapsed_lease_lets_another_server_take_over(tmp_path: Path) -> None:
+    pod = tmp_path / "pod"
+    clock = FakeClock()
+    request = reward_request()
+    write_request(pod, request)
+    rewards = CountingRewards()
+    with mac_server(
+        pod, tmp_path / "mac-a", transport=DirectoryTransport(pod, wall=clock.wall)
+    ) as a:
+        a.poll_once()
+        with mac_server(
+            pod,
+            tmp_path / "mac-b",
+            rewards=rewards,
+            transport=DirectoryTransport(pod, wall=clock.wall),
+        ) as b:
+            clock.now += 59
+            with pytest.raises(BridgeLeaseHeld):
+                b.poll_once()
+            clock.now += 2  # the first server has been silent for more than its 60 s
+            (pod / "inbox" / request.name.file_name).unlink()
+            assert b.poll_once() == [request.request_id]
+            assert lease_file(pod)["server"] == b.server_id
+        with pytest.raises(BridgeLeaseHeld):  # and the first now finds itself replaced
+            a.poll_once()
+
+
+def test_a_restart_over_the_same_state_is_the_same_server(tmp_path: Path) -> None:
+    pod = tmp_path / "pod"
+    for box in ("outbox", "inbox"):
+        (pod / box).mkdir(parents=True)
+    with mac_server(pod, tmp_path / "mac") as first:
+        first.poll_once()
+        identity = first.server_id
+    assert (tmp_path / "mac" / "server.id").read_text().strip() == identity
+    with mac_server(pod, tmp_path / "mac") as restarted:
+        assert restarted.server_id == identity
+        restarted.poll_once()  # takes its own lease back at once, however fresh
+    assert lease_file(pod)["server"] == identity
+    progress = json.loads((tmp_path / "mac" / "progress.json").read_bytes())
+    assert progress["server_id"] == identity and progress["lease_seconds"] == 60.0
+    assert server_identity(tmp_path / "mac") == identity
+    assert server_identity(tmp_path / "other", "c" * 32) == "c" * 32
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / "server.id").write_text("not hex\n")
+    with pytest.raises(ValueError, match="32 lowercase hex"):
+        server_identity(tmp_path / "bad")
+    with pytest.raises(ValueError, match="lease length"):
+        mac_server(pod, tmp_path / "x", lease_seconds=0)
+    with mac_server(pod, tmp_path / "off", lease_seconds=None) as unleased:
+        (pod / "server.lease").unlink()
+        unleased.poll_once()
+        assert not (pod / "server.lease").exists()  # no lease asked for, none taken
+
+
+class BlockingRewards:
+    """A reward source that holds a request until the test lets it go."""
+
+    def __init__(self) -> None:
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def rewards(self, update: int, items: Sequence[Attempt]) -> list[AttemptReward]:
+        self.entered.set()
+        assert self.release.wait(timeout=30)
+        return FakeRewardSource().rewards(update, items)
+
+
+def wait_until(condition: Callable[[], bool], what: str, seconds: float = 10.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.01)
+
+
+def serve_in_thread(
+    server: BridgeServer, errors: list[BaseException]
+) -> tuple[threading.Thread, threading.Event]:
+    stop = threading.Event()
+
+    def run() -> None:
+        try:
+            server.serve(poll_seconds=0.01, should_stop=stop.is_set, progress_seconds=0.02)
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, stop
+
+
+def test_the_ticker_renews_the_lease_while_a_long_request_is_scored(tmp_path: Path) -> None:
+    pod = tmp_path / "pod"
+    request = reward_request()
+    write_request(pod, request)
+    blocking = BlockingRewards()
+    errors: list[BaseException] = []
+    server = mac_server(pod, tmp_path / "mac", rewards=blocking, real_sleep=True)
+    thread, stop = serve_in_thread(server, errors)
+    try:
+        assert blocking.entered.wait(timeout=10)
+        first = lease_file(pod)["renewed"]
+        wait_until(lambda: lease_file(pod)["renewed"] > first, "a renewal during scoring")
+        blocking.release.set()
+        wait_until(lambda: (pod / "inbox" / request.name.file_name).exists(), "the reply")
+    finally:
+        stop.set()
+        blocking.release.set()
+        thread.join(timeout=10)
+        server.close()
+    assert not errors
+
+
+def test_a_server_that_lost_its_lease_while_scoring_stores_and_pushes_nothing(
+    tmp_path: Path,
+) -> None:
+    pod = tmp_path / "pod"
+    request = reward_request()
+    write_request(pod, request)
+    blocking = BlockingRewards()
+    errors: list[BaseException] = []
+    server = mac_server(pod, tmp_path / "mac", rewards=blocking, real_sleep=True)
+    thread, stop = serve_in_thread(server, errors)
+    try:
+        assert blocking.entered.wait(timeout=10)
+        # Another server took the Pod after this one's lease lapsed (a lid closed, say).
+        other = {"format": "rl-bridge-lease-v1", "server": "e" * 32, "seconds": 60.0}
+        (pod / "server.lease").write_text(json.dumps({**other, "renewed": time.time()}))
+        wait_until(lambda: server._lease_lost is not None, "the ticker to notice")
+        blocking.release.set()
+        thread.join(timeout=10)
+    finally:
+        stop.set()
+        blocking.release.set()
+        server.close()
+    assert len(errors) == 1 and isinstance(errors[0], BridgeLeaseHeld)
+    assert errors[0].holder == "e" * 32
+    assert not (pod / "inbox" / request.name.file_name).exists()
+    assert not list((tmp_path / "mac" / "replies").iterdir())  # nothing stored: not scored twice
+    assert json.loads((tmp_path / "mac" / "progress.json").read_bytes())["state"] == "failed"
 
 
 def test_the_client_carries_one_request_at_a_time(tmp_path: Path) -> None:

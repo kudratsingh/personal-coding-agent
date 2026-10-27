@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -130,8 +131,10 @@ def mac_server(
     rewards: Any = None,
     dev: Any = None,
     sleeps: list[float] | None = None,
+    real_sleep: bool = False,
     **options: Any,
 ) -> BridgeServer:
+    """A Mac server over fakes. Sleeps are recorded, not taken, unless ``real_sleep``."""
     recorded = sleeps if sleeps is not None else []
     return BridgeServer(
         transport or DirectoryTransport(pod_root),
@@ -141,6 +144,6 @@ def mac_server(
         state=state,
         reward_source=rewards if rewards is not None else CountingRewards(),
         dev_execute=dev if dev is not None else CountingDev(),
-        sleep=recorded.append,
+        sleep=time.sleep if real_sleep else recorded.append,
         **options,
     )

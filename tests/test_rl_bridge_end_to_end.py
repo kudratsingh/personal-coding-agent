@@ -59,6 +59,7 @@ from scratchcoder.rl.bridge_command import (
 )
 from scratchcoder.rl.bridge_mac import (
     REMOTE_SCRIPT,
+    BridgeLeaseHeld,
     BridgeServer,
     DirectoryTransport,
     SSHTransport,
@@ -584,6 +585,48 @@ def test_the_cli_exits_2_when_the_dotenv_check_would_find_nothing(
     assert main(arguments) == 2  # no --dotenv, and no .env anywhere
     assert "--no-dotenv" in capsys.readouterr().err
     assert not (tmp_path / "mac").exists()
+
+
+def test_a_second_command_on_one_pod_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    files = command_files(tmp_path)
+    pod = tmp_path / "pod"
+    for box in ("outbox", "inbox"):
+        (pod / box).mkdir(parents=True)
+    options: dict[str, Any] = {
+        "host": "unused",
+        "port": 22,
+        "identity_file": tmp_path / "unused",
+        "known_hosts": tmp_path / "unused",
+        "remote_root": "/unused",
+        "pod_reward_sha256": RL_SHA,
+        "pod_dev_sha256": DEV_SHA,
+        "reward_timeout": 600,
+        "dev_timeout": 300,
+        "poll_seconds": 0.0,
+        "dotenv": None,
+        "max_polls": 2,
+        "environ": {},
+        **files,
+    }
+    assert (
+        serve_command(**options, state=tmp_path / "mac-a", transport=DirectoryTransport(pod)) == 0
+    )
+    with pytest.raises(BridgeLeaseHeld):
+        serve_command(**options, state=tmp_path / "mac-b", transport=DirectoryTransport(pod))
+    assert (
+        serve_command(**options, state=tmp_path / "mac-a", transport=DirectoryTransport(pod)) == 0
+    )
+
+    def refuse(**_: Any) -> int:
+        raise BridgeLeaseHeld("f" * 32, 3.0)
+
+    monkeypatch.setattr(bridge_command, "serve_command", refuse)
+    (tmp_path / "empty.env").write_text("")
+    arguments = [*cli_arguments(tmp_path), f"--dotenv={tmp_path / 'empty.env'}"]
+    assert main(arguments) == 3
+    assert "another bridge server" in capsys.readouterr().err
 
 
 def test_the_dotenv_defaults_are_the_working_directory_and_the_checkout(tmp_path: Path) -> None:

@@ -7,9 +7,11 @@ exact code the Pod would run is exercised against a temporary bridge root.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,7 @@ from scratchcoder.rl.bridge import REWARD, BridgeRequest, RequestName
 from scratchcoder.rl.bridge_mac import (
     EXIT_REFUSED,
     REMOTE_SCRIPT,
+    BridgeLeaseHeld,
     BridgeRemoteError,
     BridgeTransportError,
     DirectoryTransport,
@@ -248,6 +251,191 @@ def test_a_refusal_by_the_remote_program_is_raised_at_once_not_retried(tmp_path:
         with pytest.raises(BridgeRemoteError):
             server.poll_once()
     assert calls == [1]
+
+
+SERVER_A = "a" * 32
+SERVER_B = "b" * 32
+
+
+@pytest.fixture(params=["directory", "remote"])
+def leased(request: pytest.FixtureRequest, tmp_path: Path) -> tuple[Path, Any]:
+    """A ready bridge root and a factory of transports over it: the directory-pair fake and
+    the exact remote program must agree on the lease."""
+    root = tmp_path.resolve() / "bridge"
+    for box in ("outbox", "inbox"):
+        (root / box).mkdir(parents=True)
+
+    def make() -> DirectoryTransport | SSHTransport:
+        if request.param == "directory":
+            return DirectoryTransport(root)
+        command = [sys.executable, "-I", "-c", REMOTE_SCRIPT]
+        return SSHTransport(command, str(root), environment=ssh_child_environment())
+
+    return root, make
+
+
+def write_lease(root: Path, server: str, renewed: float, seconds: float = 60.0) -> None:
+    body = {"format": "rl-bridge-lease-v1", "server": server, "renewed": renewed}
+    (root / "server.lease").write_text(json.dumps({**body, "seconds": seconds}))
+
+
+def test_one_server_holds_the_lease_and_a_second_is_refused(leased: tuple[Path, Any]) -> None:
+    root, make = leased
+    first, second = make(), make()
+    first.claim(SERVER_A, 60)
+    second.claim(SERVER_B, 60)
+    assert first.listing().ready
+    held = json.loads((root / "server.lease").read_text())
+    assert held["server"] == SERVER_A and held["seconds"] == 60
+    with pytest.raises(BridgeLeaseHeld) as caught:
+        second.listing()
+    assert caught.value.holder == SERVER_A and 0 <= caught.value.age_seconds < 5
+    assert json.loads((root / "server.lease").read_text()) == held  # the refusal wrote nothing
+    first.listing()  # a renewal keeps it
+    with pytest.raises(BridgeLeaseHeld):
+        second.listing()
+    # A restart of the same server (same ID, a new transport) takes its own lease at once.
+    again = make()
+    again.claim(SERVER_A, 60)
+    assert again.listing().ready
+    # Without a claim a listing neither takes nor checks a lease.
+    plain = make()
+    assert plain.listing().ready
+
+
+def test_a_lapsed_unreadable_or_future_lease_can_be_taken(leased: tuple[Path, Any]) -> None:
+    root, make = leased
+    now = time.time()
+    taker = make()
+    taker.claim(SERVER_B, 60)
+    for setup in (
+        lambda: write_lease(root, SERVER_A, now - 120),  # silent for twice its length
+        lambda: (root / "server.lease").write_text("not json"),  # unreadable
+        lambda: (root / "server.lease").write_text(json.dumps({"server": SERVER_A})),  # partial
+        lambda: write_lease(root, SERVER_A, now + 3600),  # a clock step: dated in the future
+    ):
+        setup()
+        assert taker.listing().ready
+        assert json.loads((root / "server.lease").read_text())["server"] == SERVER_B
+        (root / "server.lease").unlink()
+    write_lease(root, SERVER_A, now - 5, seconds=60)  # live: renewed 5 s into a 60 s lease
+    with pytest.raises(BridgeLeaseHeld):
+        taker.listing()
+    write_lease(root, SERVER_A, now - 5, seconds=2)  # the holder's own length decides
+    assert taker.listing().ready
+
+
+def test_the_lease_files_are_swept_by_neither_the_listing_nor_the_boxes(
+    leased: tuple[Path, Any],
+) -> None:
+    root, make = leased
+    transport = make()
+    transport.claim(SERVER_A, 60)
+    request = BridgeRequest.build(NAME, attempts(), task_file_sha256=RL_SHA, created_unix=0)
+    (root / "outbox" / NAME.file_name).write_bytes(request.to_bytes())
+    listing = transport.listing()
+    assert list(listing.requests) == [NAME.file_name]
+    assert {path.name for path in root.iterdir()} >= {"server.lease", "server.lease.lock"}
+    assert not [p for p in root.iterdir() if p.name.startswith(".")]  # no temporary left
+
+
+def test_a_pod_that_is_not_ready_takes_no_lease(tmp_path: Path) -> None:
+    root = tmp_path.resolve() / "bridge"
+    root.mkdir()
+    for transport in (
+        DirectoryTransport(root),
+        SSHTransport(
+            [sys.executable, "-I", "-c", REMOTE_SCRIPT],
+            str(root),
+            environment=ssh_child_environment(),
+        ),
+    ):
+        transport.claim(SERVER_A, 60)
+        assert transport.listing().ready is False
+    assert os.listdir(root) == []
+
+
+def test_the_two_implementations_share_one_lease_file(tmp_path: Path) -> None:
+    root = tmp_path.resolve() / "bridge"
+    for box in ("outbox", "inbox"):
+        (root / box).mkdir(parents=True)
+    fake = DirectoryTransport(root)
+    fake.claim(SERVER_A, 60)
+    fake.listing()
+    remote = SSHTransport(
+        [sys.executable, "-I", "-c", REMOTE_SCRIPT], str(root), environment=ssh_child_environment()
+    )
+    remote.claim(SERVER_B, 60)
+    with pytest.raises(BridgeLeaseHeld):
+        remote.listing()
+
+
+def test_the_remote_program_refuses_an_invalid_lease_claim(tmp_path: Path) -> None:
+    root = tmp_path.resolve() / "bridge"
+    for box in ("outbox", "inbox"):
+        (root / box).mkdir(parents=True)
+    command = [sys.executable, "-I", "-c", REMOTE_SCRIPT]
+    for claim in (
+        {"server": "short", "seconds": 60},
+        {"server": SERVER_A, "seconds": 0},
+        {"server": SERVER_A, "seconds": 7200},
+        {"server": SERVER_A, "seconds": True},
+        {"server": SERVER_A},
+        "a string",
+    ):
+        payload = json.dumps({"root": str(root), "action": "list", "lease": claim})
+        result = subprocess.run(command, input=payload.encode(), capture_output=True, check=False)
+        assert result.returncode == EXIT_REFUSED, claim
+    assert not (root / "server.lease").exists()
+    transport = SSHTransport(command, str(root), environment=ssh_child_environment())
+    for server, seconds in (("short", 60), (SERVER_A, 0), (SERVER_A, 7200), (SERVER_A, math.inf)):
+        with pytest.raises(ValueError):
+            transport.claim(server, seconds)
+
+
+def test_a_malformed_lease_reply_is_a_transport_error() -> None:
+    def make(output: bytes) -> SSHTransport:
+        transport = SSHTransport(["ssh"], "/r", run=results((0, output, b"")), environment={})
+        transport.claim(SERVER_A, 60)
+        return transport
+
+    base = {"ready": True, "requests": {}, "replies": []}
+    held = {"held": True, "holder": SERVER_A, "age": 0.0}
+    assert make(json.dumps({**base, "lease": held}).encode()).listing().ready
+    for junk in (
+        base,  # a Pod that did not answer the claim must not be assumed to have granted it
+        {**base, "lease": {**held, "held": 1}},
+        {**base, "lease": {**held, "age": "x"}},
+        {**base, "lease": {"held": True}},
+        {**base, "lease": "yes"},
+    ):
+        with pytest.raises(BridgeTransportError, match="malformed"):
+            make(json.dumps(junk).encode()).listing()
+    refused = {**base, "lease": {"held": False, "holder": SERVER_B, "age": 3.5}}
+    with pytest.raises(BridgeLeaseHeld) as caught:
+        make(json.dumps(refused).encode()).listing()
+    assert caught.value.holder == SERVER_B and caught.value.age_seconds == 3.5
+    # A Pod that is not ready answers without a lease, and that is not malformed.
+    idle = {"ready": False, "requests": {}, "replies": []}
+    assert make(json.dumps(idle).encode()).listing().ready is False
+
+
+def test_the_claim_travels_in_the_listing_request_only() -> None:
+    sent: list[dict[str, Any]] = []
+
+    def run(command: list[str], **options: Any) -> subprocess.CompletedProcess[bytes]:
+        sent.append(json.loads(options["input"]))
+        reply: dict[str, Any] = {"ready": True, "requests": {}, "replies": []}
+        if "lease" in sent[-1]:
+            reply["lease"] = {"held": True, "holder": SERVER_A, "age": 0.0}
+        return subprocess.CompletedProcess(command, 0, json.dumps(reply).encode(), b"")
+
+    transport = SSHTransport(["ssh"], "/r", run=run, environment={})
+    transport.listing()
+    transport.claim(SERVER_A, 45)
+    transport.listing()
+    assert sent[0] == {"root": "/r", "action": "list"}
+    assert sent[1] == {"root": "/r", "action": "list", "lease": {"server": SERVER_A, "seconds": 45}}
 
 
 def test_a_pod_without_a_bridge_root_yet_is_not_ready(tmp_path: Path) -> None:

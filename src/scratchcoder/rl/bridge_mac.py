@@ -18,6 +18,11 @@ and, for every request without a reply:
    ``host_failure`` reply, a Mac-side reward timeout a ``timeout`` reply;
 5. stores the reply on the Mac, then pushes it by atomic rename over SSH.
 
+One Mac server serves a Pod at a time: the server takes a lease on the Pod (``server.lease``
+in its bridge root, renewed by every listing and by the progress ticker while it scores) and
+a second server is refused with ``BridgeLeaseHeld``, so a request is never scored twice by
+two Macs to different rewards.
+
 SSH calls are retried a bounded number of times with doubling backoff; a request read whose
 size differs from the listing is looked at again on the next poll, and an unreadable one is
 refused only when the second look finds it unchanged (a non-atomic writer may still be at
@@ -41,6 +46,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shlex
 import stat
 import subprocess
@@ -94,6 +100,15 @@ from scratchcoder.rl.rewards import (
 from scratchcoder.sandbox.runner import Result
 
 PROGRESS_FORMAT = "rl-bridge-progress-v1"
+LEASE_FORMAT = "rl-bridge-lease-v1"
+LEASE_FILE = "server.lease"
+LEASE_LOCK = "server.lease.lock"
+LEASE_SECONDS = 60.0
+"""How long a server's claim on the Pod holds without renewal. A poll or the progress ticker
+renews it every few seconds, so another server can take over only after this server has
+been silent for this long."""
+MAX_LEASE_SECONDS = 3600.0
+SERVER_ID = re.compile(r"[0-9a-f]{32}\Z")
 EXIT_TOO_LARGE = 3
 EXIT_MISSING = 4
 EXIT_REFUSED = 5
@@ -111,6 +126,19 @@ class RequestMissing(Exception):
 
 class RequestTooLarge(Exception):
     """The request is larger than the read bound."""
+
+
+class BridgeLeaseHeld(BridgeError):
+    """Another bridge server holds the Pod's lease: two servers would score the same
+    request twice, possibly to different rewards, and the Pod uses whichever lands first."""
+
+    def __init__(self, holder: str, age_seconds: float) -> None:
+        super().__init__(
+            f"another bridge server ({holder}) renewed its lease on this Pod {age_seconds:.0f} s "
+            "ago; stop it first, or wait for its lease to lapse"
+        )
+        self.holder = holder
+        self.age_seconds = age_seconds
 
 
 class BridgeRemoteError(BridgeError):
@@ -131,7 +159,13 @@ class PodListing:
 
 
 class PodTransport(Protocol):
-    """How the Mac reaches the Pod's bridge root: list, read one request, write one reply."""
+    """How the Mac reaches the Pod's bridge root: list, read one request, write one reply.
+
+    ``claim`` registers the server's lease: from then on every ``listing`` of a ready Pod
+    takes or renews the lease in the same call, and raises ``BridgeLeaseHeld`` when another
+    server holds it."""
+
+    def claim(self, server: str, seconds: float) -> None: ...
 
     def listing(self) -> PodListing: ...
 
@@ -146,12 +180,52 @@ def _checked_name(name: object) -> str:
     return name
 
 
+def take_lease(
+    root: Path, server: str, seconds: float, now: float
+) -> tuple[bool, str | None, float]:
+    """Take or renew the lease in ``root`` for ``server``; ``(held, holder, age)``.
+
+    The lease is ``root/server.lease`` (JSON: server, renewed time, length), written by atomic
+    rename under an exclusive ``flock`` of ``root/server.lease.lock``. Another server's lease
+    holds until ``seconds`` after it was last renewed; an unreadable lease, or one dated in
+    the future (a clock step), counts as lapsed. This is the logic of the remote program's
+    ``take_lease``, for the directory-pair fake."""
+    lock = os.open(root / LEASE_LOCK, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        holder: tuple[str, float, float] | None = None
+        try:
+            raw = read_bounded(root / LEASE_FILE, 4096)
+            if raw is not None:
+                value = json.loads(raw)
+                holder = (
+                    str(value["server"])[:200],
+                    float(value["renewed"]),
+                    float(value["seconds"]),
+                )
+        except (BridgeSchemaError, ValueError, KeyError, TypeError):
+            holder = None
+        if holder is not None and holder[0] != server and 0 <= now - holder[1] < holder[2]:
+            return False, holder[0], now - holder[1]
+        body = {"format": LEASE_FORMAT, "server": server, "renewed": now, "seconds": seconds}
+        atomic_write(root / LEASE_FILE, json.dumps(body, sort_keys=True).encode())
+        return True, server, 0.0
+    finally:
+        os.close(lock)
+
+
 class DirectoryTransport:
     """A transport over a local directory pair (``root/outbox``, ``root/inbox``): the fake
-    SSH transport for tests, with the same semantics as the remote program."""
+    SSH transport for tests, with the same semantics as the remote program. ``wall`` is the
+    Pod's clock, which dates the lease."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, wall: Callable[[], float] = time.time) -> None:
         self.root = root
+        self._wall = wall
+        self._claim: tuple[str, float] | None = None
+
+    def claim(self, server: str, seconds: float) -> None:
+        self._claim = (server, seconds)
 
     def listing(self) -> PodListing:
         requests: dict[str, int] = {}
@@ -176,6 +250,14 @@ class DirectoryTransport:
                     requests[name] = info.st_size
                 else:
                     replies.add(name)
+        if self._claim is not None:
+            try:
+                held, holder, age = take_lease(self.root, *self._claim, self._wall())
+            except OSError as error:
+                raise BridgeTransportError(f"cannot take the lease: {error}") from error
+            if not held:
+                assert holder is not None
+                raise BridgeLeaseHeld(holder, age)
         return PodListing(requests, frozenset(replies))
 
     def read_request(self, name: str, *, max_bytes: int) -> bytes:
@@ -197,7 +279,7 @@ class DirectoryTransport:
 
 
 REMOTE_SCRIPT = r"""
-import base64, hashlib, json, os, re, stat, sys
+import base64, fcntl, hashlib, json, os, re, stat, sys, time
 
 NAME = re.compile(r'[0-9a-f]{12}-[0-9]{6}-(?:reward|dev)-[0-9]{6}\.json\Z')
 NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
@@ -205,6 +287,9 @@ NONBLOCK = getattr(os, 'O_NONBLOCK', 0)
 DIRECTORY = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | NOFOLLOW
 MAX_FILES = 10000
 MAX_WRITE = 16 * 1024 * 1024
+SERVER = re.compile(r'[0-9a-f]{32}\Z')
+LEASE = 'server.lease'
+LEASE_LOCK = 'server.lease.lock'
 
 def open_root(path):
     if not isinstance(path, str) or not path.startswith('/') or '\x00' in path:
@@ -233,7 +318,57 @@ def not_ready():
     sys.stdout.write(json.dumps(empty, sort_keys=True, separators=(',', ':')))
     return 0
 
-def listing(root):
+def take_lease(root, claim):
+    server, seconds = claim.get('server'), claim.get('seconds')
+    if not isinstance(server, str) or not SERVER.match(server):
+        raise ValueError('invalid lease server')
+    if type(seconds) not in (int, float) or not 0 < seconds <= 3600:
+        raise ValueError('invalid lease length')
+    lock = os.open(LEASE_LOCK, os.O_RDWR | os.O_CREAT | NOFOLLOW, 0o600, dir_fd=root)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        now = time.time()
+        holder = None
+        try:
+            fd = os.open(LEASE, os.O_RDONLY | NOFOLLOW | NONBLOCK, dir_fd=root)
+        except FileNotFoundError:
+            fd = None
+        if fd is not None:
+            try:
+                raw = os.read(fd, 4096)
+            finally:
+                os.close(fd)
+            try:
+                value = json.loads(raw)
+                holder = (str(value['server'])[:200], float(value['renewed']),
+                          float(value['seconds']))
+            except (ValueError, KeyError, TypeError):
+                holder = None
+        if holder is not None and holder[0] != server and 0 <= now - holder[1] < holder[2]:
+            return {'held': False, 'holder': holder[0], 'age': now - holder[1]}
+        body = {'format': 'rl-bridge-lease-v1', 'server': server, 'renewed': now,
+                'seconds': seconds}
+        data = json.dumps(body, sort_keys=True).encode()
+        temp = '.' + LEASE + '.' + os.urandom(8).hex() + '.tmp'
+        tmp = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600, dir_fd=root)
+        try:
+            try:
+                os.write(tmp, data)
+                os.fsync(tmp)
+            finally:
+                os.close(tmp)
+            os.rename(temp, LEASE, src_dir_fd=root, dst_dir_fd=root)
+        except BaseException:
+            try:
+                os.unlink(temp, dir_fd=root)
+            except OSError:
+                pass
+            raise
+        return {'held': True, 'holder': server, 'age': 0.0}
+    finally:
+        os.close(lock)
+
+def listing(root, claim):
     result = {'ready': True, 'requests': {}, 'replies': []}
     for box, key in (('outbox', 'requests'), ('inbox', 'replies')):
         try:
@@ -260,6 +395,8 @@ def listing(root):
         finally:
             os.close(fd)
     result['replies'].sort()
+    if claim is not None:
+        result['lease'] = take_lease(root, claim)
     sys.stdout.write(json.dumps(result, sort_keys=True, separators=(',', ':')))
     return 0
 
@@ -348,7 +485,10 @@ def serve():
         raise
     try:
         if action == 'list':
-            return listing(root)
+            claim = request.get('lease')
+            if claim is not None and not isinstance(claim, dict):
+                raise ValueError('invalid lease claim')
+            return listing(root, claim)
         if action == 'read':
             return read(root, checked(request.get('name')), request.get('max_bytes'))
         if action == 'write':
@@ -362,9 +502,11 @@ sys.exit(main())
 """The one program the Mac runs on the Pod, as ``python3 -I -c``; its inputs (the bridge
 root, the action, a file name, a bound, a base64 reply) arrive as JSON on stdin. It lists
 only regular files with bridge request names, reads only from ``outbox/`` and writes only to
-``inbox/``, opening every path component without following symlinks. Exit 3 means the
-request is over the bound, exit 4 that it is gone, exit 5 that the program refused its input
-(an unsafe root or name, a bad bound): a defect of the call, not an outage, so never retried."""
+``inbox/``, opening every path component without following symlinks. The one other file it
+writes is the lease: a listing that carries a claim takes or renews ``server.lease`` in the
+root (``take_lease``), so a second Mac server is refused. Exit 3 means the request is over
+the bound, exit 4 that it is gone, exit 5 that the program refused its input (an unsafe root
+or name, a bad bound): a defect of the call, not an outage, so never retried."""
 
 
 # ------------------------------------------------------------------------------- SSH
@@ -535,6 +677,7 @@ class SSHTransport:
         self.timeout = float(timeout)
         self.list_timeout = float(list_timeout)
         self._run: Run = run or subprocess.run
+        self._claim: tuple[str, float] | None = None
         self.environment = dict(ssh_child_environment() if environment is None else environment)
         leaked = [
             key
@@ -578,22 +721,35 @@ class SSHTransport:
             raise BridgeTransportError(f"SSH {request['action']} returned too many bytes")
         return stdout
 
+    def claim(self, server: str, seconds: float) -> None:
+        if not isinstance(server, str) or not SERVER_ID.fullmatch(server):
+            raise ValueError("a bridge server ID is 32 lowercase hex digits")
+        self._claim = (server, _lease_seconds(seconds))
+
     def listing(self) -> PodListing:
-        raw = self._call({"action": "list"}, timeout=self.list_timeout, limit=MAX_LISTING_BYTES)
+        request: dict[str, Any] = {"action": "list"}
+        if self._claim is not None:
+            request["lease"] = {"server": self._claim[0], "seconds": self._claim[1]}
+        raw = self._call(request, timeout=self.list_timeout, limit=MAX_LISTING_BYTES)
         try:
             value = json.loads(raw)
             requests, replies, ready = value["requests"], value["replies"], value["ready"]
+            lease = value.get("lease")
+            leased = self._claim is not None and ready is True
             if (
-                set(value) != {"ready", "requests", "replies"}
+                set(value) != {"ready", "requests", "replies"} | ({"lease"} if leased else set())
                 or type(ready) is not bool
                 or not isinstance(requests, dict)
                 or not isinstance(replies, list)
                 or any(not FILE_NAME.fullmatch(name) for name in [*requests, *replies])
                 or any(type(size) is not int or size < 0 for size in requests.values())
+                or (leased and not _valid_lease_reply(lease))
             ):
                 raise ValueError("listing shape")
         except (ValueError, TypeError, KeyError, UnicodeDecodeError) as error:
             raise BridgeTransportError("the Pod returned a malformed listing") from error
+        if leased and not lease["held"]:
+            raise BridgeLeaseHeld(lease["holder"], float(lease["age"]))
         return PodListing(dict(requests), frozenset(replies), ready)
 
     def read_request(self, name: str, *, max_bytes: int) -> bytes:
@@ -614,6 +770,27 @@ class SSHTransport:
             ok = False
         if not ok:
             raise BridgeTransportError(f"the Pod did not confirm the reply {name}")
+
+
+def _lease_seconds(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("the lease length must be a number of seconds")
+    if not math.isfinite(value) or not 0 < value <= MAX_LEASE_SECONDS:
+        raise ValueError(f"the lease length must lie in (0, {MAX_LEASE_SECONDS:g}] seconds")
+    return float(value)
+
+
+def _valid_lease_reply(lease: object) -> bool:
+    return (
+        isinstance(lease, dict)
+        and set(lease) == {"held", "holder", "age"}
+        and type(lease["held"]) is bool
+        and isinstance(lease["holder"], str)
+        and len(lease["holder"]) <= 200
+        and isinstance(lease["age"], (int, float))
+        and not isinstance(lease["age"], bool)
+        and math.isfinite(lease["age"])
+    )
 
 
 # ----------------------------------------------------------------------- Mac scoring
@@ -831,6 +1008,22 @@ def _short(error: BaseException) -> str:
     return f"{type(error).__name__}: {error}"[:300]
 
 
+def server_identity(state: Path, server_id: str | None = None) -> str:
+    """This server's ID: 32 hex digits, kept in ``state/server.id`` so a restart over the
+    same state directory is the same server and takes its own lease back at once."""
+    path = state / "server.id"
+    if server_id is None:
+        raw = read_bounded(path, 128)
+        if raw is not None:
+            server_id = raw.decode("ascii", errors="replace").strip()
+        else:
+            server_id = secrets.token_hex(16)
+            atomic_write(path, server_id.encode("ascii") + b"\n")
+    if not isinstance(server_id, str) or not SERVER_ID.fullmatch(server_id):
+        raise ValueError(f"the bridge server ID in {path} is not 32 lowercase hex digits")
+    return server_id
+
+
 class BridgeServer:
     """The Mac's end of the bridge for one Pod (see the module docstring).
 
@@ -867,6 +1060,8 @@ class BridgeServer:
         transport_retries: int = 4,
         backoff_seconds: float = 1.0,
         max_backoff_seconds: float = 16.0,
+        server_id: str | None = None,
+        lease_seconds: float | None = LEASE_SECONDS,
         inputs: Mapping[str, Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], float] = time.time,
@@ -916,6 +1111,12 @@ class BridgeServer:
             self.highest = self.store.highest_seq()
             self._deferred: dict[str, int] = {}
             self.log = EventLogger(state / "events.jsonl", "rl-bridge")
+            self.server_id = server_identity(state, server_id)
+            self.lease_seconds = None if lease_seconds is None else _lease_seconds(lease_seconds)
+            if self.lease_seconds is not None:
+                transport.claim(self.server_id, self.lease_seconds)
+            self._scoring = threading.Event()
+            self._lease_lost: BridgeLeaseHeld | None = None
         except BaseException:
             fcntl.flock(self._lock, fcntl.LOCK_UN)
             os.close(self._lock)
@@ -925,6 +1126,8 @@ class BridgeServer:
             state / "progress.json",
             wall=wall,
             fields={
+                "server_id": self.server_id,
+                "lease_seconds": self.lease_seconds,
                 "pod_task_sha256": dict(self.pod_task_sha256),
                 "allowed_tasks": {kind: len(ids) for kind, ids in self.allowed.items()},
                 "inputs": dict(inputs or {}),
@@ -932,6 +1135,8 @@ class BridgeServer:
         )
         self.log.event(
             "bridge_started",
+            server_id=self.server_id,
+            lease_seconds=self.lease_seconds,
             pod_task_sha256=dict(self.pod_task_sha256),
             allowed_tasks={kind: len(ids) for kind, ids in self.allowed.items()},
             stored_replies=self.store.count(),
@@ -1070,6 +1275,8 @@ class BridgeServer:
                 request,
             )
         reply = self._score(request)
+        if self._lease_lost is not None:
+            raise self._lease_lost  # another server took the Pod while this one scored
         raw_reply = reply.to_bytes()
         if len(raw_reply) > MAX_REPLY_BYTES:
             raise BridgeError(f"the reply to {name.request_id} is over the reply bound")
@@ -1115,8 +1322,23 @@ class BridgeServer:
         self.log.event("request_refused", request_id=name.request_id, reason=reason, detail=detail)
         return True
 
+    def _renew_lease(self) -> None:
+        """Renew the lease from the progress ticker while a long scoring call runs (the
+        polls that normally renew it are paused). A trouble is recorded and left to the next
+        poll; a lease another server took ends this server before it pushes anything."""
+        if self.lease_seconds is None:
+            return
+        try:
+            self.transport.listing()
+        except BridgeLeaseHeld as error:
+            self._lease_lost = error
+            self.progress.update(last_error=_short(error))
+        except Exception as error:
+            self.progress.update(last_error=_short(error))
+
     def _score(self, request: BridgeRequest) -> BridgeReply:
         started = self._clock()
+        self._scoring.set()
         self.progress.update(
             state="scoring",
             current={**_request_row(request.name, self._wall()), "count": request.count},
@@ -1173,6 +1395,7 @@ class BridgeServer:
                     answered_unix=self._wall(),
                 )
         finally:
+            self._scoring.clear()
             self.progress.update(state="polling", current=None)
 
     def serve(
@@ -1204,6 +1427,8 @@ class BridgeServer:
             def tick() -> None:
                 while not stop.wait(interval):
                     self.progress.write()
+                    if self._scoring.is_set():
+                        self._renew_lease()
 
             ticker = threading.Thread(target=tick, name="rl-bridge-progress", daemon=True)
             ticker.start()
