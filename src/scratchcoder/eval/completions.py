@@ -390,12 +390,27 @@ def validate_against_tasks(completions: Completions, tasks_path: Path) -> list[T
     """Check the header against the task file and return the suite's scored tasks.
 
     The task file's SHA-256 must be the header's, its scored task IDs must be exactly the
-    file's attempts' task IDs, and the exclusions must agree.
+    file's attempts' task IDs, and the exclusions must agree. For a pool suite the header
+    may instead name the Pod export of the task file (completions generated on a Pod, which
+    never holds hidden tests): the export is derived again from the given full file and its
+    SHA-256 compared (``scratchcoder.eval.export.task_file_identity``); no export record is
+    read. A pool task file that is itself a Pod export is refused.
     """
     header = completions.header
-    if file_sha256(tasks_path) != header.task_file_sha256:
+    if header.suite == POOL:
+        from scratchcoder.eval.export import ExportError, refuse_exported, task_file_identity
+
+        try:
+            task_file_identity(tasks_path, header.task_file_sha256)
+        except ExportError as error:
+            raise ValueError(
+                f"the task file's SHA-256 differs from the completions header: {error}"
+            ) from error
+    elif file_sha256(tasks_path) != header.task_file_sha256:
         raise ValueError("the task file's SHA-256 differs from the completions header")
     tasks, exclusions = load_suite_tasks(header.suite, header.split, tasks_path)
+    if header.suite == POOL:
+        refuse_exported(tasks, tasks_path)
     if [task.id for task in tasks] != completions.task_ids:
         raise ValueError("the task file's tasks differ from the completions' tasks")
     if exclusions != [dict(item) for item in header.excluded_tasks]:
