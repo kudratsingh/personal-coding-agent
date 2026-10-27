@@ -63,16 +63,22 @@ host: classify the invocation from the frames → validate and decode each row i
   identity, so `is 0` is not accepted), and `assert not CALL`, where `LITERAL` is any
   `ast.literal_eval` value of a representable type. `CALL` must not contain a comparison or be
   an `and`/`or`/`not` expression: in `(f(x) == 5) is True` the literal `5` would enter the
-  container and be compared there by candidate objects. A bare `assert CALL` is not supported:
-  its passing outcome (truthy) is known in advance, so a candidate could steer it through its
-  own objects (`assert f().startswith('x')`). Any other top-level statement, or any
-  assertion outside these forms, makes the whole task **not parseable** (`parse_function_checks`
-  returns `None`, `is_parseable` is `False`), so a partial parse can never under-count the
-  denominator and over-reward. A task whose expected value could not fit in one result row
-  (64 KiB by default) is not parseable either. In the container the child runs the candidate
-  as the main script (`__name__` is `"__main__"`, so its `if __name__ == "__main__":` block
-  runs, and `__file__` is `/tmp/candidate.py`), then the hidden tests' imports, then each
-  call in order, as the evaluation program runs the candidate followed by the tests.
+  container and be compared there by candidate objects. A bare `assert CALL` is not supported
+  at present (an open choice; see the design choices below). Any other top-level statement, or
+  any assertion outside these forms, makes the whole task **not parseable**
+  (`parse_function_checks` returns `None`, `is_parseable` is `False`), so a partial parse can
+  never under-count the denominator and over-reward. A task whose expected value could not fit
+  in one result row (64 KiB by default) is not parseable either. In the container the child
+  runs the candidate as the main script `/tmp/candidate.py`, where the supervisor writes its
+  source: a fresh `__main__` module in `sys.modules` (so its `if __name__ == "__main__":`
+  block runs and its classes pickle), `__file__` and `sys.argv[0]` are `/tmp/candidate.py`,
+  `__builtins__` is the builtins module, and stdin is empty (the driver's configuration
+  arrived there and cannot be re-read). Then come the hidden tests' imports and each call in
+  order, as the evaluation program runs the candidate followed by the tests. As there, the
+  candidate's own output beyond the 64 KiB cap, or a nonzero exit status once every call has
+  reported (an `atexit` handler calling `os._exit(1)`, a thread that keeps the process
+  alive), fails every check; a process the budget ends before every call reported keeps the
+  calls that did.
 - **I/O mode.** `parse_io_cases` returns the inputs and the expected outputs. Only the inputs
   enter the container. The supervisor starts one clean interpreter per attempt as a fork
   server; each case runs in a fresh fork of it, in turn, under one deadline shared by all the
@@ -81,7 +87,8 @@ host: classify the invocation from the frames → validate and decode each row i
   (standard streams, `sys.argv`, a new `__main__`, the startup module set) and finishes through
   the interpreter's own shutdown, so exit statuses, `atexit` output and buffered streams behave
   as in the evaluation path. A case whose stdout exceeds the output cap fails, as in the
-  evaluation path. Each case's stdout returns base64-encoded and the host compares it, after
+  evaluation path. Files a case writes to `/tmp` stay for the later cases, as in the pool
+  verification's I/O program. Each case's stdout returns base64-encoded and the host compares it, after
   `strip()`, with the expected output it kept. Every case runs (no stop at first failure);
   cases that do not run count as failed. A task with malformed cases, more than 100 cases, or an
   expected output larger than the output cap is not parseable.
@@ -93,12 +100,18 @@ host: classify the invocation from the frames → validate and decode each row i
   `-0.0 == 0.0` passes, `nan` equals nothing, and `1e999` in a hidden test is infinity.
   `is None/True/False` stays identity, so `1` fails `is True`. Subclasses of the representable
   types are read through the base type's own storage, so a `Counter` reports as a `dict`, a
-  named tuple as a `tuple`, and an `IntEnum` member as an `int`. A value whose type is not one
-  of `None, bool, int, float, str, bytes, list, tuple, set, frozenset, dict` (or a subclass,
-  recursively) cannot be encoded and counts as a failure. Because the rebuilt value contains
-  only built-in types, `==` on the host never runs a candidate-defined method.
+  named tuple as a `tuple`, and an `IntEnum` member as an `int`; a subclass is judged by that
+  base value, never by its own `__eq__`. A `bytearray` reports as `bytes` and a dict keys view
+  as a `frozenset`, which compare with any literal exactly as the originals do. A value whose
+  type is not one of `None, bool, int, float, str, bytes, list, tuple, set, frozenset, dict`
+  (or a subclass, recursively, or one of those two) cannot be encoded and counts as a failure,
+  even a standard-library value such as `Decimal('1.5')` or `Fraction(1, 2)` that would pass
+  the in-process assertion. Because the rebuilt value contains only built-in types, `==` on
+  the host never runs a candidate-defined method.
 - **Budgets.** A function task's attempt has 8 s (`FUNCTION_BUDGET_SECONDS`), and each call
-  4 s within it (`PER_CALL_SECONDS`). An I/O task's attempt has the task pool verification's
+  4 s within it (`PER_CALL_SECONDS`), more than the pool verification's 2 s for the same task,
+  so a slower function solution can still earn reward. An I/O task's attempt has the task pool
+  verification's
   deadline: 2 s plus 0.25 s per case, at most 60 s (`scratchcoder.sandbox.budget.io_seconds`,
   which `tools/task_pool.py` `limits_for` also uses), so 3 cases get 2.75 s and 100 cases
   27 s. As in the pool verification's I/O program, the cases share that one deadline and
@@ -119,13 +132,22 @@ host: classify the invocation from the frames → validate and decode each row i
   | `completed` | the final report arrived | `passed / total` |
   | `resource_kill` | the out-of-memory killer fired during the attempt, or exit 137 after `started` without a report | `passed / total` (killed checks fail), or `0.0` |
   | `malformed_report` | after `started`, the report was lost, malformed or a supervisor error | `0.0` |
+  | `oversized` | the attempt is larger than the sandbox input limit; no container started | `0.0` |
   | `not_parseable` | the hidden tests are outside the supported forms | `None` |
   | `unavailable` | no docker binary, exit 125, or an unreachable daemon, before `started` | `None` |
-  | `host_error` | any other failure before `started` | `None` |
+  | `host_error` | any other failure before `started`, or a `spawn_failed` report | `None` |
   | `host_timeout` | the docker CLI had not finished 15 s after the budget | `None` |
 
   The last three are host failures. `score_with_host_retries` retries them up to a cap and, if
-  they persist, returns the host failure rather than scoring `0.0`.
+  they persist, returns the host failure rather than scoring `0.0`. `detail` says why an
+  attempt that ran scored as it did (`output limit`, `exit status -9`, `out-of-memory kill`).
+- **Degenerate-answer baseline.** `degenerate_baseline(task)` returns the best reward that
+  one answer needing no solution would earn: a fixed return value or printed line
+  (`FUNCTION_DEGENERATE_ANSWERS`, `IO_DEGENERATE_ANSWERS`), a value copied from the public
+  tests, or echoing the first argument or the input. It runs no code: it applies the
+  channel's own comparison to the parsed hidden tests. For a function task only checks whose
+  call is a direct call of a candidate function (`f(1)`, not `len(f(1))`) take the answer, so
+  the value is a lower bound.
 
 ## Design choices and common mistakes
 
@@ -138,8 +160,13 @@ host: classify the invocation from the frames → validate and decode each row i
 - **Why the `started` frame decides attribution.** A host failure is skipped and retried, so
   if a candidate could cause one, a reward-seeking policy would learn to escape its zero
   reward. Before `started`, no candidate process exists, so any failure there is the host's.
-  After it, every lost or malformed report scores 0.0. The nonce lets the host ignore any other
-  text on the container's output.
+  After it, every lost or malformed report scores 0.0, with two exceptions that a candidate
+  cannot reach: a `spawn_failed` report, which PID 1 writes only when the candidate's first
+  process could not be started, and a CLI that is still running at the stall deadline, which
+  the supervisor's own bound (`OVERRUN_SECONDS`, 7 s past the budget) keeps out of a
+  candidate's reach. An attempt too large for the input limit is refused on the host, before
+  any container, so it cannot exhaust the supervisor before `started`. The nonce lets the host
+  ignore any other text on the container's output.
 - **Why PID 1 is hardened.** All processes in the container share one user. Without hardening,
   a candidate could interrupt the supervisor with `SIGINT`, write junk into its stdout through
   `/proc/1/fd/1`, or raise its `oom_score_adj` so the out-of-memory killer picks it. PID 1
@@ -150,6 +177,16 @@ host: classify the invocation from the frames → validate and decode each row i
   about 2 ms, so the reward channel spends less of the shared deadline than the pool
   verification, which starts an interpreter per case. Each case still gets its own process
   from a clean parent, and the parent never holds an input or an expected output.
+- **Why bare `assert CALL` is left out, and what protects the predicate-only forms.** The
+  forms `assert not CALL` and `is None/True/False` have a passing outcome known in advance
+  (falsy, or one singleton), and a bare `assert CALL` would too (any truthy value). What
+  protects them is not the channel but that the candidate never sees which form a check uses;
+  a constant answer still passes every check of its form, which `degenerate_baseline` counts.
+  Supporting bare asserts would add the same kind of exposure; whether to do so is open.
+- **Why a degenerate-answer baseline.** The RL advantage is a reward minus its group's mean,
+  so on a task where returning `None` or printing `YES` earns 0.3, that answer beats a typical
+  failing sample and the policy is paid for not solving. Screening can record the baseline per
+  task and drop tasks it rewards too well.
 - **Why Python `==`, not strict types.** The reward should decide a check the way the hidden
   assertion does, or RL would push the policy toward a stricter target than the evaluation
   that scores it (a strict comparison fails a correct `n / 2` against `== 2`). The
@@ -163,10 +200,15 @@ host: classify the invocation from the frames → validate and decode each row i
   own `__eq__`, would hand the comparison back to candidate code.
 - **Static audit.** `audit_attempt(code)` is pure and flags risky identifiers and patterns
   (`_getframe`, `co_consts`, `inspect`, `excepthook`, `atexit`, `os._exit`, `os.kill`,
-  `__eq__`/`__ne__`/`__bool__` overrides however attached, builtins tampering, `/proc`, `/tmp`,
-  `__file__`, `sys.modules`, `gc`, `ctypes`, `signal`, and dynamic imports). It resolves module
-  aliases (`import sys as s`), constant `__import__`/`importlib.import_module` names and names
-  assembled from string pieces, and it does not flag `__exit__` or `can_exit`. A flag is a
+  `__eq__`/`__ne__`/`__bool__` overrides, builtins tampering, `/proc`, `/tmp`, `__file__`,
+  `sys.modules`, `gc`, `ctypes`, `signal`, dynamic imports, frame access through tracebacks,
+  generators or `sys._current_frames`, trace hooks, `traceback`, `pdb`, `marshal`, imports of
+  `__main__`, and `exec`/`eval`/`compile` of code that is not a constant). It scans every
+  string constant in its final form (so `'__e' 'q__'` is seen), resolves module aliases
+  (`import sys as s`), constant `__import__`/`importlib.import_module` names and names
+  assembled from constant pieces (`+`, f-strings, `''.join`), audits constant code handed to
+  `exec`, and does not flag `__exit__`, `can_exit` or `re.compile`. It is best-effort: a name
+  computed at run time any other way (`chr`, `bytes.fromhex`) is not seen. A flag is a
   monitoring signal, not a verdict: audited code still runs in the sandbox and is still scored
   only against the secret expectations. `AuditTally` accumulates the counts; its
   `rewarded_rate` (flagged share of attempts with reward above zero) is the leakage stop's
@@ -203,9 +245,16 @@ host: classify the invocation from the frames → validate and decode each row i
   running at once; that I/O cases share the pool verification's deadline (a 5 s case among 40
   passes, 100 cases taking about 10 s in all earn `1.0`, a case that never ends leaves the rest
   unrun); that the fork server's per-case verdicts equal the evaluation runner's on a reference
-  corpus, and its all-cases verdict the pool verification's; and that function-mode checks
-  agree with the evaluation runner's in-process assertion, except for the documented
-  candidate-defined-type residual.
+  corpus, and its all-cases verdict the pool verification's; that function-mode checks agree
+  with the evaluation runner's in-process assertion, except for the documented reported-type
+  and subclass residuals; that the candidate runs as the main script with an empty stdin (its
+  own globals through `sys.modules['__main__']`, `sys.argv`, `inspect.getsource` and pickling
+  work, and a candidate that rewinds stdin to read the call sources finds nothing); that output
+  past the cap, an `atexit` exit status and a never-ending thread fail every check, as in
+  evaluation; that a candidate that stops the fork server is still scored well inside the
+  stall deadline; and that `/tmp` files persist across I/O cases in both paths. Unit tests also
+  cover the `oversized` refusal, the supervisor's `spawn_failed` report before any candidate
+  process and its absence after one, and the degenerate-answer baseline.
 - Commands: `uv run --locked pytest tests/test_reward_channel.py` for the unit tests, and
   `SCRATCHCODER_SANDBOX_TESTS=1 uv run --locked pytest tests/test_reward_channel.py` on a
   disposable Docker worker for the Docker-backed tests.
@@ -225,9 +274,14 @@ host: classify the invocation from the frames → validate and decode each row i
    host happens to fail on. The caller retries, then skips. Failures a candidate could cause are
    scored instead, because they all happen after `started`.
 5. **Can a check fail here that the evaluation runner would pass?** Yes, when the call returns
-   an object of a type the candidate defined (say a class with its own `__eq__`): it cannot
-   be encoded, so it fails here, while the in-process assertion would call that `__eq__`. For
-   built-in values (and their subclasses) the two agree.
+   a value outside the reported types: a class the candidate defined with its own `__eq__`,
+   or a standard-library value such as `Decimal('1.5')`, `Fraction(1, 2)`, `complex(2, 0)` or an
+   empty `deque`. It cannot be encoded, so it fails here, while the in-process assertion would
+   compare it. A subclass of a reported type is judged by its base value, so its own `__eq__`
+   can make the two disagree in either direction. For plain built-in values the two agree.
+8. **Can an answer that solves nothing still earn reward?** Yes, on weak tests: returning
+   `None` or printing `YES` passes every check that expects that value.
+   `degenerate_baseline(task)` measures this per task so RL screening can drop such tasks.
 6. **Why does an I/O attempt's budget grow with its cases?** It is the deadline the task
    pool verification gave the same task (2 s plus 0.25 s per case), so a reference that passed
    the pool verification in time is not cut short by the budget. A flat budget would cut
