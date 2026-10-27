@@ -1446,10 +1446,15 @@ def test_live_io_cases_share_the_pool_verifications_deadline() -> None:
     assert result.status == COMPLETED and result.reward == 1.0 and result.unfinished == 0
     pool_limits = task_pool.limits_for(pool_verification(), task.hidden_tests, "io")
     assert runner.run(slow, task.hidden_tests, pool_limits, mode="io").passed
+    # The container's CPU limit equals the budget by default, so a busy loop can be ended by
+    # the CPU limit a moment before the wall deadline instead of by it; the reward side lifts
+    # the CPU limit to make the outcome exact, and the pool verification may report either
+    # ``timeout`` or ``failed``.
     hang = "n = int(input())\nwhile n == 0:\n    pass\nprint(n + 1)"
-    hung = live(task, hang)
+    hung = live(task, hang, limits=Limits(timeout_seconds=30.0))
+    assert hung.budget_seconds == 12.0
     assert hung.status == COMPLETED and hung.reward == 0.0 and hung.unfinished == 40
-    assert runner.run(hang, task.hidden_tests, pool_limits, mode="io").status == "timeout"
+    assert not runner.run(hang, task.hidden_tests, pool_limits, mode="io").passed
 
 
 @integration
