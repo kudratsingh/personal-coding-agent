@@ -9,6 +9,7 @@ from eval_fixtures import pool_task, save_task_file
 
 from scratchcoder.cli import main
 from scratchcoder.eval.parallel import (
+    INPUT_LIMIT,
     OVERSIZED,
     Call,
     HostUnavailableError,
@@ -54,12 +55,33 @@ def test_a_persistent_host_failure_is_unresolved_not_failed() -> None:
     assert not stalled.resolved and stalled.status == "host_stalled"
 
 
-def test_an_input_the_runner_refuses_is_the_candidates_failure() -> None:
-    def refuse(*_: str) -> Result:
-        raise ValueError("oversized input")
+def test_a_program_too_large_to_send_is_the_candidates_failure() -> None:
+    calls: list[str] = []
 
-    outcome = resolve_call(Call("k", "c", "t", "function"), refuse)
+    def never(*_: str) -> Result:
+        calls.append("run")
+        return Result("passed")
+
+    huge = "x = 1\n" * (INPUT_LIMIT // 6 + 1)
+    outcome = resolve_call(Call("k", huge, "assert True", "function"), never)
     assert outcome.resolved and outcome.status == OVERSIZED and not outcome.passed
+    assert calls == [] and outcome.elapsed_seconds == 0.0
+    fits = resolve_call(Call("k", "x = 1", "assert True", "function"), never)
+    assert fits.passed and calls == ["run"]
+
+
+def test_a_task_side_value_error_is_not_scored_against_the_candidate() -> None:
+    def broken_task(*_: str) -> Result:
+        raise json.JSONDecodeError("tests are not JSON", "", 0)
+
+    with pytest.raises(ValueError, match="not JSON"):
+        resolve_call(Call("k", "c", "t", "io"), broken_task)
+    with pytest.raises(ValueError, match="alone exceed"):
+        resolve_call(Call("k", "c", "t" * (INPUT_LIMIT + 1), "function"), broken_task)
+    seen: list[Outcome] = []
+    with pytest.raises(ValueError, match="not JSON"):
+        run_calls([Call(0, "c", "t", "io")], broken_task, on_outcome=seen.append, workers=1)
+    assert seen == []
 
 
 def test_run_calls_delivers_every_outcome_on_the_calling_thread() -> None:

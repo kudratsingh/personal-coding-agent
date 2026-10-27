@@ -6,6 +6,12 @@ verdict on the candidate only if its status is one of the runner's candidate sta
 and the host did not stall (:func:`scratchcoder.eval.harness.is_host_failure`). Anything
 else is retried up to ``retries`` times with :func:`~scratchcoder.eval.harness.host_backoff`;
 a call still failing then is *unresolved*: reported as such, never as a pass or a fail.
+
+The only input the runner refuses on the candidate's account is a program too large to
+send with its tests, which is checked here explicitly and scored ``oversized``. Any other
+``ValueError`` from ``execute`` (tests that are not valid JSON, more than 100 I/O cases,
+a missing test file) is a defect of the task and propagates, so it is never mistaken for a
+candidate failure.
 """
 
 import time
@@ -14,12 +20,14 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 from scratchcoder.eval.harness import HOST_RETRIES, host_backoff, is_host_failure
-from scratchcoder.sandbox.runner import Result
+from scratchcoder.sandbox.runner import Limits, Result
 
 Execute = Callable[[str, str, str], Result]
 OVERSIZED = "oversized"
-"""The runner refused the input before starting a container (the candidate with its tests
-is larger than the sandbox input limit). Attributed to the candidate: scored as failed."""
+"""The candidate with its tests is larger than the sandbox input limit, so the runner would
+refuse it before starting a container. Attributed to the candidate: scored as failed."""
+INPUT_LIMIT = Limits().input_bytes
+"""The sandbox input limit of the evaluation runner's default :class:`Limits`."""
 
 
 class HostUnavailableError(RuntimeError):
@@ -49,6 +57,10 @@ class Outcome:
     host_failures: int
 
 
+def _size(text: str) -> int:
+    return len(text.encode("utf-8", errors="surrogatepass"))
+
+
 def resolve_call(
     call: Call,
     execute: Execute,
@@ -56,12 +68,13 @@ def resolve_call(
     retries: int = HOST_RETRIES,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Outcome:
+    if _size(call.code + call.tests) > INPUT_LIMIT:
+        if _size(call.tests) > INPUT_LIMIT:
+            raise ValueError(f"the tests of {call.key!r} alone exceed the sandbox input limit")
+        return Outcome(call.key, True, OVERSIZED, False, "", 0.0, 0)
     failures, elapsed = 0, 0.0
     while True:
-        try:
-            result = execute(call.code, call.tests, call.mode)
-        except ValueError:
-            return Outcome(call.key, True, OVERSIZED, False, "", elapsed, failures)
+        result = execute(call.code, call.tests, call.mode)
         elapsed += result.elapsed_seconds
         if not is_host_failure(result):
             return Outcome(
