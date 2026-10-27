@@ -3,11 +3,12 @@
 import re
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import torch
 
 from scratchcoder.data.shards import file_sha256
-from scratchcoder.engine.generation import generate
+from scratchcoder.engine.generation import SAMPLER_VERSION, generate
 from scratchcoder.eval.checkpoint import load_checkpoint
 from scratchcoder.eval.harness import ContextLimitError, EvaluationConfig, evaluate, save_report
 from scratchcoder.eval.prompt import base_prompt, prompt_protocol, truncate_completion
@@ -36,7 +37,13 @@ def evaluate_checkpoint(
         tokenizer_hash=tokenizer.sha256,
     )
     report.update(prompt_protocol(config.prompt_mode))
+    report.update(sampler_record(config))
     save_report(report, output, scorecard=scorecard)
+
+
+def sampler_record(config: EvaluationConfig) -> dict[str, Any]:
+    """Name the seeded sampler of a sampled run; greedy decoding uses no sampler."""
+    return {"sampler_version": SAMPLER_VERSION} if config.temperature > 0 else {}
 
 
 def checkpoint_generator(
@@ -50,7 +57,7 @@ def checkpoint_generator(
             raise ContextLimitError("prompt exceeds configured context")
         generated = generate(
             model,
-            torch.tensor([prompt]),
+            torch.tensor([prompt], device=next(model.parameters()).device),
             max_new_tokens=min(config.max_new_tokens, remaining),
             temperature=config.temperature,
             top_k=config.top_k,
