@@ -1415,7 +1415,8 @@ def render_posttrain_markdown(report: Mapping[str, Any]) -> str:
     lines += [
         f"R2 upload: one weights-only label of {upload['weights_label_bytes'] / 1e9:.2f} GB per "
         f"drain with a 2x margin needs {upload['required_upload_bytes_per_second'] / 1e6:.2f} MB/s "
-        f"(the pretraining rehearsal's 1.65 GB labels needed {d35.REQUIRED_UPLOAD_BYTES_PER_SECOND / 1e6:.2f} MB/s). "
+        "(the pretraining rehearsal's 1.65 GB labels needed "
+        f"{d35.REQUIRED_UPLOAD_BYTES_PER_SECOND / 1e6:.2f} MB/s). "
         f"R2 storage about {report['r2_storage']['bytes'] / GB:.1f} GB, "
         f"${report['r2_storage']['monthly_usd']:.2f}/month.",
         "",

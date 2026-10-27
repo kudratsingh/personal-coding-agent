@@ -18,8 +18,8 @@ here (``limits`` prints them), and the receipt and the worker refuse anything we
     Print a specification's derived limits; with ``--origin`` also the timer deadline, and
     with ``--policy-output`` write the watchdog policy file.
 ``round-trip`` (Pod)
-    The pretraining rehearsal's R2 round trip under ``posttrain-runs/<run>/<pod id>/``, gated on the upload rate
-    one weights-only label needs (``REQUIRED_UPLOAD_BYTES_PER_SECOND``).
+    The pretraining rehearsal's R2 round trip under ``posttrain-runs/<run>/<pod id>/``,
+    gated on the upload rate one weights-only label needs (``REQUIRED_UPLOAD_BYTES_PER_SECOND``).
 ``verify-final`` (Mac)
     Check a finished run's ``report.json`` and every artifact it lists in R2 with the Mac's
     own key, the check the supervisor applies before it lets a Pod be deleted.
@@ -67,12 +67,13 @@ PULL_RESERVE_SECONDS = rehearsal_ops.PULL_RESERVE_SECONDS
 S_WEIGHTS_LABEL_BYTES = 550_000_000
 """One weights-only S label: the 541,142,016 bytes of float32 weights, the save's framing and
 the label's record, rounded up to 0.55 GB. SFT, RL and more-SFT each start a fresh optimizer,
-so no post-training label carries optimizer state (the pretraining rehearsal's labels were 1.65 GB)."""
+so no post-training label carries optimizer state (the pretraining rehearsal's labels were
+1.65 GB)."""
 REQUIRED_UPLOAD_BYTES_PER_SECOND = S_WEIGHTS_LABEL_BYTES / DRAIN_SECONDS * 2
 """About 3.06 MB/s: one weights-only label inside the 360 s final drain with a factor-2
-margin, re-derived as the pretraining rehearsal derived 9.17 MB/s for 1.65 GB. One label is the worst case for
-run 1: its only weights label (the selected SFT checkpoint) is uploaded an hour before the
-final drain, and every other artifact is a small JSON or JSON Lines file."""
+margin, re-derived as the pretraining rehearsal derived 9.17 MB/s for 1.65 GB. One label is
+the worst case for run 1: its only weights label (the selected SFT checkpoint) is uploaded an
+hour before the final drain, and every other artifact is a small JSON or JSON Lines file."""
 ROUND_TRIP_PROBE_BYTES = rehearsal_ops.ROUND_TRIP_PROBE_BYTES
 UPLOADING_STATUS = rehearsal_ops.UPLOADING_STATUS
 AWAITING_REWARDS_STATUS = "awaiting_rewards"

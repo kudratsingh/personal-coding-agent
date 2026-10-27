@@ -17,7 +17,8 @@
     6. ``eval-sft``: SFT completions for every suite and split (chat-v1).
     7. ``screen``: RL screening attempts from the SFT weights, for ``rl-screen`` on the Mac.
 
-    Then the pretraining rehearsal's finalization: drain, HEAD checks, ``report.json``, ``r2_final``.
+    Then the pretraining rehearsal's finalization: drain, HEAD checks, ``report.json`` and
+    ``r2_final``.
 ``smoke`` (CPU)
     Run 1 end to end on a tiny model, fixture tasks and an in-memory bucket.
 
@@ -875,11 +876,11 @@ class RunLimits:
 class PosttrainWorker(Worker):
     """One post-training run on one machine; every artifact leaves through R2.
 
-    It reuses the pretraining rehearsal worker's R2 finalization (``Worker.finalize`` and the methods it
-    calls: the drain, the settle rounds, the bounded HEAD checks, the ``report.json`` upload,
-    the handover) unchanged. It sets every attribute those methods read here and does not
-    call ``Worker.__init__``, which builds a pretraining run. Every label is a milestone:
-    nothing is pruned or rolled, and the run is durable once every label verified.
+    It reuses the pretraining rehearsal worker's R2 finalization (``Worker.finalize`` and the
+    methods it calls: the drain, the settle rounds, the bounded HEAD checks, the
+    ``report.json`` upload, the handover) unchanged. It sets every attribute those methods read
+    here and does not call ``Worker.__init__``, which builds a pretraining run. Every label is
+    a milestone: nothing is pruned or rolled, and the run is durable once every label verified.
     """
 
     def __init__(

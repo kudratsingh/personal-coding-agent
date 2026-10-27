@@ -1,8 +1,8 @@
 """CPU smoke of post-training run 1: a tiny model, fixture tasks and an in-memory bucket.
 
 ``smoke`` runs every stage of run 1 (probe, ARC on three parents, base evaluation, SFT,
-ARC and evaluation of the selected SFT weights, RL screening) and the pretraining rehearsal's finalization on
-CPU, with nothing touching a network. The fixtures stand in for the real inputs:
+ARC and evaluation of the selected SFT weights, RL screening) and the pretraining rehearsal's
+finalization on CPU, with nothing touching a network. The fixtures stand in for the real inputs:
 
 - three parent checkpoints of a 1-layer model, in the parent-checkpoint format;
 - the byte tokenizer with no merges;
