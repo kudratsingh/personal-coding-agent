@@ -758,6 +758,9 @@ def test_process_level_failures_fail_every_function_check() -> None:
         unflagged = function_report(rows)
         del unflagged[flag]
         assert score_attempt(task, "c", container=report_container(unflagged)).reward == 0.0, flag
+    # When nothing passed the reward is zero already, so the detail stays empty.
+    failed = function_report([row(0, 9), row(1, 9)], marker=False, child_rc=1)
+    assert score_attempt(task, "c", container=report_container(failed)).detail == ""
     # A process the budget ended before every call reported keeps the calls that did, whatever
     # state its output was in.
     cut = function_report([row(0, 1), None], child_rc=-9, output_closed=False, marker=False)
