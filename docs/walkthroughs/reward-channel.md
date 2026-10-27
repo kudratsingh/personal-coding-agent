@@ -17,91 +17,129 @@ Hidden tests for a task, `assert add(1, 2) == 3` and `assert add(5, 5) == 10`:
 1. The host parses each assertion. The right-hand side (`3`, `10`) is a safe literal, so the
    host keeps it. Only the left-hand call source (`"add(1, 2)"`, `"add(5, 5)"`) goes into the
    container, next to the candidate code.
-2. Inside the container the trusted supervisor runs the candidate in a child process,
-   evaluates each call there, and reports a type-tagged encoding of the result on a private
-   pipe: `["int", 3]`, `["int", 10]`.
-3. The host decodes each reported value and compares type and value against the literal it
-   kept. Two of two match, so `reward = 2 / 2 = 1.0`.
+2. Inside the container the trusted supervisor writes a `started` frame tagged with the host's
+   random nonce, runs the candidate in a child process, evaluates each call there, and collects
+   a type-tagged encoding of each result from a private pipe: `["int", 3]`, `["int", 10]`.
+3. The supervisor writes a nonce-tagged `final` frame carrying those result rows
+   (base64-encoded). The host checks every row's shape and compares type and value against the
+   literal it kept. Two of two match, so `reward = 2 / 2 = 1.0`.
 
 A candidate that returns `0` reports `["int", 0]` for both, matches neither `3` nor `10`, and
 earns `0.0`. A candidate that returns an always-equal object cannot be encoded (its type is not
 one of the representable types), so that call is a failure. A candidate that forges
 `["int", 3]` on the pipe gains nothing, because it still has to produce the value `10` for the
-second check, and it was never told what `10` is.
+second check, and it was never told what `10` is. A candidate that writes a malformed row such
+as `["bytes", 10**20]` only fails that check: the host validates the row and never raises.
 
 ## Data flow and shapes
 
 ```
 Task.hidden_tests ──► host parse ──►  (setup imports, [call sources], [expected literals])
                                              │                 │ kept on host
-                                 call sources │ + candidate code
+                                 call sources │ + candidate code + nonce
                                              ▼
                                    docker run (hardened, same flags as the
                                    evaluation runner) → reward_program.py (PID 1)
-                                             │
+                                             │  writes {"frame": "started", "nonce": …}
                                    child process: run candidate, eval each call,
                                    write ["kind", payload] per call to a private pipe
                                              ▼
-                                   supervisor → one JSON object to the host stdout
+                                   supervisor → {"frame": "final", "nonce": …, "report": …}
                                              ▼
-host: decode each reported value → strict type+value compare vs the kept literals
-      → passed / total, with total taken from the task file
+host: classify the invocation from the frames → validate and decode each row →
+      strict type+value compare vs the kept literals → passed / total (total from the task file)
 ```
 
 - **Function mode.** `parse_function_checks` returns a `FunctionChecks` with the import
   `setup` and one `Check` per assertion. A `Check` is `(call, predicate, expected)` where
   `predicate` is `"eq"` (compare the decoded value to `expected`) or `"falsy"` (for
   `assert not CALL`, the host checks the decoded value is falsy). Supported assertion forms:
-  `assert CALL == LITERAL`, `assert LITERAL == CALL`, `assert CALL is None/True/False`, and
-  `assert not CALL`, where `LITERAL` is any `ast.literal_eval` value of a representable type.
-  Any other top-level statement, or any assertion outside these forms, makes the whole task
-  **not parseable** (`parse_function_checks` returns `None`, `is_parseable` is `False`), so a
-  partial parse can never under-count the denominator and over-reward.
+  `assert CALL == LITERAL`, `assert LITERAL == CALL`, `assert CALL is None/True/False` (by
+  identity, so `is 0` is not accepted), and `assert not CALL`, where `LITERAL` is any
+  `ast.literal_eval` value of a representable type. `CALL` must not contain a comparison or be
+  an `and`/`or`/`not` expression: in `(f(x) == 5) is True` the literal `5` would enter the
+  container and be compared there by candidate objects. Any other top-level statement, or any
+  assertion outside these forms, makes the whole task **not parseable** (`parse_function_checks`
+  returns `None`, `is_parseable` is `False`), so a partial parse can never under-count the
+  denominator and over-reward. A task whose expected value could not fit in one result row
+  (64 KiB by default) is not parseable either.
 - **I/O mode.** `parse_io_cases` returns the inputs and the expected outputs. Only the inputs
-  enter the container; the supervisor runs the candidate once per case under a per-case
-  deadline and the per-attempt budget, returns each case's bounded stdout, and the host
-  compares with the expected outputs it kept. Every case runs (no stop at first failure);
-  cases that do not run count as failed. I/O tasks are always parseable.
-- **The encoding** (`reward_program._encode` in the container, `_canonical_from_wire` on the
-  host) preserves exact type: `bool` is distinct from `int`, `tuple` from `list`, `set` is
-  compared order-independently, and `dict` by its items. A value whose type is not one of
-  `None, bool, int, float, str, bytes, list, tuple, set, frozenset, dict` (recursively) cannot
-  be encoded and counts as a failure.
+  enter the container. The supervisor starts one clean interpreter per attempt as a fork
+  server; each case runs in a fresh fork of it, under a per-case deadline and the per-attempt
+  budget. The forked child sees what a fresh `python -I -S /tmp/candidate.py` would see
+  (standard streams, `sys.argv`, a new `__main__`, the startup module set) and finishes through
+  the interpreter's own shutdown, so exit statuses, `atexit` output and buffered streams behave
+  as in the evaluation path. A case whose stdout exceeds the output cap fails, as in the
+  evaluation path. Each case's stdout returns base64-encoded and the host compares it, after
+  `strip()`, with the expected output it kept. Every case runs (no stop at first failure);
+  cases that do not run count as failed. A task with malformed cases, more than 100 cases, or an
+  expected output larger than the output cap is not parseable.
+- **The encoding** (`reward_program.DRIVER` in the container, `_canonical_from_wire` on the
+  host) preserves exact type: `bool` is distinct from `int`, `int` from `float`, `tuple` from
+  `list`, `set` is compared order-independently, and `dict` by its items. Subclasses of the
+  representable types are read through the base type's own storage, so a `Counter` reports as a
+  `dict`, a named tuple as a `tuple`, and an `IntEnum` member as an `int`. A value whose type is
+  not one of `None, bool, int, float, str, bytes, list, tuple, set, frozenset, dict` (or a
+  subclass, recursively) cannot be encoded and counts as a failure.
 - **Statuses.** `score_attempt` returns a `RewardResult(status, reward, passed, total,
-  audit_flags, elapsed_seconds, detail)`. `reward` is `None` for a host failure
-  (`unavailable`, `host_timeout`, `host_error`) and for a `not_parseable` task, so a host
-  problem is never mistaken for a zero reward. A resource kill (OOM) is a distinct status with
-  reward `0.0` — a failed attempt, not a host failure. `score_with_host_retries` retries host
-  failures up to a cap and, if they persist, returns the host failure rather than scoring
-  `0.0`.
+  audit_flags, elapsed_seconds, detail, unfinished, outcomes)`. `outcomes` holds one pass flag
+  per hidden check; `unfinished` counts checks that produced no result in time.
+
+  | Status | When | Reward |
+  | --- | --- | --- |
+  | `completed` | the final report arrived | `passed / total` |
+  | `resource_kill` | the out-of-memory killer fired during the attempt, or exit 137 after `started` without a report | `passed / total` (killed checks fail), or `0.0` |
+  | `malformed_report` | after `started`, the report was lost, malformed or a supervisor error | `0.0` |
+  | `not_parseable` | the hidden tests are outside the supported forms | `None` |
+  | `unavailable` | no docker binary, exit 125, or an unreachable daemon, before `started` | `None` |
+  | `host_error` | any other failure before `started` | `None` |
+  | `host_timeout` | the docker CLI had not finished 15 s after the budget | `None` |
+
+  The last three are host failures. `score_with_host_retries` retries them up to a cap and, if
+  they persist, returns the host failure rather than scoring `0.0`.
 
 ## Design choices and common mistakes
 
 - **Why the expected values stay on the host.** Forgery resistance does not come from an
   unforgeable channel — the candidate shares the child process with the driver and can write
   anything to the result pipe. It comes from the candidate never learning which value would
-  pass. The host fixes the denominator from the task file and caps `passed` at the total, so
-  flooding the pipe with forged rows, duplicate indices or out-of-range indices cannot raise
-  the reward above genuine correctness.
-- **Why a separate supervisor.** The candidate runs in a child process, not in the supervisor
-  (PID 1). The supervisor only frames the result: it keeps the candidate's stdout off the
-  container's stdout, bounds every buffer, enforces a per-call limit and an overall
-  per-attempt wall budget (default 8 s), and emits one clean JSON object. A candidate that
-  defeats the per-call alarm can at most consume the budget, after which the child is killed
-  and the remaining calls are unrun failures — the reward only falls.
+  pass. The supervisor keeps the first row per call index and drops junk, over-long or
+  out-of-range rows; the host fixes the denominator from the task file, so flooding the pipe
+  cannot raise the reward above genuine correctness.
+- **Why the `started` frame decides attribution.** A host failure is skipped and retried, so
+  if a candidate could cause one, a reward-seeking policy would learn to escape its zero
+  reward. Before `started`, no candidate process exists, so any failure there is the host's.
+  After it, every lost or malformed report scores 0.0. The nonce lets the host ignore any other
+  text on the container's output.
+- **Why PID 1 is hardened.** All processes in the container share one user. Without hardening,
+  a candidate could interrupt the supervisor with `SIGINT`, write junk into its stdout through
+  `/proc/1/fd/1`, or raise its `oom_score_adj` so the out-of-memory killer picks it. PID 1
+  therefore handles catchable signals with a no-op and marks itself non-dumpable. It also kills
+  every other process after the run and after each I/O case.
+- **Why a fork server for I/O.** Under amd64 emulation an interpreter start costs about 75 ms,
+  so 99 cases of fresh interpreters would spend about 7.4 s of the 8 s budget before any
+  candidate work, and a correct solution could lose cases to the budget. A fork costs about
+  2 ms. Each case still gets its own
+  process from a clean parent, and the parent never holds an input or an expected output.
 - **Why `float` comparison is by value, not repr.** `-0.0 == 0.0` matches the original `==`
   semantics; `nan` never matches, as `== nan` never would. A value that cannot be a safe
   literal on the right-hand side (for example `float('inf')` written as a call) makes the task
   not parseable, so it never reaches comparison.
 - **Static audit.** `audit_attempt(code)` is pure and flags risky identifiers and patterns
-  (`_getframe`, `co_consts`, `inspect`, `excepthook`, `atexit`, `os._exit`, `__eq__` overrides,
-  builtins tampering, `/proc`, `__file__`, `sys.modules`, `gc`, `ctypes`, `signal`, and
-  `open` of a `/tmp` path). A flag is a monitoring signal, not a verdict: audited code still
-  runs in the sandbox and is still scored only against the secret expectations. `AuditTally`
-  accumulates the counts the RL loop watches for its leakage stop.
+  (`_getframe`, `co_consts`, `inspect`, `excepthook`, `atexit`, `os._exit`, `os.kill`,
+  `__eq__`/`__ne__`/`__bool__` overrides however attached, builtins tampering, `/proc`, `/tmp`,
+  `__file__`, `sys.modules`, `gc`, `ctypes`, `signal`, and dynamic imports). It resolves module
+  aliases (`import sys as s`), constant `__import__`/`importlib.import_module` names and names
+  assembled from string pieces, and it does not flag `__exit__` or `can_exit`. A flag is a
+  monitoring signal, not a verdict: audited code still runs in the sandbox and is still scored
+  only against the secret expectations. `AuditTally` accumulates the counts; its
+  `rewarded_rate` (flagged share of attempts with reward above zero) is the leakage stop's
+  rate.
 - **Mistake to avoid.** Do not reuse this channel for evaluation scoring of record. The reward
   denominator here is the number of parsed hidden checks, which for not-parseable tasks is
   undefined; those tasks are screened out of RL, not scored in-process.
+- **Mistake to avoid.** Do not treat `resource_kill` or `malformed_report` as host failures to
+  retry: both happen after the candidate started and are the candidate's to own.
 
 ## Verification
 
@@ -110,15 +148,21 @@ host: decode each reported value → strict type+value compare vs the kept liter
   (container supervisor), using the shared hardened command in
   [`src/scratchcoder/sandbox/runner.py`](../../src/scratchcoder/sandbox/runner.py).
 - Reference tests: [`tests/test_reward_channel.py`](../../tests/test_reward_channel.py). The unit
-  tests drive parsing, the strict type-and-value comparison, the audit, the host statuses and the
-  retry cap with fake containers. The Docker-backed abuse tests prove that marker forgery,
-  always-equal objects, forged result lines, early exit, exceptions from `excepthook`/`atexit`,
-  output flooding, sleeping past the budget, fork bombs and reading `/proc` cannot raise the
-  reward above what correct values earn, that a correct solution earns `1.0` and a partially
-  correct one the right fraction, and that a resource kill is distinct from a candidate timeout.
+  tests drive parsing, the strict type-and-value comparison, malformed rows and values, the
+  audit, the retry cap, and the host-status classification through a fake `docker` binary
+  (a hung CLI, exit 125, an unreachable daemon, exit 137 before and after `started`, junk and
+  forged frames). The Docker-backed tests prove that marker forgery, always-equal objects,
+  forged and malformed result lines, early exit, `excepthook`/`atexit`, signals to PID 1,
+  writes to PID 1's `/proc` files, output floods and invalid UTF-8, sleeping past the budget,
+  fork bombs, filling `/tmp` and killing the fork server neither raise the reward above what
+  correct values earn nor turn into host failures; that a correct solution earns `1.0` and a
+  partially correct one the right fraction; that an out-of-memory kill is a `resource_kill`
+  distinct from a timeout; that a correct 99-case I/O solution earns `1.0` with eight attempts
+  running at once; and that the fork server's per-case verdicts equal the evaluation runner's
+  on a reference corpus.
 - Commands: `uv run --locked pytest tests/test_reward_channel.py` for the unit tests, and
   `SCRATCHCODER_SANDBOX_TESTS=1 uv run --locked pytest tests/test_reward_channel.py` on a
-  disposable Docker worker for the abuse tests.
+  disposable Docker worker for the Docker-backed tests.
 
 ## Questions and answers
 
@@ -131,8 +175,9 @@ host: decode each reported value → strict type+value compare vs the kept liter
    parseable for this channel; RL screening drops it rather than falling back to in-process
    assertions.
 4. **Why is a host failure not a reward of 0?** A stall or an unavailable daemon is a problem
-   with the grader, not the candidate. Scoring it 0 would teach the policy to cause host
-   failures. The caller retries, then skips.
+   with the grader, not the candidate. Scoring it 0 would teach the policy to avoid tasks the
+   host happens to fail on. The caller retries, then skips. Failures a candidate could cause are
+   scored instead, because they all happen after `started`.
 5. **Is this a kernel security boundary?** No. It reuses the development container's isolation
    flags unchanged and adds grading integrity on top. See
    [ADR 0004](../adr/0004-development-sandbox.md) for the threat boundary and residual risks.
