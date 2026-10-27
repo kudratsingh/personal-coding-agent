@@ -9,7 +9,13 @@ import pytest
 
 from scratchcoder.sandbox.runner import IMAGE
 from tools import mac_window_check
-from tools.mac_window_check import SHARES, check, clean_environment, dotenv_names
+from tools.mac_window_check import (
+    RESIDUAL_SHARES,
+    SHARES,
+    check,
+    clean_environment,
+    dotenv_names,
+)
 
 IMAGE_ID = "sha256:" + "d" * 64
 
@@ -63,7 +69,8 @@ def test_a_clean_window_passes_and_leaves_no_container() -> None:
     assert record["status"] == "passed"
     runs = [call for call in docker.calls if call[3] == "run"]
     mounts = [run[run.index("-v") + 1] for run in runs]
-    assert mounts == [f"{share}:/x:ro" for share in SHARES]  # Every default share is probed.
+    probed = SHARES + RESIDUAL_SHARES
+    assert mounts == [f"{share}:/x:ro" for share in probed]  # Every default share is probed.
     for run in runs:
         assert "--pull=never" in run and "--network=none" in run and IMAGE in run
         name = run[run.index("--name") + 1]
@@ -73,7 +80,7 @@ def test_a_clean_window_passes_and_leaves_no_container() -> None:
 
 
 def test_a_single_default_share_left_in_place_fails_the_window() -> None:
-    """Removing only /Users is not enough: /Volumes, /private, /tmp and /var/folders count."""
+    """Removing only /Users is not enough: /Volumes, /private and /tmp count."""
     for share in SHARES:
         record = check(image_id=IMAGE_ID, environ={}, run=FakeDocker(shared=(share,)))
         assert record["status"] == "failed"
@@ -81,6 +88,18 @@ def test_a_single_default_share_left_in_place_fails_the_window() -> None:
             row["share"]: row["refused"] for row in record["checks"]["file_sharing"]["shares"]
         }
         assert [name for name, refused in probes.items() if not refused] == [share]
+
+
+def test_the_built_in_share_is_recorded_as_a_residual_without_failing_the_window() -> None:
+    """Docker Desktop cannot unshare /var/folders: it mounts on a Mac with file sharing
+    emptied, so the window records it and passes; any removable share still fails it."""
+    record = check(image_id=IMAGE_ID, environ={}, run=FakeDocker(shared=RESIDUAL_SHARES))
+    assert record["status"] == "passed"
+    rows = {row["share"]: row for row in record["checks"]["file_sharing"]["shares"]}
+    assert rows["/var/folders"]["refused"] is False and rows["/var/folders"]["residual"] is True
+    assert all(rows[share]["refused"] and not rows[share]["residual"] for share in SHARES)
+    both = check(image_id=IMAGE_ID, environ={}, run=FakeDocker(shared=("/tmp", "/var/folders")))
+    assert both["status"] == "failed" and both["checks"]["file_sharing"]["passed"] is False
 
 
 @pytest.mark.parametrize(
@@ -130,7 +149,6 @@ def test_exec_asks_the_parent_and_session_agents_not_the_cleaned_child(
     "docker, environ, failed",
     [
         (FakeDocker(mount_succeeds=True), {}, "file_sharing"),
-        (FakeDocker(shared=("/var/folders",)), {}, "file_sharing"),
         (FakeDocker(image_id="sha256:" + "e" * 64), {}, "image"),
         (FakeDocker(), {"R2_POD_SECRET_ACCESS_KEY": "s"}, "environment"),
         (FakeDocker(), {"SSH_AUTH_SOCK": "/tmp/agent"}, "environment"),

@@ -19,10 +19,12 @@ therefore checks, with this tool:
        present locally (it is never pulled) with the image ID recorded at the window's start
        (``--image-id``), so a tampered image store is caught before a batch runs.
     4. **No file sharing:** a container from the pinned image asked to mount each of Docker
-       Desktop's default shares (``SHARES``: ``/Users``, ``/Volumes``, ``/private``, ``/tmp``
-       and ``/var/folders``) must fail every time. With file sharing emptied each mount is
-       refused; if any succeeds, the window does not start. Each container is removed
-       whatever happens, so no ``scratchcoder-*`` container is left behind.
+       Desktop's removable default shares (``SHARES``: ``/Users``, ``/Volumes``, ``/private``
+       and ``/tmp``) must fail every time. With file sharing emptied each mount is refused;
+       if any succeeds, the window does not start. The built-in ``/var/folders`` share
+       (``RESIDUAL_SHARES``) cannot be removed: it is probed and recorded as a known residual
+       (ADR 0004) but does not fail the window. Each container is removed whatever happens,
+       so no ``scratchcoder-*`` container is left behind.
 ``exec`` (Mac)
     The same checks, then the given command (``eval-execute`` or ``rl-screen``) in an
     environment without any of those variables: the ``child_environment`` pattern, so the
@@ -62,9 +64,13 @@ AGENT_NAMES = ("SSH_AUTH_SOCK", "SSH_AGENT_PID")
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 DOTENV_NAME = re.compile(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
 MOUNT_PROBE = "import os; os.listdir('/x'); print('mounted')"
-SHARES = ("/Users", "/Volumes", "/private", "/tmp", "/var/folders")
-"""Docker Desktop's default file shares on macOS: an owner who removes only ``/Users`` still
-shares the others, so every one is probed."""
+SHARES = ("/Users", "/Volumes", "/private", "/tmp")
+"""Docker Desktop's removable default file shares on macOS: an owner who removes only ``/Users``
+still shares the others, so every one is probed and each mount must be refused."""
+RESIDUAL_SHARES = ("/var/folders",)
+"""Docker Desktop's built-in share, which its settings cannot remove. ADR 0004 records it as a
+known residual: the sandbox never asks for a mount, so reaching it needs an escape into the
+Docker VM first. It is probed and recorded, but a successful mount does not fail the window."""
 NO_IDENTITIES = "no identities"
 
 Run = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
@@ -205,7 +211,7 @@ def check(
         "rule": "the pinned image is present locally with the recorded image ID; never pulled",
     }
     probes = []
-    for share in SHARES:
+    for share in SHARES + RESIDUAL_SHARES:
         name = f"scratchcoder-window-check-{uuid.uuid4().hex[:12]}"
         try:
             mounted = run(
@@ -236,12 +242,16 @@ def check(
                 "share": share,
                 "exit_code": mounted.returncode,
                 "refused": mounted.returncode != 0 and "mounted" not in mounted.stdout,
+                "residual": share in RESIDUAL_SHARES,
             }
         )
     checks["file_sharing"] = {
-        "passed": all(probe["refused"] for probe in probes),
+        "passed": all(probe["refused"] for probe in probes if not probe["residual"]),
         "shares": probes,
-        "rule": "a container from the pinned image cannot mount any default Docker Desktop share",
+        "rule": (
+            "a container from the pinned image cannot mount any removable default Docker "
+            "Desktop share; the built-in /var/folders share is recorded as a known residual"
+        ),
     }
     passed = all(item["passed"] for item in checks.values())
     return {
@@ -305,7 +315,10 @@ def main(
         parser.error(str(error))
     if args.receipt is not None:
         atomic_json(args.receipt, record)
-    print(json.dumps({"status": record["status"], "checks": record["checks"]}, sort_keys=True))
+    print(
+        json.dumps({"status": record["status"], "checks": record["checks"]}, sort_keys=True),
+        flush=True,  # Before the child writes, so a batch's log reads in order.
+    )
     if record["status"] != "passed":
         print("mac-window-check: a check failed; nothing was executed", file=sys.stderr)
         return 3
