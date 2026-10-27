@@ -456,6 +456,8 @@ def round_trip(
     receipt: Path,
     size: int = ROUND_TRIP_PROBE_BYTES,
     clock: Callable[[], float] = time.monotonic,
+    prefix: str | None = None,
+    required_upload_bytes_per_second: float = REQUIRED_UPLOAD_BYTES_PER_SECOND,
 ) -> dict[str, Any]:
     """PUT, HEAD, GET and DELETE one random object under the run's prefix; write a receipt.
 
@@ -463,11 +465,13 @@ def round_trip(
     ``download_bytes_per_second`` (retries included, so the rates err low). The probe is
     deleted again on any failure after it was stored. The receipt says ``passed`` only when
     every step succeeded and the object is gone afterwards; whether the upload rate is
-    enough for the transfer window is the readiness receipt's decision.
+    enough for the transfer window is the readiness receipt's decision. A post-training
+    run passes its own ``prefix`` and required rate (``tools.posttrain_ops``).
     """
     if type(size) is not int or size <= 0:
         raise ValueError("the probe size must be a positive integer")
-    prefix = run_prefix(run, pod_id)
+    if prefix is None:
+        prefix = run_prefix(run, pod_id)
     key = f"{prefix}preflight/round-trip-{uuid.uuid4().hex}.bin"
     steps: dict[str, float] = {}
     record: dict[str, Any] = {
@@ -480,7 +484,7 @@ def round_trip(
         "key": key,
         "bytes": size,
         "steps": steps,
-        "required_upload_bytes_per_second": REQUIRED_UPLOAD_BYTES_PER_SECOND,
+        "required_upload_bytes_per_second": required_upload_bytes_per_second,
     }
     stored = False
     with tempfile.TemporaryDirectory(prefix="r2-round-trip-") as directory:
