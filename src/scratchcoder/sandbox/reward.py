@@ -689,16 +689,30 @@ _AUDIT_DEPTH = 3
 """How deep constant source passed to ``exec``/``eval``/``compile`` is audited as code."""
 
 
-def _fold(node: ast.AST) -> str | None:
-    """The string value of a constant string expression (``'a' + 'b'``, an f-string
-    without placeholders, ``''.join(['a', 'b'])``), or ``None``."""
+def _chain(node: ast.expr) -> list[ast.expr]:
+    """The operands, left to right, of a chain of ``+`` (a single node if ``node`` is not one).
+    It walks the chain with a list instead of recursion, so a chain of any length that the
+    parser accepts costs time linear in its length and cannot exhaust the stack."""
+    operands: list[ast.expr] = []
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            pending.append(current.right)
+            pending.append(current.left)
+        else:
+            operands.append(current)
+    return operands
+
+
+def _fold_node(node: ast.AST) -> str | None:
     if isinstance(node, ast.Constant):
         return node.value if isinstance(node.value, str) else None
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left, right = _fold(node.left), _fold(node.right)
-        return left + right if left is not None and right is not None else None
+        pieces = [_fold_node(operand) for operand in _chain(node)]
+        return None if any(piece is None for piece in pieces) else "".join(map(str, pieces))
     if isinstance(node, ast.JoinedStr):
-        parts = [_fold(value) for value in node.values]
+        parts = [_fold_node(value) for value in node.values]
         return None if any(part is None for part in parts) else "".join(map(str, parts))
     if (
         isinstance(node, ast.Call)
@@ -708,12 +722,42 @@ def _fold(node: ast.AST) -> str | None:
         and not node.keywords
         and isinstance(node.args[0], (ast.List, ast.Tuple))
     ):
-        separator = _fold(node.func.value)
-        pieces = [_fold(item) for item in node.args[0].elts]
+        separator = _fold_node(node.func.value)
+        pieces = [_fold_node(item) for item in node.args[0].elts]
         if separator is None or any(piece is None for piece in pieces):
             return None
         return separator.join(piece for piece in pieces if piece is not None)
     return None
+
+
+def _fold(node: ast.AST) -> str | None:
+    """The string value of a constant string expression (``'a' + 'b'``, an f-string
+    without placeholders, ``''.join(['a', 'b'])``), or ``None``. An expression nested so deep
+    that folding it exhausts the interpreter's recursion limit is treated as not constant,
+    so one such node cannot end the audit of the nodes after it."""
+    try:
+        return _fold_node(node)
+    except RecursionError:
+        return None
+
+
+def _fold_runs(node: ast.expr) -> list[str]:
+    """The text of every maximal run of consecutive constant operands in the ``+`` chain at
+    ``node`` (``x + 'a' + 'b'`` gives ``'ab'``), for the text scan. Each chain is folded once,
+    from its root, in time linear in its length."""
+    runs: list[str] = []
+    run: list[str] = []
+    for operand in _chain(node):
+        piece = _fold(operand)
+        if piece is None:
+            if run:
+                runs.append("".join(run))
+                run = []
+        else:
+            run.append(piece)
+    if run:
+        runs.append("".join(run))
+    return runs
 
 
 def _flag_text(text: str, flags: set[str]) -> None:
@@ -739,16 +783,23 @@ def _audit_source(source: str, flags: set[str], depth: int) -> None:
         return
     try:
         _audit_tree(ast.parse(source), flags, depth)
-    except (SyntaxError, ValueError, MemoryError, RecursionError):
-        pass
+    except (SyntaxError, ValueError):
+        pass  # code that does not compile does not run
+    except (MemoryError, RecursionError):
+        flags.add("unauditable")
 
 
 def _audit_tree(tree: ast.AST, flags: set[str], depth: int = 0) -> None:
     sys_names = {"sys"}
     os_names = {"os", "posix"}
     importers = {"__import__", "import_module"}
+    inner_sums: set[int] = set()  # '+' nodes that are an operand of another '+'
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            for operand in (node.left, node.right):
+                if isinstance(operand, ast.BinOp) and isinstance(operand.op, ast.Add):
+                    inner_sums.add(id(operand))
+        elif isinstance(node, ast.Import):
             for alias in node.names:
                 _flag_module(alias.name, flags)
                 if alias.name == "sys":
@@ -784,9 +835,9 @@ def _audit_tree(tree: ast.AST, flags: set[str], depth: int = 0) -> None:
             elif isinstance(node.value, bytes):
                 _flag_text(node.value.decode("latin-1"), flags)
         elif isinstance(node, ast.BinOp):
-            folded = _fold(node)
-            if folded is not None:
-                _flag_text(folded, flags)
+            if isinstance(node.op, ast.Add) and id(node) not in inner_sums:
+                for text in _fold_runs(node):
+                    _flag_text(text, flags)
         elif isinstance(node, ast.Attribute):
             if node.attr in _ATTRIBUTE_FLAGS:
                 flags.add(_ATTRIBUTE_FLAGS[node.attr])
@@ -844,14 +895,24 @@ def audit_attempt(code: str) -> tuple[str, ...]:
     attributes, ``sys._current_frames``), trace hooks, and ``exec``/``eval``/``compile``
     (flagged ``dynamic_code`` unless the source is a constant, which is audited as code).
 
+    Code the parser cannot take (nested deeper than its limit, or too large to build a tree
+    for) is flagged ``unauditable``: it may still run, and only the text scan saw it. A
+    constant expression nested deeper than the interpreter's recursion limit is treated as
+    not constant, so it cannot end the scan of the rest of the program.
+
     The audit is best-effort: a name computed at run time any other way (``chr``,
     ``bytes.fromhex``, ``str.format``) is not seen, so a missing flag proves nothing."""
     flags: set[str] = set()
     _flag_text(code, flags)
     try:
-        _audit_tree(ast.parse(code), flags)
-    except (SyntaxError, ValueError, MemoryError, RecursionError):
-        pass
+        # The sandbox compiles the candidate's UTF-8 bytes, which drops a byte-order mark and
+        # honours an encoding line; compiling the string instead would reject a leading
+        # U+FEFF and hide the whole syntax-tree scan of a program that runs.
+        _audit_tree(ast.parse(code.encode("utf-8")), flags)
+    except (SyntaxError, ValueError):
+        pass  # code that does not compile does not run
+    except (MemoryError, RecursionError):
+        flags.add("unauditable")
     return tuple(sorted(flags))
 
 

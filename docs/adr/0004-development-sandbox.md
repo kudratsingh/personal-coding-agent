@@ -68,7 +68,10 @@ storage, so a `Counter` reports as a `dict` and an overridden `__eq__` changes n
 any literal unchanged.
 Assertions outside the supported forms make a task not parseable for this channel; those tasks
 are screened out of RL rather than graded in-process. A static audit flags risky identifiers
-and patterns on each attempt as a monitoring signal, not a verdict.
+and patterns on each attempt as a monitoring signal, not a verdict; it reads the program as
+the sandbox does and flags code too deeply nested for the parser as `unauditable`, while a
+constant expression nested deeper than the interpreter's recursion limit counts as not
+constant.
 
 The host treats everything that comes out of the container as untrusted data: every reported
 value is validated for shape, length and type before comparison, and any decoding error is a

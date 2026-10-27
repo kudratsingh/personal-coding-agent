@@ -1338,6 +1338,12 @@ def test_admit_row_keeps_the_first_well_framed_row_per_index() -> None:
         ("from __main__ import calls", "main_module"),
         ("import traceback\ntraceback.walk_stack(None)", "traceback"),
         ("import pdb", "debugger"),
+        # The sandbox compiles the candidate's bytes, so a byte-order mark is not a way to
+        # hide the syntax-tree scan of a program that runs.
+        ("\ufeffimport os\nos.kill(1, 2)", "os_kill"),
+        ("\ufeffimport sys as s\ns.modules.clear()", "sys_modules"),
+        # A run of constants after a non-constant operand still forms the name.
+        ("import os\nname = input() + '_e' + 'xit'\ngetattr(os, name)(0)", "os_exit"),
     ],
 )
 def test_audit_flags_risky_patterns(code: str, flag: str) -> None:
@@ -1374,6 +1380,60 @@ def test_audit_survives_syntax_errors_and_deep_nesting() -> None:
     assert "os_exit" in audit_attempt("os._exit(0) this is not valid python (")
     assert audit_attempt("x = " + "+".join(["'a'"] * 5000)) == ()
     assert audit_attempt("(" * 10000) == ()
+
+
+RISKY_TAIL = (
+    "exec(input())\nimport sys as s\ns.modules\ngetattr(o, '_getframe')\nimport os\nos.kill(1, 9)\n"
+)
+TAIL_FLAGS = ("_getframe", "dynamic_code", "os_kill", "sys_modules")
+
+
+@pytest.mark.parametrize("terms", [500, 1100, 3000])
+def test_audit_scans_past_a_long_constant_concatenation(terms: int) -> None:
+    # A chain of constants this long once overflowed the folding recursion, and the error
+    # silently ended the syntax-tree pass, so everything after the chain went unseen.
+    code = "x = " + " + ".join(["'a'"] * terms) + "\n" + RISKY_TAIL
+    assert audit_attempt(code) == TAIL_FLAGS
+    # A chain folds to the text it spells, so a name built from many pieces is still read.
+    spelled = "import os\nname = " + " + ".join(["'_e'", "'x'", "'it'"] + ["''"] * terms)
+    assert "os_exit" in audit_attempt(spelled + "\ngetattr(os, name)(0)")
+
+
+def test_audit_folds_each_concatenation_chain_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Folding every sub-chain of a chain costs time quadratic in its length.
+    calls = 0
+    real = reward._fold_node
+
+    def counted(node: ast.AST) -> str | None:
+        nonlocal calls
+        calls += 1
+        return real(node)
+
+    monkeypatch.setattr(reward, "_fold_node", counted)
+    terms, chains = 850, 23
+    code = "\n".join("x = " + " + ".join(["'a'"] * terms) for _ in range(chains))
+    assert audit_attempt(code) == ()
+    # Each constant is folded a few times (the chain, its operands, the constant itself).
+    assert calls <= 4 * terms * chains
+
+
+def test_audit_does_not_let_one_deep_node_end_the_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    def too_deep(node: ast.AST) -> str | None:
+        raise RecursionError
+
+    monkeypatch.setattr(reward, "_fold_node", too_deep)
+    flags = audit_attempt("x = 'a' + 'b'\nexec('1')\nimport os\nos.kill(1, 9)\nimport gc\n")
+    # A node that cannot be folded counts as not constant; the nodes after it still count.
+    assert flags == ("dynamic_code", "gc", "os_kill")
+
+
+def test_audit_flags_code_too_deep_for_the_parser_as_unauditable() -> None:
+    # Python cannot compile a chain this long either, but one near the limit may compile in
+    # the sandbox (a shallower stack) and fail to parse on the host.
+    code = "import os\nx = " + " + ".join(["'a'"] * 30000) + "\nos._exit(0)\n"
+    assert audit_attempt(code) == ("os_exit", "unauditable")
+    assert audit_attempt("exec('x = ' + " + " + ".join(["'1'"] * 30000) + ")") == ("unauditable",)
+    assert audit_attempt("def f(:\n  pass") == ()  # a syntax error does not run at all
 
 
 def test_audit_tally_tracks_the_rewarded_denominator() -> None:

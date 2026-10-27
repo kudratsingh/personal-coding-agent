@@ -207,9 +207,13 @@ host: classify the invocation from the frames → validate and decode each row i
   string constant in its final form (so `'__e' 'q__'` is seen), resolves module aliases
   (`import sys as s`), constant `__import__`/`importlib.import_module` names and names
   assembled from constant pieces (`+`, f-strings, `''.join`), audits constant code handed to
-  `exec`, and does not flag `__exit__`, `can_exit` or `re.compile`. It is best-effort: a name
-  computed at run time any other way (`chr`, `bytes.fromhex`) is not seen. A flag is a
-  monitoring signal, not a verdict: audited code still runs in the sandbox and is still scored
+  `exec`, and does not flag `__exit__`, `can_exit` or `re.compile`. It reads the program as the
+  sandbox does (the source as UTF-8 bytes, so a leading byte-order mark does not hide the
+  syntax-tree scan), folds each chain of `+` once whatever its length, and flags code too
+  deeply nested for the parser as `unauditable` (only the text scan saw it). It is best-effort:
+  a name computed at run time any other way (`chr`, `bytes.fromhex`) is not seen, and a
+  constant expression nested deeper than the interpreter's recursion limit counts as not
+  constant. A flag is a monitoring signal, not a verdict: audited code still runs in the sandbox and is still scored
   only against the secret expectations. `AuditTally` accumulates the counts; its
   `rewarded_rate` (flagged share of attempts with reward above zero) is the leakage stop's
   rate.
