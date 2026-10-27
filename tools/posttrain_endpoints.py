@@ -266,10 +266,12 @@ def _one_benchmark(directory: Path) -> str:
 def scorecard_inputs(
     plan_value: Mapping[str, Any], *, run1_shared: Path, shared: Path, artifacts: Path
 ) -> dict[str, Any]:
-    """The scorecard's inputs for a plan, every path checked to exist: run 1's base and SFT
-    results, benchmark artifacts and ARC reports under ``run1_shared``; each arm evaluated on
-    the Pod's under ``shared`` (results, benchmark results) and ``artifacts`` (ARC); a reused
-    arm as a reuse of ``sft``, with no inputs of its own."""
+    """The scorecard's inputs for a plan, every path checked to exist, laid out as the two
+    runbooks write them: run 1's base and SFT dev results, benchmark artifacts and ARC reports
+    under ``run1_shared``; every endpoint's pool-test results under ``shared`` (the unseal runs
+    only after run 2, so run 2's runbook writes base's and SFT's there too); each arm evaluated
+    on the Pod's dev results and benchmark results under ``shared`` and its ARC report under
+    ``artifacts``; a reused arm as a reuse of ``sft``, with no inputs of its own."""
     endpoints = plan_value["endpoints"]
     checkpoints, reuses = {}, {}
     results: list[str] = []
@@ -289,8 +291,10 @@ def scorecard_inputs(
         checkpoints[name] = entry["checkpoint_sha256"]
         root, arc_report = sources[name]
         stage = entry["stage"]
-        for split in ("dev", "test"):
-            results += [str(root / "results" / f"{stage}-{file}.jsonl") for file in POOL[split]]
+        for split, directory in (("dev", root), ("test", shared)):
+            results += [
+                str(directory / "results" / f"{stage}-{file}.jsonl") for file in POOL[split]
+            ]
         benchmarks += [
             _one_benchmark(root / "benchmarks-results" / f"{stage}-{file}") for file in BENCHMARKS
         ]

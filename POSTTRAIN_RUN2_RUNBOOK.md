@@ -601,7 +601,7 @@ for name in $(uv run --locked python -m tools.posttrain_endpoints list --plan "$
 done
 ```
 
-Build the scorecard. Its inputs file records the names, each reuse with its reason, and every results file, benchmark artifact and ARC report of both runs, each checked to exist (each benchmark dispatch wrote one `benchmark-<suite>-<completions sha256>.json` into its directory, which the file names directly):
+Build the scorecard. Its inputs file records the names, each reuse with its reason, and every results file, benchmark artifact and ARC report of both runs, each checked to exist (each benchmark dispatch wrote one `benchmark-<suite>-<completions sha256>.json` into its directory, which the file names directly). It reads base's and SFT's dev results, benchmark results and ARC reports from `$RUN1_SHARED`, where run 1's step 17 wrote them, and every endpoint's pool-test results from `$SHARED/results`, where the reads above wrote them:
 
 ```sh
 uv run --locked python -m tools.posttrain_endpoints scorecard-inputs --plan "$SHARED/endpoints.json" --run1-shared "$RUN1_SHARED" --shared "$SHARED" --artifacts "$ART" --output "$SHARED/scorecard-inputs.json"

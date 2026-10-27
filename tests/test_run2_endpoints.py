@@ -230,6 +230,10 @@ def test_a_reuse_is_refused_unless_the_pins_reports_and_copies_agree(tmp_path: P
 
 
 def test_the_scorecard_inputs_record_the_reuse_and_every_input(tmp_path: Path) -> None:
+    """The files sit where the two runbooks write them: run 1's step 17 wrote base's and SFT's
+    dev results and benchmark results under run 1's shared directory; run 2's step 18 writes
+    every endpoint's pool-test results (base's and SFT's too, as the unseal runs only after
+    run 2) and the arms' dev and benchmark results under run 2's."""
     value = posttrain_endpoints.plan(**fixtures(tmp_path))
     run1_shared, shared, artifacts = tmp_path / "run1", tmp_path / "run2", tmp_path / "art"
     for root, stage in (
@@ -238,7 +242,9 @@ def test_the_scorecard_inputs_record_the_reuse_and_every_input(tmp_path: Path) -
         (shared, "eval-more-sft"),
     ):
         for name in SFT_RESULT_FILES:
-            if name.startswith("pool-"):
+            if name.startswith("pool-test"):
+                path = shared / "results" / f"{stage}-{name}.jsonl"
+            elif name.startswith("pool-"):
                 path = root / "results" / f"{stage}-{name}.jsonl"
             else:
                 path = root / "benchmarks-results" / f"{stage}-{name}" / "benchmark-x-0.json"
@@ -260,6 +266,8 @@ def test_the_scorecard_inputs_record_the_reuse_and_every_input(tmp_path: Path) -
         len(inputs["results"]) == 12 and len(inputs["benchmarks"]) == 9 and len(inputs["arc"]) == 3
     )
     assert not any("eval-rl" in path for path in inputs["results"] + inputs["benchmarks"])
+    tests = [path for path in inputs["results"] if "-pool-test-" in path]
+    assert len(tests) == 6 and all(path.startswith(str(shared / "results")) for path in tests)
     written = tmp_path / "scorecard-inputs.json"
     written.write_text(json.dumps(inputs))
     loaded = load_inputs(written)
