@@ -98,7 +98,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     rl_screen.add_argument("--threshold", type=float, default=0.5)
     rl_screen.add_argument("--cap", type=int, default=1000)
     rl_screen.add_argument("--floor", type=int, default=320)
+    from scratchcoder.eval import pipeline_cli
+
+    pipeline_cli.add_parsers(subparsers)
     args = parser.parse_args(argv)
+    if args.command in pipeline_cli.COMMANDS:
+        return pipeline_cli.run(args, parser)
     if args.command in {"rl-prescreen", "rl-screen"}:
         import json
 

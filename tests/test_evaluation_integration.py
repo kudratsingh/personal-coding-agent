@@ -29,7 +29,7 @@ def test_reference_pool_and_scorecard_through_real_isolation(tmp_path: Path) -> 
         source="synthetic",
         license="fixture",
         written_by="human",
-        split="test",
+        split="dev",
         solution="def add(a,b): return a+b",
     )
     kept, _ = build_pool([task], [], execute=isolated_execution)

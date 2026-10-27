@@ -77,7 +77,7 @@ def test_reference_validation_uses_solution_and_fails_closed() -> None:
         source="synthetic",
         license="fixture",
         written_by="human",
-        split="test",
+        split="dev",
     )
     tasks = [replace(task, solution="known answer")]
 

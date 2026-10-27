@@ -17,14 +17,17 @@ BASE_STOPS = ("\nclass ", "\ndef ", "\nif __name__", "\nprint(", "\n#")
 POOL_STOPS_BY_MODE: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
         "function": ("\nif __name__", "\nprint(", "\nassert", '\n"""', "\n# Test"),
-        "io": ("\nif __name__", "\nassert", '\n"""', "\n# Test"),
+        "io": ("\nassert", '\n"""', "\n# Test"),
     }
 )
 """base-pool-completion-v1's stop strings by task mode.
 
-An I/O task's program prints its answer at the top level, so ``\\nprint(`` would cut a
-correct program short; it stops function-mode completions only. This was amended on
-2026-10-26, before the protocol's first scored use."""
+An I/O task's program runs at the top level: it prints its answer there, and a program
+written as ``main()`` is often called from ``if __name__ == "__main__":``. So
+``\\nprint(`` and ``\\nif __name__`` would cut a correct I/O program short; both stop
+function-mode completions only, where top-level code after the function is example usage.
+Both amendments were made on 2026-10-26, before the protocol's first scored use, and the
+table is part of the protocol record, so the record's hash changed with each."""
 POOL_MAX_NEW_TOKENS = 512
 POOL_PROTOCOL = "base-pool-completion-v1"
 

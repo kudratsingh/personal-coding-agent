@@ -273,10 +273,10 @@ def test_base_pool_prompt_by_hand() -> None:
     assert pool_prompt(quoted) == '"""\nReturn \\"\\"\\" as text.\n\nassert f(1) == 2\n"""\n'
     record = prompt_protocol("base-pool")["protocol"]
     assert record["name"] == "base-pool-completion-v1"
-    # The per-mode stops, written out: I/O tasks drop "\nprint(" and keep the rest.
+    # The per-mode stops, written out: I/O tasks drop "\nif __name__" and "\nprint(".
     assert record["stop_strings_by_mode"] == {
         "function": ["\nif __name__", "\nprint(", "\nassert", '\n"""', "\n# Test"],
-        "io": ["\nif __name__", "\nassert", '\n"""', "\n# Test"],
+        "io": ["\nassert", '\n"""', "\n# Test"],
     }
     assert "stop_strings" not in record  # No single list a caller could apply to both.
     assert {mode: list(pool_stops(mode)) for mode in POOL_STOPS_BY_MODE} == (
@@ -319,8 +319,16 @@ def test_base_pool_stops_treat_the_prompt_newline_as_a_line_start(
         # A stdin/stdout program's top-level print is its answer, so it is kept.
         ("n = int(input())\nprint(n + 1)\n", "n = int(input())\nprint(n + 1)\n"),
         ("print(input())", "print(input())"),
+        # A program run from a main guard keeps its guard and the call under it.
+        (
+            "def main():\n    print(input())\n\nif __name__ == '__main__':\n    main()\n",
+            "def main():\n    print(input())\n\nif __name__ == '__main__':\n    main()\n",
+        ),
+        (
+            "x = 1\nprint(x)\nif __name__ == '__main__':\n",
+            "x = 1\nprint(x)\nif __name__ == '__main__':\n",
+        ),
         # Every other stop still applies to I/O completions.
-        ("x = 1\nprint(x)\nif __name__ == '__main__':\n", "x = 1\nprint(x)"),
         ("print(1)\nassert True\n", "print(1)"),
         ('print(1)\n"""\nnext problem\n', "print(1)"),
         ("print(1)\n# Test\nprint(2)\n", "print(1)"),
@@ -329,6 +337,12 @@ def test_base_pool_stops_treat_the_prompt_newline_as_a_line_start(
 )
 def test_base_pool_io_tasks_keep_top_level_prints(completion: str, kept: str) -> None:
     assert truncate_pool_completion(completion, mode="io") == kept
+
+
+def test_base_pool_function_tasks_still_stop_at_a_main_guard() -> None:
+    completion = "def f(x):\n    return x + 1\n\nif __name__ == '__main__':\n    print(f(1))\n"
+    assert truncate_pool_completion(completion, mode="function") == "def f(x):\n    return x + 1\n"
+    assert "\nif __name__" in pool_stops("function") and "\nif __name__" not in pool_stops("io")
 
 
 def test_base_pool_truncation_needs_an_explicit_known_mode() -> None:

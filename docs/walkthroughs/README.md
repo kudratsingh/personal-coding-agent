@@ -39,3 +39,5 @@ Implemented: [reinforcement-learning reward channel](reward-channel.md).
 Implemented: [the RL update: policy gradient with group-mean advantage](rl-update.md).
 
 Implemented: [the more-SFT control](more-sft-control.md).
+
+Implemented: [evaluation pipeline: generate, execute, seal, score](evaluation-pipeline.md).

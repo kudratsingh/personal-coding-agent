@@ -20,6 +20,9 @@ import torch
 from torch import Tensor
 
 from scratchcoder.common.records import atomic_json
+from scratchcoder.data.humaneval import DATA_REVISION as DATA_REVISION
+from scratchcoder.data.humaneval import DATA_SHA256 as DATA_SHA256
+from scratchcoder.data.humaneval import normalize as normalize
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.harness import EvaluationConfig, evaluate, save_report
 from scratchcoder.eval.prompt import BASE_STOPS as STOPS
@@ -31,31 +34,6 @@ from scratchcoder.sandbox.runner import Result, run
 
 MODEL = "bigcode/tiny_starcoder_py"
 MODEL_REVISION = "8547527bef0bc927268c1653cce6948c5c242dd1"
-DATA_REVISION = "6d43fb980f9fee3c892a914eda09951f772ad10d"
-DATA_SHA256 = "b796127e635a67f93fb35c04f4cb03cf06f38c8072ee7cee8833d7bee06979ef"
-
-
-def normalize(rows: list[dict[str, Any]]) -> list[Task]:
-    tasks = []
-    for row in rows:
-        entry = row["entry_point"]
-        if not isinstance(entry, str) or not entry.isidentifier():
-            raise ValueError("invalid benchmark entry point")
-        tasks.append(
-            Task(
-                id=row["task_id"],
-                prompt=row["prompt"],
-                public_tests=f"assert callable({entry})",
-                hidden_tests=row["test"] + f"\ncheck({entry})",
-                solution=row["prompt"] + row["canonical_solution"],
-                entry_point=entry,
-                source="openai/human-eval",
-                license="MIT",
-                written_by="human",
-                split="eval",
-            )
-        )
-    return tasks
 
 
 def generate_reference_completion(
