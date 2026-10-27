@@ -20,6 +20,7 @@ from scratchcoder.eval.benchmarks import (
     score_benchmark,
 )
 from scratchcoder.eval.completions import read_completions
+from scratchcoder.sandbox.reward import FUNCTION_DEGENERATE_ANSWERS
 from scratchcoder.sandbox.runner import Limits, Result, Runtime
 from tools import benchmark_score
 from tools.check_workflows import validate_workflow
@@ -69,8 +70,8 @@ def test_scoring_runs_canonical_attempts_and_constant_answers(
     }
     assert by_task["HumanEval/0"]["passed"] is False
     assert baseline["full_pass_share"] == pytest.approx(1 / 3) == baseline["mean_reward"]
-    # 11 fixed values + the doctest example 1 (already a fixed value) + echo, per task.
-    assert baseline["executed_calls"] == 3 * 12
+    # The fixed values + the doctest example 1 (already a fixed value) + 5 echoes, per task.
+    assert baseline["executed_calls"] == 3 * (len(FUNCTION_DEGENERATE_ANSWERS) + 5)
     assert report["completions_sha256"] == completions.sha256
 
 

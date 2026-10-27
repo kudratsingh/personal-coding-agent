@@ -5,7 +5,8 @@ mean reward a constant answer would earn, so a score near the constant baseline 
 visible. A constant answer is one of the reward channel's degenerate answers
 (``scratchcoder.sandbox.reward.degenerate_baseline``): a fixed return value or printed line
 (``FUNCTION_DEGENERATE_ANSWERS`` / ``IO_DEGENERATE_ANSWERS``), a value copied from the
-task's public tests or examples, or echoing the first argument or the input. Each task
+task's public tests or examples, or an echo (an argument or all of them, or the input or
+one of its lines or tokens). Each task
 takes its best answer. A suite reports the mean best-constant reward (the fraction of a
 task's tests passed) and the share of tasks a constant answer fully passes, the figure
 comparable with pass@1.
@@ -50,23 +51,52 @@ from scratchcoder.sandbox.reward import (
 
 DEFINITION = (
     "best per task of the reward channel's degenerate answers: a fixed return value or "
-    "printed line, a value copied from the public tests or examples, or echoing the first "
-    "argument or the input"
+    "printed line, a value copied from the public tests or examples, or an echo: of an "
+    "argument or all of them, or of the input or one of its lines or tokens"
 )
 CHECK_MARK = "__scratchcoder_constant_check__"
 MAX_PUBLIC_VALUES = 8
 """At most this many distinct public example values are tried per task."""
 ECHO = "echo"
+ARGUMENT_ECHOES: tuple[tuple[str, str], ...] = (
+    (ECHO, "args[0]"),
+    ("echo argument 2", "args[1]"),
+    ("echo last argument", "args[-1]"),
+    ("echo all arguments as a tuple", "args"),
+    ("echo all arguments as a list", "list(args)"),
+)
+"""The reward channel's argument echoes, in its order and with its labels, as the expression
+a constant function returns."""
+INPUT_ECHOES: tuple[tuple[str, str, Callable[[str], str]], ...] = (
+    (ECHO, "text", lambda text: text),
+    (
+        "echo first line",
+        "(text.strip().splitlines() or [''])[0]",
+        lambda text: (text.strip().splitlines() or [""])[0],
+    ),
+    (
+        "echo last line",
+        "(text.strip().splitlines() or [''])[-1]",
+        lambda text: (text.strip().splitlines() or [""])[-1],
+    ),
+    ("echo first token", "(text.split() or [''])[0]", lambda text: (text.split() or [""])[0]),
+    ("echo last token", "(text.split() or [''])[-1]", lambda text: (text.split() or [""])[-1]),
+)
+"""The reward channel's input echoes: the label, the expression an I/O program prints from its
+input ``text``, and the same function for the host's comparison."""
 
 
 @dataclass(frozen=True)
 class Answer:
     """One constant answer: ``label`` names it; ``source`` is the Python expression a function
-    returns, or the text an I/O program prints; ``echo`` answers return/print the input."""
+    returns, or the text an I/O program prints; ``echo`` answers return an argument or
+    print from the input, where ``source`` is the expression over ``text`` and ``transform``
+    the same function for the host."""
 
     label: str
     source: str
     echo: bool = False
+    transform: Callable[[str], str] | None = None
 
 
 @dataclass(frozen=True)
@@ -156,7 +186,7 @@ def _doctest_expected(prompt: str) -> list[object]:
 
 
 def function_answers(public_values: Sequence[object]) -> list[Answer]:
-    """The fixed values, then distinct public example values, then echo."""
+    """The fixed values, then distinct public example values, then the echoes."""
     answers = [Answer(f"constant {value!r}", repr(value)) for value in FUNCTION_DEGENERATE_ANSWERS]
     seen = {answer.source for answer in answers}
     for value in public_values:
@@ -167,7 +197,7 @@ def function_answers(public_values: Sequence[object]) -> list[Answer]:
         answers.append(Answer(f"public example {value!r:.60}", source))
         if len(seen) - len(FUNCTION_DEGENERATE_ANSWERS) >= MAX_PUBLIC_VALUES:
             break
-    answers.append(Answer(ECHO, "args[0]", echo=True))
+    answers += [Answer(label, source, echo=True) for label, source in ARGUMENT_ECHOES]
     return answers
 
 
@@ -183,7 +213,10 @@ def io_answers(task: Task) -> list[Answer]:
         if isinstance(output, str) and output.strip() not in seen:
             seen.add(output.strip())
             answers.append(Answer(f"public example {output.strip()!r:.60}", output))
-    answers.append(Answer(ECHO, "", echo=True))
+    answers += [
+        Answer(label, source, echo=True, transform=transform)
+        for label, source, transform in INPUT_ECHOES
+    ]
     return answers
 
 
@@ -237,7 +270,7 @@ def solution_names(solution: str | None, tests: str) -> list[str]:
 
 
 def constant_function_program(names: Sequence[str], answer: Answer) -> str:
-    """Every named function returns the answer (or its first argument, for echo)."""
+    """Every named function returns the answer (an argument or all of them, for an echo)."""
     return "".join(
         f"def {name}(*args, **kwargs):\n    return {answer.source}\n\n\n" for name in names
     )
@@ -277,14 +310,15 @@ def counted_passes(stdout: str, total: int) -> int:
 
 def io_program(answer: Answer) -> str:
     if answer.echo:
-        return "import sys\nsys.stdout.write(sys.stdin.read())\n"
+        return f"import sys\ntext = sys.stdin.read()\nsys.stdout.write({answer.source})\n"
     return f"print({answer.source!r})\n"
 
 
 def _io_passes(answer: Answer, cases: Sequence[Mapping[str, str]]) -> int:
     """Cases the answer passes under the runner's rule (stripped stdout equals output)."""
     return sum(
-        (case["input"] if answer.echo else answer.source).strip() == case["output"].strip()
+        (answer.transform(case["input"]) if answer.transform else answer.source).strip()
+        == case["output"].strip()
         for case in cases
     )
 

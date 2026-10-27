@@ -10,7 +10,9 @@ import pytest
 from eval_fixtures import io_task, pool_task, save_task_file
 
 from scratchcoder.eval.baseline import (
+    ARGUMENT_ECHOES,
     CHECK_MARK,
+    INPUT_ECHOES,
     arc_constant_baseline,
     benchmark_constant_programs,
     candidate_names,
@@ -23,6 +25,7 @@ from scratchcoder.eval.baseline import (
     pool_constant_baseline,
 )
 from scratchcoder.eval.choices import ChoiceTask
+from scratchcoder.sandbox import reward
 from scratchcoder.sandbox.reward import FUNCTION_DEGENERATE_ANSWERS, degenerate_baseline
 from scratchcoder.sandbox.runner import Result
 
@@ -94,9 +97,10 @@ def test_unparseable_tasks_execute_constant_programs_per_answer() -> None:
     assert row["method"] == "executed" and row["total"] == 3
     assert row["passed"] == 1 and row["reward"] == pytest.approx(1 / 3)
     assert row["answer"] == "constant []"
-    # 11 fixed values, the one public example value, and echo; one call each.
-    assert len(calls) == len(FUNCTION_DEGENERATE_ANSWERS) + 2 == report["executed_calls"]
-    assert {answer_of(code) for code in calls} >= {"None", "[1, 4]", "args[0]"}
+    # The fixed values, the one public example value, and the echoes; one call each.
+    expected = len(FUNCTION_DEGENERATE_ANSWERS) + 1 + len(ARGUMENT_ECHOES)
+    assert len(calls) == expected == report["executed_calls"]
+    assert {answer_of(code) for code in calls} >= {"None", "[1, 4]", "args[0]", "list(args)"}
     assert report["sandbox_seconds"] == pytest.approx(0.5 * len(calls))
 
 
@@ -167,7 +171,8 @@ def test_program_and_test_builders_by_hand() -> None:
     assert candidate_names("def helper(x): return x\nassert helper(f(1)) == 1") == ["f"]
     answers = function_answers([[1, 4], [1, 4], 0, float("inf")])
     labels = [answer.label for answer in answers]
-    assert labels[-2:] == ["public example [1, 4]", "echo"]  # Duplicates, 0 and inf skipped.
+    echoes = [label for label, _ in ARGUMENT_ECHOES]
+    assert labels[-6:] == ["public example [1, 4]", *echoes]  # Duplicates, 0 and inf skipped.
     program = constant_function_program(["f", "g"], answers[0])
     assert program == (
         "def f(*args, **kwargs):\n    return None\n\n\n"
@@ -180,20 +185,33 @@ def test_program_and_test_builders_by_hand() -> None:
     stdout = f"noise\n{CHECK_MARK} 0 1\n{CHECK_MARK} 0 0\n{CHECK_MARK} 2 1\n{CHECK_MARK} 1 0\n"
     assert counted_passes(stdout, 2) == 1  # First report per index; index 2 is out of range.
     io_labels = [answer.label for answer in io_answers(io_task("t/1"))]
-    assert io_labels[0] == "constant ''" and io_labels[-2:] == ["public example '6'", "echo"]
+    input_echoes = [label for label, *_ in INPUT_ECHOES]
+    assert io_labels[0] == "constant ''" and io_labels[-6:] == ["public example '6'", *input_echoes]
+
+
+def test_the_echoes_are_the_reward_channels() -> None:
+    assert [label for label, _ in ARGUMENT_ECHOES] == [
+        label for label, _ in reward._ARGUMENT_ECHOES
+    ]
+    host = dict(reward._INPUT_ECHOES)
+    assert [label for label, *_ in INPUT_ECHOES] == list(host)
+    for label, expression, transform in INPUT_ECHOES:
+        for text in ("", "\n", "7\n", "3\n1 2 3\n", "  a b\n\nc  \n"):
+            printed = eval(expression, {"text": text})  # a fixed expression of this module
+            assert printed == transform(text) == host[label](text)
 
 
 def test_benchmark_constant_programs() -> None:
     prompt = (
-        "import math\n\n\ndef double(x):\n    '''Double it.\n    >>> double(2)\n    4\n    '''\n"
+        "import math\n\n\ndef double(x):\n    '''Double it.\n    >>> double(21)\n    42\n    '''\n"
     )
     task = pool_task(
         "humaneval/0", prompt=prompt, split="eval", entry_point="double", public_tests="x"
     )
     programs = dict(benchmark_constant_programs(task, "humaneval"))
-    assert set(programs) >= {"constant None", "public example 4", "echo"}
-    assert programs["public example 4"] == (
-        prompt + "    pass\n\n\ndef double(*args, **kwargs):\n    return 4\n\n\n"
+    assert set(programs) >= {"constant None", "public example 42", "echo", "echo last argument"}
+    assert programs["public example 42"] == (
+        prompt + "    pass\n\n\ndef double(*args, **kwargs):\n    return 42\n\n\n"
     )
     mbpp = pool_task(
         "mbpp/2",
@@ -210,13 +228,13 @@ def test_benchmark_constant_programs() -> None:
 def test_an_mbpp_function_named_like_a_builtin_is_still_covered() -> None:
     # mbpp/126 defines `sum`; the tests' call looks like the builtin, so the name comes from
     # the reference solution. Without a solution the task stays uncovered (and is reported).
-    public = "assert sum(10, 15) == 6"
+    public = "assert sum(10, 15) == 25"
     covered = pool_task(
-        "mbpp/126", split="eval", public_tests=public, solution="def sum(a, b):\n    return 6"
+        "mbpp/126", split="eval", public_tests=public, solution="def sum(a, b):\n    return 25"
     )
     programs = dict(benchmark_constant_programs(covered, "mbpp-plus"))
     assert programs["echo"] == "def sum(*args, **kwargs):\n    return args[0]\n\n\n"
-    assert programs["public example 6"].endswith("def sum(*args, **kwargs):\n    return 6\n\n\n")
+    assert programs["public example 25"].endswith("def sum(*args, **kwargs):\n    return 25\n\n\n")
     bare = pool_task("mbpp/126", split="eval", public_tests=public, solution="x = 1")
     assert benchmark_constant_programs(bare, "mbpp-plus") == []
     assert benchmark_constant_programs(replace(bare, solution="def sum(:"), "mbpp-plus") == []
