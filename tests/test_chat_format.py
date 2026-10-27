@@ -294,6 +294,10 @@ def test_base_pool_prompt_by_hand() -> None:
         ),
         ("x = 1\nprint(x)\n", "x = 1"),
         ('x = 1\n"""\nmore\n', "x = 1"),
+        # The stop is textual: a line that starts with the closing quotes of a string
+        # the program opened also stops, leaving an unclosed string (as the walkthrough
+        # records for one dev reference).
+        ('PAGE = """\n<p>hi</p>\n"""\n', 'PAGE = """\n<p>hi</p>'),
         ("x = 1\n# Test cases\nf(2)", "x = 1"),
         ("x = 1\n# Testing\n", "x = 1"),
         ("x = 1\n# a note\ny = 2", "x = 1\n# a note\ny = 2"),
