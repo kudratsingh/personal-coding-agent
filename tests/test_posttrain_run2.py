@@ -464,6 +464,34 @@ def test_the_waits_heartbeat_awaiting_rewards_and_a_fresh_lease_is_progress(comp
     assert bridge["requests_sent"] == len(bridge["waits"]) and bridge["lost"] is None
 
 
+def test_a_dev_checks_generation_keeps_the_gpu_stamp_and_the_heartbeat_live(
+    found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dev check generates 1,800 programs between two waits (about 184 s at the planning
+    speed): every batch stamps the GPU activity and refreshes the heartbeat, in both arms, so
+    neither idle rule nor the heartbeat's staleness reads it as a hung worker. (The refresh
+    interval is zeroed so the check does not depend on how fast this machine generates.)"""
+    import tools.posttrain_run2 as run2
+
+    monkeypatch.setattr(run2, "HEARTBEAT_REFRESH_SECONDS", 0.0)
+    seen: list[tuple[str, bool, bool]] = []
+    original = Run2Worker.dev_tick
+
+    def record(self: Run2Worker, tokens: int) -> None:
+        before = self.clock()
+        original(self, tokens)
+        seen.append((self.stage_name, self.last_activity >= before, self.last_heartbeat >= before))
+
+    monkeypatch.setattr(Run2Worker, "dev_tick", record)
+    ran = execute(found, tmp_path / "run")
+    report = ran.report
+    assert report["status"] == "completed"
+    assert {stage for stage, _, _ in seen} == {"rl", "more-sft"}
+    assert all(stamped and beat for _, stamped, beat in seen)
+    checks = len(report["rl"]["checks"]) + len(report["more_sft"]["checks"])
+    assert len(seen) >= 2 * checks  # at least the greedy batch and one sampled batch each
+
+
 def test_the_bridge_directories_are_kept_and_no_hidden_test_reaches_the_pod(
     found: Fixtures2, completed: Ran
 ) -> None:

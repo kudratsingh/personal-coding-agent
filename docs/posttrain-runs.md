@@ -145,6 +145,7 @@ The proposal's flat 420 s is not used: 256 slow I/O attempts on 8 workers can ta
 ### Liveness while the Pod waits
 
 - **Heartbeat:** while the bridge client waits, the worker's sleep between looks at its inbox heartbeats `awaiting_rewards` with the client's `heartbeat()` fields (request ID, kind, index, count, start, age) every 5 s.
+- **Dev-check generation:** between two waits a dev check generates 1,800 programs on the GPU (about 184 s at the planning speed); every generation batch stamps the GPU activity and refreshes the heartbeat (`Run2Worker.dev_tick`), so neither idle rule nor the heartbeat's staleness reads it as a hung worker.
 - **Mac watchdog:** under run 2's policy an `awaiting_rewards` heartbeat naming a reward or dev request lets the GPU idle for that kind's extension, and never more, so a worker that hangs while claiming to wait is still deleted. Run 1's policy grants none. The receipt requires the policy's extensions to be exactly the derived ones.
 - **In-Pod idle rule:** the Mac's server renews `server.lease` in the Pod's bridge root, dated by the Pod's own clock, with every poll and, while it reads, scores or answers a request, every few seconds (so a slow SSH call never lets it lapse while the Mac is alive). During a wait the worker stamps `progress_unix` from a lease renewed within its 60 s; the in-Pod timer reads it through its existing `--activity` heartbeat, and a stale lease adds nothing. A dead Mac therefore lets the Pod go within 900 s of its last renewal.
 - **Lost bridge:** a wait with no lease renewal for 600 s (from the later of the wait's start and the last renewal) is given up as `bridge_lost`: the latest weights are uploaded and the run finalizes before the in-Pod timer would fire.
@@ -163,6 +164,7 @@ At the planned $5.80 and $0.60 an hour (`ceiling_limits`): the worker stops at $
 | Watchdog extension while `awaiting_rewards`, bounded by kind | `runpod_watchdog._awaiting_within_extension`; `check_policy` | `test_posttrain_run2_guards.py`, `test_posttrain_run2_integration.py` |
 | In-Pod idle: a fresh lease is progress, a stale one is not | `Run2Worker.observe_wait`, `lease_renewed`; `pod_self_destruct --activity` | `test_posttrain_run2_guards.py`, `test_posttrain_run2.py` |
 | Lost bridge before the in-Pod timer | `Run2Worker.observe_wait` (`bridge_lost`) | `test_posttrain_run2.py` |
+| Dev-check generation stamps the GPU and the heartbeat after every batch | `Run2Worker.dev_tick`, `scratchcoder.rl.dev.ticking_generations` | `test_posttrain_run2.py`, `test_rl_dev.py` |
 | Margin for one full wait | `Run2Worker.should_stop`, `before_wait` (`wait_margin`) | `test_posttrain_run2.py`, `test_posttrain_run2_guards.py` |
 | A wait ended by an error withdraws its request | `BridgeClient._exchange` | `test_rl_bridge.py` |
 | Each check's weights in R2 at once; the latest weights before any end | `Run2Worker.upload_weights`, `salvage` | `test_posttrain_run2.py` |

@@ -235,7 +235,9 @@ def test_the_bridge_and_the_supervisor_start_before_the_watchdogs_idle_clock_run
     ):
         assert -1 < text.index(phrase) < pod, phrase
     assert text.index("scratchcoder rl-bridge") < text.index("tools.posttrain_run run")
-    worker = text[text.index(f"## {number['worker']}. ") : text.index(f"## {number['supervisor']}. ")]
+    worker = text[
+        text.index(f"## {number['worker']}. ") : text.index(f"## {number['supervisor']}. ")
+    ]
     assert "```sh\nwatchdog\n" in worker  # The watchdog is re-based just before the launch.
     supervisor = text[text.index(f"## {number['supervisor']}. ") :]
     supervisor = supervisor[: supervisor.index("\n## ")]

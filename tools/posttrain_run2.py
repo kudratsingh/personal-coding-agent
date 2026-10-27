@@ -459,7 +459,20 @@ class Run2Worker(PosttrainWorker):
             batch_size=int(rl["dev_batch_size"]),
             samples=int(rl["dev_samples"]),
             baseline=baseline,
+            tick=self.dev_tick,
         )
+
+    def dev_tick(self, tokens: int) -> None:
+        """A dev check's generation batch ended: GPU work. Stamp it and keep the heartbeat
+        live, so a check's generation (1,800 programs, about 184 s at the planning speed) is
+        never read as a hung worker by the idle rules or the heartbeat's staleness. No limit
+        is enforced here: ``should_stop`` kept a full wait free before the update, and the
+        check's own wait is refused by ``before_wait`` if it cannot fit."""
+        now = self.clock()
+        self.last_activity = now
+        self.progress += 1
+        if now - self.last_heartbeat >= HEARTBEAT_REFRESH_SECONDS:
+            self.heartbeat()
 
     def input_sha256(self, name: str) -> str:
         return file_sha256(self.inputs[name])
