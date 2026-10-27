@@ -9,7 +9,7 @@ from scratchcoder.data.evalplus import EvalPlusRelease, release
 from scratchcoder.data.evalplus_corrections import correct_find_zero
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.checkpoint import load_checkpoint
-from scratchcoder.eval.command import checkpoint_generator
+from scratchcoder.eval.command import checkpoint_generator, sampler_record
 from scratchcoder.eval.harness import EvaluationConfig, evaluate, save_report
 from scratchcoder.eval.prompt import prompt_protocol
 from scratchcoder.eval.tasks import Task
@@ -116,6 +116,7 @@ def evaluate_suite(
             execute=execute,
         )
         report.update(prompt_protocol(options.prompt_mode))
+        report.update(sampler_record(options))
         report["benchmark"] = dict(
             metadata,
             kind="project-checkpoint",

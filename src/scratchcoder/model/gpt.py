@@ -24,28 +24,43 @@ class RMSNorm(nn.Module):
         return rms_norm(x, self.weight)
 
 
-def rotary(x: Tensor, *, offset: int = 0) -> Tensor:
-    """Rotate adjacent feature pairs; x is [batch, heads, time, head_width]."""
-    width = x.shape[-1]
-    positions = torch.arange(offset, offset + x.shape[-2], device=x.device, dtype=torch.float32)
+def rotary_table(
+    width: int, start: int, stop: int, *, device: torch.device
+) -> tuple[Tensor, Tensor]:
+    """Float32 cosine and sine [stop-start, width/2] for positions start..stop-1."""
+    positions = torch.arange(start, stop, device=device, dtype=torch.float32)
     frequencies = torch.exp(
-        -math.log(10000.0) * torch.arange(0, width, 2, device=x.device).float() / width
+        -math.log(10000.0) * torch.arange(0, width, 2, device=device).float() / width
     )
     angles = positions[:, None] * frequencies[None, :]
-    cosine, sine = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
+    return angles.cos(), angles.sin()
+
+
+def apply_rotary(x: Tensor, cosine: Tensor, sine: Tensor) -> Tensor:
+    """Rotate adjacent feature pairs of x [..., T, D] by angles broadcast as [..., T, D/2]."""
     even, odd = x[..., 0::2], x[..., 1::2]
     return torch.stack((even * cosine - odd * sine, even * sine + odd * cosine), dim=-1).flatten(-2)
 
 
-def causal_attention(q: Tensor, k: Tensor, v: Tensor, *, offset: int = 0) -> Tensor:
-    """q [B,H,T,D], k/v [B,H,S,D]; allow key positions <= absolute query position."""
+def rotary(x: Tensor, *, offset: int = 0) -> Tensor:
+    """Rotate adjacent feature pairs; x is [batch, heads, time, head_width]."""
+    cosine, sine = rotary_table(x.shape[-1], offset, offset + x.shape[-2], device=x.device)
+    return apply_rotary(x, cosine.to(x.dtype), sine.to(x.dtype))
+
+
+def masked_attention(q: Tensor, k: Tensor, v: Tensor, hidden: Tensor) -> Tensor:
+    """q [B,H,T,D], k/v [B,H,S,D]; ``hidden`` (broadcast to [B,H,T,S]) marks unseen keys."""
     scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
-    query_positions = torch.arange(offset, offset + q.shape[-2], device=q.device)
-    key_positions = torch.arange(k.shape[-2], device=q.device)
-    mask = key_positions[None, :] > query_positions[:, None]
-    scores = scores.masked_fill(mask, float("-inf"))
+    scores = scores.masked_fill(hidden, float("-inf"))
     probabilities = torch.softmax(scores.float(), dim=-1).to(q.dtype)
     return probabilities @ v
+
+
+def causal_attention(q: Tensor, k: Tensor, v: Tensor, *, offset: int = 0) -> Tensor:
+    """q [B,H,T,D], k/v [B,H,S,D]; allow key positions <= absolute query position."""
+    query_positions = torch.arange(offset, offset + q.shape[-2], device=q.device)
+    key_positions = torch.arange(k.shape[-2], device=q.device)
+    return masked_attention(q, k, v, key_positions[None, :] > query_positions[:, None])
 
 
 def fused_causal_attention(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
@@ -62,6 +77,76 @@ def fused_causal_attention(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
     if q.shape[-2] != k.shape[-2]:
         raise ValueError("fused attention requires equal query and key lengths")
     return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+
+class KVCache:
+    """Preallocated keys and values for left-padded rows that decode in lockstep.
+
+    Every row occupies the same slots ``0..capacity-1``. Row ``b`` starts with
+    ``pad[b]`` padding slots, so slot ``s`` holds its token at position
+    ``s - pad[b]``. The rotary angles of each row's positions and the masks are
+    built once here; a decoding step only slices them.
+    """
+
+    def __init__(self, config: ModelConfig, pad: Tensor, *, width: int, capacity: int) -> None:
+        if pad.ndim != 1 or pad.numel() == 0 or pad.dtype != torch.long:
+            raise ValueError("padding must be a nonempty int64 [batch] tensor")
+        if not 0 < width <= capacity:
+            raise ValueError("prompt width must be positive and fit the capacity")
+        self.batch, self.width, self.capacity, self.length = pad.numel(), width, capacity, 0
+        slots = torch.arange(capacity, device=pad.device)
+        # The capacity can exceed the context (a long prompt beside a long budget), so
+        # slot numbers could pass the table; each row's own positions stay inside it
+        # while the row is active. Positions past the context occur only in rows that
+        # already finished; the clamp keeps their (discarded) work finite and in range.
+        positions = (slots[None, :] - pad[:, None]).clamp(0, config.context - 1)
+        cosine, sine = rotary_table(
+            config.width // config.heads, 0, config.context, device=pad.device
+        )
+        # Per-row angles [B, capacity, D/2], cast once per activation dtype.
+        self.angles = {torch.float32: (cosine[positions], sine[positions])}
+        self.padding = slots[None, :] < pad[:, None]  # [B, capacity]
+        self.future = slots[None, :] > slots[:, None]  # [capacity, capacity]
+        self.keys: list[Tensor | None] = [None] * config.layers
+        self.values: list[Tensor | None] = [None] * config.layers
+
+    def rotation(self, time: int, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        """Cosine and sine [B,1,T,D/2] of the next ``time`` slots, in ``dtype``."""
+        if dtype not in self.angles:
+            cosine, sine = self.angles[torch.float32]
+            self.angles[dtype] = cosine.to(dtype), sine.to(dtype)
+        cosine, sine = self.angles[dtype]
+        stop = self.length + time
+        return cosine[:, None, self.length : stop], sine[:, None, self.length : stop]
+
+    def hidden(self, time: int) -> Tensor:
+        """Keys that the next ``time`` query slots must not see, as [B,1,T,S]."""
+        start, stop = self.length, self.length + time
+        if time == 1 and start >= self.width:
+            # Decoding: the query is a real token and every earlier slot is in its past.
+            return self.padding[:, None, None, :stop]
+        # Real queries skip padding keys. A padding query sees its own causal past
+        # instead, so its softmax row is never empty; real rows never read its output.
+        skip = self.padding[:, None, :stop] & ~self.padding[:, start:stop, None]
+        return (self.future[start:stop, :stop] | skip)[:, None]
+
+    def store(self, layer: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Write k/v [B,H,T,D] at the next slots; return the filled [B,H,length+T,D] views.
+
+        Both buffers use the dtype of ``v``, the activation dtype. Under autocast,
+        query/key normalization's float32 gain promotes ``k`` to float32; attention
+        would round it to the activation dtype at every step, so it is rounded once
+        here, with the same result, instead of keeping a float32 key cache.
+        """
+        stop = self.length + k.shape[-2]
+        keys, values = self.keys[layer], self.values[layer]
+        if keys is None or values is None:
+            keys = v.new_empty((*k.shape[:2], self.capacity, k.shape[-1]))
+            values = v.new_empty((*v.shape[:2], self.capacity, v.shape[-1]))
+            self.keys[layer], self.values[layer] = keys, values
+        keys[:, :, self.length : stop] = k.to(keys.dtype)
+        values[:, :, self.length : stop] = v
+        return keys[:, :, :stop], values[:, :, :stop]
 
 
 class Attention(nn.Module):
@@ -101,6 +186,22 @@ class Attention(nn.Module):
         attended = mixed.transpose(1, 2).contiguous().view(batch, time, width)
         return cast(Tensor, self.output(attended)), (k, v)
 
+    def decode(self, x: Tensor, cache: KVCache, layer: int) -> Tensor:
+        """Attend the next ``T`` slots of x [B,T,C] through a preallocated cache."""
+        batch, time, width = x.shape
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q = q.view(batch, time, self.heads, width // self.heads).transpose(1, 2)
+        k = k.view(batch, time, self.heads, width // self.heads).transpose(1, 2)
+        if self.q_norm is not None and self.k_norm is not None:
+            q, k = self.q_norm(q), self.k_norm(k)
+        q = apply_rotary(q, *cache.rotation(time, q.dtype))
+        k = apply_rotary(k, *cache.rotation(time, k.dtype))
+        v = v.view(batch, time, self.heads, width // self.heads).transpose(1, 2)
+        keys, values = cache.store(layer, k, v)
+        mixed = masked_attention(q, keys, values, cache.hidden(time))
+        attended = mixed.transpose(1, 2).contiguous().view(batch, time, width)
+        return cast(Tensor, self.output(attended))
+
 
 class Block(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
@@ -118,11 +219,16 @@ class Block(nn.Module):
         self, x: Tensor, cache: tuple[Tensor, Tensor] | None
     ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
         attended, updated = self.attention.forward_cached(self.norm1(x), cache)
-        x = x + attended
+        return self.feed_forward(x + attended), updated
+
+    def decode(self, x: Tensor, cache: KVCache, layer: int) -> Tensor:
+        return self.feed_forward(x + self.attention.decode(self.norm1(x), cache, layer))
+
+    def feed_forward(self, x: Tensor) -> Tensor:
         hidden = self.up(self.norm2(x))
         # Exact GELU expressed with erf rather than a ready-made transformer component.
         activated = hidden * 0.5 * (1 + torch.erf(hidden / math.sqrt(2)))
-        return cast(Tensor, x + self.down(activated)), updated
+        return cast(Tensor, x + self.down(activated))
 
 
 class GPT(nn.Module):
@@ -185,6 +291,25 @@ class GPT(nn.Module):
             x, layer = cast(Block, block).forward_cached(x, None if cache is None else cache[index])
             updated.append(layer)
         return cast(Tensor, self.norm(x) @ self.embedding.weight.T), updated
+
+    def decode(self, ids: Tensor, cache: KVCache) -> Tensor:
+        """Run ids [B,T] at the cache's next slots; return float32 logits [B,V] of the last.
+
+        Only the last slot reaches the vocabulary projection, so a long prefill never
+        materializes ``[B,T,V]``. That projection runs in float32 even under bfloat16
+        autocast, so sampling sees unrounded logits.
+        """
+        if ids.ndim != 2 or ids.shape[1] == 0 or ids.shape[0] != cache.batch:
+            raise ValueError("tokens must be nonempty [batch,time] matching the cache")
+        if cache.length + ids.shape[1] > cache.capacity:
+            raise ValueError("decoding exceeds the cache capacity")
+        x = self.embedding(ids)
+        for index, block in enumerate(self.blocks):
+            x = cast(Block, block).decode(x, cache, index)
+        cache.length += ids.shape[1]
+        last = self.norm(x[:, -1])
+        with torch.autocast(device_type=last.device.type, enabled=False):
+            return cast(Tensor, last.float() @ self.embedding.weight.float().T)
 
 
 def expected_parameters(config: ModelConfig) -> int:
