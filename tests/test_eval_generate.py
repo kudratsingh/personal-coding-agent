@@ -301,3 +301,58 @@ def test_cli_writes_the_file_and_prints_its_hash(
     header = read_completions(output).header
     assert header.sampling == Sampling(samples=2, temperature=0.8, top_p=0.95)
     assert header.batch_size == 4
+
+
+def test_sampling_is_refused_on_mps_before_anything_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    tasks_path, _ = tasks_fixture(tmp_path)
+    output = tmp_path / "completions.jsonl"
+    with pytest.raises(ValueError, match="not supported on MPS"):
+        generate_completions(
+            checkpoint=tmp_path / "never-opened.pt",
+            tokenizer_path=tmp_path / "never-opened.json",
+            suite="pool",
+            split="dev",
+            tasks_path=tasks_path,
+            protocol="chat-v1",
+            output=output,
+            sampling=Sampling(samples=2, temperature=0.8),
+            device="mps",
+        )
+    assert not output.exists()
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs an MPS device")
+def test_greedy_generation_runs_on_a_real_mps_device_and_sampling_is_refused(
+    tmp_path: Path,
+) -> None:
+    checkpoint, tokenizer = checkpoint_fixture(tmp_path)
+    tasks_path, _ = tasks_fixture(tmp_path)
+    output = tmp_path / "mps.jsonl"
+    header, _ = generate_completions(
+        checkpoint=checkpoint,
+        tokenizer_path=tokenizer,
+        suite="pool",
+        split="dev",
+        tasks_path=tasks_path,
+        protocol="chat-v1",
+        output=output,
+        device="mps",
+        batch_size=2,
+    )
+    assert header.device == "mps" and header.rows == 3
+    assert len(read_completions(output).rows) == 3
+    with pytest.raises(ValueError, match="not supported on MPS"):
+        generate_completions(
+            checkpoint=checkpoint,
+            tokenizer_path=tokenizer,
+            suite="pool",
+            split="dev",
+            tasks_path=tasks_path,
+            protocol="chat-v1",
+            output=tmp_path / "mps-sampled.jsonl",
+            sampling=Sampling(samples=2, temperature=0.8),
+            device="mps",
+        )

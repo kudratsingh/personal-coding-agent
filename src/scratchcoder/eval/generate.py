@@ -70,7 +70,7 @@ def generate_completions(
     """Write ``output`` and return its header and SHA-256.
 
     An attempt whose prompt leaves no room to generate is recorded as ``context_limit``
-    with no tokens and no program; it is never shortened.
+    with no tokens and no program; it is never shortened. MPS runs greedy decoding only.
     """
     sampling = sampling or Sampling()
     if precision not in PRECISIONS:
@@ -82,6 +82,11 @@ def generate_completions(
     tasks, exclusions = load_suite_tasks(suite, split, tasks_path)
     definition = protocol_for(protocol, suite)
     resolved = generation_device(device)
+    if resolved.type == "mps" and not sampling.greedy:
+        raise ValueError(
+            "sampled decoding is not supported on MPS: the seeded sampler works in float64, "
+            "which MPS lacks; use cpu or cuda for sampling, or greedy decoding on mps"
+        )
     model, tokenizer = load_checkpoint(
         checkpoint, tokenizer_path, device="cpu" if resolved.type == "mps" else device
     )
