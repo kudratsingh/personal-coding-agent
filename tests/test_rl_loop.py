@@ -119,12 +119,14 @@ def run(
     evaluator: Any = None,
     rollouts: Callable[..., list[Rollout]] | None = None,
     should_stop: Any = None,
+    tasks: Sequence[Task] | None = None,
+    on_check: Any = None,
     **overrides: Any,
 ) -> RLResult:
     monkeypatch.setattr(loop, "generate_rollouts", rollouts or scripted())
     return run_rl(
         tiny_model(),
-        TASKS,
+        tasks or TASKS,
         encoder=TOKENIZER,
         decoder=TOKENIZER,
         rewards=rewards or FakeRewardSource(),
@@ -134,6 +136,7 @@ def run(
         tokenizer_hash="authored",
         config=config(**overrides),
         should_stop=should_stop,
+        on_check=on_check,
     )
 
 
@@ -501,7 +504,25 @@ def test_should_stop_is_checked_between_updates(
         dev_checks=(0,),
     )
     assert result.stop_reason == "external" and result.stop_detail == "cost"
-    assert result.updates == 2 and evaluator.calls == [0, 2]  # a check at the stop
+    # A cost, wall or idle stop spends nothing more: no dev check, but the weights are saved.
+    assert result.updates == 2 and evaluator.calls == [0]
+    assert result.stop_checkpoint is not None
+    saved = torch.load(result.stop_checkpoint["checkpoint"], weights_only=True)
+    assert saved["metadata"]["checked"] is False and saved["metadata"]["optimizer_steps"] == 2
+    assert result.selected is not None and result.selected.dev.check == 0
+    answers = iter([None, False, "cost"])
+    evaluator = ScriptedDevEvaluator()
+    checked = run(
+        tmp_path / "checked",
+        monkeypatch,
+        evaluator=evaluator,
+        should_stop=lambda: next(answers),
+        updates=10,
+        dev_checks=(0,),
+        check_at_external_stop=True,
+    )
+    assert checked.stop_reason == "external" and checked.stop_checkpoint is None
+    assert evaluator.calls == [0, 2]  # opted in: a check at the stop
     no_check = run(
         tmp_path / "again",
         monkeypatch,
@@ -509,6 +530,38 @@ def test_should_stop_is_checked_between_updates(
         check_at_stop=False,
     )
     assert no_check.stop_detail == "requested" and no_check.updates == 0
+
+
+def test_check_at_stop_does_not_govern_an_external_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two flags are independent: check_at_stop=False leaves the external opt-in alone,
+    and a run-decided stop (completion here) is checked or not by check_at_stop alone."""
+    answers = iter([None, "wall"])
+    evaluator = ScriptedDevEvaluator()
+    run(
+        tmp_path / "a",
+        monkeypatch,
+        evaluator=evaluator,
+        should_stop=lambda: next(answers),
+        dev_checks=(0,),
+        check_at_stop=False,
+        check_at_external_stop=True,
+    )
+    assert evaluator.calls == [0, 1]
+    evaluator = ScriptedDevEvaluator()
+    done = run(tmp_path / "b", monkeypatch, evaluator=evaluator, dev_checks=(0,))
+    assert evaluator.calls == [0, 3] and done.stop_checkpoint is None
+    evaluator = ScriptedDevEvaluator()
+    done = run(
+        tmp_path / "c",
+        monkeypatch,
+        evaluator=evaluator,
+        dev_checks=(0,),
+        check_at_stop=False,
+        check_at_external_stop=True,
+    )
+    assert evaluator.calls == [0] and done.stop_checkpoint is not None
 
 
 def test_rl_config_validation() -> None:
@@ -521,6 +574,7 @@ def test_rl_config_validation() -> None:
         {"warmup_updates": 4},
         {"leakage_rate": 1.5},
         {"check_at_stop": 1},
+        {"check_at_external_stop": 1},
     ):
         with pytest.raises(ValueError):
             config(**overrides)
@@ -548,3 +602,164 @@ def test_an_unexpected_error_saves_the_latest_weights_then_propagates(
     (failure,) = events(tmp_path, "rl_failed")
     assert failure["error_type"] == "KeyError" and failure["updates"] == 1
     assert not (tmp_path / "rl" / "result.json").exists()
+
+
+def test_an_error_in_the_stop_time_dev_check_saves_the_latest_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop-time check sits after the loop's own guard; an unexpected error there (a
+    lost bridge, an out-of-memory) must not lose the steps taken since the last check."""
+
+    def script(check: int) -> tuple[float, float]:
+        if check == 2:
+            raise ConnectionError("the Mac bridge dropped")
+        return 0.1, 0.0
+
+    answers = iter([None, None, "cost"])
+    with pytest.raises(ConnectionError):
+        run(
+            tmp_path,
+            monkeypatch,
+            evaluator=ScriptedDevEvaluator(script=script),
+            should_stop=lambda: next(answers),
+            updates=5,
+            dev_checks=(0,),
+            check_at_external_stop=True,
+        )
+    saved = torch.load(tmp_path / "rl" / "checkpoints" / "update-0002.pt", weights_only=True)
+    assert saved["metadata"]["checked"] is False and saved["metadata"]["optimizer_steps"] == 2
+    (failure,) = events(tmp_path, "rl_failed")
+    assert failure["error_type"] == "ConnectionError" and failure["updates"] == 2
+    assert not (tmp_path / "rl" / "result.json").exists()
+
+
+def test_an_error_in_the_end_of_run_dev_check_saves_the_latest_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def script(check: int) -> tuple[float, float]:
+        if check == 3:
+            raise RuntimeError("out of memory")
+        return 0.1, 0.0
+
+    with pytest.raises(RuntimeError):
+        run(tmp_path, monkeypatch, evaluator=ScriptedDevEvaluator(script=script), dev_checks=(0,))
+    saved = torch.load(tmp_path / "rl" / "checkpoints" / "update-0003.pt", weights_only=True)
+    assert saved["metadata"]["checked"] is False and saved["metadata"]["optimizer_steps"] == 3
+
+
+def test_a_reward_error_in_the_stop_time_check_still_returns_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = run(
+        tmp_path, monkeypatch, evaluator=ScriptedDevEvaluator(timeout_at=3), dev_checks=(0,)
+    )
+    assert result.stop_reason == "completed" and "stop check failed" in result.stop_detail
+    assert result.stop_checkpoint is not None and [c.dev.check for c in result.checks] == [0]
+
+
+def test_on_check_sees_every_dev_check_once_its_checkpoint_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[int, bool]] = []
+
+    def on_check(record: loop.CheckRecord) -> None:
+        seen.append((record.dev.check, Path(record.checkpoint).exists()))
+
+    result = run(tmp_path, monkeypatch, on_check=on_check)
+    assert seen == [(0, True), (2, True), (3, True)]  # scheduled checks, then the end check
+    assert [record.dev.check for record in result.checks] == [0, 2, 3]
+
+
+def test_a_failing_on_check_propagates_after_the_weights_are_saved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def on_check(record: loop.CheckRecord) -> None:
+        if record.dev.check == 2:
+            raise OSError("upload failed")
+
+    with pytest.raises(OSError):
+        run(tmp_path, monkeypatch, on_check=on_check)
+    checkpoints = tmp_path / "rl" / "checkpoints"
+    assert (checkpoints / "update-0002.pt").exists()
+    assert not (tmp_path / "rl" / "result.json").exists()
+
+
+def test_patience_reached_at_the_final_update_is_a_completed_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scores = {0: 0.5, 1: 0.1, 2: 0.1, 3: 0.1}
+    evaluator = ScriptedDevEvaluator(script=lambda check: (scores[check], 0.0))
+    result = run(tmp_path, monkeypatch, evaluator=evaluator, dev_checks=(0, 1, 2, 3))
+    assert result.updates == 3 and result.stop_reason == "completed"
+    assert "patience reached at the final update" in result.stop_detail
+    assert evaluator.calls == [0, 1, 2, 3]
+    assert result.selected is not None and result.selected.dev.check == 0
+    saved = json.loads((tmp_path / "rl" / "result.json").read_text())
+    assert saved["stop_reason"] == "completed"
+
+
+def test_the_check_taken_at_a_leakage_stop_is_recorded_but_never_selected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evaluator = ScriptedDevEvaluator(script=lambda check: (0.9 if check else 0.1, 0.0))
+    source = FakeRewardSource(flags_of=lambda attempt: ("inspect",))
+    result = run(
+        tmp_path,
+        monkeypatch,
+        rewards=source,
+        evaluator=evaluator,
+        updates=10,
+        dev_checks=(0,),
+        leakage_min_rewarded=12,
+    )
+    assert result.stop_reason == "leakage"
+    stop_check = result.checks[-1]
+    assert stop_check.dev.check == result.updates and stop_check.dev.greedy_pass_at_1 == 0.9
+    assert stop_check.selectable is False
+    assert result.selected is not None and result.selected.dev.check == 0
+    saved = json.loads((tmp_path / "rl" / "result.json").read_text())
+    assert [check["selectable"] for check in saved["checks"]] == [True, False]
+    assert saved["selected"]["dev"]["check"] == 0
+    assert events(tmp_path, "rl_dev_check")[-1]["selectable"] is False
+
+
+def test_rl_refuses_tasks_it_must_not_train_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    template = TASKS[0].__dict__
+    sealed = Task(**{**template, "id": "x-test", "split": "test"})
+    dev = Task(**{**template, "id": "x-dev", "split": "dev"})
+    unparseable = Task(**{**template, "id": "x-bad", "hidden_tests": "y = f(1)\nassert y == 2"})
+    for bad, match in (
+        (sealed, "x-test"),
+        (dev, "x-dev"),
+        (unparseable, "x-bad"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            run(tmp_path, monkeypatch, tasks=[*TASKS, bad])
+    assert not (tmp_path / "rl").exists()  # refused before anything was written
+
+
+def test_the_result_records_the_attention_kernel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = run(tmp_path, monkeypatch, updates=2, dev_checks=())
+    assert result.attention == "reference"
+    saved = json.loads((tmp_path / "rl" / "result.json").read_text())
+    assert saved["attention"] == "reference"
+
+
+def test_the_micro_batch_size_does_not_change_the_first_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accumulated micro-batches equal one full-batch step: from the same weights and
+    rollouts, the first update's loss and gradient norm agree for any micro-batch size
+    (later updates differ in rounding, which Adam's normalisation amplifies)."""
+    rows = []
+    for size in (1, 3, 40):
+        run(tmp_path / str(size), monkeypatch, updates=2, micro_batch=size, dev_checks=())
+        rows.append(events(tmp_path / str(size), "rl_update")[0])
+    for other in rows[1:]:
+        assert other["loss"] == pytest.approx(rows[0]["loss"], rel=1e-5)
+        assert other["gradient_norm"] == pytest.approx(rows[0]["gradient_norm"], rel=1e-4)
+        assert other["loss_tokens"] == rows[0]["loss_tokens"]

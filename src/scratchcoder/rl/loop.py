@@ -13,12 +13,17 @@ Each update, numbered from 1:
 5. logs one ``rl_update`` event and checks the stops.
 
 Dev checks run before the first update (check 0) and after the updates listed in
-``RLConfig.dev_checks``; each saves a weights-only checkpoint. The run stops on a
-non-finite reward, loss or gradient norm, on collapse, on dev patience, on the leakage
-rule, when the reward source times out or cannot resolve a host failure, when
-``should_stop`` asks, or after the last update. Unless the reward channel itself failed, a
-stop whose weights changed since the last check takes one more check. Selection then picks
-the best check (``scratchcoder.rl.dev.select_check``). See ``docs/rl.md`` and
+``RLConfig.dev_checks``; each saves a weights-only checkpoint (and calls ``on_check``, so
+the caller can upload it at once). The run stops on a non-finite reward, loss or gradient
+norm, on collapse, on dev patience before the last update, on the leakage rule, when the
+reward source times out or cannot resolve a host failure, when ``should_stop`` asks, or
+after the last update. A stop whose weights changed since the last check takes one more
+check, except a reward-channel stop (the check needs that side), a ``should_stop`` stop
+unless ``check_at_external_stop`` (a cost, wall or idle stop should not spend more), and
+either kind when its flag is off; the check taken at a leakage stop is recorded but never
+selected. Whatever the stop, unchecked weights are saved, and so are the latest weights if
+anything unexpected raises, the stop-time check included. Selection then picks the best
+selectable check (``scratchcoder.rl.dev.select_check``). See ``docs/rl.md`` and
 ``docs/walkthroughs/rl-update.md``.
 """
 
@@ -53,7 +58,7 @@ from scratchcoder.rl.rewards import (
     check_rewards,
 )
 from scratchcoder.rl.rollout import ROLLOUT_SEED, ROLLOUT_TOKENS, generate_rollouts, rollout_seed
-from scratchcoder.rl.screening import baseline_of
+from scratchcoder.rl.screening import require_train_tasks
 from scratchcoder.sandbox.reward import AuditTally
 from scratchcoder.train.trainer import synchronized_time
 
@@ -130,6 +135,11 @@ class RLConfig:
     """Stop when more than ``leakage_rate`` of rewarded attempts (reward > 0), counted from
     the first update, carry static-audit flags, once at least this many exist."""
     check_at_stop: bool = True
+    """Take one more dev check at a stop the run decides itself (completion, collapse, patience,
+    leakage, non-finite) when its weights changed since the last check."""
+    check_at_external_stop: bool = False
+    """The same at a ``should_stop`` stop. Off by default: a cost, wall or idle stop should not
+    start about 1,800 generations and a Mac round trip. The weights are saved either way."""
 
     def __post_init__(self) -> None:
         for name in (
@@ -163,7 +173,7 @@ class RLConfig:
             raise ValueError("Adam betas must lie in [0, 1)")
         if not 0 <= _number(self.leakage_rate, "leakage_rate") <= 1:
             raise ValueError("leakage_rate must lie in [0, 1]")
-        for name in ("optimizer_foreach", "check_at_stop"):
+        for name in ("optimizer_foreach", "check_at_stop", "check_at_external_stop"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         checks = self.dev_checks
@@ -220,6 +230,9 @@ class CheckRecord:
     checkpoint: str
     sha256: str
     label: str = ""
+    selectable: bool = True
+    """``False`` for the check taken at a leakage stop: its score is recorded, but weights
+    trained into a reward exploit are not offered as the run's result."""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -228,6 +241,7 @@ class CheckRecord:
             "checkpoint": self.checkpoint,
             "sha256": self.sha256,
             "label": self.label,
+            "selectable": self.selectable,
         }
 
 
@@ -251,6 +265,8 @@ class RLResult:
     config: RLConfig
     monitoring: list[dict[str, Any]] = field(default_factory=list)
     stop_checkpoint: dict[str, str] | None = None
+    attention: str = "reference"
+    """The model's training attention kernel; the control's ``attention`` should match."""
 
     @property
     def busy_seconds(self) -> float:
@@ -274,6 +290,7 @@ class RLResult:
             "seconds": dict(self.seconds),
             "busy_seconds": self.busy_seconds,
             "precision": self.precision,
+            "attention": self.attention,
             "device": self.device,
             "tasks": self.tasks,
             "schedule_sha256": self.schedule_sha256,
@@ -319,13 +336,21 @@ def run_rl(
     tokenizer_hash: str,
     config: RLConfig | None = None,
     should_stop: ShouldStop | None = None,
+    on_check: Callable[[CheckRecord], None] | None = None,
 ) -> RLResult:
     """Run RL on ``model`` (the SFT parent, already on its device) over the kept tasks.
 
     Writes ``events.jsonl`` (one ``rl_update`` event per update, plus dev checks and the
-    stop), ``checkpoints/update-NNNN.pt`` (weights at each check, and at a reward-channel
-    stop) and ``result.json`` under ``output``, which must not already hold a result.
-    Precision follows the device: bfloat16 autocast on CUDA, float32 on the CPU.
+    stop), ``checkpoints/update-NNNN.pt`` (weights at each check, and at a stop whose
+    weights no check covers) and ``result.json`` under ``output``, which must not already
+    hold a result. Precision follows the device: bfloat16 autocast on CUDA, float32 on the CPU.
+
+    ``tasks`` must be train-split tasks the reward channel can parse (``require_train_tasks``).
+    ``on_check`` is called with each dev check's record once its checkpoint file exists, so
+    a caller can upload it at once; an exception from it propagates like any other error,
+    after the latest weights are saved. An unexpected error in the loop or in the stop-time
+    check saves the latest weights, logs ``rl_failed`` and re-raises; no result file is
+    written then.
     """
     config = config or RLConfig()
     if (output / "result.json").exists():
@@ -333,6 +358,7 @@ def run_rl(
     by_id = {task.id: task for task in tasks}
     if len(by_id) != len(tasks):
         raise ValueError("RL task IDs must be unique")
+    task_baselines = require_train_tasks(tasks)
     device = next(model.parameters()).device
     precision = "bfloat16" if device.type == "cuda" else "float32"
     schedule = task_schedule(
@@ -345,7 +371,7 @@ def run_rl(
         json.dumps([list(ids) for _, ids in schedule]).encode()
     ).hexdigest()
     prompts = {task.id: chat_task_prompt(encoder, task) for task in tasks}
-    baselines = {task.id: baseline_of(task).reward or 0.0 for task in tasks}
+    baselines = {identifier: found.reward or 0.0 for identifier, found in task_baselines.items()}
     named = list(model.named_parameters())
     optimizer = AdamW(
         [parameter for _, parameter in named],
@@ -400,14 +426,26 @@ def run_rl(
     output.mkdir(parents=True, exist_ok=True)
     with EventLogger(output / "events.jsonl", run_id) as logger:
 
-        def dev_check(update: int) -> CheckRecord:
+        def record_failure(error: Exception) -> None:
+            """Log an unexpected error and keep the policy's latest weights before it propagates."""
+            logger.event(
+                "rl_failed",
+                error_type=type(error).__name__,
+                detail=str(error)[:500],
+                updates=completed,
+                optimizer_steps=steps,
+            )
+            if not checks or checks[-1].optimizer_steps < steps:
+                save(completed, checked=False)
+
+        def dev_check(update: int, *, selectable: bool = True) -> CheckRecord:
             result = evaluator.evaluate(model, update)
             if result.check != update:
                 raise ValueError(f"the dev evaluator labelled check {update} as {result.check}")
             seconds["dev_generation"] += result.generation_seconds
             seconds["dev_wait"] += result.wait_seconds
             path, digest = save(update, checked=True)
-            record = CheckRecord(result, steps, path, digest)
+            record = CheckRecord(result, steps, path, digest, selectable=selectable)
             checks.append(record)
             logger.event(
                 "rl_dev_check",
@@ -415,8 +453,11 @@ def run_rl(
                 optimizer_steps=steps,
                 checkpoint=path,
                 sha256=digest,
+                selectable=selectable,
                 **result.to_json(per_task=False),
             )
+            if on_check is not None:
+                on_check(record)
             return record
 
         try:
@@ -647,35 +688,34 @@ def run_rl(
                     else:
                         since_best += 1
                         if since_best >= config.patience:
-                            stop_reason = DEV_PATIENCE
-                            stop_detail = f"{since_best} checks not above {best}"
-                            break
+                            note = f"{since_best} checks not above {best}"
+                            if update < config.updates:
+                                stop_reason, stop_detail = DEV_PATIENCE, note
+                                break
+                            # No update is left to cut short: the run completed.
+                            stop_detail = f"patience reached at the final update: {note}"
         except Exception as error:
-            # Keep the policy's latest weights before the error propagates.
-            logger.event(
-                "rl_failed",
-                error_type=type(error).__name__,
-                detail=str(error)[:500],
-                updates=completed,
-                optimizer_steps=steps,
-            )
-            if not checks or checks[-1].optimizer_steps < steps:
-                save(completed, checked=False)
+            record_failure(error)
             raise
         if stop_reason is None:
             stop_reason = COMPLETED
         unchecked = not checks or checks[-1].optimizer_steps < steps
-        if stop_reason not in CHANNEL_STOPS and config.check_at_stop and unchecked:
+        wanted = config.check_at_external_stop if stop_reason == EXTERNAL else config.check_at_stop
+        if stop_reason not in CHANNEL_STOPS and wanted and unchecked:
             try:
-                dev_check(completed)
+                dev_check(completed, selectable=stop_reason != LEAKAGE)
                 unchecked = False
             except RewardError as error:
                 stop_detail = f"{stop_detail}; stop check failed: {error}"
+            except Exception as error:
+                record_failure(error)
+                raise
         if unchecked:
             path, digest = save(completed, checked=False)
             stop_checkpoint = {"checkpoint": path, "sha256": digest}
-        selected_dev = select_check([check.dev for check in checks]) if checks else None
-        selected = next((check for check in checks if check.dev is selected_dev), None)
+        candidates = [check for check in checks if check.selectable]
+        selected_dev = select_check([check.dev for check in candidates]) if candidates else None
+        selected = next((check for check in candidates if check.dev is selected_dev), None)
         result = RLResult(
             stop_reason=stop_reason,
             stop_detail=stop_detail,
@@ -693,6 +733,7 @@ def run_rl(
             config=config,
             monitoring=monitoring,
             stop_checkpoint=stop_checkpoint,
+            attention="fused" if model.fused_attention else "reference",
         )
         logger.event(
             "rl_stopped",
