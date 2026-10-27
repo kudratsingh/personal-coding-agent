@@ -135,7 +135,6 @@ SAME_WEIGHTS_RULE = (
 POD = "pod"
 REUSES_SFT = "reuses-run-1-sft"
 NOT_EVALUATED = "not-evaluated"
-ARMS = (RL_REFERENCE, CONTROL_REFERENCE)
 BRIDGE_FILES = ("server.lease", "server.lease.lock", "client.lock")
 BRIDGE_BOXES = ("outbox", "inbox", "done", "withdrawn", "rejected")
 MAX_BRIDGE_TAR_BYTES = 512 * 1024 * 1024
