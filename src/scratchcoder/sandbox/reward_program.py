@@ -29,6 +29,15 @@ solution would. The supervisor's jobs are framing and containment:
 - **Cleanup.** After the run, and after every I/O case, it kills every other process in
   the container, so no straggler can hold the pid limit or a pipe into the next case.
 
+Function mode keeps the evaluation program's judgement of the process as a whole. That
+program runs the candidate, the tests and ``print(marker)`` as one script and accepts the run
+only if the output reaches the end of file in time and ends with the marker. The driver here
+ends with the same ``print(marker)`` (a random marker of the same length), and the supervisor
+reads the candidate's output to the end of file, counts the marker toward the output cap and
+reports whether the output ended with it and whether the stream was still open when the
+budget ended; the host fails every check on any of those. The results themselves travel on a
+separate pipe, so a candidate cannot forge them through its own output.
+
 I/O cases run from a fork server: a clean interpreter is started once per attempt, and each
 case runs in a fresh fork of it, so a case costs a fork instead of an interpreter start and
 no case inherits another case's memory. Files a case leaves in ``/tmp`` do persist (and
@@ -38,8 +47,10 @@ runner's I/O program. As in that program, the cases run in turn under one shared
 """
 
 import base64
+import codecs
 import json
 import os
+import secrets
 import selectors
 import signal
 import socket
@@ -68,6 +79,12 @@ _CANDIDATE_PATH = "/tmp/candidate.py"
 """Where the evaluation program keeps the candidate's source; the reward channel runs the
 candidate under the same name."""
 
+MARKER_PREFIX = "__scratchcoder_completed_"
+"""The start of the completion marker; with 48 hex digits it is as long as the evaluation
+program's, so it takes the same share of the output cap."""
+DRAIN_SECONDS = 0.25
+"""The most the supervisor spends reading the result pipe's last rows after the output
+stream ends or the budget runs out."""
 GRACE_SECONDS = 2.0
 """How long the supervisor waits for a killed process to be reaped, or for a fork-server
 answer, before giving up on it."""
@@ -193,6 +210,7 @@ def main():
     per_call = config["per_call"]
     code = config["code"]
     setup = config["setup"]
+    marker = config["marker"]
     del config
     _empty_stdin()
     # As in the evaluation program, the candidate runs as the main script
@@ -242,6 +260,11 @@ def main():
             _emit(_dumps({"i": index, "ok": False, "e": type(error).__name__}))
             continue
         _emit(_row(index, value))
+    # The evaluation program ends the candidate-plus-tests script with this statement and
+    # accepts the run only if the output ends with the marker: output printed after it (an
+    # ``atexit`` callback, a destructor's complaint), a closed or replaced stdout and a
+    # stream a leftover process holds open all fail there, and fail here the same way.
+    print(marker)
 
 
 main()
@@ -371,6 +394,42 @@ class LineSplitter:
             self.handle(bytes(self.pending))
         self.pending.clear()
         self.dropping = False
+
+
+class MarkerWatcher:
+    """Follow a byte stream in blocks and say whether it ends with ``marker`` followed by
+    nothing but whitespace, which is the evaluation program's test of a function run's
+    output (``output.rstrip().endswith(marker)``). The last marker counts, and a marker split
+    between two blocks is found."""
+
+    def __init__(self, marker: bytes) -> None:
+        self.marker = marker
+        self.window = b""  # the end of the stream so far, long enough to hold half a marker
+        self.seen = False
+        self.stray = False  # something other than whitespace came after the last marker
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def feed(self, data: bytes) -> None:
+        joined = self.window + data
+        at = joined.rfind(self.marker)
+        if at >= 0:
+            self.seen = True
+            self.stray = False
+            self.decoder.reset()
+            data = joined[at + len(self.marker) :]
+        if self.seen and data and self.decoder.decode(data).strip():
+            self.stray = True
+        keep = len(self.marker) - 1
+        self.window = joined[-keep:] if keep else b""
+
+    def complete(self) -> bool:
+        """Whether the stream so far ends with the marker and then only whitespace."""
+        if not self.seen or self.stray:
+            return False
+        state = self.decoder.getstate()
+        ending = self.decoder.decode(b"", final=True)  # half a character is not whitespace
+        self.decoder.setstate(state)
+        return not ending.strip()
 
 
 def admit_row(rows: dict[int, bytes], count: int, line: bytes) -> None:
@@ -545,11 +604,28 @@ def _finish(process: subprocess.Popen[bytes], deadline: float) -> int | None:
 # --------------------------------------------------------------------------------------
 
 
+def _drain(fd: int, handle: Callable[[bytes], None]) -> None:
+    """Read what is already waiting on ``fd`` without blocking, for at most a moment: a
+    leftover process that keeps writing cannot hold the supervisor here."""
+    os.set_blocking(fd, False)
+    give_up = time.monotonic() + DRAIN_SECONDS
+    while time.monotonic() < give_up:
+        try:
+            block = os.read(fd, _READ_BYTES)
+        except BlockingIOError:
+            return
+        if not block:
+            return
+        handle(block)
+
+
 def _run_function(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
     calls = payload["calls"]
     count = len(calls)
     per_call = min(payload["per_call"], payload["budget"])
     cap = payload["output_bytes"]
+    marker = MARKER_PREFIX + secrets.token_hex(24)
+    watcher = MarkerWatcher(marker.encode())
     _write_candidate(payload["code"])
     read_fd, write_fd = os.pipe()
     rows: dict[int, bytes] = {}
@@ -558,6 +634,7 @@ def _run_function(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
     child_rc: int | None = None
     output_bytes = 0
     output_limit = False
+    output_closed = False
     try:
         try:
             # The driver writes results to the inherited write end at its own descriptor
@@ -571,6 +648,7 @@ def _run_function(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
                     "per_call": per_call,
                     "result_fd": write_fd,
                     "row_bytes": payload["row_bytes"],
+                    "marker": marker,
                 }
             ).encode()
             config_fd = _memory_file(config)
@@ -593,27 +671,27 @@ def _run_function(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ, "stdout")
         selector.register(read_fd, selectors.EVENT_READ, "result")
-        exited_at: float | None = None
         try:
-            while selector.get_map() and not output_limit:
+            # As in the evaluation program, read until the output stream ends: it ends when
+            # the process and everything it started have closed it, so a leftover process
+            # that holds it open keeps this loop going until the budget ends.
+            while not output_closed and not output_limit:
                 now = time.monotonic()
                 if now >= deadline:
                     break
-                if exited_at is None and process.poll() is not None:
-                    exited_at = now
-                if exited_at is not None and now - exited_at > 0.2:
-                    break  # only stragglers can still hold the pipes open
                 for key, _ in selector.select(timeout=min(0.05, deadline - now)):
                     block = os.read(key.fd, _READ_BYTES)
                     if not block:
                         selector.unregister(key.fileobj)
+                        output_closed = output_closed or key.data == "stdout"
                     elif key.data == "result":
                         lines.feed(block)
                     else:
                         # The candidate's own stdout and stderr are discarded but counted:
                         # as in the evaluation program, more than the output cap fails the
-                        # whole attempt.
+                        # whole attempt. The completion marker counts too.
                         output_bytes += len(block)
+                        watcher.feed(block)
                         if output_bytes > cap:
                             output_limit = True
                             break
@@ -622,6 +700,7 @@ def _run_function(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
         if output_limit:
             process.kill()
         child_rc = _finish(process, deadline)
+        _drain(read_fd, lines.feed)
     finally:
         os.close(read_fd)
         if process is not None and process.stdout is not None:
@@ -633,6 +712,8 @@ def _run_function(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
         "rows": [encode_bytes(rows[index]) if index in rows else None for index in range(count)],
         "child_rc": child_rc,
         "output_limit": output_limit,
+        "output_closed": output_closed,
+        "marker": watcher.complete(),
     }
 
 

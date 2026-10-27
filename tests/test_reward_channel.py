@@ -54,7 +54,7 @@ from scratchcoder.sandbox.reward import (
     score_attempt,
     score_with_host_retries,
 )
-from scratchcoder.sandbox.reward_program import LineSplitter, admit_row
+from scratchcoder.sandbox.reward_program import LineSplitter, MarkerWatcher, admit_row
 from scratchcoder.sandbox.runner import Limits, command
 from tools import task_pool
 
@@ -356,6 +356,8 @@ def function_report(rows: list[Any], **extra: Any) -> dict[str, Any]:
         "rows": rows,
         "child_rc": 0,
         "output_limit": False,
+        "output_closed": True,
+        "marker": True,
         **extra,
     }
 
@@ -744,12 +746,20 @@ def test_process_level_failures_fail_every_function_check() -> None:
     for status in (1, -9, None, "0"):
         exited = scored(child_rc=status)
         assert exited.reward == 0.0 and exited.detail == f"exit status {status}", status
-    # A report without the output flag is not trusted to have checked it.
-    unflagged = function_report(rows)
-    del unflagged["output_limit"]
-    assert score_attempt(task, "c", container=report_container(unflagged)).reward == 0.0
-    # A process the budget ended before every call reported keeps the calls that did.
-    cut = function_report([row(0, 1), None], child_rc=-9)
+    # The output stream still open at the end of the budget (a leftover process holds it), and
+    # output that does not end with the completion marker, fail every check as well.
+    held = scored(output_closed=False)
+    assert held.reward == 0.0 and held.detail == "output stream held open"
+    unmarked = scored(marker=False)
+    assert unmarked.reward == 0.0 and unmarked.detail == "output does not end with the marker"
+    # A report without a flag is not trusted to have checked it.
+    for flag in ("output_limit", "output_closed", "marker", "child_rc"):
+        unflagged = function_report(rows)
+        del unflagged[flag]
+        assert score_attempt(task, "c", container=report_container(unflagged)).reward == 0.0, flag
+    # A process the budget ended before every call reported keeps the calls that did, whatever
+    # state its output was in.
+    cut = function_report([row(0, 1), None], child_rc=-9, output_closed=False, marker=False)
     partial = score_attempt(task, "c", container=report_container(cut))
     assert partial.reward == 0.5 and partial.unfinished == 1 and partial.detail == ""
 
@@ -981,6 +991,8 @@ report = {
     "rows": [base64.b64encode(row).decode()],
     "child_rc": 0,
     "output_limit": False,
+    "output_closed": True,
+    "marker": True,
 }
 
 
@@ -1235,6 +1247,67 @@ def test_the_pool_verification_retries_what_the_runner_marks_stalled(
 # --------------------------------------------------------------------------------------
 # Supervisor stream helpers (pure; they never run candidate code).
 # --------------------------------------------------------------------------------------
+
+
+def reference_complete(stream: bytes, marker: str) -> bool:
+    """The evaluation program's test of a function run's output."""
+    return stream.decode("utf-8", errors="replace").rstrip().endswith(marker)
+
+
+def watched(blocks: list[bytes], marker: bytes) -> bool:
+    watcher = MarkerWatcher(marker)
+    for block in blocks:
+        watcher.feed(block)
+    return watcher.complete()
+
+
+MARK = b"__scratchcoder_completed_" + b"ab" * 24
+
+
+@pytest.mark.parametrize(
+    "stream,complete",
+    [
+        (MARK + b"\n", True),
+        (b"output\n" + MARK + b"\n", True),
+        (b"no newline before" + MARK, True),
+        (MARK + b"\n \t\r\n\n", True),
+        (MARK + "\n\u00a0\u2003\x1c".encode(), True),
+        (b"", False),
+        (b"output only\n", False),
+        (MARK[:-1] + b"\n", False),
+        (MARK + b"\nbye\n", False),
+        (MARK + b"\n\xff", False),
+        (MARK + b"\n\xc2", False),  # half of a character
+        (MARK + b"\n\n" + MARK + b"\n", True),  # the last marker counts
+        (MARK + b"\n" + MARK + b"x\n", False),
+        (MARK + b"\n" + MARK[:10], False),
+    ],
+)
+def test_marker_watcher_matches_the_evaluation_programs_test(stream: bytes, complete: bool) -> None:
+    assert reference_complete(stream, MARK.decode()) is complete
+    assert watched([stream], MARK) is complete
+    # Split into blocks anywhere: every cut leaves the answer unchanged.
+    for cut in range(len(stream) + 1):
+        assert watched([stream[:cut], stream[cut:]], MARK) is complete, cut
+    assert watched([stream[i : i + 1] for i in range(len(stream))], MARK) is complete
+
+
+def test_marker_watcher_agrees_with_the_reference_on_random_streams() -> None:
+    import random
+
+    rng = random.Random(7)
+    marker = b"MK7"
+    pieces = [b"MK7", b"MK", b"7", b"M", b"K7", b" ", b"\n", b"\t", b"x", b"\xc2", b"\xa0", b"\xff"]
+    for _ in range(3000):
+        stream = b"".join(rng.choice(pieces) for _ in range(rng.randint(0, 12)))
+        cuts = sorted(rng.sample(range(len(stream) + 1), k=min(len(stream) + 1, rng.randint(0, 4))))
+        blocks = [stream[a:b] for a, b in zip([0, *cuts], [*cuts, len(stream)], strict=True)]
+        assert b"".join(blocks) == stream
+        assert watched(blocks, marker) is reference_complete(stream, marker.decode()), blocks
+    # A one-byte marker has no window to carry between blocks.
+    assert watched([b"a", b"Z\n"], b"Z") is True
+    assert watched([b"Z", b"a"], b"Z") is False
+    assert watched([b"Z", b"\n"], b"Z") is True
 
 
 def test_line_splitter_drops_only_the_oversized_line() -> None:
@@ -1756,10 +1829,20 @@ def test_live_candidate_runs_as_the_main_script_as_in_evaluation() -> None:
             assert rewarded == (1.0 if expected else 0.0), hidden
 
 
-# Process-level failures the evaluation program fails as a whole: output beyond the cap, a
-# nonzero exit status, and a process that never ends. The first program is the control.
+# Process-level outcomes the evaluation program decides for the run as a whole: output beyond
+# the cap (the completion marker counts toward it), a nonzero exit status, a process that
+# never ends, anything printed after the last test, a stream a leftover process holds open and
+# a closed or replaced stdout. The first programs are controls that must pass in both paths.
+CAP_LESS_MARKER = 65536 - 20
 LIVE_PROCESS: list[tuple[str, bool]] = [
     ("def f():\n    print('x' * 1000)\n    return 1", True),
+    ("print('before')\ndef f():\n    print('during')\n    return 1", True),
+    (f"print('x' * ({CAP_LESS_MARKER} - 100))\ndef f():\n    return 1", True),
+    (
+        "import threading, time\ndef w():\n    time.sleep(0.5)\n    print('late')\n"
+        "threading.Thread(target=w, daemon=True).start()\ndef f():\n    return 1",
+        True,
+    ),
     ("def f():\n    print('x' * 70000)\n    return 1", False),
     ("import atexit, os\natexit.register(lambda: os._exit(1))\ndef f():\n    return 1", False),
     (
@@ -1767,11 +1850,27 @@ LIVE_PROCESS: list[tuple[str, bool]] = [
         "def f():\n    return 1",
         False,
     ),
+    ("import atexit\natexit.register(print, 'bye')\ndef f():\n    return 1", False),
+    ("import atexit, sys\natexit.register(sys.stderr.write, 'bye')\ndef f():\n    return 1", False),
+    (
+        "class D:\n    def __del__(self):\n        raise ValueError('x')\nd = D()\n"
+        "def f():\n    return 1",
+        False,
+    ),
+    (
+        "import os, time\nif os.fork() == 0:\n    time.sleep(60)\n    os._exit(0)\n"
+        "def f():\n    return 1",
+        False,
+    ),
+    (f"print('x' * {CAP_LESS_MARKER})\ndef f():\n    return 1", False),
+    ("import sys\nsys.stdout.close()\ndef f():\n    return 1", False),
+    ("import os\nos.close(1)\ndef f():\n    return 1", False),
+    ("import io, sys\nsys.stdout = io.StringIO()\ndef f():\n    return 1", False),
 ]
 
 
 @integration
-def test_live_process_level_failures_fail_every_check_as_in_evaluation() -> None:
+def test_live_process_level_outcomes_match_evaluation() -> None:
     hidden = "assert f() == 1"
 
     def verdicts(item: tuple[str, bool]) -> tuple[str, RewardResult, bool, bool]:

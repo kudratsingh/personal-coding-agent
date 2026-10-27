@@ -41,8 +41,15 @@ evaluation runner's in-process assertion would), identity for `is None/True/Fals
 truthiness for `assert not CALL`. Because the rebuilt value holds only built-in types, no
 candidate-defined `__eq__` ever runs on the host. The reward is `passed / total`, with the
 denominator taken from the task file. As in the evaluation program, where one process runs
-the candidate and every assertion, output beyond the 64 KiB cap or a nonzero exit status once
-every call has reported (an `atexit` exit, a thread that never ends) fails every check. For
+the candidate and every assertion and the run is accepted only if its output ends with a
+completion marker, these fail every check: output beyond the 64 KiB cap (the marker counts
+toward it), and, once every call has reported, a nonzero exit status (an `atexit` exit, a
+thread that never ends), an output stream a leftover process still holds open when the
+budget ends, and output that does not end with the marker (anything printed after the last
+call, a closed or replaced stdout). A function run that is cut off by the budget before every
+call reported keeps the calls that did, which the evaluation program does not do (it fails a
+timeout whole). A leftover process makes the attempt last until the budget ends, as the
+evaluation program's timeout does. For
 I/O tasks the cases run in turn under one deadline shared by all of them; only the inputs
 enter the container, the container returns each case's bounded stdout, and the host compares
 with expected outputs it never shared. Cases or calls that do not run count as failed.

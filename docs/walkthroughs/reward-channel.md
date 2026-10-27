@@ -74,11 +74,16 @@ host: classify the invocation from the frames → validate and decode each row i
   block runs and its classes pickle), `__file__` and `sys.argv[0]` are `/tmp/candidate.py`,
   `__builtins__` is the builtins module, and stdin is empty (the driver's configuration
   arrived there and cannot be re-read). Then come the hidden tests' imports and each call in
-  order, as the evaluation program runs the candidate followed by the tests. As there, the
-  candidate's own output beyond the 64 KiB cap, or a nonzero exit status once every call has
-  reported (an `atexit` handler calling `os._exit(1)`, a thread that keeps the process
-  alive), fails every check; a process the budget ends before every call reported keeps the
-  calls that did.
+  order, as the evaluation program runs the candidate followed by the tests, and the driver
+  ends by printing a random completion marker as long as the evaluation program's. As there,
+  the candidate's own output beyond the 64 KiB cap (the marker counts toward it) fails every
+  check, and so, once every call has reported, does a nonzero exit status (an `atexit`
+  handler calling `os._exit(1)`, a thread that keeps the process alive), an output stream
+  still open when the budget ends (a forked process that keeps the pipe), and output that
+  does not end with the marker plus whitespace (an `atexit` print, a destructor's complaint
+  on stderr, `sys.stdout.close()`, a replaced `sys.stdout`). A process the budget ends before
+  every call reported keeps the calls that did, which the evaluation program does not do (it
+  fails a timeout whole).
 - **I/O mode.** `parse_io_cases` returns the inputs and the expected outputs. Only the inputs
   enter the container. The supervisor starts one clean interpreter per attempt as a fork
   server; each case runs in a fresh fork of it, in turn, under one deadline shared by all the
@@ -254,9 +259,11 @@ host: classify the invocation from the frames → validate and decode each row i
   and subclass residuals; that the candidate runs as the main script with an empty stdin (its
   own globals through `sys.modules['__main__']`, `sys.argv`, `inspect.getsource` and pickling
   work, and a candidate that rewinds stdin to read the call sources finds nothing); that output
-  past the cap, an `atexit` exit status and a never-ending thread fail every check, as in
-  evaluation; that a candidate that stops the fork server is still scored well inside the
-  stall deadline; and that `/tmp` files persist across I/O cases in both paths. Unit tests also
+  past the cap (the marker included), an `atexit` exit status, a never-ending thread, output
+  after the last call, a stream a forked process holds open, and a closed or replaced stdout
+  fail every check, as in evaluation; that a candidate that stops the fork server is still
+  scored well inside the stall deadline; and that `/tmp` files persist across I/O cases in
+  both paths. Unit tests also
   cover the `oversized` refusal, the supervisor's `spawn_failed` report before any candidate
   process and its absence after one, and the degenerate-answer baseline.
 - Commands: `uv run --locked pytest tests/test_reward_channel.py` for the unit tests, and

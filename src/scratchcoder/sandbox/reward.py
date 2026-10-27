@@ -1143,10 +1143,13 @@ def _decode_row(raw: object, index: int) -> dict[str, Any] | None:
 
 def _score_function(checks: FunctionChecks, report: dict[str, Any]) -> tuple[list[bool], int, str]:
     """Per-check outcomes, the unfinished count and a detail. As in the evaluation program,
-    where one process runs the candidate and every assertion, two process-level failures
-    fail every check: output beyond the cap, and a nonzero (or missing) exit status once
-    every call has reported (an ``atexit`` exit, a thread that never ends). A process ended
-    by the budget before every call reported keeps the calls that did."""
+    where one process runs the candidate and every assertion and the run is accepted only if
+    its output ends with the completion marker, these process-level failures fail every
+    check: output beyond the cap, and, once every call has reported, a nonzero (or missing)
+    exit status (an ``atexit`` exit, a thread that never ends), an output stream still open
+    when the budget ended (a leftover process holds it), and output that does not end with the
+    marker (a closed or replaced stdout, anything printed after the last call). A process
+    ended by the budget before every call reported keeps the calls that did."""
     rows = report.get("rows")
     if type(rows) is not list or len(rows) != checks.total:
         return [False] * checks.total, 0, ""
@@ -1162,9 +1165,14 @@ def _score_function(checks: FunctionChecks, report: dict[str, Any]) -> tuple[lis
         outcomes.append(check_passes(check, row))
     if report.get("output_limit") is not False:
         return [False] * checks.total, unfinished, "output limit"
-    child_rc = report.get("child_rc")
-    if all(raw is not None for raw in rows) and (type(child_rc) is not int or child_rc != 0):
-        return [False] * checks.total, unfinished, f"exit status {child_rc}"
+    if all(raw is not None for raw in rows):
+        child_rc = report.get("child_rc")
+        if type(child_rc) is not int or child_rc != 0:
+            return [False] * checks.total, unfinished, f"exit status {child_rc}"
+        if report.get("output_closed") is not True:
+            return [False] * checks.total, unfinished, "output stream held open"
+        if report.get("marker") is not True:
+            return [False] * checks.total, unfinished, "output does not end with the marker"
     return outcomes, unfinished, ""
 
 
