@@ -206,6 +206,7 @@ def _derive_programs(
 
 def _new_header(
     completions: Completions,
+    tasks: Mapping[str, Task],
     *,
     execute: Execute,
     retries: int,
@@ -223,6 +224,10 @@ def _new_header(
         "completions": completions.header.to_json(),
         "task_file_sha256": completions.header.task_file_sha256,
         "attempts": completions.header.rows,
+        "tasks": [
+            {"task_id": task.id, "source": task.source, "written_by": task.written_by}
+            for task in sorted(tasks.values(), key=lambda item: item.id)
+        ],
         "execution": {
             "execute": name,
             "image": IMAGE,
@@ -277,7 +282,12 @@ def execute_completions(
     created = not results_path.exists()
     if created:
         results_header = _new_header(
-            completions, execute=execute, retries=retries, tokenizer=tokenizer, unseal=record
+            completions,
+            tasks,
+            execute=execute,
+            retries=retries,
+            tokenizer=tokenizer,
+            unseal=record,
         )
         results_path.parent.mkdir(parents=True, exist_ok=True)
         with results_path.open("xb") as stream:

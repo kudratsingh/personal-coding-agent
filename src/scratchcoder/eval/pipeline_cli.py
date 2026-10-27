@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-COMMANDS = ("eval-generate", "eval-execute", "eval-seal", "eval-baseline")
+COMMANDS = ("eval-generate", "eval-execute", "eval-seal", "eval-baseline", "scorecard")
 
 
 def _print(value: dict[str, Any]) -> None:
@@ -58,6 +58,32 @@ def add_parsers(subparsers: Any) -> None:
     baseline.add_argument("--tasks", type=Path, required=True, help="pool dev JSONL")
     baseline.add_argument("--output", type=Path, required=True, help="new JSON file")
     baseline.add_argument("--workers", type=int, default=8)
+    score = subparsers.add_parser(
+        "scorecard",
+        help="build the scorecard from results files, benchmark artifacts and ARC reports",
+    )
+    score.add_argument(
+        "--checkpoint",
+        action="append",
+        required=True,
+        metavar="NAME=SHA256",
+        help="name a checkpoint, e.g. sft=<sha256>; repeat for each",
+    )
+    score.add_argument("--results", type=Path, action="append", default=[])
+    score.add_argument("--benchmark", type=Path, action="append", default=[])
+    score.add_argument("--arc", type=Path, action="append", default=[], help="eval-choice report")
+    score.add_argument("--arc-tasks", type=Path, help="ARC-Easy choice JSONL or Parquet directory")
+    score.add_argument("--pool-baseline", type=Path, action="append", default=[])
+    score.add_argument(
+        "--pair",
+        action="append",
+        metavar="FIRST:SECOND",
+        help="compare two named checkpoints (default: sft:base, rl:sft, more-sft:sft, rl:more-sft)",
+    )
+    score.add_argument("--output", type=Path, required=True, help="new JSON file")
+    score.add_argument("--markdown", type=Path, help="also write a Markdown summary")
+    score.add_argument("--bootstrap-samples", type=int, default=2000)
+    score.add_argument("--bootstrap-seed", type=int, default=0)
 
 
 def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -128,5 +154,42 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         report = pool_baseline_report(args.tasks, split="dev", workers=args.workers)
         save_baseline(args.output, report)
         _print({"baseline": str(args.output), **report["summary"]})
+        return 0
+    if args.command == "scorecard":
+        from scratchcoder.common.records import atomic_json
+        from scratchcoder.eval.scorecard import build_scorecard, render_markdown
+
+        for path in (args.output, args.markdown):
+            if path is not None and path.exists():
+                parser.error(f"{path} already exists")
+        checkpoints: dict[str, str] = {}
+        for item in args.checkpoint:
+            name, _, digest = item.partition("=")
+            if not name or not digest or name in checkpoints:
+                parser.error("--checkpoint takes NAME=SHA256, each name once")
+            checkpoints[name] = digest
+        pairs = None
+        if args.pair:
+            pairs = []
+            for item in args.pair:
+                first, _, second = item.partition(":")
+                if first not in checkpoints or second not in checkpoints:
+                    parser.error("--pair takes FIRST:SECOND of named checkpoints")
+                pairs.append((first, second))
+        card = build_scorecard(
+            checkpoints=checkpoints,
+            results=args.results,
+            benchmarks=args.benchmark,
+            arc_reports=args.arc,
+            arc_tasks=args.arc_tasks,
+            pool_baselines=args.pool_baseline,
+            pairs=pairs,
+            bootstrap_samples=args.bootstrap_samples,
+            bootstrap_seed=args.bootstrap_seed,
+        )
+        atomic_json(args.output, card)
+        if args.markdown is not None:
+            args.markdown.write_text(render_markdown(card) + "\n", encoding="utf-8")
+        _print({"scorecard": str(args.output), "rows": len(card["rows"]), "leak": card["leak"]})
         return 0
     raise ValueError(f"unknown pipeline command {args.command}")

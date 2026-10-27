@@ -85,16 +85,25 @@ def write_fixture_completions(
     checkpoint: str = CHECKPOINT,
     context: int = 4096,
 ) -> str:
-    """A chat-v1 pool completions file whose attempts answer with ``program_for``."""
+    """A pool completions file whose attempts answer with ``program_for``.
+
+    Under chat-v1 the answer is a python block (no block for ``None``); under the base pool
+    protocol the completion text is the program itself, generated to the full budget.
+    """
     sampling = sampling or Sampling()
     definition = protocol_for(protocol, "pool")
     rows = []
     for task in tasks:
         prompt = definition.prompt_ids(TOKENIZER, task)
+        budget = definition.budget(len(prompt), context)
         for sample, seed in enumerate(sampling.seeds(task.id)):
             program = program_for(task, sample)
-            tokens = chat_tokens(program)
-            budget = definition.budget(len(prompt), context)
+            if definition.name == "chat-v1":
+                tokens, reason = chat_tokens(program), "stop"
+            else:
+                text = (program or "").ljust(budget)
+                tokens, reason = tuple(text.encode()), "length"
+            completion = TOKENIZER.decode(tokens, skip_special=True)
             rows.append(
                 CompletionRow(
                     task_id=task.id,
@@ -103,11 +112,11 @@ def write_fixture_completions(
                     prompt_tokens=len(prompt),
                     prompt_sha256=prompt_sha256(prompt),
                     tokens=tokens,
-                    completion=TOKENIZER.decode(tokens, skip_special=True),
+                    completion=completion,
                     program=definition.candidate(
-                        task, tokens=tokens, completion="", decoder=TOKENIZER
+                        task, tokens=tokens, completion=completion, decoder=TOKENIZER
                     ),
-                    stop_reason="stop",
+                    stop_reason=reason,
                     budget=budget,
                 )
             )
@@ -159,7 +168,13 @@ def benchmark_tasks() -> list[Task]:
 
 
 def write_benchmark_completions(
-    root: Path, tasks: list[Task], completions: dict[str, str], *, suite: str = "humaneval"
+    root: Path,
+    tasks: list[Task],
+    completions: dict[str, str],
+    *,
+    suite: str = "humaneval",
+    checkpoint: str = CHECKPOINT,
+    name: str = "he.jsonl",
 ) -> tuple[Path, Path]:
     release = root / "release.jsonl.gz"
     release.write_bytes(b"pinned release bytes (fixture)")
@@ -189,7 +204,7 @@ def write_benchmark_completions(
         protocol=definition.name,
         protocol_sha256=definition.sha256(),
         protocol_record=definition.record(),
-        checkpoint_sha256=CHECKPOINT,
+        checkpoint_sha256=checkpoint,
         tokenizer_sha256=TOKENIZER.sha256,
         tokenizer_vocab_size=TOKENIZER.vocab_size,
         model_context=1024,
@@ -203,6 +218,6 @@ def write_benchmark_completions(
         rows=len(rows),
         created_at="2026-10-26T00:00:00+00:00",
     )
-    path = root / "he.jsonl"
+    path = root / name
     write_completions(path, header, rows)
     return path, release
