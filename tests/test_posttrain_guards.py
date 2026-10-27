@@ -4,6 +4,7 @@ the weights-only upload rate. Offline; no Runpod or R2 call is made."""
 
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -164,6 +165,59 @@ def test_gpu_work_and_progress_stamps_hold_the_pod_but_nothing_else_does(tmp_pat
     heartbeat.write_text("{not json")
     assert activity_unix(str(heartbeat), now=clock.wall) is None
     assert activity_unix(str(tmp_path / "missing.json"), now=clock.wall) is None
+
+
+def test_no_activity_file_can_crash_or_stall_the_timer(tmp_path: Path) -> None:
+    """A huge integer, a deep document, a FIFO or a directory at an activity path reads as no
+    activity; the timer's loop never raises or blocks, so its deadline still fires."""
+    huge, deep, fifo, folder = (tmp_path / name for name in ("huge", "deep", "fifo", "dir"))
+    huge.write_text('{"progress_unix": ' + "9" * 400 + "}")
+    deep.write_text("[" * 60_000)
+    os.mkfifo(fifo)
+    folder.mkdir()
+    for path in (huge, deep, fifo, folder):
+        assert activity_unix(str(path), now=time.time()) is None
+    clock = Clock()
+    unit = idle_timer(tmp_path, clock, [huge, deep, fifo, folder])
+    assert unit.due() is None  # Nothing raised, nothing blocked on the FIFO.
+    clock.sleep(10.0)
+    assert unit.due() == "wall_clock_deadline"
+
+
+def test_an_activity_check_that_fails_never_skips_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock()
+    unit = idle_timer(tmp_path, clock, [tmp_path / "heartbeat.json"])
+
+    def broken(self: SelfDestruct) -> float:
+        raise OverflowError("a writer's stamp out of range")
+
+    monkeypatch.setattr(SelfDestruct, "observe_activity", broken)
+    assert unit.due() is None  # A failed read is no new activity, not a crash.
+    clock.sleep(10.0)
+    assert unit.run() == "terminated"
+    assert json.loads(Path(unit.receipt_path).read_text())["reason"].startswith(
+        "wall_clock_deadline"
+    )
+
+
+def test_a_receipt_write_failure_never_ends_the_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock()
+    unit = idle_timer(tmp_path, clock, [tmp_path / "heartbeat.json"])
+    original = SelfDestruct.record
+    failures = [0]
+
+    def full_disk(self: SelfDestruct) -> None:
+        if self.state == "armed":
+            failures[0] += 1
+            raise OSError(28, "No space left on device")
+        original(self)
+
+    monkeypatch.setattr(SelfDestruct, "record", full_disk)
+    assert unit.run() == "terminated" and failures[0] >= 1
 
 
 def test_an_idle_limit_needs_activity_files_and_stays_bounded(tmp_path: Path) -> None:

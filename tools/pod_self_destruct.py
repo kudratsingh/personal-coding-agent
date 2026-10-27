@@ -14,10 +14,13 @@ With ``--idle-seconds`` (post-training runs) the timer also deletes the Pod afte
 with no activity, independent of the Mac. Activity is the latest of the timer's own arming
 and, in each ``--activity`` JSON file (the worker's heartbeat, the bootstrap's setup
 progress), the ``last_gpu_activity_unix`` and ``progress_unix`` values. A missing,
-unreadable, oversized or malformed file adds nothing, and a value more than
+unreadable, oversized, non-regular or malformed file adds nothing (a FIFO is never opened
+for a blocking read, and no content can raise out of the check), and a value more than
 ``CLOCK_SKEW_SECONDS`` in the future is ignored, so a broken writer can only bring the
-deletion closer. ``progress_unix`` is the documented hook for waits that keep the Pod busy
-without GPU work: run 2's reward waits stamp it when the Mac's reward files arrive.
+deletion closer: the wall-clock and monotonic deadlines are checked before the idle rule on
+every pass, whatever the activity files hold. ``progress_unix`` is the documented hook for
+waits that keep the Pod busy without GPU work: run 2's reward waits stamp it when the Mac's
+reward files arrive.
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -52,29 +56,54 @@ _SAFE_POD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _BACKOFF = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
 
 
-def activity_unix(path: str, *, now: float) -> float | None:
-    """The latest activity stamp one file records, or None when it records none usable."""
+def _read_regular(path: str) -> bytes | None:
+    """At most ``MAX_ACTIVITY_BYTES + 1`` bytes of a regular file, or None.
+
+    The file is opened without blocking and must be a regular file once open, so a FIFO,
+    a device or a socket at an activity path can never stall the timer's loop.
+    """
     try:
-        with open(path, "rb") as stream:
-            raw = stream.read(MAX_ACTIVITY_BYTES + 1)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
         return None
-    if len(raw) > MAX_ACTIVITY_BYTES:
-        return None
     try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1  # The stream owns it now and closes it.
+            return stream.read(MAX_ACTIVITY_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def activity_unix(path: str, *, now: float) -> float | None:
+    """The latest activity stamp one file records, or None when it records none usable.
+
+    Nothing a writer puts in the file can raise here: an unreadable, oversized, non-regular
+    or malformed file, a deeply nested document, an integer too large for a float and a
+    stamp from the future all read as no activity.
+    """
+    try:
+        raw = _read_regular(path)
+        if raw is None or len(raw) > MAX_ACTIVITY_BYTES:
+            return None
         value = json.loads(raw)
-    except (ValueError, UnicodeDecodeError):
+        if not isinstance(value, dict):
+            return None
+        found = []
+        for name in ACTIVITY_FIELDS:
+            stamp = value.get(name)
+            if isinstance(stamp, bool) or not isinstance(stamp, int | float):
+                continue
+            number = float(stamp)  # An integer past the float range raises OverflowError.
+            if math.isfinite(number) and 0 < number <= now + CLOCK_SKEW_SECONDS:
+                found.append(number)
+        return max(found) if found else None
+    except Exception:  # Any malformed content is no activity.
         return None
-    if not isinstance(value, dict):
-        return None
-    found = [
-        float(value[name])
-        for name in ACTIVITY_FIELDS
-        if type(value.get(name)) in (int, float)
-        and math.isfinite(value[name])
-        and 0 < value[name] <= now + CLOCK_SKEW_SECONDS
-    ]
-    return max(found) if found else None
 
 
 class Transport(Protocol):
@@ -244,7 +273,11 @@ class SelfDestruct:
         if self.monotonic() >= self.deadline_monotonic:
             return "monotonic_deadline"
         if self.idle_seconds is not None:
-            if self.clock() - self.observe_activity() >= self.idle_seconds:
+            try:
+                last = self.observe_activity()
+            except Exception:  # A failed read is no new activity.
+                last = self.last_activity
+            if self.clock() - last >= self.idle_seconds:
                 return "idle_limit"
         return None
 
@@ -256,7 +289,10 @@ class SelfDestruct:
             if self.idle_seconds is not None:
                 remaining = min(remaining, self.last_activity + self.idle_seconds - self.clock())
             self.reason = f"waiting; {max(0.0, remaining):.0f}s remaining"
-            self.record()
+            try:
+                self.record()
+            except OSError:  # A full disk must not end the wait: the deadline still fires.
+                pass
             self.sleep(max(0.05, min(self.poll_seconds, remaining)))
         return reason
 
