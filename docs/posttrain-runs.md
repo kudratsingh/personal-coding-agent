@@ -120,7 +120,7 @@ A wall or cost stop ends the run, as in run 1. A stop of the Mac's side in eithe
 | Stop | In RL | In the control |
 | --- | --- | --- |
 | Mac's side | RL's endpoint selected from its scored checks and evaluated; the control skipped | the control not evaluated; RL's endpoint evaluated |
-| `wait_margin` | as for the Mac's side (the control could not run its dev checks) | the control's endpoint selected from its scored checks; each arm evaluated as the projected-finish rule admits it: when both do not fit but RL's alone does, the control is recorded `not-evaluated` (`arm_stop.control_not_admitted`) and RL's is evaluated |
+| `wait_margin` | as for the Mac's side (the control could not run its dev checks) | the control's endpoint selected from its scored checks; each arm evaluated as the projected-finish rule admits it: when both do not fit at `arc-post` (before any of the control's evaluation runs) but RL's alone does, the control is recorded `not-evaluated` (`arm_stop.control_not_admitted`) and RL's is evaluated; a refusal at a later stage stops the run on the projected finish |
 | wall or cost | the run ends | the run ends |
 
 The evaluation that follows needs no Mac wait and runs under the projected-finish rule, the finalization reserve and every limit; the projection prices only the stages and ARC entries that will run. An arm with the SFT weights is not evaluated (above). With no RL dev check scored there is nothing to select and the run finalizes at once. The run then ends `stopped` with the arm's reason, recorded in `report.json`'s `arm_stop` and the archived summary. While the evaluation runs the heartbeat reads `running`, never `awaiting_rewards`, so the watchdog's 600 s idle rule and the in-Pod 900 s rule apply as to any stage.

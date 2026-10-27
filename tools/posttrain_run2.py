@@ -923,7 +923,9 @@ class Run2Worker(PosttrainWorker):
         """The projected-finish rule, admitting each arm: after a margin stop in the control
         both arms are evaluable, and when the evaluation of both does not fit but RL's alone
         might, the control is left unevaluated (``not-evaluated``, the reason recorded) and
-        RL's evaluation is projected again on its own. Otherwise as in run 1."""
+        RL's evaluation is projected again on its own. That is decided only before any of the
+        control's evaluation has begun (at ``arc-post``); a later refusal stops the run as in
+        run 1, so no stage refused here runs. Otherwise as in run 1."""
         try:
             super().projected_finish(stage)
         except PilotStop:
@@ -932,10 +934,20 @@ class Run2Worker(PosttrainWorker):
             self.stop_reason = None
             super().projected_finish(stage)  # RL alone; raises if that does not fit either.
 
+    def evaluates_control(self, stage: StagePlan) -> bool:
+        """Whether ``stage`` evaluates the control's checkpoint here (its ARC entry or its
+        generation files)."""
+        if stage.kind == "eval":
+            return str(stage.settings["checkpoint"]) == CONTROL_REFERENCE
+        if stage.kind == "arc":
+            return CONTROL_REFERENCE in list(stage.settings["checkpoints"])
+        return False
+
     def drop_control_for_rl(self, stage: StagePlan) -> bool:
         """Leave the control unevaluated so RL's evaluation may run alone; ``True`` when that
         changed what remains (only after the control's margin stop, while both arms were
-        still to be evaluated here)."""
+        still to be evaluated here, before any of the control's evaluation has begun, and at
+        a stage that still runs without the control)."""
         stop = self.arm_stop
         if (
             stop is None
@@ -943,8 +955,17 @@ class Run2Worker(PosttrainWorker):
             or CONTROL_REFERENCE in self.not_on_pod
             or RL_REFERENCE in self.not_on_pod
             or stage.kind not in {"arc", "eval"}
+            or (stage.kind == "eval" and self.evaluates_control(stage))
         ):
             return False
+        begun = [
+            earlier.name
+            for earlier in self.plan.stages[: self.plan.stages.index(stage)]
+            if self.evaluates_control(earlier)
+            and self.stage_by_name[earlier.name]["status"] != "pending"
+        ]
+        if begun:
+            return False  # The control's evaluation has begun: the run stops as in run 1.
         before = [later.name for later in self.remaining_stages(stage)]
         reason = (
             "not evaluated: after the control's margin stop the projected-finish rule did "

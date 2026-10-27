@@ -1364,6 +1364,68 @@ def test_after_a_control_margin_stop_each_arm_is_admitted_by_the_projected_finis
     assert not any(name.startswith("eval-more-sft") for name in labels(report))
 
 
+@pytest.mark.parametrize("refused_at", ["eval-rl", "eval-more-sft"])
+def test_the_control_is_not_dropped_once_its_evaluation_has_begun(
+    found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refused_at: str
+) -> None:
+    """After a control margin stop, the control may be left unevaluated only before any of
+    its evaluation has run (at arc-post). When the projected-finish rule refuses a later
+    stage (arc-post having scored the control's ARC entry), the run stops on the projected
+    finish as in run 1: the refused stage does not run, eval-more-sft never runs, and the
+    control is not recorded as unevaluated."""
+    from tools.posttrain_run2 import MARGIN
+
+    original_control = Run2Worker.run_more_sft
+
+    def stopped_by_the_margin(self: Run2Worker, stage: Any) -> list[dict[str, Any]]:
+        outputs = original_control(self, stage)
+        self.stop_arm(stage, "more-sft", MARGIN, WAIT_MARGIN_STOP, "a test's margin stop")
+        return outputs
+
+    def stage_named(self: Run2Worker, name: str) -> Any:
+        return next(later for later in self.plan.stages if later.name == name)
+
+    def tighten(self: Run2Worker) -> None:
+        """Leave room for the refused stage alone (and RL's alone at eval-rl), but not for
+        everything that remains."""
+        refused = stage_named(self, refused_at)
+        everything = planned_seconds(self.plan, self.rates, stages=self.remaining_stages(refused))
+        alone = [refused] if refused_at == "eval-rl" else []
+        less = planned_seconds(self.plan, self.rates, stages=alone)
+        assert less["total_seconds"] < everything["total_seconds"]
+        self.pod_end = self.clock() + (less["total_seconds"] + everything["total_seconds"]) / 2
+
+    original_arc, original_eval = Run2Worker.run_arc, Run2Worker.run_eval
+
+    def arc_then_tighten(self: Run2Worker, stage: Any) -> list[dict[str, Any]]:
+        outputs = original_arc(self, stage)
+        if refused_at == "eval-rl":
+            tighten(self)
+        return outputs
+
+    def eval_then_tighten(self: Run2Worker, stage: Any) -> list[dict[str, Any]]:
+        outputs = original_eval(self, stage)
+        if refused_at == "eval-more-sft" and stage.name == "eval-rl":
+            tighten(self)
+        return outputs
+
+    monkeypatch.setattr(Run2Worker, "run_more_sft", stopped_by_the_margin)
+    monkeypatch.setattr(Run2Worker, "run_arc", arc_then_tighten)
+    monkeypatch.setattr(Run2Worker, "run_eval", eval_then_tighten)
+    report = execute(found, tmp_path / "run", clock=SlowClock()).report
+    assert (report["status"], report["stop_reason"]) == (
+        "stopped",
+        "projected_finish_after_deadline",
+    )
+    rows = [row["fits"] for row in report["projections"] if row["stage"] == refused_at]
+    assert rows == [False]
+    assert statuses(report)[refused_at] != "completed"
+    assert statuses(report)["eval-more-sft"] != "completed"
+    assert not any(name.startswith("eval-more-sft") for name in labels(report))
+    assert "control_not_admitted" not in report["arm_stop"]
+    assert report["selection"]["endpoints"]["more-sft"]["evaluation"] != "not-evaluated"
+
+
 def test_a_refusal_during_the_control_fails_the_run_after_its_weights_and_events_reach_r2(
     found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
