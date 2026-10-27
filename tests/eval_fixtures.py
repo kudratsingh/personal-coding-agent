@@ -1,5 +1,6 @@
 """Shared authored fixtures for the evaluation-pipeline tests (never real pool data)."""
 
+import hashlib
 import json
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from scratchcoder.data import chat
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.engine.generation import SAMPLER_VERSION
+from scratchcoder.eval import protocols
 from scratchcoder.eval.completions import (
     CompletionRow,
     CompletionsHeader,
@@ -132,3 +134,75 @@ def write_fixture_completions(
         generation_seconds=1.5,
     )
     return write_completions(path, header, rows)
+
+
+def benchmark_tasks() -> list[Task]:
+    tasks = []
+    for index in range(3):
+        prompt = f"def f{index}(x):\n    '''Return x.\n    >>> f{index}(1)\n    1\n    '''\n"
+        tasks.append(
+            pool_task(
+                f"HumanEval/{index}",
+                prompt=prompt,
+                split="eval",
+                entry_point=f"f{index}",
+                public_tests=f"assert callable(f{index})",
+                hidden_tests=(
+                    f"def check(candidate):\n    assert candidate(2) == 2\ncheck(f{index})"
+                ),
+                solution=prompt + "    return x\n",
+                source="openai/human-eval",
+                written_by="human",
+            )
+        )
+    return tasks
+
+
+def write_benchmark_completions(
+    root: Path, tasks: list[Task], completions: dict[str, str], *, suite: str = "humaneval"
+) -> tuple[Path, Path]:
+    release = root / "release.jsonl.gz"
+    release.write_bytes(b"pinned release bytes (fixture)")
+    definition = protocols.protocol_for("base-completion-rstrip-v1", suite)
+    rows = []
+    for task in tasks:
+        prompt = definition.prompt_ids(TOKENIZER, task)
+        text = completions[task.id]
+        tokens = tuple(text.encode())
+        rows.append(
+            CompletionRow(
+                task_id=task.id,
+                sample=0,
+                seed=Sampling().seeds(task.id)[0],
+                prompt_tokens=len(prompt),
+                prompt_sha256=prompt_sha256(prompt),
+                tokens=tokens,
+                completion=text,
+                program=definition.candidate(task, tokens=tokens, completion=text),
+                stop_reason="length",
+                budget=len(tokens),
+            )
+        )
+    header = CompletionsHeader(
+        suite=suite,
+        split="eval",
+        protocol=definition.name,
+        protocol_sha256=definition.sha256(),
+        protocol_record=definition.record(),
+        checkpoint_sha256=CHECKPOINT,
+        tokenizer_sha256=TOKENIZER.sha256,
+        tokenizer_vocab_size=TOKENIZER.vocab_size,
+        model_context=1024,
+        task_file_sha256=hashlib.sha256(release.read_bytes()).hexdigest(),
+        task_count=len(tasks),
+        task_ids_sha256=task_ids_sha256(task.id for task in tasks),
+        sampling=Sampling(),
+        max_new_tokens=256,
+        precision="bfloat16",
+        device="cuda:0",
+        rows=len(rows),
+        created_at="2026-10-26T00:00:00+00:00",
+    )
+    path = root / "he.jsonl"
+    write_completions(path, header, rows)
+    return path, release

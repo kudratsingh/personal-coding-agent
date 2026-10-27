@@ -144,6 +144,74 @@ def signature_headers(
     }
 
 
+PRESIGN_MAX_SECONDS = 7 * 24 * 3600
+"""Signature Version 4 query signing allows at most seven days."""
+
+
+def presigned_url(
+    *,
+    host: str,
+    path: str,
+    access_key_id: str,
+    secret_access_key: str,
+    now: dt.datetime,
+    expires_seconds: int,
+    region: str = REGION,
+    method: str = "GET",
+) -> str:
+    """A Signature Version 4 query-signed URL for one request (``path`` already URI-encoded).
+
+    Only the ``host`` header is signed and the payload is unsigned, as for any presigned
+    GET. The URL carries the access key ID and the signature, never the secret, and stops
+    working ``expires_seconds`` after ``now``.
+    """
+    if type(expires_seconds) is not int or not 1 <= expires_seconds <= PRESIGN_MAX_SECONDS:
+        raise ValueError("expires_seconds must be an integer from 1 to 604800")
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    day = stamp[:8]
+    scope = f"{day}/{region}/{SERVICE}/aws4_request"
+    query = {
+        "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+        "X-Amz-Credential": f"{access_key_id}/{scope}",
+        "X-Amz-Date": stamp,
+        "X-Amz-Expires": str(expires_seconds),
+        "X-Amz-SignedHeaders": "host",
+    }
+    canonical_query = "&".join(
+        f"{quote(key, safe='-_.~')}={quote(value, safe='-_.~')}"
+        for key, value in sorted(query.items())
+    )
+    canonical = "\n".join(
+        [method, path, canonical_query, f"host:{host}\n", "host", "UNSIGNED-PAYLOAD"]
+    )
+    to_sign = "\n".join(
+        ["AWS4-HMAC-SHA256", stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()]
+    )
+    key = ("AWS4" + secret_access_key).encode()
+    for part in (day, region, SERVICE, "aws4_request"):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    signature = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
+    return f"https://{host}{path}?{canonical_query}&X-Amz-Signature={signature}"
+
+
+def presigned_get(
+    credentials: Credentials, key: str, *, expires_seconds: int, now: dt.datetime
+) -> str:
+    """A presigned GET URL for exactly one object of the bucket (path-style, as R2 serves)."""
+    if not key or key.endswith("/") or "?" in key or "#" in key:
+        raise ValueError("a presigned GET names exactly one object key")
+    host = urlsplit(credentials.endpoint).hostname or ""
+    path = "/" + quote(credentials.bucket) + "/" + quote(key, safe="/")
+    return presigned_url(
+        host=host,
+        path=path,
+        access_key_id=credentials.access_key_id,
+        secret_access_key=credentials.secret_access_key,
+        now=now,
+        expires_seconds=expires_seconds,
+    )
+
+
 class TransientError(RuntimeError):
     """An R2 answer worth retrying (HTTP 5xx); still a ``RuntimeError`` for older callers."""
 

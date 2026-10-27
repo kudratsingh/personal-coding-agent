@@ -1,0 +1,99 @@
+name: Benchmark completions scoring
+run-name: Benchmark ${{ inputs.suite }} ${{ inputs.request_id }}
+
+# Scores one public-benchmark completions file (HumanEval, HumanEval+ or MBPP+) and its
+# constant-answer baseline in the project's sandbox. The completions arrive through a
+# presigned R2 link created by tools/benchmark_dispatch.py: one object, expiring within an
+# hour, holding only public-benchmark completions. The link is visible in this public
+# repository's run metadata; no credential is passed to the runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        type: choice
+        options:
+          - humaneval
+          - humaneval-plus
+          - mbpp-plus
+        required: true
+      completions_url:
+        description: Presigned HTTPS GET link to one completions file (expires within 1 hour)
+        type: string
+        required: true
+      completions_sha256:
+        description: SHA-256 of the completions file; any other bytes are refused
+        type: string
+        required: true
+      request_id:
+        description: 32 hex characters chosen by tools/benchmark_dispatch.py to find this run
+        type: string
+        required: true
+      constant_baseline:
+        description: Also score every task's constant answers
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Download the completions before the link expires and check their SHA-256
+        env:
+          COMPLETIONS_URL: ${{ inputs.completions_url }}
+          COMPLETIONS_SHA256: ${{ inputs.completions_sha256 }}
+          REQUEST_ID: ${{ inputs.request_id }}
+        run: |
+          set -euo pipefail
+          [[ "$COMPLETIONS_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid SHA-256"; exit 1; }
+          [[ "$REQUEST_ID" =~ ^[0-9a-f]{32}$ ]] || { echo "invalid request ID"; exit 1; }
+          [[ "$COMPLETIONS_URL" =~ ^https://[a-z0-9]+\.r2\.cloudflarestorage\.com/ ]] || { echo "not an R2 HTTPS link"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/completions"
+          curl --fail --silent --show-error --proto '=https' --max-redirs 0 \
+            --max-filesize 268435456 --max-time 900 \
+            --output "$RUNNER_TEMP/completions/completions.jsonl" "$COMPLETIONS_URL"
+          echo "$COMPLETIONS_SHA256  $RUNNER_TEMP/completions/completions.jsonl" | sha256sum --check --strict
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.28"
+      - run: make setup
+      - name: Prepare the suite's sandbox image
+        env:
+          SUITE: ${{ inputs.suite }}
+        run: |
+          set -euo pipefail
+          if [ "$SUITE" = "humaneval" ]; then
+            docker --host unix:///var/run/docker.sock pull --platform linux/amd64 python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe
+            echo default > "$RUNNER_TEMP/image-id"
+          else
+            docker --host unix:///var/run/docker.sock build --platform linux/amd64 --iidfile "$RUNNER_TEMP/image-id" sandbox/evalplus
+          fi
+      - name: Score the completions and the constant answers
+        env:
+          SUITE: ${{ inputs.suite }}
+          COMPLETIONS_SHA256: ${{ inputs.completions_sha256 }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          CONSTANT_BASELINE: ${{ inputs.constant_baseline }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$CONSTANT_BASELINE" != "true" ]; then args+=(--no-constant-baseline); fi
+          uv run --locked python tools/benchmark_score.py --suite "$SUITE" \
+            --completions "$RUNNER_TEMP/completions/completions.jsonl" \
+            --sha256 "$COMPLETIONS_SHA256" --request-id "$REQUEST_ID" \
+            --release-path "runs/data/$SUITE.release" --download \
+            --image-id "$(cat "$RUNNER_TEMP/image-id")" \
+            --output runs/benchmark-results "${args[@]}"
+      - name: Upload per-task results named by the completions SHA-256
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ inputs.completions_sha256 }}
+          path: runs/benchmark-results/
+          if-no-files-found: warn
+          retention-days: 30
