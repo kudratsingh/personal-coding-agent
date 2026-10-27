@@ -4,20 +4,31 @@ Three stages, each refusing to overwrite a completed result:
 
 ``download``
     Fetch the language source's pinned files with size and SHA-256 receipts. It
-    refuses unless the spec records the owner's approval of the source's terms.
+    refuses unless the spec records the owner's approval of the source's terms, and
+    checks the dataset card at the pinned revision against the terms of record.
 ``language``
     Adapt the downloaded OpenAssistant trees to chat-v1 conversations
-    (``scratchcoder.data.oasst``) and screen them: e-mail addresses, benchmark and
-    ARC-Easy n-gram matches, pool dev/test matches, and near-duplicate prompts.
+    (``scratchcoder.data.oasst``, human-written messages only) and screen them:
+    e-mail addresses, benchmark and ARC-Easy n-gram matches, pool dev/test matches,
+    and near-duplicate prompts.
 ``build``
     From the pool's train file and the language conversations:
 
     - hold out RL candidates by ID hash, stratified by source in train proportions;
-    - render every other train task's verified reference in chat-v1;
-    - hold out a language dev set by ID hash and cap the language rows at the target
-      share of assistant-plus-context tokens;
-    - write the rows, the candidate list, the dev sets and a record with counts,
-      shares, drops and SHA-256 values.
+    - render the verified reference of every other train task that fits in chat-v1
+      (code is never subsampled);
+    - hold out a language dev set by ID hash, and take a hash-order prefix of the
+      rest only if all of it would pass the language share cap, measured by default in
+      loss tokens (``scratchcoder.data.sft.loss_tokens``);
+    - write the rows, the candidate list, the dev sets and a record with counts, the
+      measured shares of both loss tokens and all tokens, drops, SHA-256 values and the
+      language source's provenance.
+
+The source's provenance (pinned revision, downloaded files' sizes and SHA-256, the
+owner's ruling and the terms of record) is copied from the download receipts into the
+language record and from there into the build record. The language record also names
+what its screens used (benchmark identities and each holdout file's SHA-256), and the
+build record copies that too.
 
 AceCode is flagged and stays out unless ``--include-acecode`` is given. Nothing here
 executes code or spends money.
@@ -30,10 +41,12 @@ import gzip
 import hashlib
 import json
 import math
+import re
 import shutil
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -49,13 +62,14 @@ from scratchcoder.data.oasst import (
     has_email,
 )
 from scratchcoder.data.pool import SimilarityIndex
-from scratchcoder.data.sft import SFTRow, fits, write_rows
+from scratchcoder.data.sft import SFTRow, fits, loss_tokens, write_rows
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.choices import ChoiceTask
 from scratchcoder.eval.tasks import Task, load_tasks
 from tools.rehearsal_build import Hub, _accepted, _exact_keys, _hex, _positive, _text
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+"""Spec, receipts and records; 2 adds the terms of record, provenance and share cap."""
 CODE_SOURCES = ("nvidia/OpenCodeInstruct", "BAAI/TACO", "google-research-datasets/mbpp")
 ACECODE = "TIGER-Lab/AceCode-87K"
 """Flagged under the owner's generator-terms review; used only by explicit option."""
@@ -65,9 +79,28 @@ RL_SALT = "rl-candidate-v1"
 LANGUAGE_SALT = "language-dev-v1"
 RULINGS = ("approved", "rejected")
 """The owner's possible rulings on a language source's terms; only approval downloads."""
+CARD_KEYS = {"file", "revision", "size_bytes", "sha256", "git_blob_id", "license", "license_line"}
+PAPER_KEYS = {"title", "authors", "arxiv_id", "version", "date", "statement"}
 
 
 # ---------------------------------------------------------------------------- build
+
+
+def all_tokens(row: SFTRow) -> int:
+    """Every token of a row: assistant plus context."""
+    return len(row.ids)
+
+
+CAP_BASES: dict[str, Callable[[SFTRow], int]] = {
+    "loss_tokens": loss_tokens,
+    "all_tokens": all_tokens,
+}
+"""What a language share can be measured in; the cap uses one, the record reports both."""
+BASIS_DEFINITIONS = {
+    "loss_tokens": "targets ids[1:] under the assistant mask: the SFT loader's non-IGNORE "
+    "targets, which the trainer's update_targets normalization counts",
+    "all_tokens": "every token of a row (assistant plus context)",
+}
 
 
 @dataclass(frozen=True)
@@ -77,23 +110,33 @@ class BuildConfig:
     rl_candidates: int | None = None
     """None means 1,000 without AceCode and 2,000 with it."""
     language_dev: int = 300
-    language_train_max: int = 3000
-    language_share: float = 0.30
-    """Target language share of assistant-plus-context tokens in the training rows."""
+    language_train_max: int | None = None
+    """An optional count cap on language training rows; None (the default) means none."""
+    language_cap: float = 0.30
+    """The cap on the language share of the training rows, measured in ``language_cap_basis``.
+
+    Code is never subsampled: language is sized to the code, and subsampled only if
+    all of it would pass this share."""
+    language_cap_basis: str = "loss_tokens"
+    """``loss_tokens`` (the default: the tokens the SFT loss is computed on) or
+    ``all_tokens`` (every token of a row); see ``CAP_BASES``."""
 
     def __post_init__(self) -> None:
         if type(self.include_acecode) is not bool:
             raise ValueError("include_acecode must be a boolean")
-        for name in ("sequence_length", "language_train_max"):
-            _positive(getattr(self, name), name)
+        _positive(self.sequence_length, "sequence_length")
+        if self.language_train_max is not None:
+            _positive(self.language_train_max, "language_train_max")
         if type(self.language_dev) is not int or self.language_dev < 0:
             raise ValueError("language_dev must be a nonnegative integer")
         if self.rl_candidates is not None and (
             type(self.rl_candidates) is not int or self.rl_candidates < 0
         ):
             raise ValueError("rl_candidates must be a nonnegative integer or None")
-        if not isinstance(self.language_share, float) or not 0 <= self.language_share < 1:
-            raise ValueError("language_share must be a float in [0, 1)")
+        if not isinstance(self.language_cap, float) or not 0 <= self.language_cap < 1:
+            raise ValueError("language_cap must be a float in [0, 1)")
+        if not isinstance(self.language_cap_basis, str) or self.language_cap_basis not in CAP_BASES:
+            raise ValueError(f"language_cap_basis must be one of {sorted(CAP_BASES)}")
 
     @property
     def sources(self) -> tuple[str, ...]:
@@ -145,11 +188,24 @@ def stratified_holdout(
 
 
 def _domain(rows: Sequence[SFTRow]) -> dict[str, int]:
-    return {
-        "rows": len(rows),
-        "tokens": sum(len(row.ids) for row in rows),
-        "assistant_tokens": sum(row.assistant_tokens for row in rows),
+    """Rows and their size in every basis, counted with the cap's own functions."""
+    return {"rows": len(rows)} | {
+        basis: sum(measure(row) for row in rows) for basis, measure in CAP_BASES.items()
     }
+
+
+def _shares(code: Mapping[str, int], language: Mapping[str, int]) -> dict[str, Any]:
+    """Per basis: the code and language counts and each one's share of their sum."""
+    result: dict[str, Any] = {}
+    for basis in CAP_BASES:
+        total = code[basis] + language[basis]
+        result[basis] = {
+            "code": code[basis],
+            "language": language[basis],
+            "language_share": language[basis] / total if total else 0.0,
+            "code_share": code[basis] / total if total else 0.0,
+        }
+    return result
 
 
 def _file(path: Path, rows: int) -> dict[str, Any]:
@@ -174,6 +230,38 @@ def read_conversations(path: Path) -> list[Conversation]:
     return conversations
 
 
+def language_source(conversations: Path) -> dict[str, Any]:
+    """The checked language-stage record beside ``conversations`` and its provenance.
+
+    The build refuses conversations without a completed record of this schema whose
+    ``conversations.jsonl`` SHA-256 matches them and which names what its screens used,
+    or whose source the owner has not approved, so every build record carries the
+    source's provenance and the screens' benchmarks and holdout files.
+    """
+    path = conversations.parent / "record.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"{path}: the language stage record is required")
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(record, dict)
+        or record.get("schema_version") != SCHEMA_VERSION
+        or record.get("status") != "completed"
+        or not isinstance(record.get("provenance"), dict)
+        or not isinstance(record.get("screened_against"), dict)
+    ):
+        raise ValueError(f"{path} is not a completed language record of this schema")
+    listed = (record.get("files") or {}).get("conversations.jsonl") or {}
+    if listed.get("sha256") != file_sha256(conversations):
+        raise ValueError("the conversations differ from their language record")
+    if record["provenance"].get("owner_ruling") != "approved":
+        raise PermissionError("the language record does not carry the owner's approval")
+    return {
+        "record": {"path": str(path), "sha256": file_sha256(path)},
+        "provenance": record["provenance"],
+        "screened_against": record["screened_against"],
+    }
+
+
 def build(
     *,
     pool_train: Path,
@@ -184,7 +272,11 @@ def build(
     language: Path | None = None,
     pool_dev: Path | None = None,
 ) -> dict[str, Any]:
-    """Write the SFT data set into the new directory ``output``; return its record."""
+    """Write the SFT data set into the new directory ``output``; return its record.
+
+    ``language`` is a language stage's ``conversations.jsonl``; its ``record.json``
+    must sit beside it (see ``language_source``).
+    """
     if output.exists():
         raise FileExistsError(f"{output} already exists")
     _hex(tokenizer_identity, 64, "tokenizer identity")
@@ -214,6 +306,7 @@ def build(
     language_rows: list[SFTRow] = []
     dev_rows: list[SFTRow] = []
     language_counts: Counter[str] = Counter()
+    source = language_source(language) if language is not None else None
     conversations = read_conversations(language) if language is not None else []
     fitting: list[SFTRow] = []
     for conversation in conversations:
@@ -228,24 +321,31 @@ def build(
     if language is not None and len(fitting) < config.language_dev:
         raise ValueError(f"{len(fitting)} conversations cannot fill the language dev set")
     dev_rows = fitting[: config.language_dev]
-    code_tokens = sum(len(row.ids) for row in code_rows)
-    share = config.language_share
-    budget = code_tokens * share / (1 - share)
-    # The training conversations are a prefix of the hash order: the first one that
-    # would pass the token budget or the count cap ends the selection.
+    available = fitting[config.language_dev :]
+    # Language is sized to the code, which is never subsampled. The training
+    # conversations are a prefix of the hash order: the first one that would take the
+    # language share past the cap (or pass the optional count cap) ends the selection.
+    # The share is measured in the configured basis (loss tokens by default) with the
+    # same function the record uses, and compared as an exact fraction of the
+    # configured decimal: language / (language + code) <= cap.
+    measure = CAP_BASES[config.language_cap_basis]
+    cap = Fraction(str(config.language_cap))
+    code_size = sum(measure(row) for row in code_rows)
     used, stop = 0, ""
-    for row in fitting[config.language_dev :]:
+    for row in available:
+        size = measure(row)
         if not stop and len(language_rows) == config.language_train_max:
             stop = "over_train_max"
-        elif not stop and used + len(row.ids) > budget:
+        elif not stop and (used + size) * (1 - cap) > code_size * cap:
             stop = "over_share"
         if stop:
             language_counts[stop] += 1
             continue
         language_rows.append(row)
-        used += len(row.ids)
+        used += size
     language_counts["dev"] = len(dev_rows)
     language_counts["train"] = len(language_rows)
+    language_counts["train_available"] = len(available)
 
     code_dev_rows: list[SFTRow] = []
     code_dev_drops: Counter[str] = Counter()
@@ -281,8 +381,6 @@ def build(
     if pool_dev is not None:
         files["code_dev.jsonl"] = _file(staging / "code_dev.jsonl", len(code_dev_rows))
     code, words = _domain(code_rows), _domain(language_rows)
-    total = code["tokens"] + words["tokens"]
-    total_assistant = code["assistant_tokens"] + words["assistant_tokens"]
     commit, dirty = git_state()
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -296,8 +394,8 @@ def build(
         "inputs": {
             "pool_train": {"path": str(pool_train), "sha256": file_sha256(pool_train)},
             "language": None
-            if language is None
-            else {"path": str(language), "sha256": file_sha256(language)},
+            if language is None or source is None
+            else {"path": str(language), "sha256": file_sha256(language), **source},
             "pool_dev": None
             if pool_dev is None
             else {"path": str(pool_dev), "sha256": file_sha256(pool_dev)},
@@ -306,6 +404,7 @@ def build(
             "train_tasks_by_source": dict(sorted(seen_sources.items())),
             "excluded_sources": dict(sorted(excluded.items())),
             "rl_candidates": {"total": len(candidates), "by_source": shares, "salt": RL_SALT},
+            "sft_rows": len(code_rows),
             "sft_rows_by_source": dict(sorted(Counter(r.source for r in code_rows).items())),
             "dropped": dict(sorted(code_drops.items())),
             "dev_rows": len(code_dev_rows),
@@ -314,14 +413,12 @@ def build(
         "language": {**dict(sorted(language_counts.items())), "salt": LANGUAGE_SALT},
         "tokens": {"code": code, "language": words},
         "shares": {
-            "basis": "assistant-plus-context tokens (every token of a row)",
-            "target_language": share,
-            "language": words["tokens"] / total if total else 0.0,
-            "code": code["tokens"] / total if total else 0.0,
-            "language_assistant_only": (
-                words["assistant_tokens"] / total_assistant if total_assistant else 0.0
-            ),
-            "language_target_met": bool(language_counts["over_share"]),
+            "language_cap": config.language_cap,
+            "language_cap_basis": config.language_cap_basis,
+            "bases": dict(BASIS_DEFINITIONS),
+            **_shares(code, words),
+            "cap_bound": bool(language_counts["over_share"]),
+            "cap_dropped": language_counts["over_share"],
         },
         "files": files,
         "paid_runs": 0,
@@ -334,6 +431,38 @@ def build(
 # ------------------------------------------------------------------------- language
 
 
+def _past_date(value: Any, name: str) -> str:
+    try:
+        return _accepted(value, name)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a YYYY-MM-DD date, not in the future") from error
+
+
+def _terms_of_record(spec: Mapping[str, Any]) -> None:
+    """The dataset card at the pinned revision and the paper the owner accepted."""
+    terms = _exact_keys(spec["terms_of_record"], {"card", "paper", "scope"}, "terms of record")
+    _text(terms, ("scope",), "terms of record")
+    card = _exact_keys(terms["card"], CARD_KEYS, "terms-of-record card")
+    _text(card, ("file", "license"), "terms-of-record card")
+    if card["revision"] != spec["revision"]:
+        raise ValueError("the terms-of-record card must be read at the pinned revision")
+    _positive(card["size_bytes"], "card size_bytes")
+    _positive(card["license_line"], "card license_line")
+    _hex(card["sha256"], 64, "card sha256")
+    _hex(card["git_blob_id"], 40, "card git_blob_id")
+    if card["license"].lower() != str(spec["license_label"]).lower():
+        raise ValueError("the card's license label differs from license_label")
+    paper = _exact_keys(terms["paper"], PAPER_KEYS, "terms-of-record paper")
+    _text(paper, ("title", "authors", "statement"), "terms-of-record paper")
+    if not isinstance(paper["arxiv_id"], str) or not re.fullmatch(
+        r"\d{4}\.\d{4,5}", paper["arxiv_id"]
+    ):
+        raise ValueError("the paper's arxiv_id must look like 2304.07327")
+    if not isinstance(paper["version"], str) or not re.fullmatch(r"v[1-9]\d*", paper["version"]):
+        raise ValueError("the paper's version must look like v2")
+    _past_date(paper["date"], "the paper's date")
+
+
 def load_language_spec(path: Path) -> dict[str, Any]:
     """Parse the language-source spec; unknown or missing keys are errors."""
     spec = _exact_keys(
@@ -344,6 +473,7 @@ def load_language_spec(path: Path) -> dict[str, Any]:
             "revision",
             "files",
             "license_label",
+            "terms_of_record",
             "terms_finding",
             "terms_reviewed_on",
             "owner_ruling",
@@ -365,7 +495,8 @@ def load_language_spec(path: Path) -> dict[str, Any]:
             raise ValueError("owner_ruling is approved, rejected or null")
         _accepted(spec["owner_ruling_on"], "owner ruling")
     if spec["license_label"] not in TRAINING_LICENSES:
-        raise ValueError("the language license label is not on the D-05 allowlist")
+        raise ValueError("the language license label is not on the training-license allowlist")
+    _terms_of_record(spec)
     _positive(spec["max_download_bytes"], "max_download_bytes")
     _positive(spec["max_tokens"], "max_tokens")
     files = spec["files"]
@@ -379,20 +510,36 @@ def load_language_spec(path: Path) -> dict[str, Any]:
     return dict(spec)
 
 
+def _terms(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """The spec's source identity, ruling and terms of record, as records carry them."""
+    keys = (
+        "dataset",
+        "revision",
+        "license_label",
+        "terms_of_record",
+        "terms_reviewed_on",
+        "owner_ruling",
+        "owner_ruling_on",
+    )
+    return {key: spec[key] for key in keys}
+
+
 def fetch(
     spec: Mapping[str, Any],
     directory: Path,
     *,
     hub_factory: Callable[[str | None], Hub] = Hub,
 ) -> dict[str, Any]:
-    """Download the spec's files at the pinned revision; refuse without an approval."""
+    """Download the spec's files at the pinned revision; refuse without an approval.
+
+    Before any download the dataset card listed at the revision must have the terms of
+    record's size and git blob ID, so the card the owner accepted is the one pinned.
+    """
     if spec["owner_ruling"] is None:
-        raise PermissionError(
-            "the source's terms await the owner's ruling (D-05); nothing was downloaded"
-        )
+        raise PermissionError("the source's terms await the owner's ruling; nothing was downloaded")
     if spec["owner_ruling"] != "approved":
         raise PermissionError(
-            "the owner did not approve the source's terms (D-05); nothing was downloaded"
+            "the owner did not approve the source's terms; nothing was downloaded"
         )
     receipts_path = directory / "download-receipts.json"
     if receipts_path.exists():
@@ -405,6 +552,13 @@ def fetch(
     if info.get("sha") != spec["revision"]:
         raise ValueError("the pinned revision resolved differently")
     siblings = {item["rfilename"]: item for item in info["siblings"]}
+    card = spec["terms_of_record"]["card"]
+    listed_card = siblings.get(card["file"]) or {}
+    if (
+        listed_card.get("size") != card["size_bytes"]
+        or listed_card.get("blobId") != card["git_blob_id"]
+    ):
+        raise ValueError("the dataset card at the pinned revision differs from the terms of record")
     planned = []
     for name in spec["files"]:
         item = siblings.get(name)
@@ -431,8 +585,13 @@ def fetch(
         "status": "completed",
         "created_at": utc_now(),
         "spec_sha256": spec["sha256"],
-        "dataset": spec["dataset"],
-        "revision": spec["revision"],
+        **_terms(spec),
+        "card": {
+            "filename": card["file"],
+            "size_bytes": card["size_bytes"],
+            "git_blob_id": card["git_blob_id"],
+            "checked": "size and git blob ID listed at the pinned revision",
+        },
         "files": files,
         "listed_bytes": listed,
         "paid_runs": 0,
@@ -505,15 +664,32 @@ def adapt_language(
     encoder: TextEncoder,
     benchmarks: Sequence[Task],
     choices: Sequence[ChoiceTask],
-    holdouts: Sequence[Task],
+    benchmark_identities: Mapping[str, Any],
+    holdout_files: Sequence[Path],
     min_alpha_tokens: int,
 ) -> dict[str, Any]:
-    """Adapt and screen the downloaded trees into ``directory/language``."""
+    """Adapt and screen the downloaded trees into ``directory/language``.
+
+    The record's ``provenance`` carries the spec's source identity, ruling and terms of
+    record, the receipts' SHA-256, the card check and each downloaded file's size and
+    SHA-256. Its ``screened_against`` names what the screens used: the benchmark
+    identities (``tools.task_pool.protection``) with the task and question counts
+    screened, each holdout file's path, SHA-256, task count and split counts, and the
+    n-gram floor. The holdout tasks are read from ``holdout_files`` here, so the record
+    lists exactly the files screened. The build copies both blocks into its own record.
+    """
+    if spec["owner_ruling"] != "approved":
+        raise PermissionError("the owner has not approved the source's terms")
     output = directory / "language"
     if output.exists():
         raise FileExistsError(f"{output} already exists")
-    receipts = json.loads((directory / "download-receipts.json").read_text())
-    if receipts["status"] != "completed" or receipts["spec_sha256"] != spec["sha256"]:
+    receipts_path = directory / "download-receipts.json"
+    receipts = json.loads(receipts_path.read_text())
+    if (
+        receipts["status"] != "completed"
+        or receipts.get("schema_version") != SCHEMA_VERSION
+        or receipts["spec_sha256"] != spec["sha256"]
+    ):
         raise ValueError("download receipts do not match this spec")
     adapted: list[Conversation] = []
     intake: dict[str, dict[str, int]] = {}
@@ -524,6 +700,19 @@ def adapt_language(
         kept, counts = adapt_trees(read_trees(path), encoder, max_tokens=spec["max_tokens"])
         adapted.extend(kept)
         intake[item["filename"]] = counts
+    holdouts: list[Task] = []
+    holdout_records = []
+    for holdout in holdout_files:
+        tasks = list(load_tasks(holdout))
+        holdouts.extend(tasks)
+        holdout_records.append(
+            {
+                "path": str(holdout),
+                "sha256": file_sha256(holdout),
+                "tasks": len(tasks),
+                "splits": dict(sorted(Counter(task.split for task in tasks).items())),
+            }
+        )
     screened, screens = screen_conversations(
         adapted,
         benchmarks=benchmarks,
@@ -550,6 +739,23 @@ def adapt_language(
         "spec_sha256": spec["sha256"],
         "dataset": spec["dataset"],
         "revision": spec["revision"],
+        "provenance": {
+            **_terms(spec),
+            "spec_sha256": spec["sha256"],
+            "receipts_sha256": file_sha256(receipts_path),
+            "card": receipts["card"],
+            "files": [
+                {key: item[key] for key in ("filename", "url", "size_bytes", "sha256")}
+                for item in receipts["files"]
+            ],
+        },
+        "screened_against": {
+            "benchmarks": dict(benchmark_identities),
+            "benchmark_tasks": len(benchmarks),
+            "choice_tasks": len(choices),
+            "holdouts": holdout_records,
+            "min_alpha_tokens": min_alpha_tokens,
+        },
         "max_tokens": spec["max_tokens"],
         "intake": intake,
         "screens": screens,
@@ -588,7 +794,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--language-spec", type=Path, help="language source spec")
     parser.add_argument("--directory", type=Path, help="language intake directory")
     parser.add_argument("--pool-dir", type=Path, help="pool directory with train/dev/test")
-    parser.add_argument("--language", type=Path, help="screened conversations.jsonl")
+    parser.add_argument(
+        "--language", type=Path, help="screened conversations.jsonl, its record.json beside it"
+    )
     parser.add_argument("--output", type=Path, help="new SFT data directory")
     parser.add_argument("--include-acecode", action="store_true", help="use the flagged source")
     parser.add_argument("--rl-candidates", type=int)
@@ -608,18 +816,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.stage == "language":
         if args.language_spec is None or args.directory is None:
             parser.error("language needs --language-spec and --directory")
-        benchmarks, choices, _ = protection(pool_spec)
-        holdouts = [
-            *load_tasks(args.pool_dir / "dev.jsonl"),
-            *load_tasks(args.pool_dir / "test.jsonl"),
-        ]
+        benchmarks, choices, identities = protection(pool_spec)
         record = adapt_language(
             load_language_spec(args.language_spec),
             args.directory,
             encoder=encoder,
             benchmarks=benchmarks,
             choices=choices,
-            holdouts=holdouts,
+            benchmark_identities=identities,
+            holdout_files=[args.pool_dir / "dev.jsonl", args.pool_dir / "test.jsonl"],
             min_alpha_tokens=pool_spec["protection"]["min_alpha_tokens"],
         )
         print(json.dumps({"screens": record["screens"], "tokens": record["tokens"]}, indent=1))

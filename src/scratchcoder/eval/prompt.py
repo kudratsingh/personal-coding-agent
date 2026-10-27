@@ -2,17 +2,29 @@
 
 ``base-completion-rstrip-v1`` scores HumanEval-style prefix completion.
 ``base-pool-completion-v1`` scores pool tasks with a base model: the task text and
-public test sit in a module docstring, and the model writes the program after it.
+public test sit in a module docstring, and the model writes the program after it. Its
+stop strings depend on the task's mode, so truncation always names the mode.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 from typing import Any
 
 from scratchcoder.data import chat
 from scratchcoder.eval.tasks import Task
 
 BASE_STOPS = ("\nclass ", "\ndef ", "\nif __name__", "\nprint(", "\n#")
-POOL_STOPS = ("\nif __name__", "\nprint(", "\nassert", '\n"""', "\n# Test")
+POOL_STOPS_BY_MODE: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "function": ("\nif __name__", "\nprint(", "\nassert", '\n"""', "\n# Test"),
+        "io": ("\nif __name__", "\nassert", '\n"""', "\n# Test"),
+    }
+)
+"""base-pool-completion-v1's stop strings by task mode.
+
+An I/O task's program prints its answer at the top level, so ``\\nprint(`` would cut a
+correct program short; it stops function-mode completions only. This was amended on
+2026-10-26, before the protocol's first scored use."""
 POOL_MAX_NEW_TOKENS = 512
 POOL_PROTOCOL = "base-pool-completion-v1"
 
@@ -47,13 +59,22 @@ def pool_budget(prompt_tokens: int, *, context: int = 1024, cap: int = POOL_MAX_
     return min(cap, context - prompt_tokens)
 
 
-def truncate_pool_completion(text: str, *, stops: Sequence[str] = POOL_STOPS) -> str:
-    """The completion before its first stop string; the retained text is the program.
+def pool_stops(mode: str) -> tuple[str, ...]:
+    """The base-pool stop strings for a task's mode, ``function`` or ``io``."""
+    if mode not in POOL_STOPS_BY_MODE:
+        raise ValueError("a pool task's mode is function or io")
+    return POOL_STOPS_BY_MODE[mode]
 
-    The prompt ends with a newline, so the completion starts a line: a stop's leading
-    newline may be that final prompt newline, and a completion that opens with
-    ``assert`` keeps nothing.
+
+def truncate_pool_completion(text: str, *, mode: str) -> str:
+    """The completion before its first stop string for ``mode``; the retained program.
+
+    ``mode`` is the task's ``mode`` and has no default, so no caller can silently
+    apply the other mode's stops. The prompt ends with a newline, so the completion
+    starts a line: a stop's leading newline may be that final prompt newline, and a
+    completion that opens with ``assert`` keeps nothing.
     """
+    stops = pool_stops(mode)
     line = "\n" + text
     offsets = [line.find(stop) for stop in stops if stop in line]
     return text[: max(min(offsets) - 1, 0)] if offsets else text
@@ -77,7 +98,9 @@ def prompt_protocol(mode: str = "base", *, stops: Sequence[str] = BASE_STOPS) ->
                 "name": POOL_PROTOCOL,
                 "prompt_format": 'module docstring: """\\n{prompt}\\n\\n{public test}\\n"""\\n',
                 "prompt_strip": "task prompt.strip() and public test.strip()",
-                "stop_strings": list(POOL_STOPS),
+                "stop_strings_by_mode": {
+                    task_mode: list(stops) for task_mode, stops in POOL_STOPS_BY_MODE.items()
+                },
                 "max_new_tokens": f"min({POOL_MAX_NEW_TOKENS}, context - prompt tokens)",
                 "candidate_assembly": "retained-completion",
             },

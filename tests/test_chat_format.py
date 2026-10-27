@@ -26,9 +26,10 @@ from scratchcoder.data.chat import (
 )
 from scratchcoder.data.onepass import IGNORE
 from scratchcoder.eval.prompt import (
-    POOL_STOPS,
+    POOL_STOPS_BY_MODE,
     pool_budget,
     pool_prompt,
+    pool_stops,
     prompt_protocol,
     truncate_pool_completion,
 )
@@ -270,8 +271,17 @@ def test_base_pool_prompt_by_hand() -> None:
     assert pool_prompt(pool_task()) == '"""\nAdd one.\n\nassert f(1) == 2\n"""\n'
     quoted = pool_task(prompt='Return """ as text.')
     assert pool_prompt(quoted) == '"""\nReturn \\"\\"\\" as text.\n\nassert f(1) == 2\n"""\n'
-    assert prompt_protocol("base-pool")["protocol"]["name"] == "base-pool-completion-v1"
-    assert prompt_protocol("base-pool")["protocol"]["stop_strings"] == list(POOL_STOPS)
+    record = prompt_protocol("base-pool")["protocol"]
+    assert record["name"] == "base-pool-completion-v1"
+    # The per-mode stops, written out: I/O tasks drop "\nprint(" and keep the rest.
+    assert record["stop_strings_by_mode"] == {
+        "function": ["\nif __name__", "\nprint(", "\nassert", '\n"""', "\n# Test"],
+        "io": ["\nif __name__", "\nassert", '\n"""', "\n# Test"],
+    }
+    assert "stop_strings" not in record  # No single list a caller could apply to both.
+    assert {mode: list(pool_stops(mode)) for mode in POOL_STOPS_BY_MODE} == (
+        record["stop_strings_by_mode"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -284,6 +294,10 @@ def test_base_pool_prompt_by_hand() -> None:
         ),
         ("x = 1\nprint(x)\n", "x = 1"),
         ('x = 1\n"""\nmore\n', "x = 1"),
+        # The stop is textual: a line that starts with the closing quotes of a string
+        # the program opened also stops, leaving an unclosed string (as the walkthrough
+        # records for one dev reference).
+        ('PAGE = """\n<p>hi</p>\n"""\n', 'PAGE = """\n<p>hi</p>'),
         ("x = 1\n# Test cases\nf(2)", "x = 1"),
         ("x = 1\n# Testing\n", "x = 1"),
         ("x = 1\n# a note\ny = 2", "x = 1\n# a note\ny = 2"),
@@ -296,7 +310,37 @@ def test_base_pool_prompt_by_hand() -> None:
 def test_base_pool_stops_treat_the_prompt_newline_as_a_line_start(
     completion: str, kept: str
 ) -> None:
-    assert truncate_pool_completion(completion) == kept
+    assert truncate_pool_completion(completion, mode="function") == kept
+
+
+@pytest.mark.parametrize(
+    ("completion", "kept"),
+    [
+        # A stdin/stdout program's top-level print is its answer, so it is kept.
+        ("n = int(input())\nprint(n + 1)\n", "n = int(input())\nprint(n + 1)\n"),
+        ("print(input())", "print(input())"),
+        # Every other stop still applies to I/O completions.
+        ("x = 1\nprint(x)\nif __name__ == '__main__':\n", "x = 1\nprint(x)"),
+        ("print(1)\nassert True\n", "print(1)"),
+        ('print(1)\n"""\nnext problem\n', "print(1)"),
+        ("print(1)\n# Test\nprint(2)\n", "print(1)"),
+        ("assert 1\n", ""),
+    ],
+)
+def test_base_pool_io_tasks_keep_top_level_prints(completion: str, kept: str) -> None:
+    assert truncate_pool_completion(completion, mode="io") == kept
+
+
+def test_base_pool_truncation_needs_an_explicit_known_mode() -> None:
+    with pytest.raises(TypeError):
+        truncate_pool_completion("print(1)")  # type: ignore[call-arg]
+    for mode in ("", "IO", "instruction", "base"):
+        with pytest.raises(ValueError, match="function or io"):
+            truncate_pool_completion("print(1)", mode=mode)
+    # The modes are exactly the task modes a pool task can have.
+    assert set(POOL_STOPS_BY_MODE) == {"function", "io"}
+    with pytest.raises(TypeError):
+        POOL_STOPS_BY_MODE["io"] = ("\nprint(",)  # type: ignore[index]
 
 
 def test_base_pool_budget_is_min_512_and_remaining_context() -> None:

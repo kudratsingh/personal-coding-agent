@@ -13,6 +13,7 @@ from scratchcoder.data.sft import (
     SFTLoader,
     SFTRow,
     loss_spans,
+    loss_tokens,
     read_rows,
     row_from_json,
     row_json,
@@ -80,6 +81,17 @@ def test_rows_pad_to_length_with_ignore_outside_the_mask_by_hand() -> None:
     assert source.total_targets == 2 + 1 + 3
     with pytest.raises(RuntimeError, match="exhausted"):
         source.next_batch()
+
+
+def test_loss_tokens_are_the_targets_the_loader_emits_that_are_not_ignore() -> None:
+    # The count the SFT data build caps and records is the trainer's real-target count.
+    kept = [item for item in authored() if item.id in {"a", "b", "c"}]
+    for item in kept:
+        _, targets, _ = loader([item], batch_size=1).next_batch()
+        assert sum(target != IGNORE for target in targets[0]) == loss_tokens(item)
+        assert loss_tokens(item) == sum(item.mask)  # The first token is never a target.
+    assert [loss_tokens(item) for item in authored()] == [2, 1, 3, 3, 0]
+    assert loader().total_targets == sum(loss_tokens(item) for item in kept)
 
 
 def test_order_is_the_seeded_hash_order_and_changes_with_seed_and_pass() -> None:

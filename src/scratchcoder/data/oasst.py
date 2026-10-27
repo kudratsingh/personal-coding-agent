@@ -1,16 +1,21 @@
 """OpenAssistant conversation trees to chat-v1 language conversations.
 
 Each tree is a prompter message with nested replies. A message is eligible only if it
-is English, not synthetic, not deleted, accepted by review, carries no nonzero PII label
-and has text. Labels, when present, must be the README's mapping form (each label name
-maps to an object with a numeric ``value``); any other shape is ``missing_metadata``.
-Eligible messages that carry no PII label at all are counted separately.
+is English, human-written (``synthetic`` is false and ``model_name`` is null or empty),
+not deleted, accepted by review, carries no nonzero PII label and has text. Every
+message must carry both ``synthetic`` and ``model_name``, as every message of the pinned
+export does; a message missing either is ``missing_metadata``. Labels, when present,
+must be the README's mapping form (each label name maps to an object with a numeric
+``value``); any other shape is ``missing_metadata``. Eligible messages that carry no
+PII label at all are counted separately.
 
 From each exported tree the adapter follows the best-ranked eligible reply at every
 turn (rank 0 first, unranked replies last, message ID breaking ties), so the chosen
-path never contains an ineligible message. It then keeps the longest prefix
-that ends on an assistant turn and renders to at most ``max_tokens`` chat-v1 tokens.
-Every drop is counted by reason. See ``docs/sft-data.md``.
+path never contains an ineligible message: a best-ranked reply that is model-written
+is passed over for the next eligible one, and with none the walk ends. It then keeps
+the longest prefix that ends on an assistant turn and renders to at most
+``max_tokens`` chat-v1 tokens. Every drop is counted by reason. See
+``docs/sft-data.md``.
 """
 
 from __future__ import annotations
@@ -25,7 +30,29 @@ from scratchcoder.data.chat import Message, TextEncoder
 
 ROLES = {"prompter": "user", "assistant": "assistant"}
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
-REQUIRED = ("message_id", "text", "role", "lang", "synthetic", "deleted", "review_result")
+REQUIRED = (
+    "message_id",
+    "text",
+    "role",
+    "lang",
+    "synthetic",
+    "model_name",
+    "deleted",
+    "review_result",
+)
+REASONS = (
+    "missing_metadata",
+    "unknown_role",
+    "not_english",
+    "synthetic",
+    "model_written",
+    "deleted",
+    "failed_review",
+    "pii_label",
+    "empty_text",
+)
+"""Every reason ``message_reason`` can give, in the order it checks them. Each is
+counted, zero included, so a record shows that every check ran."""
 
 
 @dataclass(frozen=True)
@@ -60,6 +87,8 @@ def message_reason(raw: Mapping[str, Any]) -> str | None:
         return "not_english"
     if raw["synthetic"] is not False:
         return "synthetic"
+    if raw["model_name"] not in (None, ""):
+        return "model_written"
     if raw["deleted"] is not False:
         return "deleted"
     if raw["review_result"] is not True:
@@ -147,7 +176,7 @@ def adapt_trees(
     """One conversation per exported tree whose best eligible path fits ``max_tokens``."""
     if type(max_tokens) is not int or max_tokens < 7:
         raise ValueError("max_tokens must fit at least one exchange")
-    counts: Counter[str] = Counter()
+    counts: Counter[str] = Counter({f"message:{name}": 0 for name in ("eligible", *REASONS)})
     kept: list[Conversation] = []
     seen: set[str] = set()
     for raw in trees:

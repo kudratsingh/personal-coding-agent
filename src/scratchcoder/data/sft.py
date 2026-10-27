@@ -8,7 +8,9 @@ read as a big-endian integer, with the row ID breaking ties. Every row becomes o
 ``IGNORE``. Padded input positions hold ``pad_id`` and follow every real position, so
 causal attention keeps them from changing a scored logit. Rows after the last
 conversation, up to the end of the final update, are entirely padding, so every
-microbatch has the same ``[B, L]`` shape. See ``docs/walkthroughs/sft-batching.md``.
+microbatch has the same ``[B, L]`` shape. A row's loss tokens (``loss_tokens``) are
+the targets it contributes that are not ``IGNORE``: the count the trainer divides by
+under ``update_targets``. See ``docs/walkthroughs/sft-batching.md``.
 """
 
 from __future__ import annotations
@@ -56,6 +58,18 @@ class SFTRow:
         return hashlib.sha256(
             json.dumps(row_json(self), sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+
+
+def loss_tokens(row: SFTRow) -> int:
+    """The row's loss tokens: its targets ``ids[1:]`` that fall under ``mask[1:]``.
+
+    These are exactly the row's targets that the loader emits as something other than
+    ``IGNORE`` (token IDs are nonnegative), which the trainer counts as real targets.
+    The first token is never a target, so this also equals ``sum(mask)``. The SFT data
+    build caps and records the language share with this count, and the loader's
+    ``total_targets`` and tickets use it too.
+    """
+    return sum(row.mask[1:])
 
 
 def loss_spans(mask: Sequence[bool]) -> list[list[int]]:
@@ -167,7 +181,7 @@ class SFTLoader:
         for row in rows:
             if not fits(row, sequence_length):
                 dropped["over_length"] += 1
-            elif not any(row.mask[1:]):
+            elif not loss_tokens(row):
                 dropped["no_assistant_targets"] += 1
             else:
                 kept.append(row)
@@ -188,7 +202,7 @@ class SFTLoader:
         self.rows_per_update = batch_size * accumulation_steps
         self.planned_updates = -(-len(self._order) // self.rows_per_update)
         self.planned_rows = self.planned_updates * self.rows_per_update
-        self.total_targets = passes * sum(row.assistant_tokens for row in kept)
+        self.total_targets = passes * sum(loss_tokens(row) for row in kept)
         self.order_sha256 = hashlib.sha256(
             "\n".join(kept[index].id for index in self._order).encode()
         ).hexdigest()
@@ -266,7 +280,7 @@ class SFTLoader:
             row = self._rows[index]
             entry = per_source.setdefault(row.source, {"rows": 0, "targets": 0})
             entry["rows"] += 1
-            entry["targets"] += row.assistant_tokens
+            entry["targets"] += loss_tokens(row)
         return {
             "complete": self.exhausted,
             "rows": len(read),
