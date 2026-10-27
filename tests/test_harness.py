@@ -1,3 +1,4 @@
+import hashlib
 import json
 from dataclasses import replace
 from functools import partial
@@ -5,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from scratchcoder.eval.harness import ContextLimitError, EvaluationConfig, evaluate, save_report
+from scratchcoder.eval.harness import (
+    ContextLimitError,
+    EvaluationConfig,
+    attempt_seed,
+    evaluate,
+    save_report,
+)
 from scratchcoder.eval.tasks import Task
 from scratchcoder.sandbox.runner import Result
 
@@ -93,3 +100,20 @@ def test_task_order_does_not_change_seeds_or_scores() -> None:
     first = run_evaluation(tasks_fixture(), lambda *_: "code")
     second = run_evaluation(list(reversed(tasks_fixture())), lambda *_: "code")
     assert first["per_task"] == second["per_task"]
+
+
+def test_attempt_seeds_follow_the_recorded_formula() -> None:
+    digest = int(hashlib.sha256(b"authored/7").hexdigest()[:16], 16)
+    assert attempt_seed(5, "authored/7", 2) == (5 + digest + 2) % (2**63 - 1)
+    assert attempt_seed(5, "authored/7", 2) == 6715044113498020353
+    report = evaluate(
+        tasks_fixture(),
+        lambda *_: "code",
+        config=EvaluationConfig(samples=3, temperature=1.0, seed=4, bootstrap_samples=10),
+        checkpoint_hash="c",
+        tokenizer_hash="t",
+        execute=lambda *_: Result("passed"),
+    )
+    for row in report["per_task"]:
+        seeds = [attempt["seed"] for attempt in row["attempts"]]
+        assert seeds == [attempt_seed(4, row["id"], index) for index in range(3)]

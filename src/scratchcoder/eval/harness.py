@@ -49,6 +49,11 @@ def isolated_execution(code: str, tests: str, mode: str) -> Result:
     return run(code, tests, mode=mode)
 
 
+def attempt_seed(seed: int, task_id: str, index: int) -> int:
+    """Sampling seed of attempt ``index`` on a task: one per row in batched generation."""
+    return (seed + int(hashlib.sha256(task_id.encode()).hexdigest()[:16], 16) + index) % (2**63 - 1)
+
+
 def evaluate(
     tasks: Sequence[Task],
     generate: Callable[[Task, int], str],
@@ -78,9 +83,7 @@ def evaluate(
         outcomes = []
         successes = []
         for index in range(config.samples):
-            seed = (
-                config.seed + int(hashlib.sha256(task.id.encode()).hexdigest()[:16], 16) + index
-            ) % (2**63 - 1)
+            seed = attempt_seed(config.seed, task.id, index)
             try:
                 code = generate(task, seed)
                 result = execute(code, task.hidden_tests, task.mode)
