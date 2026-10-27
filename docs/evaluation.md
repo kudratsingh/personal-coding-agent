@@ -38,18 +38,22 @@ Generation and execution are separate steps joined by a hashed completions file;
   - **Protocols:** `chat-v1` for every suite, `base-pool-completion-v1` for the pool and `base-completion-rstrip-v1` for the benchmarks.
   - **Budgets:** `min(512, 1,024 − prompt)` for chat-v1 and the base pool protocol, 256 for the base benchmark protocol.
   - **HumanEval+:** always excludes task 32, and every file records the exclusion.
+  - **MPS:** greedy decoding only. The seeded sampler works in float64, which MPS lacks, so sampling on `mps` is refused before anything loads; use `cpu` or `cuda` for sampled files.
   - **Output:** the file's SHA-256 is printed, and the file runs no code.
-- **`scratchcoder eval-execute`:** executes a pool completions file through the evaluation runner, with `--workers` (default 8) and `--tokenizer` (required for chat-v1, whose extraction reads token IDs).
+- **`scratchcoder eval-execute`:** executes a pool completions file through the evaluation runner, with `--workers` (default 8) and `--tokenizer` (required for chat-v1, whose extraction reads token IDs, and for the test split, so its one read is never spent on unverified completions).
   - **Scoring:** host failures, including `host_stalled` results, are retried three times with bounded backoff and never scored. An attempt still failing is listed as unresolved. Every passing attempt records the reward channel's static audit.
-  - **Results file:** append-only, keyed by task and sample, and named by the completions SHA-256. Running it again continues an interrupted run. The command exits with status 3 while any attempt is unresolved.
-- **`scratchcoder eval-seal`:** records a pool test completions file's SHA-256 in a hash-chained seal ledger.
+  - **Results file:** append-only, keyed by task and sample, and named by the completions SHA-256. Running it again continues an interrupted run, but only under the execution environment it started under: the runner and supervisor sources, the image and the deadline rule must match the results header, or the run is refused. The command exits with status 3 while any attempt is unresolved.
+- **`scratchcoder eval-seal`:** records a pool test completions file's SHA-256 in a hash-chained seal ledger. A head record, `<ledger>.head`, beside it names the event count and last hash, so removing the ledger's last events, or the ledger or its head record, is refused. Keep the two files together.
   - **Unsealing:** `eval-execute` refuses the test split unless given `--seal-ledger` and `--unseal`. The unseal record is a JSON file naming all four frozen endpoints' checkpoint SHA-256 values and the completions SHA-256 values to unseal.
   - **One read:** each test completions file is executed once, as a logged read that can resume after an interruption. A second execution is refused.
+  - **No second look by regeneration:** one unseal record governs a ledger. Once any read has opened, no file can be sealed and every later read must present the same record, and a record may not list two files of one checkpoint, protocol and decoding (greedy or sampled).
+  - **Refusals come first:** the ledger and the record are checked before the sealed task file is opened.
 - **`scratchcoder eval-baseline`:** writes the constant-answer baseline of the pool dev split.
   - **Definition:** the reward channel's degenerate answers, best per task, reported as the mean best-constant reward and the share of tasks fully passed.
   - **Unparseable tasks:** constant-answer programs run through the runner. Tasks covered neither way are counted.
   - **Test split:** its baseline is computed only inside the first complete unseal read and recorded in the ledger.
-- **Public benchmarks:** these run on GitHub Actions, through the manual `benchmark-score` workflow and `tools/benchmark_dispatch.py`.
+- **`scratchcoder eval-test-baseline`:** the retry for a test-split baseline that the read could not log (a constant-answer call stayed unresolved, or the ledger write failed). It runs only after every completions file the unseal record lists has a completed read, under that same record and the task file those files name, and it exits with status 3 if the baseline is still not logged. A baseline already logged is returned unchanged.
+- **Public benchmarks:** these run on GitHub Actions, through the manual `benchmark-score` workflow and `uv run --locked python -m tools.benchmark_dispatch` (run it as a module from the repository root; it imports its sibling `tools.r2_store`).
   - **Dispatch:** on the Mac, the tool checks a public-benchmark completions file against its R2 object and signs a GET link for that one object, expiring within an hour. It dispatches the workflow with `gh`, waits, downloads the `benchmark-results-<sha256>` artifact and checks that it names the same hash.
   - **Scoring:** the workflow downloads the file first and refuses another SHA-256. It runs the canonical preflight, then scores the attempts and every task's constant answers. HumanEval uses the reference gate's stdlib image; HumanEval+ and MBPP+ use the EvalPlus image and limits.
 - **`scratchcoder scorecard`:** builds the scorecard from results files (`--results`), benchmark artifacts (`--benchmark`), `eval-choice` reports (`--arc`, with `--arc-tasks` for the labels) and baselines (`--pool-baseline`). Each checkpoint is named with `--checkpoint NAME=SHA256`. JSON goes to `--output`, with optional Markdown to `--markdown`. Each row reports:
@@ -60,6 +64,6 @@ Generation and execution are separate steps joined by a hashed completions file;
   - GPU- and sandbox-minutes;
   - the checkpoint, tokenizer, task-file and protocol hashes and the precision.
 
-  Named pairs (`--pair FIRST:SECOND`; by default SFT vs base, RL vs SFT, more-SFT vs SFT and RL vs more-SFT) get a paired task bootstrap with 2,000 resamples and seed 0, labelled cross-protocol when the protocols differ. Any checkpoint above 20% greedy pass@1 on HumanEval carries the leak flag.
+  Named pairs (`--pair FIRST:SECOND`; by default SFT vs base, RL vs SFT, more-SFT vs SFT and RL vs more-SFT) get a paired task bootstrap with 2,000 resamples and seed 0, labelled cross-protocol when the protocols differ. Any checkpoint above 20% greedy pass@1 on HumanEval carries the leak flag. The flag is true, false or unknown: a checkpoint with no complete greedy HumanEval row is listed as not evaluated rather than clean.
 
 No completions file, results file or scorecard has been produced for a trained checkpoint yet. The pool dev constant-answer baseline is 0.276 mean reward and 4.3% of tasks fully passed (1,995 of 2,000 tasks covered); the walkthrough gives it by source.
