@@ -18,10 +18,11 @@ Three stages, each refusing to overwrite a completed result:
     - render the verified reference of every other train task that fits in chat-v1
       (code is never subsampled);
     - hold out a language dev set by ID hash, and take a hash-order prefix of the
-      rest only if all of it would pass the language share cap of
-      assistant-plus-context tokens;
-    - write the rows, the candidate list, the dev sets and a record with counts,
-      measured shares, drops, SHA-256 values and the language source's provenance.
+      rest only if all of it would pass the language share cap, measured by default in
+      loss tokens (``scratchcoder.data.sft.loss_tokens``);
+    - write the rows, the candidate list, the dev sets and a record with counts, the
+      measured shares of both loss tokens and all tokens, drops, SHA-256 values and the
+      language source's provenance.
 
 The source's provenance (pinned revision, downloaded files' sizes and SHA-256, the
 owner's ruling and the terms of record) is copied from the download receipts into the
@@ -61,7 +62,7 @@ from scratchcoder.data.oasst import (
     has_email,
 )
 from scratchcoder.data.pool import SimilarityIndex
-from scratchcoder.data.sft import SFTRow, fits, write_rows
+from scratchcoder.data.sft import SFTRow, fits, loss_tokens, write_rows
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.choices import ChoiceTask
 from scratchcoder.eval.tasks import Task, load_tasks
@@ -85,6 +86,23 @@ PAPER_KEYS = {"title", "authors", "arxiv_id", "version", "date", "statement"}
 # ---------------------------------------------------------------------------- build
 
 
+def all_tokens(row: SFTRow) -> int:
+    """Every token of a row: assistant plus context."""
+    return len(row.ids)
+
+
+CAP_BASES: dict[str, Callable[[SFTRow], int]] = {
+    "loss_tokens": loss_tokens,
+    "all_tokens": all_tokens,
+}
+"""What a language share can be measured in; the cap uses one, the record reports both."""
+BASIS_DEFINITIONS = {
+    "loss_tokens": "targets ids[1:] under the assistant mask: the SFT loader's non-IGNORE "
+    "targets, which the trainer's update_targets normalization counts",
+    "all_tokens": "every token of a row (assistant plus context)",
+}
+
+
 @dataclass(frozen=True)
 class BuildConfig:
     sequence_length: int = 1024
@@ -94,11 +112,14 @@ class BuildConfig:
     language_dev: int = 300
     language_train_max: int | None = None
     """An optional count cap on language training rows; None (the default) means none."""
-    language_share: float = 0.30
-    """The cap on the language share of assistant-plus-context tokens in the training rows.
+    language_cap: float = 0.30
+    """The cap on the language share of the training rows, measured in ``language_cap_basis``.
 
     Code is never subsampled: language is sized to the code, and subsampled only if
     all of it would pass this share."""
+    language_cap_basis: str = "loss_tokens"
+    """``loss_tokens`` (the default: the tokens the SFT loss is computed on) or
+    ``all_tokens`` (every token of a row); see ``CAP_BASES``."""
 
     def __post_init__(self) -> None:
         if type(self.include_acecode) is not bool:
@@ -112,8 +133,10 @@ class BuildConfig:
             type(self.rl_candidates) is not int or self.rl_candidates < 0
         ):
             raise ValueError("rl_candidates must be a nonnegative integer or None")
-        if not isinstance(self.language_share, float) or not 0 <= self.language_share < 1:
-            raise ValueError("language_share must be a float in [0, 1)")
+        if not isinstance(self.language_cap, float) or not 0 <= self.language_cap < 1:
+            raise ValueError("language_cap must be a float in [0, 1)")
+        if self.language_cap_basis not in CAP_BASES:
+            raise ValueError(f"language_cap_basis must be one of {sorted(CAP_BASES)}")
 
     @property
     def sources(self) -> tuple[str, ...]:
@@ -165,11 +188,24 @@ def stratified_holdout(
 
 
 def _domain(rows: Sequence[SFTRow]) -> dict[str, int]:
-    return {
-        "rows": len(rows),
-        "tokens": sum(len(row.ids) for row in rows),
-        "assistant_tokens": sum(row.assistant_tokens for row in rows),
+    """Rows and their size in every basis, counted with the cap's own functions."""
+    return {"rows": len(rows)} | {
+        basis: sum(measure(row) for row in rows) for basis, measure in CAP_BASES.items()
     }
+
+
+def _shares(code: Mapping[str, int], language: Mapping[str, int]) -> dict[str, Any]:
+    """Per basis: the code and language counts and each one's share of their sum."""
+    result: dict[str, Any] = {}
+    for basis in CAP_BASES:
+        total = code[basis] + language[basis]
+        result[basis] = {
+            "code": code[basis],
+            "language": language[basis],
+            "language_share": language[basis] / total if total else 0.0,
+            "code_share": code[basis] / total if total else 0.0,
+        }
+    return result
 
 
 def _file(path: Path, rows: int) -> dict[str, Any]:
@@ -286,24 +322,27 @@ def build(
         raise ValueError(f"{len(fitting)} conversations cannot fill the language dev set")
     dev_rows = fitting[: config.language_dev]
     available = fitting[config.language_dev :]
-    code_tokens = sum(len(row.ids) for row in code_rows)
     # Language is sized to the code, which is never subsampled. The training
     # conversations are a prefix of the hash order: the first one that would take the
-    # language share of all training tokens past the cap (or pass the optional count
-    # cap) ends the selection. The share is compared as an exact fraction of the
-    # configured decimal: language / (language + code) <= share.
-    share = Fraction(str(config.language_share))
+    # language share past the cap (or pass the optional count cap) ends the selection.
+    # The share is measured in the configured basis (loss tokens by default) with the
+    # same function the record uses, and compared as an exact fraction of the
+    # configured decimal: language / (language + code) <= cap.
+    measure = CAP_BASES[config.language_cap_basis]
+    cap = Fraction(str(config.language_cap))
+    code_size = sum(measure(row) for row in code_rows)
     used, stop = 0, ""
     for row in available:
+        size = measure(row)
         if not stop and len(language_rows) == config.language_train_max:
             stop = "over_train_max"
-        elif not stop and (used + len(row.ids)) * (1 - share) > code_tokens * share:
+        elif not stop and (used + size) * (1 - cap) > code_size * cap:
             stop = "over_share"
         if stop:
             language_counts[stop] += 1
             continue
         language_rows.append(row)
-        used += len(row.ids)
+        used += size
     language_counts["dev"] = len(dev_rows)
     language_counts["train"] = len(language_rows)
     language_counts["train_available"] = len(available)
@@ -342,8 +381,6 @@ def build(
     if pool_dev is not None:
         files["code_dev.jsonl"] = _file(staging / "code_dev.jsonl", len(code_dev_rows))
     code, words = _domain(code_rows), _domain(language_rows)
-    total = code["tokens"] + words["tokens"]
-    total_assistant = code["assistant_tokens"] + words["assistant_tokens"]
     commit, dirty = git_state()
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -376,13 +413,10 @@ def build(
         "language": {**dict(sorted(language_counts.items())), "salt": LANGUAGE_SALT},
         "tokens": {"code": code, "language": words},
         "shares": {
-            "basis": "assistant-plus-context tokens (every token of a row)",
-            "language_cap": config.language_share,
-            "language": words["tokens"] / total if total else 0.0,
-            "code": code["tokens"] / total if total else 0.0,
-            "language_assistant_only": (
-                words["assistant_tokens"] / total_assistant if total_assistant else 0.0
-            ),
+            "language_cap": config.language_cap,
+            "language_cap_basis": config.language_cap_basis,
+            "bases": dict(BASIS_DEFINITIONS),
+            **_shares(code, words),
             "cap_bound": bool(language_counts["over_share"]),
             "cap_dropped": language_counts["over_share"],
         },

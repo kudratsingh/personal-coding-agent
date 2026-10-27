@@ -4,7 +4,7 @@ import gzip
 import hashlib
 import json
 import shutil
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -19,7 +19,8 @@ from scratchcoder.data.oasst import (
     conversation_json,
     message_reason,
 )
-from scratchcoder.data.sft import SFTRow, read_rows
+from scratchcoder.data.onepass import IGNORE
+from scratchcoder.data.sft import SFTLoader, SFTRow, read_rows
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.choices import ChoiceTask
 from scratchcoder.eval.tasks import Task, save_tasks
@@ -183,13 +184,47 @@ def test_build_holds_out_candidates_excludes_acecode_and_records_hashes(tmp_path
         run_build(tmp_path)
 
 
-def test_language_dev_is_held_out_by_hash_and_train_is_capped_at_the_share(tmp_path: Path) -> None:
-    record = run_build(tmp_path)
+def targets_carrying_loss(row: SFTRow) -> int:
+    """Count, by hand, a row's targets ``ids[1:]`` that are not ``IGNORE`` in the loader."""
+    loader = SFTLoader([row], sequence_length=len(row.ids) - 1, batch_size=1, accumulation_steps=1)
+    _, targets, _ = loader.next_batch()
+    return sum(target != IGNORE for target in targets[0])
+
+
+def row_length(row: SFTRow) -> int:
+    return len(row.ids)
+
+
+MEASURES: dict[str, Callable[[SFTRow], int]] = {
+    "loss_tokens": targets_carrying_loss,
+    "all_tokens": row_length,
+}
+
+
+def language_row(index: int) -> SFTRow:
+    """The fixture conversation ``tree-index`` as its chat-v1 row."""
+    messages = [
+        Message("user", f"Question {index}?"),
+        Message("assistant", "An answer. " * (index + 3)),
+    ]
+    return SFTRow.of(
+        f"tree-{index}", "OpenAssistant/oasst2", render_conversation(TOKENIZER, messages)
+    )
+
+
+@pytest.mark.parametrize("basis", [None, "all_tokens"])
+def test_language_dev_is_held_out_by_hash_and_train_is_capped_at_the_share(
+    tmp_path: Path, basis: str | None
+) -> None:
+    # The default basis is loss tokens; the all-token basis is kept as an option.
+    record = run_build(tmp_path) if basis is None else run_build(tmp_path, language_cap_basis=basis)
+    basis = basis or "loss_tokens"
+    other = "all_tokens" if basis == "loss_tokens" else "loss_tokens"
     output = tmp_path / "sft"
     dev = list(read_rows(output / "language_dev.jsonl"))
-    train = [
-        row for row in read_rows(output / "train.jsonl") if row.source == "OpenAssistant/oasst2"
-    ]
+    rows = list(read_rows(output / "train.jsonl"))
+    train = [row for row in rows if row.source == "OpenAssistant/oasst2"]
+    code_rows = [row for row in rows if row.source != "OpenAssistant/oasst2"]
 
     def key(name: str) -> bytes:
         return hashlib.sha256(f"language-dev-v1|{name}".encode()).digest()
@@ -197,87 +232,106 @@ def test_language_dev_is_held_out_by_hash_and_train_is_capped_at_the_share(tmp_p
     ordered = sorted((f"tree-{index}" for index in range(10)), key=key)
     assert [row.id for row in dev] == ordered[:3]
     assert {row.id for row in train} <= set(ordered[3:])
-    tokens = record["tokens"]
-    code_tokens, language_tokens = tokens["code"]["tokens"], tokens["language"]["tokens"]
-    assert language_tokens / (language_tokens + code_tokens) <= 0.3
+    # Both bases, recounted from the written rows: loss tokens as the loader's targets
+    # that are not IGNORE, all tokens as the row lengths.
+    counted = {
+        name: {"code": sum(map(measure, code_rows)), "language": sum(map(measure, train))}
+        for name, measure in MEASURES.items()
+    }
+    code_size, language_size = counted[basis]["code"], counted[basis]["language"]
+    assert language_size / (language_size + code_size) <= 0.3
     accepted = [name for name in ordered[3:] if name in {row.id for row in train}]
     assert accepted == ordered[3 : 3 + len(accepted)]  # A prefix of the hash order.
     # The first conversation left out would have taken the share past 30%.
-    index = int(ordered[3 + len(accepted)].split("-")[1])
-    rendered = render_conversation(
-        TOKENIZER,
-        [Message("user", f"Question {index}?"), Message("assistant", "An answer. " * (index + 3))],
-    )
-    more = language_tokens + len(rendered.ids)
-    assert more / (more + code_tokens) > 0.3
+    refused = language_row(int(ordered[3 + len(accepted)].split("-")[1]))
+    more = language_size + MEASURES[basis](refused)
+    assert more / (more + code_size) > 0.3
     language = record["language"]
     assert language["dev"] == 3 and language["train"] == len(train)
     assert language["train_available"] == 7 and "over_train_max" not in language
     assert language["train"] + language["over_share"] == 7
-    shares = record["shares"]
-    assert shares["language"] == pytest.approx(language_tokens / (language_tokens + code_tokens))
-    assert shares["language_assistant_only"] == pytest.approx(
-        tokens["language"]["assistant_tokens"]
-        / (tokens["language"]["assistant_tokens"] + tokens["code"]["assistant_tokens"])
-    )
+    # 360 code loss tokens and 1,205 code tokens in all: the loss-token cap keeps two
+    # conversations here and the all-token cap five.
+    assert language["train"] == {"loss_tokens": 2, "all_tokens": 5}[basis]
+    shares, tokens = record["shares"], record["tokens"]
+    assert record["config"]["language_cap_basis"] == shares["language_cap_basis"] == basis
     assert shares["language_cap"] == 0.3 and shares["cap_bound"]
     assert shares["cap_dropped"] == language["over_share"] > 0
+    assert set(shares["bases"]) == {"loss_tokens", "all_tokens"}
+    for name, counts in counted.items():
+        total = counts["code"] + counts["language"]
+        assert shares[name] == {
+            **counts,
+            "language_share": pytest.approx(counts["language"] / total),
+            "code_share": pytest.approx(counts["code"] / total),
+        }
+        assert tokens["code"][name] == counts["code"]
+        assert tokens["language"][name] == counts["language"]
+    # Every chat-v1 row's loss tokens are also sum(mask): its first token is never a target.
+    assert all(MEASURES["loss_tokens"](row) == sum(row.mask) for row in rows)
+    # Code carries long prompts and short programs, so the two bases differ.
+    assert shares[other]["language_share"] != pytest.approx(shares[basis]["language_share"])
     # Code is never subsampled: every non-candidate task that fits is a row.
     assert record["code"]["sft_rows"] == sum(record["code"]["sft_rows_by_source"].values())
     first = next(row for row in train if row.id == accepted[0])
-    index = int(accepted[0].split("-")[1])
-    assert first == SFTRow.of(
-        accepted[0],
-        "OpenAssistant/oasst2",
-        render_conversation(
-            TOKENIZER,
-            [
-                Message("user", f"Question {index}?"),
-                Message("assistant", "An answer. " * (index + 3)),
-            ],
-        ),
-    )
+    assert first == language_row(int(accepted[0].split("-")[1]))
 
 
 def test_language_under_the_cap_is_kept_whole(tmp_path: Path) -> None:
     # At a 90% cap all seven training conversations fit: nothing is subsampled.
-    record = run_build(tmp_path, language_share=0.9)
+    record = run_build(tmp_path, language_cap=0.9)
     language, shares = record["language"], record["shares"]
     assert language["train"] == language["train_available"] == 7
     assert "over_share" not in language and "over_train_max" not in language
     assert not shares["cap_bound"] and shares["cap_dropped"] == 0
-    assert 0 < shares["language"] < 0.9
+    assert 0 < shares["loss_tokens"]["language_share"] < 0.9
 
 
+@pytest.mark.parametrize("basis", ["loss_tokens", "all_tokens"])
 @pytest.mark.parametrize(("extra", "kept"), [(0, True), (1, False)])
-def test_the_share_cap_is_exact_at_its_boundary(tmp_path: Path, extra: int, kept: bool) -> None:
-    # A 50% cap lets language equal the code's tokens exactly, and not one token more.
+def test_the_share_cap_is_exact_at_its_boundary(
+    tmp_path: Path, basis: str, extra: int, kept: bool
+) -> None:
+    # A 50% cap lets language equal the code exactly in the cap's basis, not one more.
     tasks = [task(OCI, index) for index in range(3)]
     save_tasks(tmp_path / "train.jsonl", tasks)
-    code_tokens = sum(len(render_code_task(TOKENIZER, item).ids) for item in tasks)
-    # A one-exchange chat-v1 row costs five marker tokens plus its text bytes.
-    answer = "x" * (code_tokens - 5 - 1 + extra)
+    rendered = [render_code_task(TOKENIZER, item) for item in tasks]
+    if basis == "loss_tokens":
+        code_size = sum(sum(item.mask[1:]) for item in rendered)
+        # A one-exchange chat-v1 row's loss tokens are its answer bytes and
+        # <|assistant_end|>.
+        answer = "x" * (code_size - 1 + extra)
+    else:
+        code_size = sum(len(item.ids) for item in rendered)
+        # A one-exchange chat-v1 row costs five marker tokens plus its text bytes.
+        answer = "x" * (code_size - 5 - 1 + extra)
     record = build(
         pool_train=tmp_path / "train.jsonl",
         language=conversations(tmp_path, texts=[("Q", answer)]),
         output=tmp_path / "sft",
         encoder=TOKENIZER,
         tokenizer_identity=IDENTITY,
-        config=BuildConfig(rl_candidates=0, language_dev=0, language_share=0.5),
+        config=BuildConfig(
+            rl_candidates=0, language_dev=0, language_cap=0.5, language_cap_basis=basis
+        ),
     )
-    assert record["tokens"]["code"]["tokens"] == code_tokens
+    shares = record["shares"]
+    assert shares["language_cap_basis"] == basis
+    assert record["tokens"]["code"][basis] == shares[basis]["code"] == code_size
     assert record["language"]["train"] == int(kept)
-    assert record["shares"]["cap_bound"] is not kept
+    assert shares["cap_bound"] is not kept and shares["cap_dropped"] == int(not kept)
     if kept:
-        assert record["tokens"]["language"]["tokens"] == code_tokens
-        assert record["shares"]["language"] == 0.5
+        assert shares[basis]["language"] == code_size
+        assert shares[basis]["language_share"] == 0.5
+    else:
+        assert shares[basis]["language"] == 0 and shares[basis]["language_share"] == 0.0
 
 
 def test_language_train_max_and_without_language(tmp_path: Path) -> None:
     assert BuildConfig().language_train_max is None  # No count cap by default.
     with pytest.raises(ValueError):
         BuildConfig(language_train_max=0)
-    record = run_build(tmp_path / "a", language_train_max=2, language_share=0.9)
+    record = run_build(tmp_path / "a", language_train_max=2, language_cap=0.9)
     assert record["language"]["train"] == 2 and record["language"]["over_train_max"] == 5
     assert not record["shares"]["cap_bound"]
     alone = build(
@@ -288,6 +342,7 @@ def test_language_train_max_and_without_language(tmp_path: Path) -> None:
         config=BuildConfig(sequence_length=400, rl_candidates=5),
     )
     assert alone["inputs"]["language"] is None and alone["tokens"]["language"]["rows"] == 0
+    assert alone["shares"]["loss_tokens"]["language_share"] == 0.0
     assert (tmp_path / "b" / "sft" / "language_dev.jsonl").read_text() == ""
 
 
@@ -322,8 +377,12 @@ def test_code_dev_rows_and_input_validation(tmp_path: Path) -> None:
             tokenizer_identity=IDENTITY,
             config=BuildConfig(),
         )
+    assert BuildConfig().language_cap == 0.3
+    assert BuildConfig().language_cap_basis == "loss_tokens"  # The owner's ruling.
     with pytest.raises(ValueError):
-        BuildConfig(language_share=1.0)
+        BuildConfig(language_cap=1.0)
+    with pytest.raises(ValueError, match="language_cap_basis"):
+        BuildConfig(language_cap_basis="assistant_tokens")
 
 
 def test_build_record_carries_the_language_records_provenance(tmp_path: Path) -> None:

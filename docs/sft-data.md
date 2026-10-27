@@ -6,6 +6,7 @@
 
 - **Code rows** can be built now from the 2026-10-25 pool.
 - **The language intake is approved.** On 2026-10-26 the owner accepted the dataset card's Apache-2.0 label plus the dataset paper as the [terms of record](#terms-of-record), for human-written conversation paths only. The `download`, `language` and `build` stages run end to end. No build of record has been made yet.
+- **The language cap is on loss tokens.** On 2026-10-26 the owner ruled that the 30% language cap applies to the tokens the SFT loss is computed on, with the shares recorded both ways. See [language rows](#build).
 - **AceCode is flagged** and left out of every source list by default. It is used only with `--include-acecode`.
 
 ## Build
@@ -29,8 +30,10 @@ Run it from the main checkout, where the ignored `runs/` tree and the frozen tok
 3. **Code rows.** Every other selected task's verified reference is rendered in chat-v1. Code is never subsampled: every task with a reference whose row fits becomes a row. A task without a reference, or whose row has more than 1,024 input/target pairs, is dropped and counted.
 4. **Language rows.** Each conversation is rendered in chat-v1, and rows over 1,024 pairs are dropped and counted.
    - **Dev set:** the 300 conversations with the lowest `sha256("language-dev-v1|" + ID)` become the language dev set.
-   - **Training rows:** language is sized to the code. The share is measured in assistant-plus-context tokens (every token of a row). If all the remaining conversations together keep the language share of the training tokens at or below 30%, all of them are used. Otherwise they are taken in that hash order until the next one would take the share past 30%. That conversation and every later one are dropped and counted as `over_share`, so the training rows are a prefix of the hash order.
-   - **Exact cap:** the test is `language / (language + code) <= 0.3`, compared as exact fractions with 0.3 read as 3/10, so a share of exactly 30% is kept.
+   - **Training rows:** language is sized to the code. The share is measured in loss tokens (`language_cap_basis: loss_tokens`), the tokens the SFT loss is computed on. If all the remaining conversations together keep the language share of the training rows' loss tokens at or below 30%, all of them are used. Otherwise they are taken in that hash order until the next one would take the share past 30%. That conversation and every later one are dropped and counted as `over_share`, so the training rows are a prefix of the hash order.
+   - **Loss tokens:** a row's loss tokens are its targets `ids[1:]` that fall under the assistant mask. They are exactly the targets the [SFT batch source](walkthroughs/sft-batching.md) emits as something other than `IGNORE`, which the trainer's `update_targets` normalization counts and divides by. `scratchcoder.data.sft.loss_tokens` counts them; the cap, the build record and the batch source all use it. A row's first token is never a target, so the count also equals the number of true mask entries.
+   - **Exact cap:** the test is `language / (language + code) <= 0.3` in loss tokens, compared as exact fractions with 0.3 read as 3/10, so a share of exactly 30% is kept.
+   - **Other basis:** `BuildConfig(language_cap_basis="all_tokens")` measures the cap in every token of a row (assistant plus context) instead. The default is loss tokens, and the CLI always uses the default.
    - **No count cap:** there is none by default. `BuildConfig(language_train_max=N)` adds one; conversations past it count as `over_train_max`.
    - **Provenance:** the language stage's `record.json` must sit beside `conversations.jsonl`. The build refuses the conversations unless that record is completed, of this schema, lists their SHA-256, names what its screens used and carries the owner's approval. It then copies the record's `provenance` and `screened_against` into the build record.
 5. **Code dev rows.** The pool's dev tasks are rendered with their references for the assistant-only dev loss.
@@ -60,12 +63,11 @@ Run it from the main checkout, where the ignored `runs/` tree and the frozen tok
   - the n-gram screen's minimum words per n-gram;
 - code: train tasks per source, the excluded sources, the RL strata, the SFT rows in total and by source, and the drops by reason;
 - language counts: seen, over length, dev, available for training, training, and the conversations each cap dropped;
-- per domain: rows, tokens and assistant tokens;
-- the shares:
-  - `language`: the measured language share of all training tokens, which the cap bounds;
-  - `code`: the code share of the same;
-  - `language_assistant_only`: the language share of the assistant (loss-target) tokens, for information;
-  - `language_cap`, `cap_bound` (whether the cap dropped any conversation) and `cap_dropped` (how many);
+- per domain (`tokens`): rows, `loss_tokens` and `all_tokens`;
+- the shares (`shares`), measured both ways:
+  - `language_cap` (0.3) and `language_cap_basis` (`loss_tokens`), and `bases`, a one-line definition of each basis;
+  - `loss_tokens` and `all_tokens`: for each basis, the `code` and `language` counts, `language_share` and `code_share`. The cap bounds the share in `language_cap_basis`; the other is reported for information;
+  - `cap_bound` (whether the cap dropped any conversation) and `cap_dropped` (how many);
 - each output file's SHA-256, rows and bytes.
 
 ## Language intake: OpenAssistant oasst2
@@ -157,5 +159,5 @@ The record counts every message by reason, every dropped tree by reason, each sc
 - **Terms.** The terms of record are a metadata label and a sentence in the paper's abstract, accepted by the owner. There is no license file or contributor grant.
 - **Fields.** The adapter assumes the README's message fields and mapping-form labels. Missing fields and labels in another shape show up as `missing_metadata` counts, not as silent passes.
 - **PII.** The e-mail screen and the PII label do not find every kind of personal data, and messages that no reviewer labelled for PII are kept (and counted). A manual sample scan is still needed before training.
-- **Loss-target share.** The 30% cap is on all tokens. Code rows carry long prompts and short programs, so language takes a larger share of the assistant (loss-target) tokens than of all tokens. The record reports both.
+- **All-token share.** The 30% cap is on loss tokens. Code rows carry long prompts and short programs, so language takes a smaller share of all tokens than of loss tokens. The record reports both.
 - **Code rows.** They inherit the pool's limitations, including its unchecked seed provenance.
