@@ -58,7 +58,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     validation.add_argument("--scorecard", type=Path, default=Path("runs/scorecard.jsonl"))
     validation.add_argument("--documents", type=int, required=True)
     validation.add_argument("--sequence-length", type=int)
+    benchmark = subparsers.add_parser(
+        "generation-benchmark",
+        help="time batched generation on synthetic prompts and print JSON",
+    )
+    model_source = benchmark.add_mutually_exclusive_group(required=True)
+    model_source.add_argument("--checkpoint", type=Path)
+    model_source.add_argument("--config", type=Path, help="YAML or JSON with a model mapping")
+    benchmark.add_argument("--tokenizer", type=Path, help="required with --checkpoint")
+    benchmark.add_argument("--device", default="cpu", help="cpu (default), cuda or cuda:N")
+    benchmark.add_argument("--precision", choices=("float32", "bfloat16"), default="float32")
+    benchmark.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 64, 128, 256])
+    benchmark.add_argument("--prompt-lengths", type=int, nargs="+", default=[190])
+    benchmark.add_argument("--max-new-tokens", type=int, default=256)
+    benchmark.add_argument("--temperature", type=float, default=1.0)
+    benchmark.add_argument("--top-k", type=int)
+    benchmark.add_argument("--top-p", type=float, default=1.0)
+    benchmark.add_argument("--seed", type=int, default=0)
+    benchmark.add_argument("--repeats", type=int, default=1)
     args = parser.parse_args(argv)
+    if args.command == "generation-benchmark":
+        import json
+
+        from scratchcoder.engine.benchmark import run_generation_benchmark
+
+        result = run_generation_benchmark(
+            checkpoint=args.checkpoint,
+            tokenizer=args.tokenizer,
+            config=args.config,
+            device=args.device,
+            precision=args.precision,
+            batch_sizes=args.batch_sizes,
+            prompt_lengths=args.prompt_lengths,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            seed=args.seed,
+            repeats=args.repeats,
+        )
+        sys.stdout.write(json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n")
+        return 0
     if args.command == "smoke":
         return run_smoke(sys.stdout, config_path=args.config, output_root=args.output)
     if args.command == "data-build":
