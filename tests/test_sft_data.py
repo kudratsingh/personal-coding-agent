@@ -3,6 +3,7 @@
 import gzip
 import hashlib
 import json
+import shutil
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -70,6 +71,7 @@ def pool(tmp_path: Path) -> Path:
 
 
 PROVENANCE = {"dataset": "OpenAssistant/oasst2", "revision": "a" * 40, "owner_ruling": "approved"}
+SCREENED = {"benchmarks": {}, "holdouts": [{"path": "dev.jsonl", "sha256": "b" * 64, "tasks": 1}]}
 
 
 def language_record(path: Path, **changes: Any) -> Path:
@@ -78,6 +80,7 @@ def language_record(path: Path, **changes: Any) -> Path:
         "schema_version": sft_data.SCHEMA_VERSION,
         "status": "completed",
         "provenance": dict(PROVENANCE),
+        "screened_against": dict(SCREENED),
         "files": {"conversations.jsonl": {"sha256": file_sha256(path)}},
     }
     record.update(changes)
@@ -327,6 +330,7 @@ def test_build_record_carries_the_language_records_provenance(tmp_path: Path) ->
     record = run_build(tmp_path)
     entry = record["inputs"]["language"]
     assert entry["provenance"] == PROVENANCE
+    assert entry["screened_against"] == SCREENED
     assert entry["record"] == {
         "path": str(tmp_path / "record.json"),
         "sha256": file_sha256(tmp_path / "record.json"),
@@ -340,6 +344,7 @@ def test_build_record_carries_the_language_records_provenance(tmp_path: Path) ->
         ({"schema_version": 1}, ValueError),
         ({"status": "partial"}, ValueError),
         ({"provenance": None}, ValueError),
+        ({"screened_against": None}, ValueError),
         ({"files": {"conversations.jsonl": {"sha256": "0" * 64}}}, ValueError),
         ({"files": {}}, ValueError),
         ({"provenance": {**PROVENANCE, "owner_ruling": "rejected"}}, PermissionError),
@@ -843,7 +848,8 @@ def test_an_unruled_spec_blocks_the_download(tmp_path: Path) -> None:
             encoder=TOKENIZER,
             benchmarks=[],
             choices=[],
-            holdouts=[],
+            benchmark_identities={},
+            holdout_files=[],
             min_alpha_tokens=3,
         )
 
@@ -863,13 +869,16 @@ def test_fetch_adapt_and_build_carry_the_provenance(tmp_path: Path) -> None:
     assert receipt["card"]["git_blob_id"] == spec["terms_of_record"]["card"]["git_blob_id"]
     with pytest.raises(FileExistsError):
         sft_data.fetch(spec, directory, hub_factory=lambda _: FakeHub({TREES: data}))
+    dev = tmp_path / "dev.jsonl"
+    save_tasks(dev, [task(OCI, 2, prompt="Pick? an option", split="dev")])
     record = sft_data.adapt_language(
         spec,
         directory,
         encoder=TOKENIZER,
         benchmarks=[],
         choices=[],
-        holdouts=[task(OCI, 2, prompt="Pick? an option", split="dev")],
+        benchmark_identities={},
+        holdout_files=[dev],
         min_alpha_tokens=3,
     )
     assert record["intake"][TREES]["tree:kept"] == 3
@@ -905,7 +914,8 @@ def test_fetch_adapt_and_build_carry_the_provenance(tmp_path: Path) -> None:
             encoder=TOKENIZER,
             benchmarks=[],
             choices=[],
-            holdouts=[],
+            benchmark_identities={},
+            holdout_files=[],
             min_alpha_tokens=3,
         )
     built = build(
@@ -917,9 +927,99 @@ def test_fetch_adapt_and_build_carry_the_provenance(tmp_path: Path) -> None:
         config=BuildConfig(sequence_length=400, rl_candidates=5, language_dev=1),
     )
     assert built["inputs"]["language"]["provenance"] == provenance
+    assert built["inputs"]["language"]["screened_against"] == record["screened_against"]
     assert built["inputs"]["language"]["record"]["sha256"] == file_sha256(
         directory / "language" / "record.json"
     )
+
+
+def intake(tmp_path: Path, name: str = "intake") -> tuple[dict[str, Any], Path]:
+    """The committed spec, sized to the authored trees, fetched into ``tmp_path/name``."""
+    data = gz_trees(authored_trees())
+    spec_path = spec_file(tmp_path, max_tokens=60, max_download_bytes=len(data))
+    spec = sft_data.load_language_spec(spec_path)
+    directory = tmp_path / name
+    sft_data.fetch(spec, directory, hub_factory=lambda _: FakeHub({TREES: data}))
+    return spec, directory
+
+
+def test_the_language_record_names_the_benchmarks_and_holdout_files_it_screened(
+    tmp_path: Path,
+) -> None:
+    spec, directory = intake(tmp_path)
+    shutil.copytree(directory, tmp_path / "dev-only")
+    dev, test = tmp_path / "dev.jsonl", tmp_path / "test.jsonl"
+    # The dev task's prompt is t1's whole opening, so the n-gram screen drops t1.
+    save_tasks(dev, [task(OCI, 2, prompt="What is two plus two?", split="dev")])
+    save_tasks(test, [task(OCI, 3, split="test"), task(TACO, 4, split="test")])
+    identities = {"humaneval": {"tasks": 1, "sha256": "c" * 64}, "arc-easy": {"suite": "ARC"}}
+    benchmark = task(OCI, 1, prompt="Unrelated benchmark prompt.", split="test")
+    arc = choice("Which gas do plants take in from the air to make their food each day?")
+
+    def adapt(where: Path, files: list[Path]) -> dict[str, Any]:
+        return sft_data.adapt_language(
+            spec,
+            where,
+            encoder=TOKENIZER,
+            benchmarks=[benchmark],
+            choices=[arc],
+            benchmark_identities=identities,
+            holdout_files=files,
+            min_alpha_tokens=3,
+        )
+
+    record = adapt(directory, [dev, test])
+    assert record["screens"] == {"contamination": 1, "kept": 2, "seen": 3}
+    assert record["screened_against"] == {
+        "benchmarks": identities,
+        "benchmark_tasks": 1,
+        "choice_tasks": 1,
+        "holdouts": [
+            {"path": str(dev), "sha256": file_sha256(dev), "tasks": 1, "splits": {"dev": 1}},
+            {"path": str(test), "sha256": file_sha256(test), "tasks": 2, "splits": {"test": 2}},
+        ],
+        "min_alpha_tokens": 3,
+    }
+    # A screen against dev alone is visible in its record, not only in its counts.
+    alone = adapt(tmp_path / "dev-only", [dev])["screened_against"]["holdouts"]
+    assert [item["splits"] for item in alone] == [{"dev": 1}]
+
+
+def test_the_language_cli_screens_against_pool_dev_and_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tools import task_pool
+
+    spec, directory = intake(tmp_path)
+    pool_dir = tmp_path / "pool"
+    pool_dir.mkdir()
+    save_tasks(pool_dir / "dev.jsonl", [task(OCI, 2, split="dev")])
+    save_tasks(pool_dir / "test.jsonl", [task(OCI, 3, split="test")])
+    identities = {"humaneval": {"tasks": 0, "sha256": "c" * 64}}
+    monkeypatch.setattr(task_pool, "load_spec", lambda _: {"protection": {"min_alpha_tokens": 3}})
+    monkeypatch.setattr(task_pool, "protection", lambda _: ([], [], identities))
+    monkeypatch.setattr(sft_data, "_encoder", lambda _: (TOKENIZER, IDENTITY))
+    status = sft_data.main(
+        [
+            "language",
+            "--language-spec",
+            str(tmp_path / "spec.json"),
+            "--directory",
+            str(directory),
+            "--pool-spec",
+            str(tmp_path / "pool-spec.json"),
+            "--pool-dir",
+            str(pool_dir),
+        ]
+    )
+    assert status == 0
+    record = json.loads((directory / "language" / "record.json").read_text())
+    screened = record["screened_against"]
+    assert screened["benchmarks"] == identities and screened["min_alpha_tokens"] == 3
+    assert [(item["path"], item["sha256"], item["splits"]) for item in screened["holdouts"]] == [
+        (str(pool_dir / name), file_sha256(pool_dir / name), {split: 1})
+        for name, split in (("dev.jsonl", "dev"), ("test.jsonl", "test"))
+    ]
 
 
 @pytest.mark.parametrize(

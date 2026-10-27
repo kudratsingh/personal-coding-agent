@@ -25,7 +25,9 @@ Three stages, each refusing to overwrite a completed result:
 
 The source's provenance (pinned revision, downloaded files' sizes and SHA-256, the
 owner's ruling and the terms of record) is copied from the download receipts into the
-language record and from there into the build record.
+language record and from there into the build record. The language record also names
+what its screens used (benchmark identities and each holdout file's SHA-256), and the
+build record copies that too.
 
 AceCode is flagged and stays out unless ``--include-acecode`` is given. Nothing here
 executes code or spends money.
@@ -196,8 +198,9 @@ def language_source(conversations: Path) -> dict[str, Any]:
     """The checked language-stage record beside ``conversations`` and its provenance.
 
     The build refuses conversations without a completed record of this schema whose
-    ``conversations.jsonl`` SHA-256 matches them, or whose source the owner has not
-    approved, so every build record carries the source's provenance.
+    ``conversations.jsonl`` SHA-256 matches them and which names what its screens used,
+    or whose source the owner has not approved, so every build record carries the
+    source's provenance and the screens' benchmarks and holdout files.
     """
     path = conversations.parent / "record.json"
     if not path.is_file():
@@ -208,6 +211,7 @@ def language_source(conversations: Path) -> dict[str, Any]:
         or record.get("schema_version") != SCHEMA_VERSION
         or record.get("status") != "completed"
         or not isinstance(record.get("provenance"), dict)
+        or not isinstance(record.get("screened_against"), dict)
     ):
         raise ValueError(f"{path} is not a completed language record of this schema")
     listed = (record.get("files") or {}).get("conversations.jsonl") or {}
@@ -218,6 +222,7 @@ def language_source(conversations: Path) -> dict[str, Any]:
     return {
         "record": {"path": str(path), "sha256": file_sha256(path)},
         "provenance": record["provenance"],
+        "screened_against": record["screened_against"],
     }
 
 
@@ -625,14 +630,19 @@ def adapt_language(
     encoder: TextEncoder,
     benchmarks: Sequence[Task],
     choices: Sequence[ChoiceTask],
-    holdouts: Sequence[Task],
+    benchmark_identities: Mapping[str, Any],
+    holdout_files: Sequence[Path],
     min_alpha_tokens: int,
 ) -> dict[str, Any]:
     """Adapt and screen the downloaded trees into ``directory/language``.
 
     The record's ``provenance`` carries the spec's source identity, ruling and terms of
     record, the receipts' SHA-256, the card check and each downloaded file's size and
-    SHA-256; the build copies it into its own record.
+    SHA-256. Its ``screened_against`` names what the screens used: the benchmark
+    identities (``tools.task_pool.protection``) with the task and question counts
+    screened, each holdout file's path, SHA-256, task count and split counts, and the
+    n-gram floor. The holdout tasks are read from ``holdout_files`` here, so the record
+    lists exactly the files screened. The build copies both blocks into its own record.
     """
     if spec["owner_ruling"] != "approved":
         raise PermissionError("the owner has not approved the source's terms")
@@ -656,6 +666,19 @@ def adapt_language(
         kept, counts = adapt_trees(read_trees(path), encoder, max_tokens=spec["max_tokens"])
         adapted.extend(kept)
         intake[item["filename"]] = counts
+    holdouts: list[Task] = []
+    holdout_records = []
+    for holdout in holdout_files:
+        tasks = list(load_tasks(holdout))
+        holdouts.extend(tasks)
+        holdout_records.append(
+            {
+                "path": str(holdout),
+                "sha256": file_sha256(holdout),
+                "tasks": len(tasks),
+                "splits": dict(sorted(Counter(task.split for task in tasks).items())),
+            }
+        )
     screened, screens = screen_conversations(
         adapted,
         benchmarks=benchmarks,
@@ -691,6 +714,13 @@ def adapt_language(
                 {key: item[key] for key in ("filename", "url", "size_bytes", "sha256")}
                 for item in receipts["files"]
             ],
+        },
+        "screened_against": {
+            "benchmarks": dict(benchmark_identities),
+            "benchmark_tasks": len(benchmarks),
+            "choice_tasks": len(choices),
+            "holdouts": holdout_records,
+            "min_alpha_tokens": min_alpha_tokens,
         },
         "max_tokens": spec["max_tokens"],
         "intake": intake,
@@ -752,18 +782,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.stage == "language":
         if args.language_spec is None or args.directory is None:
             parser.error("language needs --language-spec and --directory")
-        benchmarks, choices, _ = protection(pool_spec)
-        holdouts = [
-            *load_tasks(args.pool_dir / "dev.jsonl"),
-            *load_tasks(args.pool_dir / "test.jsonl"),
-        ]
+        benchmarks, choices, identities = protection(pool_spec)
         record = adapt_language(
             load_language_spec(args.language_spec),
             args.directory,
             encoder=encoder,
             benchmarks=benchmarks,
             choices=choices,
-            holdouts=holdouts,
+            benchmark_identities=identities,
+            holdout_files=[args.pool_dir / "dev.jsonl", args.pool_dir / "test.jsonl"],
             min_alpha_tokens=pool_spec["protection"]["min_alpha_tokens"],
         )
         print(json.dumps({"screens": record["screens"], "tokens": record["tokens"]}, indent=1))

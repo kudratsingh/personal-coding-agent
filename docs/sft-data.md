@@ -32,7 +32,7 @@ Run it from the main checkout, where the ignored `runs/` tree and the frozen tok
    - **Training rows:** language is sized to the code. The share is measured in assistant-plus-context tokens (every token of a row). If all the remaining conversations together keep the language share of the training tokens at or below 30%, all of them are used. Otherwise they are taken in that hash order until the next one would take the share past 30%. That conversation and every later one are dropped and counted as `over_share`, so the training rows are a prefix of the hash order.
    - **Exact cap:** the test is `language / (language + code) <= 0.3`, compared as exact fractions with 0.3 read as 3/10, so a share of exactly 30% is kept.
    - **No count cap:** there is none by default. `BuildConfig(language_train_max=N)` adds one; conversations past it count as `over_train_max`.
-   - **Provenance:** the language stage's `record.json` must sit beside `conversations.jsonl`. The build refuses the conversations unless that record is completed, of this schema, lists their SHA-256 and carries the owner's approval. It then copies the record's provenance into the build record.
+   - **Provenance:** the language stage's `record.json` must sit beside `conversations.jsonl`. The build refuses the conversations unless that record is completed, of this schema, lists their SHA-256, names what its screens used and carries the owner's approval. It then copies the record's `provenance` and `screened_against` into the build record.
 5. **Code dev rows.** The pool's dev tasks are rendered with their references for the assistant-only dev loss.
 
 ### Outputs
@@ -54,6 +54,10 @@ Run it from the main checkout, where the ignored `runs/` tree and the frozen tok
   - the SHA-256 of the spec and of the download receipts;
   - the dataset card check;
   - each downloaded file's URL, size and SHA-256;
+- what the language screens used, also copied from that record (`screened_against`):
+  - the benchmark identities and the number of benchmark tasks and ARC-Easy questions screened;
+  - each holdout file's path, SHA-256, task count and tasks per split;
+  - the n-gram screen's minimum words per n-gram;
 - code: train tasks per source, the excluded sources, the RL strata, the SFT rows in total and by source, and the drops by reason;
 - language counts: seen, over length, dev, available for training, training, and the conversations each cap dropped;
 - per domain: rows, tokens and assistant tokens;
@@ -114,7 +118,7 @@ Under the project's data rule, a label without a license file is the owner's dec
      --language-spec configs/sft-language-oasst2.json --directory runs/oasst2-<date>
    ```
 
-3. **Adapt and screen.** `language` adapts and screens the trees into `language/conversations.jsonl` and `language/record.json`. The record's `provenance` carries the receipts' source, ruling and terms, the receipts' SHA-256 and each downloaded file. The stage needs the `evaluation` extra to read ARC-Easy.
+3. **Adapt and screen.** `language` adapts and screens the trees into `language/conversations.jsonl` and `language/record.json`. The record's `provenance` carries the receipts' source, ruling and terms, the receipts' SHA-256 and each downloaded file. Its `screened_against` names what the screens used: the benchmark identities, and each holdout file's path, SHA-256, task count and tasks per split. The command screens against the pool's `dev.jsonl` and `test.jsonl`, so its record lists both; a record screened against fewer files shows it. The stage needs the `evaluation` extra to read ARC-Easy.
 
    ```sh
    uv run --locked --extra evaluation python -m tools.sft_data language \
@@ -146,7 +150,7 @@ Labels must be the README's mapping form: each label name maps to an object with
 3. a first user turn that near-duplicates a benchmark or holdout prompt, at 5-word-shingle Jaccard of 0.85 or more;
 4. a first user turn that near-duplicates, by the same measure, the first user turn of a conversation already kept (`repeated_prompt`). The earliest conversation in input order is kept. As in the pool's own screen, this keeps one copy of a repeated prompt, so the language dev set and the training rows never share an opening prompt.
 
-The record counts every message by reason, every dropped tree by reason, each screen, the exchanges per conversation and the total tokens.
+The record counts every message by reason, every dropped tree by reason, each screen, the exchanges per conversation and the total tokens, and it names the benchmarks and holdout files the screens used.
 
 ## Limitations
 
