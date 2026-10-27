@@ -42,6 +42,6 @@ Implemented: [the more-SFT control](more-sft-control.md).
 
 Implemented: [evaluation pipeline: generate, execute, seal, score](evaluation-pipeline.md).
 
-Implemented: [post-training run worker](posttrain-run.md).
+Implemented: [post-training run worker, runs 1 and 2](posttrain-run.md).
 
 Implemented: [the RL reward bridge between the Pod and the Mac](rl-bridge.md).

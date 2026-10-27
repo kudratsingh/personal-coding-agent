@@ -48,9 +48,14 @@ MODE_STATUSES = {
 """Worker statuses beyond the pilot's that a mode's heartbeat may carry. A rehearsal worker
 reads ``uploading`` while it drains its last checkpoints to R2 with the GPU idle. A
 post-training worker may also read ``awaiting_rewards``, run 2's wait for the Mac's RL
-rewards; here it is an ordinary in-progress status, so the idle rule applies to it unchanged.
-Run 2 extends it with Mac-stamped reward progress (as ``transfer_progress_unix`` extends an
-upload); run 1 never writes it."""
+rewards or dev verdicts. Without an extension in the policy (run 1's) it is an ordinary
+in-progress status and the idle rule applies unchanged; a run-2 policy grants it a bounded
+idle extension per request kind (``AWAITING_KINDS``, ``_awaiting_within_extension``)."""
+AWAITING_STATUS = "awaiting_rewards"
+AWAITING_KINDS = ("reward", "dev")
+"""The bridge request kinds an ``awaiting_rewards`` heartbeat names in ``awaiting.kind``."""
+MAX_AWAITING_EXTENSION_SECONDS = 60_000.0
+"""No extension may exceed the post-training wall ceiling, whatever a policy file says."""
 _SAFE_POD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 
 
@@ -165,6 +170,12 @@ class Policy:
     # are not read as an idle GPU. Wall and cost limits are unaffected.
     idle_baseline_unix: float | None = None
     mode: str = "pilot"
+    # Run 2: while the heartbeat reads ``awaiting_rewards`` for a reward request (or a dev
+    # check), the GPU may sit idle up to this long instead of ``max_idle_seconds``: the Pod's
+    # own timeout for that wait plus a stated slack (``posttrain_ops.bridge_timeouts``). Zero,
+    # the default and run 1's value, is no extension.
+    awaiting_reward_extension_seconds: float = 0.0
+    awaiting_dev_extension_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         for key in (
@@ -209,6 +220,16 @@ class Policy:
             or self.idle_baseline_unix <= 0
         ):
             raise ValueError("idle_baseline_unix must be a finite positive time when provided")
+        for key in ("awaiting_reward_extension_seconds", "awaiting_dev_extension_seconds"):
+            value = getattr(self, key)
+            if (
+                not _is_number(value)
+                or not math.isfinite(value)
+                or not 0 <= value <= MAX_AWAITING_EXTENSION_SECONDS
+            ):
+                raise ValueError(f"{key} must be finite, nonnegative and at most 60000 seconds")
+            if value and self.mode != "posttrain":
+                raise ValueError(f"{key} applies only to a posttrain policy")
         if type(self.delete_verify_attempts) is not int or self.delete_verify_attempts < 1:
             raise ValueError("delete_verify_attempts must be a positive integer")
         if (
@@ -255,6 +276,9 @@ class Heartbeat:
     transfer_progress_unix: float | None = None
     ignored: str | None = None
     """Why a heartbeat on disk was treated as absent (another Pod's, or older than this Pod)."""
+    awaiting_kind: str | None = None
+    """For an ``awaiting_rewards`` heartbeat, the kind of request the Pod waits on (``reward``
+    or ``dev``), when its ``awaiting`` object names one; anything else reads as ``None``."""
 
 
 def foreign_heartbeat(
@@ -360,12 +384,15 @@ def read_heartbeat(
         not _is_number(progress) or not math.isfinite(progress) or not 0 <= progress <= now
     ):
         return Heartbeat(float(activity), "heartbeat_malformed", worker_status)
+    awaiting = value.get("awaiting")
+    kind = awaiting.get("kind") if isinstance(awaiting, dict) else None
     return Heartbeat(
         float(activity),
         None,
         worker_status,
         receipts_verified,
         None if progress is None else float(progress),
+        awaiting_kind=kind if worker_status == AWAITING_STATUS and kind in AWAITING_KINDS else None,
     )
 
 
@@ -552,6 +579,8 @@ def check_once(
                 elif checked_at - heartbeat.last_gpu_activity_unix >= policy.max_idle_seconds:
                     if _transfer_in_progress(heartbeat, policy, checked_at):
                         trigger = ""
+                    elif _awaiting_within_extension(heartbeat, policy, checked_at):
+                        trigger = ""
                     else:
                         trigger = "idle_gpu_limit"
                 else:
@@ -611,6 +640,32 @@ def _transfer_in_progress(heartbeat: Heartbeat, policy: Policy, now: float) -> b
     )
 
 
+def awaiting_extension(policy: Policy, kind: str | None) -> float:
+    """The policy's idle extension for a wait on a request of ``kind`` (0 for none)."""
+    if policy.mode != "posttrain" or kind not in AWAITING_KINDS:
+        return 0.0
+    if kind == "reward":
+        return float(policy.awaiting_reward_extension_seconds)
+    return float(policy.awaiting_dev_extension_seconds)
+
+
+def _awaiting_within_extension(heartbeat: Heartbeat, policy: Policy, now: float) -> bool:
+    """Run 2: an ``awaiting_rewards`` heartbeat keeps an idle GPU for the policy's extension.
+
+    The Pod waits on the Mac for one reward request or dev check at a time, and its own
+    timeout ends that wait; the extension is that timeout plus a stated slack, measured from
+    the last GPU work like the idle rule itself, and never more, so a worker that hangs
+    while claiming to wait is still deleted. The wall and cost limits apply unchanged, and a
+    stale or malformed heartbeat has already failed before this is asked.
+    """
+    extension = awaiting_extension(policy, heartbeat.awaiting_kind)
+    return (
+        heartbeat.status == AWAITING_STATUS
+        and extension > 0
+        and now - heartbeat.last_gpu_activity_unix < max(policy.max_idle_seconds, extension)
+    )
+
+
 POLICY_FILE_FIELDS = (
     "mode",
     "max_wall_seconds",
@@ -637,8 +692,13 @@ def check_policy_file(policy: Policy, path: Path) -> None:
     if missing:
         raise ValueError(f"the policy file lacks {', '.join(missing)}")
     differ = [name for name in POLICY_FILE_FIELDS if getattr(policy, name) != value[name]]
-    if value.get("starting_cost_usd", 0.0) != policy.starting_cost_usd:
-        differ.append("starting_cost_usd")
+    for name in (
+        "starting_cost_usd",
+        "awaiting_reward_extension_seconds",
+        "awaiting_dev_extension_seconds",
+    ):
+        if value.get(name, 0.0) != getattr(policy, name):
+            differ.append(name)
     if differ:
         raise ValueError("the watchdog's flags differ from the policy file in " + ", ".join(differ))
 
@@ -677,6 +737,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="before the first heartbeat, start the idle clock here instead of at Pod creation",
     )
     parser.add_argument("--max-transfer-seconds", type=float, default=0.0)
+    parser.add_argument(
+        "--awaiting-reward-extension-seconds",
+        type=float,
+        default=0.0,
+        help="posttrain run 2: idle limit while the Pod awaits a reward request",
+    )
+    parser.add_argument(
+        "--awaiting-dev-extension-seconds",
+        type=float,
+        default=0.0,
+        help="posttrain run 2: idle limit while the Pod awaits a dev check",
+    )
     parser.add_argument("--poll-seconds", type=float, default=15.0)
     parser.add_argument("--request-timeout-seconds", type=float, default=5.0)
     parser.add_argument("--delete-verify-attempts", type=int, default=3)
@@ -712,6 +784,8 @@ def policy_from_args(args: argparse.Namespace) -> Policy:
         max_transfer_seconds=args.max_transfer_seconds,
         idle_baseline_unix=args.idle_baseline_unix,
         mode=args.mode,
+        awaiting_reward_extension_seconds=args.awaiting_reward_extension_seconds,
+        awaiting_dev_extension_seconds=args.awaiting_dev_extension_seconds,
     )
 
 

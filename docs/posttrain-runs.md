@@ -2,10 +2,10 @@
 
 The rest of the rehearsal continues from run B's `mixed-final` checkpoint in two paid runs on one Runpod A40 Pod each, under limits the owner approved on 2026-10-26:
 
-- **Run 1** (this page): the generation probe, ARC-Easy on run A's two finals and run B, base-B evaluation generation, SFT, ARC and evaluation generation of the SFT weights, and RL screening generation. Hard ceiling **$3.00**.
-- **Run 2** (a later change): RL with the Mac computing rewards, the compute-matched more-SFT control, and their evaluation generation. Its ceiling, about $5.80, is fixed at the owner's gate from run 1's measured rates.
+- **Run 1:** the generation probe, ARC-Easy on run A's two finals and run B, base-B evaluation generation, SFT, ARC and evaluation generation of the SFT weights, and RL screening generation. Hard ceiling **$3.00**. Commands: the [run 1 runbook](../POSTTRAIN_RUNBOOK.md).
+- **Run 2** ([below](#run-2)): RL with the Mac computing rewards and dev verdicts through the reward bridge, the compute-matched more-SFT control, ARC-Easy and evaluation generation of both selected checkpoints. Its ceiling, about $5.80, is fixed at the owner's gate from run 1's measured rates. Commands: the [run 2 runbook](../POSTTRAIN_RUN2_RUNBOOK.md).
 
-**Status (2026-10-27): pre-launch.** The worker, its safeguards, the Mac-side tools and the [runbook](../POSTTRAIN_RUNBOOK.md) are written and CPU-tested, including an end-to-end smoke replayed into the real supervisor. Nothing has run on a GPU, no input has been staged to R2, and nothing has been spent. Every figure below is a projection.
+**Status (2026-10-27): pre-launch.** Both runs' workers, their safeguards, the Mac-side tools and the runbooks are written and CPU-tested, each with an end-to-end smoke replayed into the real supervisor (run 2's with the Mac's bridge server in a thread, and once with the Mac scoring in the Docker sandbox). Nothing has run on a GPU, no input has been staged to R2, and nothing has been spent. Every figure below is a projection.
 
 ## Stages
 
@@ -92,13 +92,114 @@ At twice the planning speed the run takes about 1.98 hours and $1.19. At half th
 
 On the Mac, in an execution window: `eval-execute` of the four dev completions files and the dev constant-answer baseline; `eval-seal` of the four test completions files (they execute only after all four endpoints are frozen, after run 2); `rl-screen` of the screening attempts; and `tools.benchmark_dispatch` of the six benchmark files on GitHub Actions. The screening record and the measured rates re-price run 2 at the owner's gate.
 
-## Run 2 hooks
+## Run 2
 
-The stage machinery is a registry of kinds (`STAGE_KINDS`): run 2 adds RL, the more-SFT control and their evaluation stages on the same worker. The watchdog's `posttrain` mode already accepts an `awaiting_rewards` heartbeat, with the ordinary idle rule until run 2 adds its Mac-stamped reward progress, and the in-Pod timer counts a heartbeat's `progress_unix` as activity.
+`tools/posttrain_run.py run` runs a run-2 specification with `Run2Worker` (`tools/posttrain_run2.py`): run 1's worker with two more stage kinds and the reward bridge. Every artifact goes up as soon as it exists, as one label under `posttrain-runs/2/<pod id>/<label>/`, recorded in `report.json` with its seconds and SHA-256s.
+
+| Stage | Reads | Writes (R2 label: files) |
+| --- | --- | --- |
+| `rl` | run 1's selected SFT weights; the withheld RL task file, the withheld dev subset and the facts file | `rl-check-<update>`: `checkpoint.pt` at each dev check (updates 0, 12, 25, 50, 75, 100); `rl`: `result.json`, `events.jsonl`; `rl-stop-weights` when weights no check covers |
+| `more-sft` | the same SFT weights and files; RL's busy seconds, update-0 check and attention kernel | `more-sft-check-<step>`: `checkpoint.pt` after 1, 2, 4 and 8 passes and at the budget's end; `more-sft`: `control-result.json`, `control-events.jsonl` |
+| `arc-post` | each arm's selected checkpoint; the ARC-Easy questions | `arc-post-rl`, `arc-post-more-sft`: `arc.json` |
+| `eval-rl`, `eval-more-sft` | each selected checkpoint; run 1's pool exports and benchmark releases | `eval-<arm>-<file>`: `completions.jsonl`, seven files each (`chat-v1`) |
+
+Then run 1's finalization, after the bridge directories (`outbox/`, `inbox/`, `done/`, `withdrawn/`, `rejected/`, `server.lease`, `server.lease.lock`, `client.lock`) are uploaded as one label, `bridge` (`bridge.tar`), so a late reply is kept; a file the Mac replaces while it is archived is kept whole, and one it removes is named in `report.json` and left out.
+
+**RL** runs `run_rl` on the frozen protocol: 100 updates of 32 kept tasks x G = 8, temperature 1.0, top-p 1.0, at most min(256, 1,024 - prompt) new tokens, tasks shuffled with seed 0 and reshuffled each pass, a fresh AdamW (0.9 / 0.95, weight decay 0.1) at 3e-6 after 5 linear warmup updates, clip 1.0, no KL, and the RL loop's stops (non-finite, collapse, dev patience 3, leakage above 1% of rewarded attempts, reward wait, external). Rewards come through `BridgeRewardSource` and dev checks through `BridgeDevEvaluator`, one `BridgeClient` for the run, with the Mac's facts in place of the hidden tests and the cached encoder for every prompt; the model trains with fused attention and the foreach AdamW, as SFT did. `report.json` records RL's GPU-busy seconds (rollout generation plus training steps) and, separately, the dev checks' generation, the Mac waits and the checkpoint saves (RL does not compile). A reward-wait timeout, a lost bridge, a margin stop or a limit ends the run after the latest weights reach R2, since the control needs the bridge too; any other stop is a result and the control runs.
+
+**The control** runs `run_more_sft` from the same SFT weights on the kept tasks' reference solutions (chat-v1, assistant-only loss), SFT's optimizer at a constant 6e-5 after 10 warmup updates, 16 x 2 rows an update, its GPU-busy budget RL's measured busy seconds within 5%, RL's attention kernel, its start RL's update-0 check. `report.json` records the measured mismatch. The same stops end the run.
+
+**Selection.** Each arm reports the selectable check with the highest dev-subset greedy pass@1, ties to the higher 8-sample mean, then to the later check; `report.json`'s `selection` lists every check's scores and the winner's label, and the ARC and evaluation stages read the two winners. The control starts from RL's update-0 check, so when neither arm beats it both select that one file: `selection.identical_endpoints` then reads `identical: true`, both evaluation stages still run, and the owner rules how the two rows are reported before the endpoints are frozen (the unseal record and the scorecard refuse one checkpoint under two names).
+
+### Inputs and the gate
+
+`configs/rehearsal-a40-s-post-2.json` is the approved template (`posttrain_approved.run2_specification`). The values fixed at the owner's gate are `null` there: the ceiling, run 1's selected SFT weights (key, size and SHA-256 of the `sft-weights` label in run 1's verified report), the three files `scratchcoder rl-pod-export` writes and the pool test export (run 1's: the sealed split is not read again). `python -m tools.posttrain_approved run2-gate` fills them from the gate's own files and writes the launch specification; the worker, `check_run2` and the readiness receipt refuse a `null`.
+
+`scratchcoder rl-pod-export` reads the pool train split, the screening record's kept list and the pool dev split on the Mac and writes, deterministically:
+
+- `rl-tasks.jsonl`: each kept task with its hidden tests replaced by the fixed placeholder and its reference kept;
+- `rl-dev.jsonl`: the fixed 200-task dev subset, withheld, without references;
+- `rl-facts.json`: each task's parseability and best constant answer's reward, computed from the real tests (the answer itself is left out);
+- `rl-pod-export.json`: the SHA-256 and size of the sources and of the exact bytes written.
+
+The binding pins the three files; the binding, the Pod's `verify` and the worker refuse a file in which any task carries its hidden tests, and the worker checks the facts file with `load_facts` against its pinned SHA-256 before any stage starts.
+
+### The reward bridge's bounds
+
+Every bound on one wait is derived in one place, `posttrain_ops.bridge_timeouts`, and the specification writes them down (it is refused if one differs):
+
+| Bound | Rehearsal value | Derivation |
+| --- | ---: | --- |
+| One program's longest try | 42 s | the reward channel's longest budget, 27 s (2 s + 0.25 s x 100 cases), + 15 s host slack |
+| One reward attempt | 175 s | 4 tries x 42 s + 1 + 2 + 4 s of backoff |
+| Mac `--reward-timeout` | 5,600 s | ceil(256 / 8) = 32 rounds x 175 s |
+| Mac `--dev-timeout` | 9,492 s | ceil(1,800 / 8) = 225 rounds x 42 s, + 42 s for a program still running |
+| Bridge allowance | 1,397.5 s | 2 s Mac poll + 5 tries x (30 + 120 + 120 s) SSH timeouts + 3 x 15 s backoff + 0.5 s Pod poll |
+| Pod reward / dev timeout | 6,997.5 s / 10,889.5 s | the Mac's bound plus the allowance |
+| Watchdog idle extension | 7,057.5 s / 10,949.5 s | the Pod's timeout for the wait + 60 s |
+| Wait margin | 10,889.5 s | one full wait, the longer kind ($1.81 at $0.60/h) |
+| Lost bridge | 600 s | the in-Pod idle limit less 300 s |
+
+The proposal's flat 420 s is not used: 256 slow I/O attempts on 8 workers can take far longer, and a fixed value would stop a run that is merely slow.
+
+### Liveness while the Pod waits
+
+- **Heartbeat:** while the bridge client waits, the worker's sleep between looks at its inbox heartbeats `awaiting_rewards` with the client's `heartbeat()` fields (request ID, kind, index, count, start, age) every 5 s.
+- **Dev-check generation:** between two waits a dev check generates 1,800 programs on the GPU (about 184 s at the planning speed); every generation batch stamps the GPU activity and refreshes the heartbeat (`Run2Worker.dev_tick`), so neither idle rule nor the heartbeat's staleness reads it as a hung worker.
+- **Mac watchdog:** under run 2's policy an `awaiting_rewards` heartbeat naming a reward or dev request lets the GPU idle for that kind's extension, and never more, so a worker that hangs while claiming to wait is still deleted. Run 1's policy grants none. The receipt requires the policy's extensions to be exactly the derived ones.
+- **In-Pod idle rule:** the Mac's server renews `server.lease` in the Pod's bridge root, dated by the Pod's own clock, with every poll and, while it reads, scores or answers a request, every few seconds (so a slow SSH call never lets it lapse while the Mac is alive). During a wait the worker stamps `progress_unix` from a lease renewed within its 60 s; the in-Pod timer reads it through its existing `--activity` heartbeat, and a stale lease adds nothing. A dead Mac therefore lets the Pod go within 900 s of its last renewal.
+- **Lost bridge:** a wait with no lease renewal for 600 s (from the later of the wait's start and the last renewal) is given up as `bridge_lost`: the latest weights are uploaded and the run finalizes before the in-Pod timer would fire.
+- **Margin:** `should_stop` is not read during a wait, so before every update and every request the worker stops (`wait_margin`) unless one full wait fits before the cost stop, the wall and the finalization reserve. It finalizes in full.
+
+### Limits of run 2
+
+At the planned $5.80 and $0.60 an hour (`ceiling_limits`): the worker stops at $5.80, the watchdog at $5.79, the Pod wall is 34,800 s, the in-Pod timer 34,620 s; the in-Pod idle limit 900 s, the watchdog's 600 s outside waits, the transfer window 900 s. The launch rule needs 21,302 s at the planning rates, which leaves about 3.6 hours of the timer's lifetime for setup. Run 2 has no probe: the projected-finish rule prices RL's later stages at RL's measured rates, and the evaluation at the lower of the planning speed and RL's dev-check rate (the same batch and token cap), lowered further by slow evaluation files; a fast measurement never loosens it, as in run 1.
+
+### Safeguards of run 2
+
+| Safeguard | Enforced in | Tested in |
+| --- | --- | --- |
+| Gate values filled, the approved protocol unchanged | `Specification.from_dict`, `posttrain_approved.check_run2`, the receipt | `test_posttrain_run2.py`, `test_posttrain_run2_readiness.py` |
+| Derived wait bounds, equal in the specification, the policy and the runbook | `posttrain_ops.bridge_timeouts`, `specification_bridge_timeouts` | `test_posttrain_run2_guards.py`, `test_posttrain_run2_runbook.py` |
+| Watchdog extension while `awaiting_rewards`, bounded by kind | `runpod_watchdog._awaiting_within_extension`; `check_policy` | `test_posttrain_run2_guards.py`, `test_posttrain_run2_integration.py` |
+| In-Pod idle: a fresh lease is progress, a stale one is not | `Run2Worker.observe_wait`, `lease_renewed`; `pod_self_destruct --activity` | `test_posttrain_run2_guards.py`, `test_posttrain_run2.py` |
+| Lost bridge before the in-Pod timer | `Run2Worker.observe_wait` (`bridge_lost`) | `test_posttrain_run2.py` |
+| Dev-check generation stamps the GPU and the heartbeat after every batch | `Run2Worker.dev_tick`, `scratchcoder.rl.dev.ticking_generations` | `test_posttrain_run2.py`, `test_rl_dev.py` |
+| Margin for one full wait | `Run2Worker.should_stop`, `before_wait` (`wait_margin`) | `test_posttrain_run2.py`, `test_posttrain_run2_guards.py` |
+| A wait ended by an error withdraws its request | `BridgeClient._exchange` | `test_rl_bridge.py` |
+| Each check's weights in R2 at once; the latest weights and the arm's event log before any end, in either arm | `Run2Worker.upload_weights`, `salvage` | `test_posttrain_run2.py` |
+| No hidden test on the Pod | `scratchcoder.rl.pod_export`; `posttrain_binding.require_withheld`, `require_facts`; `load_facts` | `test_rl_pod_export.py`, `test_posttrain_run2.py` |
+| Run 1's safeguards (ceiling-derived lifetime, projected finish, reserve, prefix guard, verified teardown) | as run 1 | the run-2 tests above and run 1's |
+
+### Projected cost of run 2
+
+`python -m tools.pilot_feasibility posttrain --specification configs/rehearsal-a40-s-post-2.json --ceiling-usd 5.80` at the planning speeds, in the proposal's table form (with `--run1-report`, `--screening` and `--dev-results` it adds a table at run 1's measured rates):
+
+| Stage | Hours | Dollars |
+| --- | ---: | ---: |
+| Setup (bootstrap, fetch the SFT weights, tests, preflight) | 0.25 | $0.15 |
+| RL rollouts (6.55M tokens at batch 256) | 0.18 | $0.11 |
+| RL training steps (26.2M slots) | 0.13 | $0.08 |
+| RL waiting on Mac rewards (100 x 48 s) | 1.33 | $0.80 |
+| RL dev checks: generation / Mac wait (6) | 0.31 / 0.50 | $0.48 |
+| More-SFT training (equal to RL's busy time) | 0.31 | $0.19 |
+| More-SFT dev checks: generation / Mac wait (5) | 0.26 / 0.42 | $0.40 |
+| Evaluation generation, RL and more-SFT (37.6M tokens at cap) | 2.17 | $1.30 |
+| ARC-Easy on both selected checkpoints | 0.04 | $0.02 |
+| Checkpoint loads and weights saves | 0.03 | $0.02 |
+| Finalization | 0.25 | $0.15 |
+| **Total** | **6.17** | **$3.70** |
+
+With the Mac twice as slow on model output it is about 8.42 hours and $5.05, still under $5.80. The ceiling is fixed at the gate from the table at run 1's measured rates.
+
+### After run 2
+
+On the Mac, in an execution window: `eval-execute` of both checkpoints' dev completions, `eval-seal` of their test completions in run 1's ledger, and `tools.benchmark_dispatch` of their six benchmark files on GitHub Actions. Only after the owner freezes all four endpoints (base B, SFT, RL, more-SFT) is the unseal record written and the eight test completions files executed, one logged read each; then the scorecard. The [run 2 runbook](../POSTTRAIN_RUN2_RUNBOOK.md) gives every command.
 
 ## Limitations
 
 - Generation speed has never been measured; the probe measures it first.
+- Run 2's bridge has not crossed a real SSH link, and its bounds are worst cases of the channel's rules: a real wait is expected to take minutes, not hours. A live but stuck Mac can hold the Pod idle up to the extension before the watchdog deletes it, at most about $1.83 of a reward or dev wait.
 - The SSH rescue carries only the weights label (`checkpoint.pt` and `record.json`). Any other label R2 never verified is listed for a rescue by hand and teardown is not approved, but the watchdog and the in-Pod idle rule still delete the Pod 600 to 900 s after its last GPU work: the runbook's rescue block has about 2 to 7 minutes after the handover.
 - Termination is layered best effort: there is no provider-enforced Pod lifetime.
 - One seed per arm; the results are integration evidence at 135M parameters, not capability claims.

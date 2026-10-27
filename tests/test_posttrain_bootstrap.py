@@ -112,10 +112,15 @@ def test_posttrain_arms_the_derived_lifetime_and_idle_rule_first(tmp_path: Path)
     assert tests[2 : 2 + len(PILOT_TESTS)] == PILOT_TESTS
     listed = [name for name in tests if name.startswith("tests/")]
     # Every post-training test runs there, except the runbook's: a Mac document's test, which
-    # names the Mac's container runtime.
-    expected = {f"tests/{path.name}" for path in (ROOT / "tests").glob("test_posttrain_*.py")}
+    # names the Mac's container runtime. Run 2's tests run on run 2's Pod (below).
+    expected = {
+        f"tests/{path.name}"
+        for path in (ROOT / "tests").glob("test_posttrain_*.py")
+        if not path.name.startswith("test_posttrain_run2")
+    }
     assert expected - {"tests/test_posttrain_runbook.py"} <= set(listed)
     assert "tests/test_posttrain_runbook.py" not in listed
+    assert not [name for name in listed if "posttrain_run2" in name]
     for name in listed:
         path = ROOT / name
         assert path.is_file(), name  # A missing file would stop pytest on the Pod.
@@ -124,6 +129,35 @@ def test_posttrain_arms_the_derived_lifetime_and_idle_rule_first(tmp_path: Path)
     assert SECRET not in result.stdout + result.stderr + paths["log"].read_text()
     assert "R2 environment loaded for run 1 (names only)" in result.stdout
     assert "run 1 inputs are pinned and verified" in result.stdout
+
+
+def test_run_two_arms_its_own_lifetime_and_runs_its_worker_tests_too(tmp_path: Path) -> None:
+    """Run 2's Pod runs every post-training test run 1's runs, and run 2's own: the worker over
+    the bridge's directory transport, its bounds, receipt and projection. None needs a
+    container runtime or the network; the runbook's and the sandbox's tests stay on the Mac."""
+    paths = posttrain_setup(tmp_path)
+    change = {"--run": "2", "--deadline-unix": "1800034620", "--lifetime-seconds": "34620"}
+    result = run(paths, arguments(paths, **change))
+    assert result.returncode == 0, result.stderr
+    lines = calls(paths)
+    timer = lines[index(lines, "pod_self_destruct.py")]
+    assert "--max-lifetime-seconds 34620" in timer and "--deadline-unix 1800034620" in timer
+    assert "--run 2" in lines[index(lines, "tools.posttrain_ops round-trip")]
+    tests = lines[index(lines, "-m pytest")].split()
+    listed = [name for name in tests if name.startswith("tests/")]
+    expected = {f"tests/{path.name}" for path in (ROOT / "tests").glob("test_posttrain_*.py")}
+    mac_only = {
+        "tests/test_posttrain_runbook.py",
+        "tests/test_posttrain_run2_runbook.py",
+        "tests/test_posttrain_run2_sandbox.py",
+    }
+    assert expected - mac_only <= set(listed) and not mac_only & set(listed)
+    for name in listed:
+        path = ROOT / name
+        assert path.is_file(), name
+        if path.name != Path(__file__).name:
+            assert not NEEDS_DOCKER_OR_NETWORK.search(path.read_text(encoding="utf-8")), name
+    assert "R2 environment loaded for run 2 (names only)" in result.stdout
 
 
 @pytest.mark.parametrize(

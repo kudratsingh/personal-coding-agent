@@ -1,4 +1,14 @@
-"""The owner-approved definition of post-training run 1, in one place.
+"""The owner-approved definitions of post-training runs 1 and 2, in one place.
+
+Run 2 (below run 1's values): ``run2_specification()`` is the tracked template
+``configs/rehearsal-a40-s-post-2.json``, every gate value ``null`` (the ceiling, run 1's
+selected SFT weights, the three ``rl-pod-export`` files and the pool test export);
+``python -m tools.posttrain_approved run2-gate`` fills them from the gate's own files and writes
+the launch specification, and ``check_run2`` is what the readiness receipt applies to it. Its
+protocol is the proposal's, frozen at approval (RL, the more-SFT control, ARC-Easy and the
+seven evaluation files of each selected checkpoint), with the owner's later rulings: the
+1,000 RL candidates without AceCode and the reward-wait bounds derived from the channel's
+budgets (``posttrain_ops.bridge_timeouts``) in place of a flat 420 s.
 
 ``run1_specification()`` is ``configs/rehearsal-a40-s-post-1.json`` (a test keeps the two
 equal), and ``check_run1`` is what the readiness receipt applies to the specification it is
@@ -35,7 +45,7 @@ from typing import Any
 
 from scratchcoder.data import evalplus, humaneval
 from scratchcoder.eval import protocols
-from scratchcoder.rl.rollout import SCREENING_SEED
+from scratchcoder.rl.rollout import ROLLOUT_SEED, SCREENING_SEED
 
 SPECIFICATION_PATH = (
     Path(__file__).resolve().parent.parent / "configs" / "rehearsal-a40-s-post-1.json"
@@ -350,3 +360,378 @@ def check_run1(raw: Mapping[str, Any]) -> None:
 def write_specification(path: Path = SPECIFICATION_PATH) -> None:
     """Write ``run1_specification()`` in the repository's JSON style."""
     path.write_text(json.dumps(run1_specification(), indent=2) + "\n", encoding="utf-8")
+
+
+# Run 2 --------------------------------------------------------------------------------------
+
+SPECIFICATION_PATH_2 = SPECIFICATION_PATH.with_name("rehearsal-a40-s-post-2.json")
+RUN2_LIMITS: dict[str, Any] = {**LIMITS, "ceiling_usd": None, "startup_seconds": 900}
+"""Run 2's limits: the ceiling (about $5.80) is fixed at the owner's gate from run 1's
+measured rates; setup fetches only the 541 MB SFT weights, so its allowance is 900 s."""
+RUN2_PLANNING = {
+    "generation_tokens_per_second": {"64": 5_000.0, "256": 10_000.0},
+    "training_slots_per_second": 56_765.0,
+    "arc_seconds_per_checkpoint": 54,
+    "checkpoint_load_seconds": 20,
+    "weights_save_seconds": 5,
+    "reward_wait_seconds_per_update": 48,
+    "dev_wait_seconds_per_check": 300,
+}
+"""The proposal's planning speeds and run B's measured training rate, and the Mac's time: about
+48 s of rewards per update (256 attempts on 8 workers) and 300 s per 1,800-program dev check.
+The gate's projection re-prices them from run 1's measured rates."""
+RUN2_RL: dict[str, Any] = {
+    "updates": 100,
+    "tasks_per_update": 32,
+    "group_size": 8,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "max_new_tokens": 256,
+    "learning_rate": 3e-06,
+    "warmup_updates": 5,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "adam_epsilon": 1e-08,
+    "weight_decay": 0.1,
+    "gradient_clip": 1.0,
+    "micro_batch": 16,
+    "generation_batch": 256,
+    "optimizer_foreach": True,
+    "shuffle_seed": 0,
+    "rollout_seed": ROLLOUT_SEED,
+    "dev_checks": [0, 12, 25, 50, 75, 100],
+    "patience": 3,
+    "collapse_distinct": 2.0,
+    "collapse_updates": 5,
+    "leakage_rate": 0.01,
+    "leakage_min_rewarded": 100,
+    "check_at_stop": True,
+    "check_at_external_stop": False,
+    "attention": "fused",
+    "dev_tasks": 200,
+    "dev_samples": 8,
+    "dev_batch_size": 64,
+    "min_tasks": 320,
+}
+"""The frozen RL protocol: 100 updates of 32 tasks x G = 8 at temperature 1.0 and top-p 1.0,
+at most min(256, 1,024 - prompt) new tokens; tasks shuffled with seed 0 and reshuffled each
+pass; a fresh AdamW (0.9 / 0.95, weight decay 0.1) at 3e-6 after 5 warmup updates, clip 1.0,
+no KL; dev checks at 0, 12, 25, 50, 75 and 100 on the 200-task subset (greedy and n = 8);
+the collapse, patience-3 and 1% leakage stops. The kernel and the optimizer path match SFT
+(fused attention, the foreach AdamW)."""
+RUN2_CONTROL: dict[str, Any] = {
+    "batch_size": 16,
+    "accumulation_steps": 2,
+    "learning_rate": 6e-05,
+    "warmup_updates": 10,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "adam_epsilon": 1e-08,
+    "weight_decay": 0.1,
+    "gradient_clip": 1.0,
+    "seed": 0,
+    "pass_checks": [1, 2, 4, 8],
+    "max_passes": 400,
+    "tolerance": 0.05,
+    "optimizer_foreach": True,
+    "check_at_stop": True,
+    "check_at_external_stop": False,
+}
+"""The more-SFT control: SFT's optimizer at a constant 6e-5 after 10 warmup updates, 16 x 2
+rows of the kept tasks' references per update, checks after 1, 2, 4 and 8 passes and at the
+budget's end (the start is RL's update-0 check), the budget RL's busy seconds within 5%."""
+RUN2_BRIDGE_SETTINGS: dict[str, Any] = {
+    "root": "/workspace/posttrain-bridge",
+    "workers": 8,
+    "mac_poll_seconds": 2.0,
+    "pod_poll_seconds": 0.5,
+    "ssh_timeout_seconds": 120.0,
+    "ssh_list_timeout_seconds": 30.0,
+    "ssh_retries": 4,
+    "awaiting_slack_seconds": 60.0,
+}
+"""The bridge's settings, the inputs of ``posttrain_ops.bridge_timeouts``: the Pod's bridge
+root, the Mac's 8 sandbox workers, both sides' poll intervals, the SSH timeouts and retries
+(``scratchcoder rl-bridge`` defaults) and the watchdog's slack on top of a wait's timeout."""
+
+
+def bridge_section(settings: Mapping[str, Any], rl: Mapping[str, Any]) -> dict[str, Any]:
+    """A specification's ``bridge`` object: the settings and every bound they derive."""
+    from tools.posttrain_ops import DERIVED_BRIDGE_KEYS, bridge_timeouts
+
+    derived = bridge_timeouts(
+        attempts_per_request=int(rl["tasks_per_update"]) * int(rl["group_size"]),
+        dev_programs=int(rl["dev_tasks"]) * (int(rl["dev_samples"]) + 1),
+        workers=int(settings["workers"]),
+        mac_poll_seconds=float(settings["mac_poll_seconds"]),
+        pod_poll_seconds=float(settings["pod_poll_seconds"]),
+        ssh_timeout_seconds=float(settings["ssh_timeout_seconds"]),
+        ssh_list_timeout_seconds=float(settings["ssh_list_timeout_seconds"]),
+        ssh_retries=int(settings["ssh_retries"]),
+        awaiting_slack_seconds=float(settings["awaiting_slack_seconds"]),
+        pod_idle_seconds=float(LIMITS["pod_idle_seconds"]),
+    )
+    return {**settings, **{key: getattr(derived, key) for key in DERIVED_BRIDGE_KEYS}}
+
+
+RUN2_INPUTS: dict[str, dict[str, Any]] = {
+    "tokenizer": dict(INPUTS["tokenizer"]),
+    "sft-weights": {"kind": "checkpoint", "key": None, "size_bytes": None, "sha256": None},
+    "rl-tasks": {"kind": "rl-tasks", "key": None, "size_bytes": None, "sha256": None},
+    "rl-dev": {"kind": "rl-dev-tasks", "key": None, "size_bytes": None, "sha256": None},
+    "rl-facts": {"kind": "rl-facts", "key": None, "size_bytes": None, "sha256": None},
+    "pool-dev": dict(INPUTS["pool-dev"]),
+    "pool-test": dict(INPUTS["pool-test"]),
+    "humaneval": dict(INPUTS["humaneval"]),
+    "humaneval-plus": dict(INPUTS["humaneval-plus"]),
+    "mbpp-plus": dict(INPUTS["mbpp-plus"]),
+    "arc-easy-test": dict(INPUTS["arc-easy-test"]),
+}
+"""Run 2's inputs. Fixed at the gate (``null`` here): run 1's selected SFT weights (the
+``sft-weights`` label of run 1's verified report: key, size, SHA-256), the three
+``rl-pod-export`` files and the pool test export. The rest are run 1's pins."""
+GATED_INPUTS = ("sft-weights", "rl-tasks", "rl-dev", "rl-facts", "pool-test")
+
+
+def run2_stages() -> list[dict[str, Any]]:
+    """Run 2's stages in order."""
+    common = {"parent": "sft-weights", "tasks": "rl-tasks", "dev": "rl-dev", "facts": "rl-facts"}
+    return [
+        {"name": "rl", "kind": "rl", **common},
+        {"name": "more-sft", "kind": "more-sft", **common},
+        {
+            "name": "arc-post",
+            "kind": "arc",
+            "checkpoints": ["rl", "more-sft"],
+            "questions": "arc-easy-test",
+        },
+        {"name": "eval-rl", "kind": "eval", "checkpoint": "rl", "files": eval_files(False)},
+        {
+            "name": "eval-more-sft",
+            "kind": "eval",
+            "checkpoint": "more-sft",
+            "files": eval_files(False),
+        },
+    ]
+
+
+def run2_specification(gate: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Run 2's specification: the tracked template (``gate`` None, every gate value ``null``),
+    or the launch specification with the gate's values (``fill_gate``)."""
+    raw: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "posttrain-run-specification",
+        "run": "2",
+        "model": dict(MODEL),
+        "limits": dict(RUN2_LIMITS),
+        "planning": json.loads(json.dumps(RUN2_PLANNING)),
+        "generation": dict(GENERATION),
+        "rl": json.loads(json.dumps(RUN2_RL)),
+        "control": json.loads(json.dumps(RUN2_CONTROL)),
+        "bridge": bridge_section(RUN2_BRIDGE_SETTINGS, RUN2_RL),
+        "stages": run2_stages(),
+        "inputs": json.loads(json.dumps(RUN2_INPUTS)),
+        "r2": {"storage_cap_usd_per_month": 5.0},
+    }
+    return raw if gate is None else fill_gate(raw, gate)
+
+
+def _sha256_hex(value: object, name: str) -> str:
+    if not isinstance(value, str) or len(value) != 64 or value.strip("0123456789abcdef"):
+        raise ValueError(f"{name} must be 64 lowercase hex digits")
+    return value
+
+
+def fill_gate(raw: Mapping[str, Any], gate: Mapping[str, Any]) -> dict[str, Any]:
+    """The template with the gate's values: ``ceiling_usd`` and, for each gated input, its
+    pin (``sft-weights``: key, size_bytes, sha256; the others: size_bytes, sha256)."""
+    if set(gate) != {"ceiling_usd", *GATED_INPUTS}:
+        raise ValueError(f"the gate gives exactly ceiling_usd and {list(GATED_INPUTS)}")
+    filled: dict[str, Any] = json.loads(json.dumps(raw))
+    ceiling = gate["ceiling_usd"]
+    if isinstance(ceiling, bool) or not isinstance(ceiling, int | float) or not 0 < ceiling:
+        raise ValueError("the gate's ceiling must be a positive number of dollars")
+    filled["limits"]["ceiling_usd"] = float(ceiling)
+    for name in GATED_INPUTS:
+        pin = gate[name]
+        fields = (
+            {"key", "size_bytes", "sha256"} if name == "sft-weights" else {"size_bytes", "sha256"}
+        )
+        if not isinstance(pin, Mapping) or set(pin) != fields:
+            raise ValueError(f"the gate's {name} pin gives exactly {sorted(fields)}")
+        if type(pin["size_bytes"]) is not int or pin["size_bytes"] < 1:
+            raise ValueError(f"the gate's {name} size must be a positive integer")
+        _sha256_hex(pin["sha256"], f"the gate's {name} SHA-256")
+        filled["inputs"][name].update(pin)
+    from tools.posttrain_ops import ceiling_limits
+
+    ceiling_limits(float(ceiling), float(filled["limits"]["quoted_total_hourly"]))
+    return filled
+
+
+RUN2_APPROVED_SECTIONS = (
+    "model",
+    "planning",
+    "generation",
+    "rl",
+    "control",
+    "bridge",
+    "stages",
+    "r2",
+)
+"""Sections of run 2 that must equal the approved template exactly."""
+
+
+def check_run2(raw: Mapping[str, Any]) -> None:
+    """Refuse a run-2 launch specification that differs from the approved one, or in which any
+    gate value is still ``null``: every approved section equal, the limits equal but for the
+    gate's ceiling, every input pin equal but for the gate's."""
+    from tools.posttrain_run import gate_nulls
+
+    approved = run2_specification()
+    if raw.get("run") != "2" or raw.get("kind") != approved["kind"]:
+        raise ValueError("not a run-2 post-training specification")
+    missing = gate_nulls(raw)
+    if missing:
+        raise ValueError(f"run 2's gate values are still null: {missing}")
+    differ = [name for name in RUN2_APPROVED_SECTIONS if raw.get(name) != approved[name]]
+    limits = raw.get("limits", {})
+    if not isinstance(limits, Mapping) or {
+        key: value for key, value in limits.items() if key != "ceiling_usd"
+    } != {key: value for key, value in approved["limits"].items() if key != "ceiling_usd"}:
+        differ.append("limits")
+    inputs = raw.get("inputs", {})
+    if not isinstance(inputs, Mapping) or set(inputs) != set(approved["inputs"]):
+        differ.append("inputs")
+    else:
+        for name, pin in approved["inputs"].items():
+            for field, value in pin.items():
+                if value is not None and inputs[name].get(field) != value:
+                    differ.append(f"inputs.{name}.{field}")
+    if differ:
+        raise ValueError(f"the specification differs from the approved run 2 in {differ}")
+
+
+def write_specification_2(path: Path = SPECIFICATION_PATH_2) -> None:
+    """Write the tracked run-2 template (``run2_specification()``)."""
+    path.write_text(json.dumps(run2_specification(), indent=2) + "\n", encoding="utf-8")
+
+
+def run1_sft_weights(report_path: Path) -> dict[str, Any]:
+    """The pin of run 1's selected SFT weights from its verified ``report.json``: the R2 key,
+    size and SHA-256 of the ``sft-weights`` label's ``checkpoint.pt``."""
+    from tools.posttrain_ops import REPORT_KIND, SUCCESS_STATUSES, report_artifacts, run_prefix
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(report, dict)
+        or report.get("kind") != REPORT_KIND
+        or report.get("run") != "1"
+    ):
+        raise ValueError(f"{report_path} is not post-training run 1's report")
+    if report.get("status") not in SUCCESS_STATUSES:
+        raise ValueError(f"run 1's report is {report.get('status')!r}, not completed")
+    prefix = run_prefix("1", str(report.get("pod_id")))
+    rows = [
+        row
+        for row in report_artifacts(report, prefix=prefix)
+        if (row["label"], row["name"]) == ("sft-weights", "checkpoint.pt")
+    ]
+    if len(rows) != 1:
+        raise ValueError("run 1's report lists no single sft-weights/checkpoint.pt")
+    row = rows[0]
+    return {"key": row["key"], "size_bytes": row["bytes"], "sha256": row["sha256"]}
+
+
+def pod_export_pins(directory: Path) -> dict[str, dict[str, Any]]:
+    """The pins of the three ``rl-pod-export`` files, hashed from the bytes in ``directory``
+    (the record is only cross-checked), each file checked to hold no hidden test."""
+    from scratchcoder.data.shards import file_sha256
+    from scratchcoder.rl.pod_export import FILES, RECORD, read_record
+    from tools.posttrain_binding import require_export
+
+    record = read_record(directory / RECORD)
+    kinds = {"rl-tasks": "rl-tasks", "rl-dev": "rl-dev-tasks", "rl-facts": "rl-facts"}
+    pins = {}
+    for name, file in FILES.items():
+        path = directory / file
+        pin = {"size_bytes": path.stat().st_size, "sha256": file_sha256(path)}
+        listed = record["files"][name]
+        if (listed.get("bytes"), listed.get("sha256")) != (pin["size_bytes"], pin["sha256"]):
+            raise ValueError(f"{path} differs from its rl-pod-export record")
+        require_export(name, kinds[name], path)
+        pins[name] = pin
+    return pins
+
+
+def gate_values(
+    *, ceiling_usd: float, run1_report: Path, rl_pod_export: Path, pool_test_export: Path
+) -> dict[str, Any]:
+    """Every run-2 gate value from the gate's own files: the owner's ceiling, run 1's verified
+    report, the ``rl-pod-export`` directory and the pool test export."""
+    from scratchcoder.data.shards import file_sha256
+    from tools.posttrain_binding import require_export
+
+    count = require_export("pool-test", "pool-export", pool_test_export)
+    if count != POOL_TASKS:
+        raise ValueError(f"the pool test export holds {count} tasks, not {POOL_TASKS}")
+    return {
+        "ceiling_usd": ceiling_usd,
+        "sft-weights": run1_sft_weights(run1_report),
+        **pod_export_pins(rl_pod_export),
+        "pool-test": {
+            "size_bytes": pool_test_export.stat().st_size,
+            "sha256": file_sha256(pool_test_export),
+        },
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``run2-gate``: write run 2's launch specification from the gate's values (Mac);
+    ``write-template``: rewrite the tracked run-2 template."""
+    import argparse
+    import hashlib
+    import sys
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    gate = commands.add_parser("run2-gate", help="fill run 2's gate values (Mac, at the gate)")
+    gate.add_argument("--ceiling-usd", type=float, required=True, help="the owner's ceiling")
+    gate.add_argument("--run1-report", type=Path, required=True, help="run 1's verified report")
+    gate.add_argument("--rl-pod-export", type=Path, required=True, help="the rl-pod-export dir")
+    gate.add_argument("--pool-test-export", type=Path, required=True)
+    gate.add_argument("--output", type=Path, required=True, help="the new launch specification")
+    template = commands.add_parser("write-template", help="rewrite the tracked run-2 template")
+    template.add_argument("--output", type=Path, default=SPECIFICATION_PATH_2)
+    args = parser.parse_args(argv)
+    if args.command == "write-template":
+        write_specification_2(args.output)
+        return 0
+    try:
+        if args.output.exists() or args.output.is_symlink():
+            raise FileExistsError(f"{args.output} already exists; a launch spec is never rewritten")
+        values = gate_values(
+            ceiling_usd=args.ceiling_usd,
+            run1_report=args.run1_report,
+            rl_pod_export=args.rl_pod_export,
+            pool_test_export=args.pool_test_export,
+        )
+        filled = run2_specification(values)
+        check_run2(filled)
+        from tools.posttrain_run import Specification
+
+        Specification.from_dict(filled)
+    except (OSError, ValueError, KeyError) as error:
+        print(f"posttrain-approved: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    data = (json.dumps(filled, indent=2) + "\n").encode()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_bytes(data)
+    print(
+        json.dumps({"specification": str(args.output), "sha256": hashlib.sha256(data).hexdigest()})
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

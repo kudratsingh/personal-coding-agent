@@ -8,7 +8,8 @@ A dev check scores the current policy on a fixed 200-task subset of the pool's d
   ``n = 8`` samples at temperature 0.8 and top-p 0.95, sample ``i`` seeded
   ``attempt_seed(0, task ID, i)``; at most min(512, context - prompt) new tokens; stops at
   ``<|python_end|>`` or ``<|assistant_end|>``; through ``generate_many``
-  (``dev_generations``).
+  (``dev_generations``), with an optional ``tick(generated tokens)`` after every batch
+  so a long check keeps a worker's heartbeat live (the batches are unchanged).
 - **Execution:** the first closed python block of each completion goes to an injected
   executor, which returns pass or fail for each ``(task, code)`` pair. A completion without
   a program, or a prompt that fills the context, fails without running.
@@ -31,14 +32,14 @@ from __future__ import annotations
 import hashlib
 import math
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
 import torch
 
 from scratchcoder.data.chat import CODE_STOP_IDS, TextDecoder, TextEncoder, extract_program
-from scratchcoder.engine.generation import generate_many
+from scratchcoder.engine.generation import Completion, generate_many
 from scratchcoder.eval.harness import attempt_seed
 from scratchcoder.eval.metrics import pass_at_k
 from scratchcoder.eval.tasks import Task
@@ -55,6 +56,8 @@ DEV_TOP_P = 0.95
 
 DevExecutor = Callable[[Sequence[tuple[Task, str]]], Sequence[bool]]
 """Runs each ``(task, program)`` against the task's hidden tests; one pass flag per pair."""
+Tick = Callable[[int], None]
+"""Called after every generation batch with the tokens it generated."""
 
 
 def dev_subset(tasks: Sequence[Task], n: int = DEV_SUBSET_SIZE) -> list[Task]:
@@ -184,6 +187,51 @@ def _synchronized(device: torch.device) -> float:
     return time.perf_counter()
 
 
+def ticking_generations(
+    model: GPT,
+    prompts: Sequence[Sequence[int]],
+    *,
+    tick: Tick | None,
+    batch_size: int,
+    seeds: Sequence[int] | None = None,
+    stops: Sequence[Collection[int]] | None = None,
+    **options: Any,
+) -> list[Completion]:
+    """``generate_many``, with ``tick(generated tokens)`` after every batch when given.
+
+    The batches are ``generate_many``'s exactly: prompts sorted longest first (ties by
+    input index), cut into batches of ``batch_size``; each batch goes to ``generate_many``
+    on its own, already in that order, so it is one ``generate_batch`` call over the same
+    rows and every row gets the same completion.
+    """
+    if tick is None:
+        return generate_many(
+            model, prompts, batch_size=batch_size, seeds=seeds, stops=stops, **options
+        )
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+    if not prompts:
+        raise ValueError("prompts must be nonempty")
+    for name, values in (("seeds", seeds), ("stops", stops)):
+        if values is not None and len(values) != len(prompts):
+            raise ValueError(f"{name} need one entry per prompt")
+    order = sorted(range(len(prompts)), key=lambda index: (-len(prompts[index]), index))
+    results: dict[int, Completion] = {}
+    for start in range(0, len(order), batch_size):
+        chunk = order[start : start + batch_size]
+        completions = generate_many(
+            model,
+            [prompts[index] for index in chunk],
+            batch_size=batch_size,
+            seeds=None if seeds is None else [seeds[index] for index in chunk],
+            stops=None if stops is None else [stops[index] for index in chunk],
+            **options,
+        )
+        results.update(zip(chunk, completions, strict=True))
+        tick(sum(len(completion.tokens) for completion in completions))
+    return [results[index] for index in range(len(prompts))]
+
+
 def dev_generations(
     model: GPT,
     tasks: Sequence[Task],
@@ -197,11 +245,13 @@ def dev_generations(
     top_p: float = DEV_TOP_P,
     seed: int = DEV_SEED,
     max_new_tokens: int = DEV_TOKENS,
+    tick: Tick | None = None,
 ) -> list[DevGeneration]:
     """The generation half of a dev check: greedy plus ``samples`` seeded samples per task.
 
     A prompt that fills the model's context gets no generation and no programs; it fails
     every attempt and stays in the denominator, as a context limit does in evaluation.
+    ``tick``, when given, is called after every generation batch (``ticking_generations``).
     """
     if type(samples) is not int or samples < 1:
         raise ValueError("samples must be a positive integer")
@@ -211,9 +261,10 @@ def dev_generations(
     sampled: dict[tuple[int, int], str | None] = {}
     if fits:
         stops = [CODE_STOP_IDS] * len(fits)
-        completions = generate_many(
+        completions = ticking_generations(
             model,
             [prompts[index] for index in fits],
+            tick=tick,
             batch_size=batch_size,
             max_new_tokens=max_new_tokens,
             stops=stops,
@@ -222,9 +273,10 @@ def dev_generations(
         for index, completion in zip(fits, completions, strict=True):
             greedy[index] = extract_program(completion.tokens, decoder)
         rows = [(index, sample) for index in fits for sample in range(samples)]
-        completions = generate_many(
+        completions = ticking_generations(
             model,
             [prompts[index] for index, _ in rows],
+            tick=tick,
             batch_size=batch_size,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -313,8 +365,10 @@ class PoolDevEvaluator:
         precision: str | None = None,
         samples: int = DEV_SAMPLES,
         baseline: ConstantBaseline | None = None,
+        tick: Tick | None = None,
     ) -> None:
         """``precision=None`` follows the model's device: bfloat16 on CUDA, float32 otherwise.
+        ``tick`` is called after every generation batch with its tokens (a worker's heartbeat).
 
         ``baseline`` is the constant baseline the Mac computed from the real hidden tests
         (``scratchcoder.rl.facts.constant_baseline_from_facts``), for a Pod that holds none;
@@ -325,6 +379,7 @@ class PoolDevEvaluator:
         self.tasks = list(tasks)
         self.encoder, self.decoder, self.execute = encoder, decoder, execute
         self.batch_size, self.precision, self.samples = batch_size, precision, samples
+        self.tick = tick
         if baseline is None:
             refuse_withheld(tuple(self.tasks), "the dev check's constant baseline")
             baseline = constant_baseline(self.tasks)
@@ -343,6 +398,7 @@ class PoolDevEvaluator:
             batch_size=self.batch_size,
             precision=self.precision or ("bfloat16" if device.type == "cuda" else "float32"),
             samples=self.samples,
+            tick=self.tick,
         )
         generated = _synchronized(device)
         results, missing = score_generations(self.tasks, generations, self.execute)

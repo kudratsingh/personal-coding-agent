@@ -396,6 +396,13 @@ if [[ "$RUN_TESTS" == "1" ]]; then
       tests/test_posttrain_binding.py tests/test_posttrain_integration.py
       tests/test_posttrain_readiness.py
       tests/test_posttrain_bootstrap.py tests/test_posttrain_feasibility.py)
+    if [[ "$RUN" == "2" ]]; then
+      # Run 2's worker over the reward bridge's directory transport, its bounds and its
+      # receipt; the bridge itself. None needs a container runtime or the network.
+      TESTS+=(tests/test_posttrain_run2.py tests/test_posttrain_run2_guards.py
+        tests/test_posttrain_run2_integration.py tests/test_posttrain_run2_readiness.py
+        tests/test_posttrain_run2_feasibility.py tests/test_rl_facts.py)
+    fi
   fi
   python3 -m pytest "${TESTS[@]}" -q -p no:cacheprovider 2>&1 | tail -5
   stamp tests

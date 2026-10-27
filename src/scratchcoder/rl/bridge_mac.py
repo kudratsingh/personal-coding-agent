@@ -19,9 +19,10 @@ and, for every request without a reply:
 5. stores the reply on the Mac, then pushes it by atomic rename over SSH.
 
 One Mac server serves a Pod at a time: the server takes a lease on the Pod (``server.lease``
-in its bridge root, renewed by every listing and by the progress ticker while it scores) and
-a second server is refused with ``BridgeLeaseHeld``, so a request is never scored twice by
-two Macs to different rewards.
+in its bridge root, renewed by every listing and by the progress ticker while it scores,
+reads a request or pushes a reply, so a slow SSH call never lets it lapse) and a second
+server is refused with ``BridgeLeaseHeld``, so a request is never scored twice by two Macs
+to different rewards.
 
 SSH calls are retried a bounded number of times with doubling backoff; a request read whose
 size differs from the listing is looked at again on the next poll, and an unreadable one is
@@ -105,8 +106,8 @@ LEASE_FILE = "server.lease"
 LEASE_LOCK = "server.lease.lock"
 LEASE_SECONDS = 60.0
 """How long a server's claim on the Pod holds without renewal. A poll or the progress ticker
-renews it every few seconds, so another server can take over only after this server has
-been silent for this long."""
+(while a request is read, scored or answered) renews it every few seconds, so another
+server can take over only after this server has been silent for this long."""
 MAX_LEASE_SECONDS = 3600.0
 SERVER_ID = re.compile(r"[0-9a-f]{32}\Z")
 EXIT_TOO_LARGE = 3
@@ -1115,6 +1116,7 @@ class BridgeServer:
             if self.lease_seconds is not None:
                 transport.claim(self.server_id, self.lease_seconds)
             self._scoring = threading.Event()
+            self._transferring = threading.Event()
             self._lease_lost: BridgeLeaseHeld | None = None
             self.log = EventLogger(state / "events.jsonl", "rl-bridge")  # last: nothing to close
         except BaseException:
@@ -1169,8 +1171,21 @@ class BridgeServer:
                 self._sleep(min(self.max_backoff_seconds, self.backoff_seconds * 2.0**attempt))
         raise AssertionError("unreachable")
 
+    def _transfer[T](self, what: str, operation: Callable[[], T]) -> T:
+        """``_retry`` for a read or a write, with the ticker renewing the lease meanwhile:
+        at its worst (every try to its timeout) one such call outlasts the lease and the
+        Pod's lost-bridge rule, though the Mac is alive. A lease another server took ends
+        this server before anything is pushed."""
+        self._transferring.set()
+        try:
+            return self._retry(what, operation)
+        finally:
+            self._transferring.clear()
+
     def _push(self, name: RequestName, raw: bytes) -> None:
-        self._retry("write", lambda: self.transport.write_reply(name.file_name, raw))
+        if self._lease_lost is not None:
+            raise self._lease_lost
+        self._transfer("write", lambda: self.transport.write_reply(name.file_name, raw))
 
     # ----------------------------------------------------------------------- polling
 
@@ -1203,7 +1218,7 @@ class BridgeServer:
         if size > self.max_request_bytes:
             return self._refuse(name, "oversized", f"{size} bytes, over {self.max_request_bytes}")
         try:
-            raw = self._retry(
+            raw = self._transfer(
                 "read",
                 lambda: self.transport.read_request(
                     name.file_name, max_bytes=self.max_request_bytes
@@ -1213,6 +1228,8 @@ class BridgeServer:
             return False  # consumed or withdrawn since the listing
         except RequestTooLarge:
             return self._refuse(name, "oversized", f"over {self.max_request_bytes} bytes")
+        if self._lease_lost is not None:
+            raise self._lease_lost  # another server took the Pod during the read
         if len(raw) != size:
             self.log.event(
                 "request_changed", request_id=name.request_id, listed=size, read=len(raw)
@@ -1323,9 +1340,10 @@ class BridgeServer:
         return True
 
     def _renew_lease(self) -> None:
-        """Renew the lease from the progress ticker while a long scoring call runs (the
-        polls that normally renew it are paused). A trouble is recorded and left to the next
-        poll; a lease another server took ends this server before it pushes anything."""
+        """Renew the lease from the progress ticker while a long scoring call, a read or a
+        write runs (the polls that normally renew it are paused). A trouble is recorded and
+        left to the next poll; a lease another server took ends this server before it pushes
+        anything."""
         if self.lease_seconds is None:
             return
         try:
@@ -1415,7 +1433,8 @@ class BridgeServer:
         last ``BridgeTransportError``. Any other error is recorded in ``progress.json``
         (state ``failed``) and raised; nothing unscored is stored, so a restarted server
         scores that request again. ``progress_seconds`` is the ticker that rewrites
-        ``progress.json`` while a long scoring call runs (``None`` for no ticker).
+        ``progress.json`` and, while a request is read, scored or answered, renews the lease
+        (``None`` for no ticker).
         """
         if type(max_consecutive_failures) is not int or max_consecutive_failures < 1:
             raise ValueError("max_consecutive_failures must be a positive integer")
@@ -1427,7 +1446,7 @@ class BridgeServer:
             def tick() -> None:
                 while not stop.wait(interval):
                     self.progress.write()
-                    if self._scoring.is_set():
+                    if self._scoring.is_set() or self._transferring.is_set():
                         self._renew_lease()
 
             ticker = threading.Thread(target=tick, name="rl-bridge-progress", daemon=True)

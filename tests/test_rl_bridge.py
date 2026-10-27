@@ -329,6 +329,32 @@ def test_a_timeout_withdraws_the_request_and_raises_reward_timeout(tmp_path: Pat
         BridgeRewardSource(client, task_file_sha256="nope", timeout=1)
 
 
+def test_an_error_raised_while_waiting_withdraws_the_request(tmp_path: Path) -> None:
+    """Whatever ends a wait, nobody waits for the request any more: an error from the injected
+    sleep (the run-2 worker giving up on a lost bridge, or a limit) withdraws it too, so the
+    Mac never scores a request no Pod reads."""
+    clock = FakeClock()
+    pod = tmp_path / "pod"
+
+    class GiveUp(Exception):
+        pass
+
+    def give_up() -> None:
+        if clock.now >= 4:
+            raise GiveUp
+
+    clock.hooks.append(give_up)
+    with pod_client(pod, clock, poll_seconds=2.0) as client:
+        source = BridgeRewardSource(client, task_file_sha256=RL_SHA, timeout=60)
+        with pytest.raises(GiveUp):
+            source.rewards(5, attempts())
+        assert not list((pod / "outbox").iterdir())
+        assert [path.name for path in (pod / "withdrawn").iterdir()] == [
+            f"{SESSION}-000001-reward-000005.json"
+        ]
+        assert client.waiting() is None
+
+
 def test_the_pod_rejects_wrong_replies_and_accepts_the_right_one(tmp_path: Path) -> None:
     clock = FakeClock()
     pod = tmp_path / "pod"
@@ -1121,6 +1147,85 @@ def test_the_ticker_renews_the_lease_while_a_long_request_is_scored(tmp_path: Pa
         thread.join(timeout=10)
         server.close()
     assert not errors
+
+
+class HeldTransport(DirectoryTransport):
+    """A directory transport whose first read or write (``hold``) waits until the test lets it
+    go: an SSH call retried towards its timeout, which at its worst outlasts the lease."""
+
+    def __init__(self, root: Path, *, hold: str) -> None:
+        super().__init__(root)
+        self.hold = hold
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def _held(self, what: str) -> None:
+        if what == self.hold and not self.entered.is_set():
+            self.entered.set()
+            assert self.release.wait(timeout=30)
+
+    def read_request(self, name: str, *, max_bytes: int) -> bytes:
+        self._held("read")
+        return super().read_request(name, max_bytes=max_bytes)
+
+    def write_reply(self, name: str, data: bytes) -> None:
+        self._held("write")
+        super().write_reply(name, data)
+
+
+@pytest.mark.parametrize("hold", ["read", "write"])
+def test_the_ticker_renews_the_lease_while_a_slow_read_or_push_runs(
+    tmp_path: Path, hold: str
+) -> None:
+    """The Pod gives a wait up when the lease stays stale for its lost-bridge bound; a read or
+    a push retried to its timeouts must not let it go stale while the Mac is alive."""
+    pod = tmp_path / "pod"
+    request = reward_request()
+    write_request(pod, request)
+    transport = HeldTransport(pod, hold=hold)
+    errors: list[BaseException] = []
+    server = mac_server(pod, tmp_path / "mac", transport=transport, real_sleep=True)
+    thread, stop = serve_in_thread(server, errors)
+    try:
+        assert transport.entered.wait(timeout=10)
+        first = lease_file(pod)["renewed"]
+        wait_until(lambda: lease_file(pod)["renewed"] > first, f"a renewal during the {hold}")
+        transport.release.set()
+        wait_until(lambda: (pod / "inbox" / request.name.file_name).exists(), "the reply")
+    finally:
+        stop.set()
+        transport.release.set()
+        thread.join(timeout=10)
+        server.close()
+    assert not errors
+
+
+def test_a_server_that_lost_its_lease_during_a_read_scores_and_pushes_nothing(
+    tmp_path: Path,
+) -> None:
+    pod = tmp_path / "pod"
+    request = reward_request()
+    write_request(pod, request)
+    transport = HeldTransport(pod, hold="read")
+    rewards = CountingRewards()
+    errors: list[BaseException] = []
+    server = mac_server(
+        pod, tmp_path / "mac", transport=transport, rewards=rewards, real_sleep=True
+    )
+    thread, stop = serve_in_thread(server, errors)
+    try:
+        assert transport.entered.wait(timeout=10)
+        other = {"format": "rl-bridge-lease-v1", "server": "e" * 32, "seconds": 60.0}
+        (pod / "server.lease").write_text(json.dumps({**other, "renewed": time.time()}))
+        wait_until(lambda: server._lease_lost is not None, "the ticker to notice")
+        transport.release.set()
+        thread.join(timeout=10)
+    finally:
+        stop.set()
+        transport.release.set()
+        server.close()
+    assert len(errors) == 1 and isinstance(errors[0], BridgeLeaseHeld)
+    assert rewards.calls == [] and not (pod / "inbox" / request.name.file_name).exists()
+    assert not list((tmp_path / "mac" / "replies").iterdir())
 
 
 def test_a_server_that_lost_its_lease_while_scoring_stores_and_pushes_nothing(

@@ -4,10 +4,12 @@ Built on the Mac from the Pod's own evidence and the owner's confirmations, in e
 form ``tools.posttrain_run run`` accepts (its ``check_readiness`` is applied before anything
 is written). Besides the pretraining rehearsal's owner gates and termination checks it requires:
 
-- the specification to be the approved run 1 (``posttrain_approved.check_run1``) and the
-  binding to name exactly its inputs at every pinned value;
+- the specification to be the approved run 1 or run 2 (``posttrain_approved.check_run1``,
+  ``check_run2``; for run 2 with every gate value filled) and the binding to name exactly its
+  inputs at every pinned value;
 - a watchdog policy at least as strict as the ceiling-derived limits (mode ``posttrain``,
-  wall and cost stop from ``posttrain_ops.ceiling_limits``, the 900 s transfer window);
+  wall and cost stop from ``posttrain_ops.ceiling_limits``, the 900 s transfer window), with
+  run 2's ``awaiting_rewards`` idle extensions exactly the derived bounds (run 1: none);
 - a live in-Pod timer, not a dry run, armed no later than the billing origin plus the
   derived timer lifetime (17,820 s), with the 900 s idle rule watching the worker's
   heartbeat (``self_destruct_idle``);
@@ -15,7 +17,8 @@ is written). Besides the pretraining rehearsal's owner gates and termination che
   weights-only label needs (``r2_round_trip_tested``);
 - the Pod's fetch receipt and re-verification of every bound input
   (``r2_inputs_staged_and_hash_checked``);
-- the Mac's own pinned copies of the parent checkpoints (``mac_parent_copies_verified``);
+- the Mac's own pinned copies of the parent checkpoints (``mac_parent_copies_verified``; run
+  2's parent is run 1's selected SFT weights);
 - a completed A40 preflight with the fused-attention and compile checks, a clean code
   revision and a captured Pod price no higher than the GPU quote;
 - the lifetime left to hold every stage at the planning rates (the worker's launch rule).
@@ -40,11 +43,15 @@ from tools.pilot_readiness_receipt import (
     round_trip_passed,
     self_destruct_live,
 )
-from tools.posttrain_approved import PARENTS, check_run1
+from tools.posttrain_approved import PARENTS, check_run1, check_run2
 from tools.posttrain_run import Specification, check_policy, check_readiness, launch_fit
 from tools.rehearsal_run import lifetime_end
 from tools.runpod_watchdog import PodIdentity, Policy, parse_timestamp
 
+MAC_COPIES = {"1": PARENTS, "2": ("sft-weights",)}
+"""The inputs the Mac must hold its own pinned copy of before the Pod exists: run 1's three
+parent checkpoints, run 2's SFT weights (run 1's selected checkpoint)."""
+APPROVED_CHECKS = {"1": check_run1, "2": check_run2}
 DEFAULT_HEARTBEAT = "/workspace/posttrain-run/heartbeat.json"
 """The worker's heartbeat on the Pod (its ``--output``), which the in-Pod timer must watch."""
 
@@ -87,7 +94,7 @@ def build_receipt(
 ) -> dict[str, Any]:
     created_at = time.time() if now is None else now
     spec = Specification.load(specification)
-    check_run1(spec.raw)
+    APPROVED_CHECKS[spec.run](spec.raw)  # Run 2 also refuses any gate value still null.
     bound = posttrain_binding.load_binding(binding, expected_sha256=binding_sha256)
     posttrain_binding.require_specification(bound, spec.raw)
     pod_identity = PodIdentity.from_dict(_load(identity))
@@ -128,7 +135,7 @@ def build_receipt(
         raise ValueError("the A40 preflight has not completed on cuda:0")
     posttrain_binding.check_fetch_receipt(_load(data_fetch), bound)
     check_verification(_load(data_verification), bound)
-    posttrain_binding.check_fetch_receipt(_load(mac_copy), bound, names=PARENTS)
+    posttrain_binding.check_fetch_receipt(_load(mac_copy), bound, names=MAC_COPIES[spec.run])
     prefix = posttrain_ops.run_prefix(spec.run, pod_identity.pod_id)
     probed = round_trip_passed(
         _load(round_trip),
@@ -199,6 +206,9 @@ def build_receipt(
         },
         "time_fit": {**fit, "lifetime_end_unix": end, "checked_at_unix": created_at},
     }
+    bridge = spec.bridge_timeouts
+    if bridge is not None:
+        receipt["bridge_timeouts"] = asdict(bridge)  # Run 2's derived wait bounds.
     for gate in posttrain_ops.OWNER_GATES:
         receipt[gate] = owner.get(gate)
     # Exactly the worker's own acceptance check, so a written receipt is one it accepts.

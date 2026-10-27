@@ -10,7 +10,7 @@ import torch
 
 from scratchcoder.common.config import ModelConfig
 from scratchcoder.data.chat import CODE_STOP_IDS, PYTHON_END, PYTHON_START, task_prompt
-from scratchcoder.engine.generation import Completion
+from scratchcoder.engine.generation import Completion, generate_many
 from scratchcoder.eval.harness import attempt_seed
 from scratchcoder.eval.tasks import Task
 from scratchcoder.model.gpt import GPT
@@ -162,6 +162,51 @@ def test_pool_dev_evaluator_runs_end_to_end_on_a_tiny_model() -> None:
     assert result.mean_pass_n8 * 8 * 3 + result.greedy_pass_at_1 * 3 == pytest.approx(programs)
     again = evaluator.evaluate(model, 13)
     assert again.per_task == result.per_task  # seeded: the same policy gives the same check
+
+
+def test_a_ticking_dev_check_generates_exactly_what_an_unticked_one_does() -> None:
+    """``tick`` after every batch keeps a worker's heartbeat live through a long check; the
+    batches are ``generate_many``'s, so every row gets the same completion."""
+    torch.manual_seed(0)
+    model = GPT(ModelConfig(vocab_size=272, width=16, layers=1, heads=2, context=128))
+    tasks = [
+        Task(**{**dev_task(f"t{index}").__dict__, "prompt": "Compute f." + " now" * index})
+        for index in range(5)
+    ]
+    plain = dev_generations(model, tasks, TOKENIZER, TOKENIZER, batch_size=3)
+    ticks: list[int] = []
+    ticked = dev_generations(model, tasks, TOKENIZER, TOKENIZER, batch_size=3, tick=ticks.append)
+    assert ticked == plain
+    assert len(ticks) == math.ceil(5 / 3) + math.ceil(5 * 8 / 3) and all(n >= 0 for n in ticks)
+    prompts = [task_prompt(TOKENIZER, task) for task in tasks]
+    options: dict[str, Any] = {"max_new_tokens": 6, "temperature": 0.8, "top_p": 0.95}
+    seeds = list(range(10, 15))
+    expected = generate_many(model, prompts, batch_size=2, seeds=seeds, **options)
+    calls: list[int] = []
+    got = dev.ticking_generations(
+        model, prompts, tick=calls.append, batch_size=2, seeds=seeds, **options
+    )
+    assert [row.tokens for row in got] == [row.tokens for row in expected]
+    assert len(calls) == 3 and sum(calls) == sum(len(row.tokens) for row in got)
+    with pytest.raises(ValueError, match="nonempty"):
+        dev.ticking_generations(model, [], tick=calls.append, batch_size=2, **options)
+    with pytest.raises(ValueError, match="one entry per prompt"):
+        dev.ticking_generations(
+            model, prompts, tick=calls.append, batch_size=2, seeds=[1], **options
+        )
+    executed: list[int] = []
+
+    def execute(pairs: Sequence[tuple[Task, str]]) -> list[bool]:
+        executed.append(len(pairs))
+        return [len(code) % 2 == 0 for _, code in pairs]
+
+    beats: list[int] = []
+    evaluator = PoolDevEvaluator(tasks, TOKENIZER, TOKENIZER, execute, batch_size=4)
+    ticking = PoolDevEvaluator(
+        tasks, TOKENIZER, TOKENIZER, execute, batch_size=4, tick=beats.append
+    )
+    assert ticking.evaluate(model, 1).per_task == evaluator.evaluate(model, 1).per_task
+    assert len(beats) == math.ceil(5 / 4) + math.ceil(40 / 4)
 
 
 def test_selection_prefers_greedy_then_the_mean_then_the_later_check() -> None:
