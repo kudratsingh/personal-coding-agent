@@ -2,10 +2,13 @@
 
 The command reads the Mac's full task files (the pool's train split for the kept
 screening list, the dev split for the 200-task dev subset), refuses to start when a
-secret could reach a child process (any ``R2_`` variable, the Runpod key, or a name the
-``.env`` file defines), clears the SSH agent variables, and runs ``BridgeServer`` over the
-rehearsal's SSH options until interrupted. It never opens the sealed test or holdout split.
-See ``docs/rl.md`` and ``docs/walkthroughs/rl-bridge.md``.
+secret could reach a child process (any ``R2_`` variable, the Runpod key, or a name a
+``.env`` file defines; the files are found in the current directory and the checkout, and
+at least one must exist unless ``--no-dotenv``), clears the SSH agent variables, and runs
+``BridgeServer`` over the rehearsal's SSH options until interrupted, with the required
+Mac-side bounds on a reward request and a dev check. It never opens the sealed test or
+holdout split, whether named directly or reached through a link. See ``docs/rl.md`` and
+``docs/walkthroughs/rl-bridge.md``.
 """
 
 from __future__ import annotations
