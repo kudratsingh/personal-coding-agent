@@ -112,6 +112,11 @@ def evaluate(
         raise ValueError("evaluation needs nonempty unique tasks")
     if any(task.split == "train" for task in tasks):
         raise ValueError("reported evaluation cannot use training tasks")
+    if any(task.split == "test" for task in tasks):
+        raise ValueError(
+            "the sealed pool test split is scored only by eval-execute under an unseal "
+            "record, which logs the read; this path would score it unlogged"
+        )
     if not checkpoint_hash or not tokenizer_hash:
         raise ValueError("checkpoint and tokenizer identities are required")
     commit, dirty = git_state()

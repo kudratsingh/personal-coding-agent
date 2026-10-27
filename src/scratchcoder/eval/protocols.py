@@ -198,8 +198,12 @@ def load_suite_tasks(suite: str, split: str, path: Path) -> tuple[list[Task], li
     if suite == POOL:
         if split not in POOL_SPLITS:
             raise ValueError("a pool suite's split is dev or test")
-        tasks = list(load_tasks(path))
-        if not tasks or any(task.split != split for task in tasks):
+        tasks = []
+        for task in load_tasks(path):
+            if task.split != split:  # Stop at the first foreign task; read no further.
+                raise ValueError(f"the pool task file must hold only {split} tasks")
+            tasks.append(task)
+        if not tasks:
             raise ValueError(f"the pool task file must hold only {split} tasks")
     else:
         family(suite)

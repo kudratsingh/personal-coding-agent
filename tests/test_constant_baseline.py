@@ -3,6 +3,7 @@
 import json
 import re
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -145,6 +146,13 @@ def test_the_test_split_is_refused_outside_the_unseal_step(tmp_path: Path) -> No
     path = save_task_file(tmp_path / "test.jsonl", [task])
     with pytest.raises(PermissionError, match="unseal"):
         pool_baseline_report(path, split="test")
+    # A sealed file handed to the dev path is dropped at its first foreign task: the loader
+    # reads no further (the invalid second line is never parsed) and nothing is hashed.
+    first = json.dumps(asdict(task), sort_keys=True)
+    foreign = tmp_path / "foreign.jsonl"
+    foreign.write_text(first + "\nthis line is not JSON\n")
+    with pytest.raises(ValueError, match="only dev tasks"):
+        pool_baseline_report(foreign, split="dev")
     dev = save_task_file(tmp_path / "dev.jsonl", [pool_task("t/2")])
     report = pool_baseline_report(dev, split="dev")
     assert report["split"] == "dev" and len(report["task_file_sha256"]) == 64

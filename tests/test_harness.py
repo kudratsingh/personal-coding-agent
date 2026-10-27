@@ -32,7 +32,7 @@ def tasks_fixture() -> list[Task]:
             source=f"synthetic-{i}",
             license="fixture",
             written_by="human" if i == 0 else "model",
-            split="test",
+            split="dev",
         )
         for i in range(2)
     ]
@@ -92,6 +92,25 @@ def test_context_limit_counts_as_model_limit_and_training_tasks_rejected() -> No
             checkpoint_hash="checkpoint",
             tokenizer_hash="tokenizer",
         )
+
+
+def test_the_sealed_test_split_is_not_scored_by_the_unlogged_path() -> None:
+    ran: list[str] = []
+
+    def generate(task: Task, seed: int) -> str:
+        ran.append(task.id)
+        return "correct"
+
+    with pytest.raises(ValueError, match="eval-execute under an unseal"):
+        evaluate(
+            [replace(tasks_fixture()[0], split="test")],
+            generate,
+            config=EvaluationConfig(),
+            checkpoint_hash="checkpoint",
+            tokenizer_hash="tokenizer",
+            execute=lambda *_: Result("passed"),
+        )
+    assert ran == []  # Refused before anything is generated or executed.
 
 
 def test_task_order_does_not_change_seeds_or_scores() -> None:
