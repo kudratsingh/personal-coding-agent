@@ -1885,6 +1885,38 @@ def test_live_process_level_outcomes_match_evaluation() -> None:
             assert result.reward == (1.0 if expected else 0.0), code
 
 
+# Source text the evaluation program hands to ``python /tmp/candidate.py`` as UTF-8 bytes: a
+# byte-order mark is dropped, an encoding line is honoured (or rejected), and both paths agree.
+SOURCE_FUNCTION = "def f():\n    return 1\n"
+LIVE_SOURCE_FORMS: list[tuple[str, bool]] = [
+    (SOURCE_FUNCTION, True),
+    ("\ufeff" + SOURCE_FUNCTION, True),
+    (SOURCE_FUNCTION.replace("\n", "\r\n"), True),
+    ("# coding: latin-1\ns = '\u00e9'\n" + SOURCE_FUNCTION, True),
+    ("# coding: ascii\n# \u00e9\n" + SOURCE_FUNCTION, False),
+    ("# coding: nosuchcodec\n" + SOURCE_FUNCTION, False),
+]
+
+
+@integration
+def test_live_source_text_is_read_as_the_evaluation_program_reads_it() -> None:
+    hidden = "assert f() == 1"
+
+    def verdicts(item: tuple[str, bool]) -> tuple[str, float | None, bool, bool]:
+        code, expected = item
+        return (
+            code,
+            live(function_task(hidden), code).reward,
+            runner.run(code, hidden).passed,
+            expected,
+        )
+
+    with ThreadPoolExecutor(4) as pool:
+        for code, rewarded, evaluated, expected in pool.map(verdicts, LIVE_SOURCE_FORMS):
+            assert evaluated is expected, code
+            assert rewarded == (1.0 if expected else 0.0), code
+
+
 @integration
 def test_live_resource_kill_is_distinct_from_timeout() -> None:
     task = function_task("assert secret(1) == 1")
@@ -2105,6 +2137,7 @@ EQUIVALENCE = {
         TWO_CASES[:1],
     ),
     "coding_cookie": ("# -*- coding: latin-1 -*-\nprint(int(input()) * 2)", TWO_CASES),
+    "byte_order_mark": ("\ufeffprint(int(input()) * 2)", TWO_CASES),
     "os_exit_flushed": (
         "import os, sys\nprint(int(input()) * 2)\nsys.stdout.flush()\nos._exit(0)",
         TWO_CASES,

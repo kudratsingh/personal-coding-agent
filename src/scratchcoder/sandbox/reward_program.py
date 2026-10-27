@@ -227,7 +227,9 @@ def main():
     sys.argv[:] = ["/tmp/candidate.py"]
     namespace = vars(script)
     try:
-        exec(compile(code, "/tmp/candidate.py", "exec"), namespace)
+        # The source is compiled as UTF-8 bytes, as ``python /tmp/candidate.py`` reads the
+        # file: a byte-order mark is dropped and an encoding line is honoured (or rejected).
+        exec(compile(code.encode("utf-8"), "/tmp/candidate.py", "exec"), namespace)
         exec(compile(setup, "<setup>", "exec"), namespace)
     except BaseException:
         for index in range(len(calls)):

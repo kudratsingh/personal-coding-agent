@@ -83,7 +83,8 @@ host: classify the invocation from the frames → validate and decode each row i
   does not end with the marker plus whitespace (an `atexit` print, a destructor's complaint
   on stderr, `sys.stdout.close()`, a replaced `sys.stdout`). A process the budget ends before
   every call reported keeps the calls that did, which the evaluation program does not do (it
-  fails a timeout whole).
+  fails a timeout whole). The source is compiled as UTF-8 bytes, as the file is read, so a
+  byte-order mark is dropped and an encoding line is honoured or rejected as it is there.
 - **I/O mode.** `parse_io_cases` returns the inputs and the expected outputs. Only the inputs
   enter the container. The supervisor starts one clean interpreter per attempt as a fork
   server; each case runs in a fresh fork of it, in turn, under one deadline shared by all the
@@ -261,11 +262,12 @@ host: classify the invocation from the frames → validate and decode each row i
   work, and a candidate that rewinds stdin to read the call sources finds nothing); that output
   past the cap (the marker included), an `atexit` exit status, a never-ending thread, output
   after the last call, a stream a forked process holds open, and a closed or replaced stdout
-  fail every check, as in evaluation; that a candidate that stops the fork server is still
-  scored well inside the stall deadline; and that `/tmp` files persist across I/O cases in
-  both paths. Unit tests also
-  cover the `oversized` refusal, the supervisor's `spawn_failed` report before any candidate
-  process and its absence after one, and the degenerate-answer baseline.
+  fail every check, as in evaluation, and that source text (a byte-order mark, encoding
+  lines) is read as the evaluation program reads it; that a candidate that stops the fork
+  server is still scored well inside the stall deadline; and that `/tmp` files persist
+  across I/O cases in both paths. Unit tests also cover the `oversized` refusal, the
+  supervisor's `spawn_failed` report before any candidate process and its absence after one,
+  and the degenerate-answer baseline.
 - Commands: `uv run --locked pytest tests/test_reward_channel.py` for the unit tests, and
   `SCRATCHCODER_SANDBOX_TESTS=1 uv run --locked pytest tests/test_reward_channel.py` on a
   disposable Docker worker for the Docker-backed tests.
