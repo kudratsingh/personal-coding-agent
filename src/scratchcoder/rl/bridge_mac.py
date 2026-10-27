@@ -24,6 +24,12 @@ reads a request or pushes a reply, so a slow SSH call never lets it lapse) and a
 server is refused with ``BridgeLeaseHeld``, so a request is never scored twice by two Macs
 to different rewards.
 
+With a ``window_check`` the server repeats the Mac execution-window checks
+(``scratchcoder.sandbox.window``) on its own process while it runs: at its start and before
+it scores a request once the last pass is ``window_check_seconds`` old. A failed or errored
+pass ends the server (``WindowCheckFailed``) before anything more is scored, its receipt in
+``window-checks/`` in the state directory.
+
 SSH calls are retried a bounded number of times with doubling backoff; a request read whose
 size differs from the listing is looked at again on the next poll, and an unreadable one is
 refused only when the second look finds it unchanged (a non-atomic writer may still be at

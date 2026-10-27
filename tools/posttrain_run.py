@@ -25,12 +25,17 @@
     1. ``rl``: ``run_rl`` from run 1's selected SFT weights on the withheld kept tasks, its
        rewards and dev verdicts from the Mac through the reward bridge
        (``BridgeRewardSource``, ``BridgeDevEvaluator``), each dev check's weights uploaded
-       at once. A reward-wait timeout, a lost bridge or a margin stop ends the run (the
-       control needs the bridge too); collapse, patience, leakage or completion is a result.
+       at once. A reward-wait timeout, a host failure, a lost bridge or a margin stop ends
+       RL's training, not the run: the stages that need no Mac wait follow
+       (``tools/posttrain_run2.py``, ``ARM_STOP_RULE``); collapse, patience, leakage or
+       completion is a result.
     2. ``more-sft``: ``run_more_sft`` from the same SFT weights on the kept tasks' references,
        its GPU-busy budget RL's measured busy seconds, its dev checks through the bridge.
     3. ``arc-post``: ARC-Easy on the RL-selected and the control-selected checkpoints.
     4. ``eval-rl``, ``eval-more-sft``: the seven completions files of each (chat-v1).
+
+    An arm whose selected weights are the SFT weights, bit for bit, is not evaluated again:
+    run 1's SFT results, pinned in ``sft_results``, stand for it (``SAME_WEIGHTS_RULE``).
 
     While the bridge client waits the heartbeat reads ``awaiting_rewards``, and a Mac lease
     renewed on the Pod counts as progress for the in-Pod idle rule (``RUN2_LIVENESS``).
