@@ -666,6 +666,39 @@ def test_a_wait_that_cannot_fit_never_starts(found: Fixtures2, tmp_path: Path) -
     assert report["rl"]["stop_reason"] == "reward_wait" and report["rl"]["checks"] == []
 
 
+def test_a_limit_reached_during_a_wait_ends_the_run_with_that_limit(
+    found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defense in depth behind the margin: with the margin disabled, a cost stop reached while
+    the Pod waits ends the wait cleanly and the run with ``cost_limit``."""
+    bridge = tmp_path / "bridge"
+    clock = FastClock(step=50.0, on_sleep=lease_writer(bridge))
+    monkeypatch.setattr(Run2Worker, "margin_reason", lambda self, wait_seconds: None)
+    limits = RunLimits(
+        pod_seconds=18_000,
+        quoted_total_hourly=0.6,
+        cost_stop_usd=3.0,
+        idle_seconds=600,
+        starting_cost_usd=3.0 - 120 / 3600 * 0.6,
+    )
+    ran = execute(
+        found,
+        tmp_path / "run",
+        mac=False,
+        clock=clock.wall,
+        bridge_root=bridge,
+        bridge_clock=clock.monotonic,
+        bridge_sleep=clock.sleep,
+        limits=limits,
+        pod_created=clock.wall(),
+    )
+    report = ran.report
+    assert (report["status"], report["stop_reason"]) == ("stopped", "cost_limit")
+    assert report["rl"]["stop_reason"] == "reward_wait"
+    assert "cost_limit stop was reached while waiting" in report["rl"]["stop_detail"]
+    assert not list((bridge / "outbox").iterdir())  # The request was withdrawn.
+
+
 def test_an_rl_early_stop_is_a_result_and_the_control_runs(
     found: Fixtures2, tmp_path: Path
 ) -> None:

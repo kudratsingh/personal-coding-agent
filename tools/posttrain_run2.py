@@ -104,6 +104,12 @@ class WaitMarginStop(RewardTimeout):
     saved; the worker reports ``wait_margin``."""
 
 
+class WaitLimitStop(RewardTimeout):
+    """The wall or cost stop was reached during a wait: the wait ends cleanly as a reward
+    wait and the worker reports the limit (the finalization then does not wait for uploads,
+    as for any wall or cost stop)."""
+
+
 class BridgeLost(RewardTimeout):
     """The Mac's lease stayed stale for ``lost_bridge_seconds`` during a wait: no live Mac
     server is scoring. Ends the wait cleanly as a reward wait; the worker reports
@@ -279,8 +285,11 @@ class Run2Worker(PosttrainWorker):
             self.report["bridge"]["lease_last_renewed_unix"] = self.lease_renewed_unix
         reason = self.limits.stop_reason(pod_elapsed=max(0.0, now - self.pod_created))
         if reason is not None:
-            self.stop_reason = reason
-            raise PilotStop(reason)
+            # The margin keeps this from happening; should it, the wait ends as a reward wait
+            # (RL and the control both stop cleanly on it, the control's trainer would read a
+            # TrainingStop as its loader running out) and the run ends with the limit.
+            self.stop_reason = self.ending = reason
+            raise WaitLimitStop(f"the {reason} stop was reached while waiting on the Mac")
         silent_since = max(float(wait["started_unix"]), self.lease_renewed_unix or 0.0)
         if now - silent_since >= self.timeouts.lost_bridge_seconds:
             self.report["bridge"]["lost"] = {
@@ -563,7 +572,8 @@ class Run2Worker(PosttrainWorker):
             [("result.json", output / "result.json"), ("events.jsonl", output / "events.jsonl")],
         )
         self.measure_rl(result)
-        if result.stop_reason in RL_STOPS_ENDING_THE_RUN or result.selected is None:
+        ending = result.stop_reason in RL_STOPS_ENDING_THE_RUN or self.ending is not None
+        if ending or result.selected is None:
             raise PilotStop(self.end_reason(result.stop_reason, result.stop_detail))
         self.produced[RL_REFERENCE] = Path(result.selected.checkpoint)
         return outputs
@@ -752,7 +762,7 @@ class Run2Worker(PosttrainWorker):
                 ("control-events.jsonl", run_dir / "control-events.jsonl"),
             ],
         )
-        if result.stop_reason in RL_STOPS_ENDING_THE_RUN:
+        if result.stop_reason in RL_STOPS_ENDING_THE_RUN or self.ending is not None:
             raise PilotStop(self.end_reason(result.stop_reason, result.stop_detail))
         self.produced[CONTROL_REFERENCE] = Path(result.selected.checkpoint)
         return outputs
