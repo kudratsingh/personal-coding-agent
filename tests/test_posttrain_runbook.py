@@ -66,6 +66,10 @@ VALUES = {
     "SANDBOX_IMAGE_ID": "sha256:" + "d" * 64,
     "SUITE": "humaneval",
     "BUCKETS": "6",
+    "LABEL": "screen",
+    "NAME": "attempts.jsonl",
+    "POD_PATH": "exports/screen/attempts.jsonl",
+    "SHA256": "cd" * 32,
 }
 TOOL = re.compile(r"(?:uv run --locked(?: --extra [a-z]+)? python|python3) -m (tools\.[a-z_]+)")
 CLI = re.compile(r"uv run --locked(?: --extra [a-z]+)? scratchcoder ([a-z-]+)")
@@ -256,6 +260,7 @@ def test_the_pod_commands_name_the_post_training_paths(monkeypatch: pytest.Monke
     options = dict(zip(watchdog[::2], watchdog[1::2], strict=False))
     assert options["--mode"] == "posttrain" and options["--max-wall-seconds"] == "18000"
     assert options["--max-cost-usd"] == "2.99" and options["--max-transfer-seconds"] == "900"
+    assert options["--policy"] == f"{VALUES['CTRL']}/policy.json"
     (supervisor,) = by("tools.pilot_supervisor")
     assert ["--mode", "posttrain", "--run", "1"] == supervisor[:4]
     assert "/workspace/posttrain-run" in supervisor
@@ -309,6 +314,46 @@ def test_the_bootstrap_call_uses_only_flags_the_script_knows() -> None:
     assert "--lifetime-seconds $TIMER" in command
     assert "--lifetime-seconds 17820" in substitute(command)
     assert "--heartbeat /workspace/posttrain-run/heartbeat.json" in command
+
+
+def test_the_hand_rescue_copies_every_unsecured_file_inside_the_window(tmp_path: Path) -> None:
+    """The listing the rescue block reads is the supervisor's own record, and the block says
+    how short the window is: both guards delete the Pod soon after its last GPU work."""
+    from tools.pilot_supervisor import MILESTONE_ERROR_FILE
+
+    text = RUNBOOK.read_text()
+    assert f"$CTRL/supervisor/{MILESTONE_ERROR_FILE}" in text
+    assert "about 2 to 7 minutes" in text and "no way to hold the Pod" in text
+    (block,) = [block for block in blocks() if "rescue-list.txt" in block]
+    script = block[block.index("<<'PY'\n") + len("<<'PY'\n") : block.index("\nPY\n")]
+    record = {
+        "files": [
+            {
+                "label": "screen",
+                "pod_paths": ["exports/screen/attempts.jsonl", "exports/screen/record.json"],
+                "sha256": {"attempts.jsonl": "ab" * 32, "record.json": "cd" * 32},
+                "pulled": False,
+            }
+        ]
+    }
+    listing = tmp_path / MILESTONE_ERROR_FILE
+    listing.write_text(json.dumps(record))
+    found = subprocess.run(
+        ["python3", "-", str(listing)], input=script, capture_output=True, text=True, timeout=60
+    )
+    assert found.returncode == 0, found.stderr
+    assert found.stdout.splitlines() == [
+        f"screen attempts.jsonl exports/screen/attempts.jsonl {'ab' * 32}",
+        f"screen record.json exports/screen/record.json {'cd' * 32}",
+    ]
+    for path in ("exports/../../etc/passwd", "exports/../passwd"):
+        record["files"][0]["pod_paths"] = [path]
+        record["files"][0]["sha256"] = {"passwd": "ab" * 32}
+        listing.write_text(json.dumps(record))
+        unsafe = subprocess.run(
+            ["python3", "-", str(listing)], input=script, capture_output=True, text=True, timeout=60
+        )
+        assert unsafe.returncode != 0 and "unsafe" in unsafe.stderr
 
 
 def test_no_block_holds_a_comment() -> None:

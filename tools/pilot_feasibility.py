@@ -1407,8 +1407,8 @@ def render_posttrain_markdown(report: Mapping[str, Any]) -> str:
         if scenario["probe_stops_run"]:
             lines += [
                 "Below the planning speed the probe stops the run, so this row never runs: it "
-                f"ends after setup, the probe and finalization, about "
-                f"${scenario['spend_if_probe_stops_usd']:.2f}.",
+                "ends after the setup allowance, the probe and the whole finalization reserve, "
+                f"at most about ${scenario['spend_if_probe_stops_usd']:.2f}.",
                 "",
             ]
     upload = report["r2_upload"]

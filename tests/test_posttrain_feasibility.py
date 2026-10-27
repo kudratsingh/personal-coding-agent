@@ -56,3 +56,15 @@ def test_the_cli_prints_the_table_and_writes_the_report(
     assert "the probe stops the run" in text
     assert json.loads(output.read_text())["kind"] == "posttrain-feasibility"
     assert render_posttrain_markdown(posttrain_report(SPEC, quoted_gpu_hourly=0.59)) == text
+
+
+def test_the_documents_quote_the_projections_probe_stop_cost() -> None:
+    """The runbook and the operations page give the probe-stop spend the tool prints."""
+    root = SPEC.parents[1]
+    spend = posttrain_report(SPEC)["scenarios"]["0.5x generation"]["spend_if_probe_stops_usd"]
+    figure = f"at most about ${spend:.2f}"
+    assert figure == "at most about $0.39"
+    for path in (root / "POSTTRAIN_RUNBOOK.md", root / "docs" / "posttrain-runs.md"):
+        text = path.read_text()
+        assert text.count(figure) >= 2, path.name
+        assert "$0.25" not in text and "$0.30 in" not in text, path.name

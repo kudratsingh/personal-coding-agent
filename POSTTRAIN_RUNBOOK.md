@@ -2,7 +2,7 @@
 
 Operational sequence for post-training run 1 of the 135M-parameter S rehearsal model, on one Runpod A40 Pod, from run B's `mixed-final` checkpoint. The worker (`tools/posttrain_run.py`) runs seven stages in order and uploads every artifact to R2 under `posttrain-runs/1/<pod id>/` as soon as it exists:
 
-1. **probe:** generation speed at batch 1, 64, 128 and 256 on 256 real chat-v1 prompt lengths around the pool dev median, top-p 0.95, bf16. Below 5,000 generated tok/s at batch 64 or 10,000 at batch 256 the run stops here (`generation_below_planning_speed`) with the measured rates in `report.json`, about $0.30 in.
+1. **probe:** generation speed at batch 1, 64, 128 and 256 on 256 real chat-v1 prompt lengths around the pool dev median, top-p 0.95, bf16. Below 5,000 generated tok/s at batch 64 or 10,000 at batch 256 the run stops here (`generation_below_planning_speed`) with the measured rates in `report.json`, at most about $0.39 in (the 18-minute setup allowance, the 6-minute probe and the whole 15-minute finalization reserve at $0.60/h; step 3's projection prints it).
 2. **arc-base:** ARC-Easy label log-likelihood (float32) on run A's `stage1-final` and `stage2-final` and run B's `mixed-final`.
 3. **eval-base:** base-B completions: pool dev and test greedy plus n = 8 (temperature 0.8, top-p 0.95, seed 0) under `base-pool-completion-v1`; HumanEval, HumanEval+ (task 32 excluded) and MBPP+ greedy under `base-completion-rstrip-v1`.
 4. **sft:** one pass over the 3,390 SFT rows (106 updates of 16 x 2 rows), peak 6e-5, 3% warmup, cosine to 10%, a fresh AdamW, compiled; assistant-token dev loss at each quarter, the lowest kept as weights only (about 541 MB); after 50 updates the slot throughput must reach 90% of 56,765 slots/s or the run stops (`sft_throughput_below_limit`).
@@ -76,7 +76,7 @@ Open the Runpod console: Secure Cloud, NVIDIA A40, on-demand, 1 GPU, container d
 uv run --locked python -m tools.pilot_feasibility posttrain --specification "$SPEC" --quoted-gpu-hourly 0.59 --output "$SHARED/feasibility.json"
 ```
 
-Replace `0.59` with the console price; above $0.59, stop and ask the owner. The table gives hours and dollars per stage at half, the planning and twice the planning generation speed; at the planning speeds run 1 is about 3.1 hours and $1.85 against the $3.00 ceiling, and at half speed the probe stops the run after about $0.25. Confirm the account balance covers $3.00 plus a margin and any other project's Pod over the time until run 2, and that no network volume exists.
+Replace `0.59` with the console price; above $0.59, stop and ask the owner. The table gives hours and dollars per stage at half, the planning and twice the planning generation speed; at the planning speeds run 1 is about 3.1 hours and $1.85 against the $3.00 ceiling, and at half speed the probe stops the run after at most about $0.39. Confirm the account balance covers $3.00 plus a margin and any other project's Pod over the time until run 2, and that no network volume exists.
 
 ## 4. Pod exports and benchmark releases (Mac, at the go, free)
 
@@ -161,7 +161,7 @@ else
 fi
 ```
 
-`SELF_DESTRUCT_DEADLINE` is `ORIGIN` + 17,820 s. Capture the identity, write the watchdog policy from the derived limits, write the helpers (the rehearsal runbook's step 5 helpers with the post-training mode and the derived wall and cost stop), and start the watchdog at once:
+`SELF_DESTRUCT_DEADLINE` is `ORIGIN` + 17,820 s. Capture the identity, write the watchdog policy from the derived limits, write the helpers (the rehearsal runbook's step 5 helpers with the post-training mode and the derived wall and cost stop), and start the watchdog at once. With `--policy` the watchdog refuses to start unless its flags give exactly the limits of `policy.json`, the file the readiness receipt checks:
 
 ```sh
 uv run --locked python -m tools.runpod_pod_identity capture --pod-id "$POD_ID" \
@@ -177,7 +177,7 @@ watchdog() {
     --pidfile "$CTRL/watchdog.pid" --max-wall-seconds "$WALL" --max-idle-seconds 600 \
     --max-transfer-seconds 900 \
     --max-cost-usd "$WATCHDOG_COST" --quoted-total-hourly 0.60 --billing-started-at-unix "$ORIGIN" \
-    --idle-baseline-unix "$BASE" --poll-seconds 20 \
+    --idle-baseline-unix "$BASE" --poll-seconds 20 --policy "$CTRL/policy.json" \
     >> "$CTRL/watchdog.log" 2>&1 < /dev/null &
   JOB=$!
   NEW=""
@@ -427,7 +427,26 @@ Once the Pod is gone, the **owner** revokes the Pod's R2 token in the Cloudflare
 
 - **Bootstrap or receipt fails:** read `bootstrap.log` or the receipt tool's message, terminate the Pod (step 15) and report. A new Pod is a new launch: ask the owner first.
 - **The worker stops** (`generation_below_planning_speed`, `sft_throughput_below_limit`, `projected_finish_after_deadline`, `finalization_reserve`, the cost, wall or idle limit) **or fails:** after its drain the heartbeat shows `stopped` or `failed`. With `r2_final` the supervisor verifies and archives as in step 14; without it, it archives the worker's own report to `.../diagnostics/` after 60 s and approves teardown. Every artifact made before the stop is in R2. Report the measured rates; do not relaunch without the owner.
-- **A label never reached R2** (`failed`, failure `r2_milestones_unverified`): `finalization.json` lists each unverified label's files and SHA-256s. The supervisor checks each in R2 with the Mac's key; the weights label (`sft-weights`: `checkpoint.pt` and `record.json`) it pulls over SSH with the pilot's verified pull inside the 420 s reserve and checks. Any other label it writes to `MILESTONES-NOT-SECURED.json` and never approves teardown: copy each listed file by hand, for example `podscp root@$POD_HOST:/workspace/posttrain-run/exports/<label>/<file> "$CTRL/rescued-<label>-<file>"`, check `shasum -a 256` against the recorded SHA-256, and only then end the Pod with `TERMINATE=yes`.
+- **A label never reached R2** (`failed`, failure `r2_milestones_unverified`): `finalization.json` lists each unverified label's files and SHA-256s. The supervisor checks each in R2 with the Mac's key; the weights label (`sft-weights`: `checkpoint.pt` and `record.json`) it pulls over SSH with the pilot's verified pull inside the 420 s reserve and checks. Any other label it writes to `MILESTONES-NOT-SECURED.json` and never approves teardown, but **the Pod is still deleted soon**, whatever the supervisor decides: the Mac watchdog deletes it 600 s after the worker's last GPU work (the heartbeat's `last_gpu_activity_unix`), or up to its 900 s transfer window while the supervisor sees transfer progress, and the in-Pod timer's idle rule deletes it 900 s after that work. The worker hands over 480 s after its last GPU work, so the copy has about 2 to 7 minutes. Such a label is a JSON or JSON Lines file of a few MB at most, which copies in seconds: run the block below at once. It copies every listed file and checks each SHA-256. A `pod_progress.py` stamp holds only the in-Pod rule, not the watchdog, so it is no way to hold the Pod; if the window closes first, the Pod and the label are gone: report it. Once every file prints `OK`, end the Pod with `TERMINATE=yes` (step 15).
+
+```sh
+python3 - "$CTRL/supervisor/MILESTONES-NOT-SECURED.json" > "$CTRL/rescue-list.txt" <<'PY'
+import json, re, sys
+
+for row in json.load(open(sys.argv[1]))["files"]:
+    for pod_path in row["pod_paths"]:
+        name = pod_path.rsplit("/", 1)[1]
+        digest = row["sha256"][name]
+        if not re.fullmatch(r"exports/[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*", pod_path) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            sys.exit(f"refusing an unsafe entry: {pod_path}")
+        print(row["label"], name, pod_path, digest)
+PY
+while read -r LABEL NAME POD_PATH SHA256; do
+  podscp root@$POD_HOST:/workspace/posttrain-run/$POD_PATH "$CTRL/rescued-$LABEL-$NAME" < /dev/null
+  printf '%s  %s\n' "$SHA256" "$CTRL/rescued-$LABEL-$NAME" | shasum -a 256 -c -
+done < "$CTRL/rescue-list.txt"
+```
+
 - **The Pod disappears or a watchdog exits:** read `$CTRL/watchdog-receipt.json` and its `.prev-<time>` copies and confirm with the `status` command in step 15. The in-Pod timer's own receipt names `idle_limit` when the idle rule deleted the Pod.
 
 ## 17. After the run: execution on the Mac (Mac execution window)

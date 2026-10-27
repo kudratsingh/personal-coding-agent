@@ -23,7 +23,7 @@ The rest of the rehearsal continues from run B's `mixed-final` checkpoint in two
 
 Then `report.json` at the prefix root. The seven evaluation files of a stage are pool dev and pool test, each greedy and n = 8 (temperature 0.8, top-p 0.95, seed 0), and HumanEval, HumanEval+ (task 32 excluded) and MBPP+ greedy. Base B uses `base-pool-completion-v1` on the pool and `base-completion-rstrip-v1` on the benchmarks; the SFT weights use `chat-v1` everywhere ([evaluation](evaluation.md)).
 
-**Probe.** `benchmark_generation` at batch 1, 64, 128 and 256 on the 256 chat-v1 prompt lengths around the pool dev median (about 190 tokens), 256 new tokens each, temperature 0.8 and top-p 0.95, in bf16. Below the planning speeds, 5,000 generated tokens a second at batch 64 or 10,000 at batch 256, the run stops with `generation_below_planning_speed`, its rates in `report.json`, about $0.25 to $0.30 in. Otherwise the batch-64 rate replaces the planning speed in every later projection.
+**Probe.** `benchmark_generation` at batch 1, 64, 128 and 256 on the 256 chat-v1 prompt lengths around the pool dev median (about 190 tokens), 256 new tokens each, temperature 0.8 and top-p 0.95, in bf16. Below the planning speeds, 5,000 generated tokens a second at batch 64 or 10,000 at batch 256, the run stops with `generation_below_planning_speed`, its rates in `report.json`, at most about $0.39 in (the setup allowance, the probe and the whole finalization reserve). Otherwise the batch-64 rate replaces the planning speed in every later projection.
 
 **SFT.** One pass over the 3,390 rows of record (2,871 code, 519 language) in 16 x 2 rows per update: 106 updates, 3.47M token slots. Peak 6e-5, 3% warmup (3 updates), cosine to 10%, a fresh AdamW (0.9 / 0.95, weight decay 0.1, clip 1.0), bf16 with fused attention and `torch.compile`, assistant-token loss divided by each update's assistant tokens. The token-weighted assistant-token dev loss over the 2,000 code and 300 language dev conversations is measured at updates 26, 53, 80 and 106; each new lowest is saved as a weights-only checkpoint (about 541 MB), and only the lowest is kept and uploaded. After 50 updates the slot throughput over the step seconds of updates 3 to 50 must reach 90% of run B's 56,765 slots a second, or the run stops with `sft_throughput_below_limit`.
 
@@ -86,7 +86,7 @@ The **launch rule** (worker and readiness receipt): the lifetime left must hold 
 | Finalization | 0.25 | $0.15 |
 | **Total** | **3.08** | **$1.85** |
 
-At twice the planning speed the run takes about 1.98 hours and $1.19. At half the planning speed the probe stops the run after about $0.25. Every pool attempt is priced at its token cap, as if none stopped early.
+At twice the planning speed the run takes about 1.98 hours and $1.19. At half the planning speed the probe stops the run after at most about $0.39. Every pool attempt is priced at its token cap, as if none stopped early.
 
 ## After run 1
 
@@ -99,6 +99,6 @@ The stage machinery is a registry of kinds (`STAGE_KINDS`): run 2 adds RL, the m
 ## Limitations
 
 - Generation speed has never been measured; the probe measures it first.
-- The SSH rescue carries only the weights label (`checkpoint.pt` and `record.json`). Any other label R2 never verified is held for a rescue by hand, and the Pod is not torn down until then.
+- The SSH rescue carries only the weights label (`checkpoint.pt` and `record.json`). Any other label R2 never verified is listed for a rescue by hand and teardown is not approved, but the watchdog and the in-Pod idle rule still delete the Pod 600 to 900 s after its last GPU work: the runbook's rescue block has about 2 to 7 minutes after the handover.
 - Termination is layered best effort: there is no provider-enforced Pod lifetime.
 - One seed per arm; the results are integration evidence at 135M parameters, not capability claims.
