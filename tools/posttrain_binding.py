@@ -76,11 +76,20 @@ INPUT_KINDS = (
     "candidate-list",
     "benchmark",
     "arc-export",
+    "rl-tasks",
+    "rl-dev-tasks",
+    "rl-facts",
 )
+"""Run 2 adds the Pod's withheld RL task file, its withheld dev-subset file and the facts
+file (``scratchcoder rl-pod-export``)."""
 BINDING_KEYS = {"schema_version", "kind", "run", "created_at", "binder", "specification", "inputs"}
 INPUT_KEYS = {"kind", "key", "path", "size_bytes", "sha256", "origin", "source"}
 EXPORT_KINDS = frozenset({"pool-export", "candidates-export"})
 """Input kinds that are task files the Pod reads: only ever Pod exports, never hidden tests."""
+WITHHELD_KINDS = {"rl-tasks": "train", "rl-dev-tasks": "dev"}
+"""Run 2's task files and the split each holds: every task withheld (the placeholder of
+``scratchcoder.rl.withheld``), a reference solution on every train task and on no dev task."""
+POD_TASK_KINDS = EXPORT_KINDS | frozenset(WITHHELD_KINDS)
 NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 GIT_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
@@ -96,7 +105,14 @@ def binding_sha256(binding: Mapping[str, Any]) -> str:
 
 def require_export(name: str, kind: str, path: Path) -> int | None:
     """For a pool or candidates input, refuse any task that is not a Pod export placeholder;
-    return the task count (None for another kind). Errors name task IDs, never tests."""
+    for run 2's task files, any task that is not withheld (``require_withheld``); for the facts
+    file, anything but a canonical facts record. Return the task count (None for another
+    kind). Errors name task IDs, never tests."""
+    if kind in WITHHELD_KINDS:
+        return require_withheld(name, kind, path)
+    if kind == "rl-facts":
+        require_facts(name, path)
+        return None
     if kind not in EXPORT_KINDS:
         return None
     tasks = list(load_tasks(path))
@@ -109,6 +125,49 @@ def require_export(name: str, kind: str, path: Path) -> int | None:
             f"hidden tests (e.g. {leaked[0]}); give the file scratchcoder pod-task-export wrote"
         )
     return len(tasks)
+
+
+def require_withheld(name: str, kind: str, path: Path) -> int:
+    """Run 2's RL or dev-subset task file holds only withheld tasks of its split.
+
+    Every task's hidden tests must be the fixed placeholder (``is_withheld``); an RL task must
+    keep its reference solution (the control trains on it) and a dev task must have none."""
+    from scratchcoder.rl.withheld import is_withheld
+
+    split = WITHHELD_KINDS[kind]
+    tasks = list(load_tasks(path))
+    if not tasks:
+        raise ValueError(f"input {name} holds no tasks")
+    leaked = [task.id for task in tasks if not is_withheld(task)]
+    if leaked:
+        raise ValueError(
+            f"input {name} is not a withheld task file: {len(leaked)} of {len(tasks)} tasks "
+            f"carry their hidden tests (e.g. {leaked[0]}); give the file rl-pod-export wrote"
+        )
+    for label, bad in (
+        (f"not {split}-split tasks", [task.id for task in tasks if task.split != split]),
+        (
+            "without a reference solution" if split == "train" else "with a reference solution",
+            [task.id for task in tasks if (task.solution is None) == (split == "train")],
+        ),
+    ):
+        if bad:
+            raise ValueError(f"input {name}: {len(bad)} tasks are {label}, e.g. {bad[0]}")
+    if len({task.id for task in tasks}) != len(tasks):
+        raise ValueError(f"input {name} lists a task twice")
+    return len(tasks)
+
+
+def require_facts(name: str, path: Path) -> None:
+    """Run 2's facts file is a canonical ``rl-task-facts-v1`` record (its own SHA-256 is
+    checked against the specification by the binding and by ``load_facts`` on the Pod)."""
+    from scratchcoder.rl.facts import load_facts
+
+    raw = path.read_bytes()
+    try:
+        load_facts(raw, sha256=hashlib.sha256(raw).hexdigest())
+    except ValueError as error:
+        raise ValueError(f"input {name} is not a facts file: {error}") from error
 
 
 def planned_task_counts(specification: Mapping[str, Any]) -> dict[str, int]:

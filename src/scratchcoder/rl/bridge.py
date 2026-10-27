@@ -949,6 +949,13 @@ class BridgeClient:
                         f"{request.count} items) within {limit:g} s"
                     )
                 self._sleep(min(self.poll_seconds, limit - waited))
+        except BaseException:
+            # Whatever ends the wait (a timeout, a refusal, or an error raised by the injected
+            # sleep, such as the worker giving up on a lost bridge), nobody waits for the
+            # request any more: withdraw it, so the Mac never scores it. A request already
+            # answered was moved to done/, and withdrawing a missing file is a no-op.
+            self._withdraw(outbox)
+            raise
         finally:
             with self._state:
                 self._waiting = None

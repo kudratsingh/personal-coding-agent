@@ -113,6 +113,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     export.add_argument("--arc-directory", type=Path, help="arc: the pinned ARC-Easy Parquet files")
     export.add_argument("--output", type=Path, required=True, help="the new export file")
     export.add_argument("--record", type=Path, required=True, help="the new record file")
+    rl_export = subparsers.add_parser(
+        "rl-pod-export",
+        help="write run 2's withheld RL and dev-subset task files and the facts file (Mac)",
+    )
+    rl_export.add_argument("--train-tasks", type=Path, required=True, help="pool train.jsonl")
+    rl_export.add_argument("--kept", type=Path, required=True, help="the RL screening record")
+    rl_export.add_argument("--dev-tasks", type=Path, required=True, help="pool dev.jsonl")
+    rl_export.add_argument("--output", type=Path, required=True, help="a new directory")
     rl_bridge = subparsers.add_parser(
         "rl-bridge",
         help="serve one Pod's RL rewards and dev verdicts from the Mac over SSH",
@@ -196,6 +204,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             arc_directory=args.arc_directory,
         )
         printed = {key: record[key] for key in ("export", "output") if key in record}
+        sys.stdout.write(json.dumps(printed, indent=2, sort_keys=True) + "\n")
+        return 0
+    if args.command == "rl-pod-export":
+        import json
+
+        from scratchcoder.rl.pod_export import write_rl_pod_export
+
+        record = write_rl_pod_export(
+            train_tasks=args.train_tasks,
+            kept=args.kept,
+            dev_tasks=args.dev_tasks,
+            output=args.output,
+        )
+        printed = {
+            name: {key: row[key] for key in ("name", "sha256", "bytes")}
+            for name, row in record["files"].items()
+        }
         sys.stdout.write(json.dumps(printed, indent=2, sort_keys=True) + "\n")
         return 0
     if args.command == "rl-bridge":

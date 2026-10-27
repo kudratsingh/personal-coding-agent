@@ -329,6 +329,32 @@ def test_a_timeout_withdraws_the_request_and_raises_reward_timeout(tmp_path: Pat
         BridgeRewardSource(client, task_file_sha256="nope", timeout=1)
 
 
+def test_an_error_raised_while_waiting_withdraws_the_request(tmp_path: Path) -> None:
+    """Whatever ends a wait, nobody waits for the request any more: an error from the injected
+    sleep (the run-2 worker giving up on a lost bridge, or a limit) withdraws it too, so the
+    Mac never scores a request no Pod reads."""
+    clock = FakeClock()
+    pod = tmp_path / "pod"
+
+    class GiveUp(Exception):
+        pass
+
+    def give_up() -> None:
+        if clock.now >= 4:
+            raise GiveUp
+
+    clock.hooks.append(give_up)
+    with pod_client(pod, clock, poll_seconds=2.0) as client:
+        source = BridgeRewardSource(client, task_file_sha256=RL_SHA, timeout=60)
+        with pytest.raises(GiveUp):
+            source.rewards(5, attempts())
+        assert not list((pod / "outbox").iterdir())
+        assert [path.name for path in (pod / "withdrawn").iterdir()] == [
+            f"{SESSION}-000001-reward-000005.json"
+        ]
+        assert client.waiting() is None
+
+
 def test_the_pod_rejects_wrong_replies_and_accepts_the_right_one(tmp_path: Path) -> None:
     clock = FakeClock()
     pod = tmp_path / "pod"
