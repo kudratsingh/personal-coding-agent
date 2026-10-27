@@ -25,9 +25,10 @@ from typing import Any
 import pytest
 
 from scratchcoder.eval.tasks import Task
-from scratchcoder.sandbox import reward, reward_program, runner
+from scratchcoder.sandbox import budget, reward, reward_program, runner
 from scratchcoder.sandbox.reward import (
     COMPLETED,
+    FUNCTION_BUDGET_SECONDS,
     HOST_ERROR,
     HOST_TIMEOUT,
     MALFORMED_REPORT,
@@ -38,7 +39,9 @@ from scratchcoder.sandbox.reward import (
     Check,
     ContainerOutcome,
     RewardResult,
+    attempt_budget,
     audit_attempt,
+    budget_for,
     check_passes,
     is_parseable,
     parse_function_checks,
@@ -49,6 +52,9 @@ from scratchcoder.sandbox.reward import (
 )
 from scratchcoder.sandbox.reward_program import LineSplitter, admit_row
 from scratchcoder.sandbox.runner import Limits, command
+from tools import task_pool
+
+POOL_SPEC = Path(__file__).resolve().parents[1] / "configs" / "task-pool-rehearsal.json"
 
 
 def function_task(hidden: str, public: str = "assert callable(f)") -> Task:
@@ -207,6 +213,84 @@ def test_malformed_or_unmatchable_io_tasks_are_not_parseable(hidden: str) -> Non
 def test_io_output_cap_follows_the_limits() -> None:
     hidden = json.dumps([{"input": "", "output": "x" * 70000}])
     assert parse_io_cases(hidden, limits=Limits(output_bytes=1024 * 1024)) is not None
+
+
+# --------------------------------------------------------------------------------------
+# Attempt budgets.
+# --------------------------------------------------------------------------------------
+
+
+def pool_verification() -> dict[str, Any]:
+    verification: dict[str, Any] = json.loads(POOL_SPEC.read_text(encoding="utf-8"))["verification"]
+    return verification
+
+
+def test_the_shared_rule_holds_the_pool_specs_values() -> None:
+    verification = pool_verification()
+    assert verification["timeout_seconds"] == budget.IO_BASE_SECONDS == 2.0
+    assert verification["io_seconds_per_case"] == budget.IO_SECONDS_PER_CASE == 0.25
+    assert budget.io_seconds(0) == 2.0
+    assert budget.io_seconds(24) == 8.0
+    assert budget.io_seconds(100) == 27.0
+    assert budget.io_seconds(232) == 60.0
+    assert budget.io_seconds(4, base_seconds=1.0, seconds_per_case=0.5) == 3.0
+    for bad in (-1, 1.5, True):
+        with pytest.raises(ValueError):
+            budget.io_seconds(bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("count", [1, 2, 7, 24, 40, 99, 100])
+def test_pool_verification_and_reward_channel_give_an_io_task_the_same_deadline(
+    count: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = io_task([{"input": f"{n}\n", "output": str(n)} for n in range(count)])
+    pool_limits = task_pool.limits_for(pool_verification(), task.hidden_tests, "io")
+    assert budget_for(task) == pool_limits.timeout_seconds
+    seen: list[tuple[dict[str, Any], Limits]] = []
+
+    def fake_container(payload: dict[str, Any], *, limits: Limits) -> ContainerOutcome:
+        seen.append((payload, limits))
+        return ContainerOutcome(HOST_TIMEOUT, None)
+
+    monkeypatch.setattr(reward, "run_reward_container", fake_container)
+    result = score_attempt(task, "print(input())")
+    payload, limits = seen[0]
+    # The same deadline, and the same container limits (CPU seconds and memory) as the pool's.
+    assert payload["budget"] == result.budget_seconds == pool_limits.timeout_seconds
+    assert limits == pool_limits
+    # Every case may use what the budget has left, as in the pool verification's I/O program.
+    assert payload["per_case"] is None
+
+
+def test_function_tasks_keep_the_eight_second_budget() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def capture(payload: dict[str, Any]) -> ContainerOutcome:
+        seen.append(payload)
+        return ContainerOutcome(COMPLETED, function_report([row(0, 1)]))
+
+    task = function_task("assert f() == 1")
+    result = score_attempt(task, "c", container=capture)
+    assert budget_for(task) == FUNCTION_BUDGET_SECONDS == 8.0
+    assert result.budget_seconds == seen[0]["budget"] == 8.0
+    assert seen[0]["per_call"] == reward.PER_CALL_SECONDS == 4.0
+    parsed = parse_function_checks("assert f() == 1")
+    assert parsed is not None and attempt_budget(parsed) == 8.0
+
+
+def test_explicit_budgets_are_used_and_recorded() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def capture(payload: dict[str, Any]) -> ContainerOutcome:
+        seen.append(payload)
+        return ContainerOutcome(UNAVAILABLE, None)
+
+    task = io_task([{"input": "1", "output": "2"}])
+    result = score_attempt(task, "c", budget=3.5, per_case=1.0, container=capture)
+    assert seen[0]["budget"] == result.budget_seconds == 3.5 and seen[0]["per_case"] == 1.0
+    unparseable = score_attempt(function_task("assert f() != 1"), "c", container=capture)
+    assert unparseable.budget_seconds is None and len(seen) == 1
+    assert budget_for(function_task("assert f() != 1")) is None
 
 
 # --------------------------------------------------------------------------------------
@@ -754,6 +838,16 @@ def test_fake_docker_end_to_end_scoring(fake_docker: Callable[[str], str]) -> No
     assert stalled.status == HOST_TIMEOUT and stalled.reward is None
 
 
+def test_the_host_stall_deadline_follows_the_budget(fake_docker: Callable[[str], str]) -> None:
+    payload = {**fake_payload(), "budget": 1.0}
+    started = time.monotonic()
+    outcome = run_reward_container(payload, limits=Limits(), docker=fake_docker("stall_silent"))
+    elapsed = time.monotonic() - started
+    assert outcome.host_status == HOST_TIMEOUT
+    # Declared at the budget plus the (shortened) slack of 0.6 s, not before.
+    assert 1.6 <= outcome.elapsed_seconds and elapsed < 10
+
+
 def test_a_missing_docker_binary_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(shutil, "which", lambda name: None)
     outcome = run_reward_container(fake_payload(), limits=Limits())
@@ -982,7 +1076,7 @@ PARTIAL = "def secret(n):\n    return n * 212121 if n < 10 else -1"
 
 def live(task: Task, code: str, **kwargs: Any) -> RewardResult:
     """Score in the real container; a host failure is a test failure, never a skip."""
-    result = score_attempt(task, code, **{"budget": 6.0, **kwargs})
+    result = score_attempt(task, code, **kwargs)
     assert not result.is_host_failure, result
     return result
 
@@ -1176,10 +1270,42 @@ def test_live_io_output_abuse_scores_zero_not_a_host_failure(code: str, count: i
     ],
 )
 def test_live_io_one_case_cannot_spoil_the_next(first_case: str) -> None:
+    # An explicit per-case limit, so a case that hangs leaves time for the next ones.
     code = "import os, signal, time\nn = int(input())\nif n == 1:\n" + first_case + "print(n + 1)\n"
-    result = live(io_task(THREE_CASES), code, per_call=1.5)
+    result = live(io_task(THREE_CASES), code, budget=6.0, per_case=1.5)
     assert result.status == COMPLETED
     assert result.outcomes == (False, True, True)
+
+
+@integration
+def test_live_io_cases_share_the_pool_verifications_deadline() -> None:
+    # 40 cases: 2 s + 0.25 s x 40 = 12 s for the whole attempt. One case needing 5 s (more
+    # than any fixed per-case limit of 4 s would allow) still passes, as it does in the pool
+    # verification; a case that never ends uses up the budget and leaves the rest unrun.
+    cases = [{"input": f"{n}\n", "output": str(n + 1)} for n in range(40)]
+    task = io_task(cases)
+    slow = "import time\nn = int(input())\nif n == 0:\n    time.sleep(5)\nprint(n + 1)"
+    result = live(task, slow)
+    assert result.budget_seconds == 12.0
+    assert result.status == COMPLETED and result.reward == 1.0 and result.unfinished == 0
+    pool_limits = task_pool.limits_for(pool_verification(), task.hidden_tests, "io")
+    assert runner.run(slow, task.hidden_tests, pool_limits, mode="io").passed
+    hang = "n = int(input())\nwhile n == 0:\n    pass\nprint(n + 1)"
+    hung = live(task, hang)
+    assert hung.status == COMPLETED and hung.reward == 0.0 and hung.unfinished == 40
+    assert runner.run(hang, task.hidden_tests, pool_limits, mode="io").status == "timeout"
+
+
+@integration
+def test_live_io_a_hundred_correct_cases_are_not_cut_by_the_old_flat_budget() -> None:
+    # About 0.1 s of work per case is about 10 s in all: over the old flat 8 s budget, inside
+    # the rule's 27 s for 100 cases.
+    cases = [{"input": f"{n}\n", "output": str(n + 1)} for n in range(100)]
+    code = "import time\nn = int(input())\ntime.sleep(0.1)\nprint(n + 1)"
+    result = live(io_task(cases), code)
+    assert result.budget_seconds == 27.0
+    assert result.status == COMPLETED and result.reward == 1.0 and result.unfinished == 0
+    assert result.elapsed_seconds > 8.0
 
 
 @integration
@@ -1192,15 +1318,18 @@ def test_live_io_signals_to_pid_one_are_ignored() -> None:
 @integration
 def test_live_io_out_of_memory_case_is_a_resource_kill() -> None:
     code = "n = int(input())\nif n == 1:\n    x = bytearray(1024 * 1024 * 1024)\nprint(n + 1)"
-    result = live(io_task(THREE_CASES), code, limits=Limits(timeout_seconds=6.0, memory_mb=64))
+    result = live(
+        io_task(THREE_CASES), code, budget=6.0, limits=Limits(timeout_seconds=6.0, memory_mb=64)
+    )
     assert result.status == RESOURCE_KILL
     assert result.outcomes == (False, True, True)
 
 
 @integration
 def test_live_io_many_cases_fit_the_budget_under_parallel_load() -> None:
-    # 99 interpreter starts used to take the whole 8 s budget under emulation; the fork server
-    # makes a correct 99-case solution earn 1.0, also with 8 attempts running at once.
+    # 99 interpreter starts used to take a whole 8 s budget under emulation; the fork server
+    # makes a correct 99-case solution earn 1.0 even within 8 s (the rule allows 26.75 s), also
+    # with 8 attempts running at once.
     cases = [{"input": f"{n}\n", "output": str(n + 1)} for n in range(99)]
     task = io_task(cases)
     with ThreadPoolExecutor(8) as pool:
@@ -1302,16 +1431,21 @@ EQUIVALENCE = {
 def test_live_io_fork_server_matches_the_evaluation_path_of_record() -> None:
     def verdicts(item: tuple[str, tuple[str, list[dict[str, str]]]]) -> tuple[str, Any, Any]:
         name, (code, cases) = item
-        rewarded = live(io_task(cases), code, budget=8.0, per_call=4.0).outcomes
+        task = io_task(cases)
+        rewarded = live(task, code).outcomes
         evaluated = tuple(
             runner.run(code, json.dumps([case]), Limits(timeout_seconds=4.0), mode="io").passed
             for case in cases
         )
-        return name, rewarded, evaluated
+        # The pool verification runs all cases in one call under the same deadline rule.
+        pool_limits = task_pool.limits_for(pool_verification(), task.hidden_tests, "io")
+        whole = runner.run(code, task.hidden_tests, pool_limits, mode="io").passed
+        return name, rewarded, (evaluated, whole)
 
     with ThreadPoolExecutor(4) as pool:
-        for name, rewarded, evaluated in pool.map(verdicts, EQUIVALENCE.items()):
+        for name, rewarded, (evaluated, whole) in pool.map(verdicts, EQUIVALENCE.items()):
             assert rewarded == evaluated, name
+            assert all(rewarded) == whole, name
     # An output beyond the cap fails both ways: the evaluation path reports output_limit, and
     # the reward channel never admits a task whose expected output could not fit.
     oversized = [{"input": "", "output": "x" * 70000}]

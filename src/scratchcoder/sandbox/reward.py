@@ -50,12 +50,15 @@ from typing import Any
 from uuid import uuid4
 
 from scratchcoder.eval.tasks import Task
+from scratchcoder.sandbox.budget import io_seconds
 from scratchcoder.sandbox.reward_program import LineSplitter
 from scratchcoder.sandbox.runner import ENDPOINT, Limits, Runtime, command
 
-# Per-attempt and per-call defaults (seconds). The proposal fixes the per-attempt budget at 8 s.
-DEFAULT_BUDGET_SECONDS = 8.0
-DEFAULT_PER_CALL_SECONDS = 4.0
+FUNCTION_BUDGET_SECONDS = 8.0
+"""Per-attempt wall budget for a function task. An I/O task's budget is the pool
+verification's rule instead (:func:`attempt_budget`)."""
+PER_CALL_SECONDS = 4.0
+"""Deadline for one hidden-assertion call of a function task, inside the attempt budget."""
 HOST_SLACK_SECONDS = 15.0
 """Extra wall time the host waits past the budget before declaring a host stall, covering
 amd64 emulation startup. The container supervisor enforces the budget well within this."""
@@ -101,7 +104,8 @@ class RewardResult:
     ``unfinished`` counts calls or cases that produced no result in time (a per-call or
     per-case timeout, or the per-attempt budget running out); a correct solution with a
     nonzero ``unfinished`` was under-scored by the budget. ``outcomes`` holds one pass flag
-    per hidden check, in task-file order."""
+    per hidden check, in task-file order. ``budget_seconds`` is the per-attempt wall budget
+    the attempt ran under (``None`` when nothing ran: an unparseable task)."""
 
     status: str
     reward: float | None
@@ -112,6 +116,7 @@ class RewardResult:
     detail: str = ""
     unfinished: int = 0
     outcomes: tuple[bool, ...] = ()
+    budget_seconds: float | None = None
 
     @property
     def is_host_failure(self) -> bool:
@@ -785,7 +790,7 @@ def _function_payload(
 
 
 def _io_payload(
-    code: str, cases: IoCases, *, budget: float, per_case: float, limits: Limits
+    code: str, cases: IoCases, *, budget: float, per_case: float | None, limits: Limits
 ) -> dict[str, Any]:
     return {
         "mode": "io",
@@ -851,12 +856,30 @@ def _score_io(cases: IoCases, report: dict[str, Any]) -> tuple[list[bool], int]:
     return outcomes, unfinished
 
 
+def attempt_budget(parsed: FunctionChecks | IoCases) -> float:
+    """The per-attempt wall budget for parsed hidden tests: ``FUNCTION_BUDGET_SECONDS`` for a
+    function task, and for an I/O task the pool verification's rule
+    (:func:`scratchcoder.sandbox.budget.io_seconds`: 2 s plus 0.25 s per case, at most 60 s),
+    so the reward channel gives an I/O task exactly the deadline its reference passed under."""
+    if isinstance(parsed, IoCases):
+        return io_seconds(parsed.total)
+    return FUNCTION_BUDGET_SECONDS
+
+
+def budget_for(task: Task, *, limits: Limits | None = None) -> float | None:
+    """The per-attempt wall budget ``score_attempt`` applies to ``task`` by default, or
+    ``None`` when the task is not parseable for this channel."""
+    parsed = parse_task(task, limits=limits)
+    return None if parsed is None else attempt_budget(parsed)
+
+
 def score_attempt(
     task: Task,
     code: str,
     *,
-    budget: float = DEFAULT_BUDGET_SECONDS,
-    per_call: float = DEFAULT_PER_CALL_SECONDS,
+    budget: float | None = None,
+    per_call: float = PER_CALL_SECONDS,
+    per_case: float | None = None,
     limits: Limits | None = None,
     container: ContainerRunner | None = None,
 ) -> RewardResult:
@@ -864,34 +887,48 @@ def score_attempt(
     ``total`` taken from the task file. Unparseable tasks and host failures return a reward
     of ``None`` (never 0.0), so the RL loop can skip or retry instead of optimising against a
     host problem. Everything that happens after the candidate started is scored: a resource
-    kill or a disrupted report counts as a failed attempt."""
-    limits = limits or Limits(timeout_seconds=min(60.0, max(1.0, budget)))
+    kill or a disrupted report counts as a failed attempt.
+
+    ``budget`` defaults to :func:`attempt_budget` (the value used is recorded in the result's
+    ``budget_seconds``). ``per_call`` bounds each function-mode call. ``per_case`` bounds each
+    I/O case; the default ``None`` lets each case use whatever the attempt budget has left, as
+    the pool verification's I/O program does, so a case is never cut short while the budget
+    lasts. Without explicit ``limits`` the container's CPU limit is the budget, as in the pool
+    verification."""
     flags = audit_attempt(code)
     parsed = parse_task(task, limits=limits)
     if parsed is None:
         return RewardResult(NOT_PARSEABLE, None, audit_flags=flags)
     total = parsed.total
+    if budget is None:
+        budget = attempt_budget(parsed)
+    run_limits = limits or Limits(timeout_seconds=min(60.0, max(1.0, budget)))
 
     def default_runner(payload: dict[str, Any]) -> ContainerOutcome:
-        return run_reward_container(payload, limits=limits)
+        return run_reward_container(payload, limits=run_limits)
 
     runner = container if container is not None else default_runner
     if isinstance(parsed, FunctionChecks):
-        payload = _function_payload(code, parsed, budget=budget, per_call=per_call, limits=limits)
+        payload = _function_payload(
+            code, parsed, budget=budget, per_call=per_call, limits=run_limits
+        )
     else:
-        payload = _io_payload(code, parsed, budget=budget, per_case=per_call, limits=limits)
+        payload = _io_payload(code, parsed, budget=budget, per_case=per_case, limits=run_limits)
     outcome = runner(payload)
     elapsed = outcome.elapsed_seconds
     if outcome.host_status in HOST_FAILURES:
+        detail = outcome.detail or "host failure"
         return RewardResult(
-            outcome.host_status, None, 0, total, flags, elapsed, outcome.detail or "host failure"
+            outcome.host_status, None, 0, total, flags, elapsed, detail, budget_seconds=budget
         )
     failed = (False,) * total
     if outcome.report is None:
         status = outcome.host_status
         if status not in (RESOURCE_KILL, MALFORMED_REPORT):
             status = MALFORMED_REPORT
-        return RewardResult(status, 0.0, 0, total, flags, elapsed, outcome.detail, 0, failed)
+        return RewardResult(
+            status, 0.0, 0, total, flags, elapsed, outcome.detail, 0, failed, budget
+        )
     try:
         if isinstance(parsed, FunctionChecks):
             outcomes, unfinished = _score_function(parsed, outcome.report)
@@ -899,7 +936,7 @@ def score_attempt(
             outcomes, unfinished = _score_io(parsed, outcome.report)
     except Exception:
         return RewardResult(
-            MALFORMED_REPORT, 0.0, 0, total, flags, elapsed, "bad report", 0, failed
+            MALFORMED_REPORT, 0.0, 0, total, flags, elapsed, "bad report", 0, failed, budget
         )
     passed = sum(outcomes)
     # A complete report is labelled a resource kill only on in-container evidence (the
@@ -916,6 +953,7 @@ def score_attempt(
         "out-of-memory kill" if killed else "",
         unfinished,
         tuple(outcomes),
+        budget,
     )
 
 

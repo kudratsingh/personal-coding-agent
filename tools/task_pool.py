@@ -61,6 +61,7 @@ from scratchcoder.data.mbpp import mbpp_release, read_mbpp
 from scratchcoder.data.pool import SimilarityIndex, build_pool, shingles, split_summary
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.tasks import Task, save_tasks
+from scratchcoder.sandbox.budget import io_seconds
 from scratchcoder.sandbox.diagnostics import failure_category
 from scratchcoder.sandbox.runner import IMAGE, Limits, Result, Runtime, run
 from scratchcoder.tokenizer.bulk import FastEncoder
@@ -461,10 +462,17 @@ def _kind(task: Task) -> str:
 
 
 def limits_for(verification: Mapping[str, Any], tests: str, mode: str) -> Limits:
-    """The sandbox deadline covers every I/O case in one call, so it grows with the cases."""
+    """The sandbox deadline covers every I/O case in one call, so it grows with the cases.
+
+    The I/O rule is :func:`scratchcoder.sandbox.budget.io_seconds`, which the reward channel
+    also uses, so both give a task the same deadline."""
     timeout = verification["timeout_seconds"]
     if mode == "io":
-        timeout += verification["io_seconds_per_case"] * len(json.loads(tests))
+        timeout = io_seconds(
+            len(json.loads(tests)),
+            base_seconds=timeout,
+            seconds_per_case=verification["io_seconds_per_case"],
+        )
     return Limits(timeout_seconds=min(60.0, timeout), memory_mb=verification["memory_mb"])
 
 

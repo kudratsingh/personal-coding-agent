@@ -19,15 +19,17 @@ solution would. The supervisor's jobs are framing and containment:
   (a pid-namespace init never receives signals it has no handler for) and marks itself
   non-dumpable, so a candidate cannot open ``/proc/1/fd``, ``/proc/1/mem`` or
   ``/proc/1/oom_score_adj``.
-- **Bounds.** Every buffer is bounded and every wait is under the per-call (or per-case)
-  limit and the per-attempt wall budget; report values travel base64-encoded so the
+- **Bounds.** Every buffer is bounded and every wait is under the per-attempt wall budget
+  (and, in function mode, the per-call limit); report values travel base64-encoded so the
   report size is fixed by the payload, whatever bytes the candidate produced.
 - **Cleanup.** After the run, and after every I/O case, it kills every other process in
   the container, so no straggler can hold the pid limit or memory for the next case.
 
 I/O cases run from a fork server: a clean interpreter is started once per attempt, and each
 case runs in a fresh fork of it, so a case costs a fork instead of an interpreter start
-while no candidate state survives from one case to the next.
+while no candidate state survives from one case to the next. As in the evaluation runner's
+I/O program, the cases run in turn under one shared deadline (the attempt budget), unless
+the host sets a per-case limit.
 """
 
 import base64
@@ -648,6 +650,7 @@ class _Zygote:
 
 def _run_io(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
     cases = payload["cases"]
+    # None: every case may use whatever the attempt budget has left, as in ``program.py``.
     per_case = payload["per_case"]
     cap = payload["output_bytes"]
     try:
@@ -666,7 +669,9 @@ def _run_io(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
             try:
                 if zygote is None:
                     zygote = _Zygote(payload)
-                case_deadline = min(deadline, time.monotonic() + per_case)
+                case_deadline = (
+                    deadline if per_case is None else min(deadline, time.monotonic() + per_case)
+                )
                 out.append(zygote.run_case(text, cap, case_deadline))
             except Exception:
                 # A broken or killed fork server fails this case; the next case gets a new one.
