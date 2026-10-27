@@ -35,3 +35,7 @@ Implemented: [chat-v1 conversations, loss masks and code extraction](chat-format
 Implemented: [SFT batching, assistant-token normalization and dev loss](sft-batching.md).
 
 Implemented: [reinforcement-learning reward channel](reward-channel.md).
+
+Implemented: [the RL update: policy gradient with group-mean advantage](rl-update.md).
+
+Implemented: [the more-SFT control](more-sft-control.md).
