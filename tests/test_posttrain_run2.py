@@ -384,17 +384,20 @@ def test_run_two_fits_its_ceiling_at_the_planning_rates() -> None:
         + 100 * 256 * 256 / 10_000
         + 100 * 256 * 1_024 / 56_765
         + 100 * 48
-        + 6 * (1_800 * 512 / 5_000 + 300 + 5)
+        + 6 * (1_800 * 512 / 10_000 + 300 + 5)
     )
     assert stages["more-sft"] == pytest.approx(
-        20 + 100 * 256 * 256 / 10_000 + 100 * 256 * 1_024 / 56_765 + 5 * (1_800 * 512 / 5_000 + 305)
+        20
+        + 100 * 256 * 256 / 10_000
+        + 100 * 256 * 1_024 / 56_765
+        + 5 * (1_800 * 512 / 10_000 + 305)
     )
     assert stages["eval-rl"] == pytest.approx(7 * 20 + 18_792_960 / 5_000)
     assert stages["arc-post"] == pytest.approx(2 * (20 + 54))
     lifetime = spec.ceiling.self_destruct_seconds
     fit = launch_fit(spec, remaining_seconds=lifetime - spec.limits["startup_seconds"])
     assert fit["fits_at_planning"] and fit["planning_seconds_needed"] == pytest.approx(
-        21_302, abs=1
+        20_288, abs=1
     )
 
 
@@ -529,9 +532,9 @@ def test_the_waits_heartbeat_awaiting_rewards_and_a_fresh_lease_is_progress(comp
 def test_a_dev_checks_generation_keeps_the_gpu_stamp_and_the_heartbeat_live(
     found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A dev check generates 1,800 programs between two waits (about 184 s at the planning
-    speed): every batch stamps the GPU activity and refreshes the heartbeat, in both arms, so
-    neither idle rule nor the heartbeat's staleness reads it as a hung worker. (The refresh
+    """A dev check generates 1,800 programs between two waits (about 92 s at batch 256 at the
+    planning speed): every batch stamps the GPU activity and refreshes the heartbeat, in both
+    arms, so neither idle rule nor the heartbeat's staleness reads it as a hung worker. (The refresh
     interval is zeroed so the check does not depend on how fast this machine generates.)"""
     import tools.posttrain_run2 as run2
 
@@ -552,6 +555,42 @@ def test_a_dev_checks_generation_keeps_the_gpu_stamp_and_the_heartbeat_live(
     assert all(stamped and beat for _, stamped, beat in seen)
     checks = len(report["rl"]["checks"]) + len(report["more_sft"]["checks"])
     assert len(seen) >= 2 * checks  # at least the greedy batch and one sampled batch each
+
+
+def test_every_dev_check_of_both_arms_generates_at_the_one_dev_batch_of_256(
+    found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner's run 2 gate rulings: every dev check of both arms, RL's check 0 included,
+    generates at one batch, the specification's ``rl.dev_batch_size``, which is 256. The
+    control has no batch of its own to drift from it. (The smoke runs at a batch of 3, one
+    no other setting uses, so a check generated at any other batch would show.)"""
+    import tools.posttrain_run2 as run2
+
+    approved = posttrain_approved.run2_specification()
+    assert approved["rl"]["dev_batch_size"] == 256 and "dev_batch_size" not in approved["control"]
+    assert json.loads(TEMPLATE.read_text())["rl"]["dev_batch_size"] == 256
+    seen: list[tuple[str, int, int]] = []
+
+    class Recording(run2.BridgeDevEvaluator):
+        def evaluate(self, model: Any, check: int) -> Any:
+            seen.append((worker[0].stage_name, check, self.pool.batch_size))
+            return super().evaluate(model, check)
+
+    def small_batch(raw: dict[str, Any]) -> None:
+        raw["rl"]["dev_batch_size"] = 3
+        raw["planning"]["generation_tokens_per_second"]["3"] = 50.0
+
+    worker: list[Run2Worker] = []
+    monkeypatch.setattr(run2, "BridgeDevEvaluator", Recording)
+    ran = execute(
+        found,
+        tmp_path / "run",
+        changes=small_batch,
+        setup=lambda unit, server: worker.append(unit),
+    )
+    assert ran.report["status"] == "completed"
+    assert {stage for stage, _, _ in seen} == {"rl", "more-sft"}
+    assert ("rl", 0, 3) in seen and {batch for _, _, batch in seen} == {3}
 
 
 def test_the_bridge_directories_are_kept_and_no_hidden_test_reaches_the_pod(

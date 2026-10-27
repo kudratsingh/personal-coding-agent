@@ -27,20 +27,20 @@ def test_run_two_fits_its_ceiling_at_the_planning_speeds() -> None:
     assert hours["rl_training"] == pytest.approx(100 * 256 * 1_024 / 56_765 / 3600)  # 0.13
     assert hours["rl_reward_waits"] == pytest.approx(100 * 48 / 3600)  # 1.33
     generation, wait = hours["rl_dev_checks"]
-    assert generation == pytest.approx(6 * 1_800 * 512 / 5_000 / 3600)  # 0.31
+    assert generation == pytest.approx(6 * 1_800 * 512 / 10_000 / 3600)  # 0.15 at batch 256
     assert wait == pytest.approx(6 * 300 / 3600)  # 0.50
     assert hours["control_training"] == pytest.approx(hours["rl_rollouts"] + hours["rl_training"])
     assert hours["control_dev_checks"] == pytest.approx(
-        [5 * 1_800 * 512 / 5_000 / 3600, 5 * 300 / 3600]
+        [5 * 1_800 * 512 / 10_000 / 3600, 5 * 300 / 3600]
     )
     assert planned["evaluation_tokens"] == 2 * 18_792_960  # 37.6M tokens at cap.
     assert hours["evaluation"] == pytest.approx((14 * 20 + 2 * 18_792_960 / 5_000) / 3600)
-    assert planned["total_hours"] == pytest.approx(6.17, abs=0.01)
-    assert planned["total_usd"] == pytest.approx(3.70, abs=0.01)
+    assert planned["total_hours"] == pytest.approx(5.89, abs=0.01)
+    assert planned["total_usd"] == pytest.approx(3.53, abs=0.01)
     assert planned["fits_lifetime"] and planned["fits_ceiling"]
     assert report["wait_margin_usd"] == pytest.approx(10_889.5 / 3600 * 0.6)
     slow = report["scenarios"]["planning speeds, Mac twice as slow"]
-    assert slow["total_usd"] == pytest.approx(5.05, abs=0.01) and slow["fits_ceiling"]
+    assert slow["total_usd"] == pytest.approx(4.88, abs=0.01) and slow["fits_ceiling"]
     assert report["limits"]["watchdog_cost_stop_usd"] == 5.79
 
 
@@ -102,8 +102,8 @@ def test_the_cli_prints_the_proposals_table_for_run_two(
     argv = ["posttrain", "--specification", str(TEMPLATE), "--ceiling-usd", "5.80"]
     assert main([*argv, "--quoted-gpu-hourly", "0.59", "--output", str(output)]) == 0
     text = capsys.readouterr().out
-    assert "| **Total** | **6.17** | **$3.70** |" in text
-    assert "| RL dev checks: generation / Mac wait | 0.31 / 0.50 |" in text
+    assert "| **Total** | **5.89** | **$3.53** |" in text
+    assert "| RL dev checks: generation / Mac wait | 0.15 / 0.50 |" in text
     assert json.loads(output.read_text())["run"] == "2"
     report, screening, _ = run1_records(tmp_path)
     assert main([*argv, "--run1-report", str(report), "--screening", str(screening)]) == 0

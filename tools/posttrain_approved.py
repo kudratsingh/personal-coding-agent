@@ -410,15 +410,16 @@ RUN2_RL: dict[str, Any] = {
     "attention": "fused",
     "dev_tasks": 200,
     "dev_samples": 8,
-    "dev_batch_size": 64,
+    "dev_batch_size": 256,
     "min_tasks": 320,
 }
 """The frozen RL protocol: 100 updates of 32 tasks x G = 8 at temperature 1.0 and top-p 1.0,
 at most min(256, 1,024 - prompt) new tokens; tasks shuffled with seed 0 and reshuffled each
 pass; a fresh AdamW (0.9 / 0.95, weight decay 0.1) at 3e-6 after 5 warmup updates, clip 1.0,
-no KL; dev checks at 0, 12, 25, 50, 75 and 100 on the 200-task subset (greedy and n = 8);
-the collapse, patience-3 and 1% leakage stops. The kernel and the optimizer path match SFT
-(fused attention, the foreach AdamW)."""
+no KL; dev checks at 0, 12, 25, 50, 75 and 100 on the 200-task subset (greedy and n = 8),
+generated at batch 256 (the owner's run 2 gate rulings: every dev check of both arms, check 0
+included, reads this one value); the collapse, patience-3 and 1% leakage stops. The kernel and
+the optimizer path match SFT (fused attention, the foreach AdamW)."""
 RUN2_CONTROL: dict[str, Any] = {
     "batch_size": 16,
     "accumulation_steps": 2,

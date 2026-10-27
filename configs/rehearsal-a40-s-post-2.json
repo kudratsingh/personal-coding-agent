@@ -75,7 +75,7 @@
     "attention": "fused",
     "dev_tasks": 200,
     "dev_samples": 8,
-    "dev_batch_size": 64,
+    "dev_batch_size": 256,
     "min_tasks": 320
   },
   "control": {
