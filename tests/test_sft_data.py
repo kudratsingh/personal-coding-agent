@@ -381,8 +381,9 @@ def test_code_dev_rows_and_input_validation(tmp_path: Path) -> None:
     assert BuildConfig().language_cap_basis == "loss_tokens"  # The owner's ruling.
     with pytest.raises(ValueError):
         BuildConfig(language_cap=1.0)
-    with pytest.raises(ValueError, match="language_cap_basis"):
-        BuildConfig(language_cap_basis="assistant_tokens")
+    for bad in ("assistant_tokens", ["loss_tokens"], None, 1):
+        with pytest.raises(ValueError, match="language_cap_basis"):
+            BuildConfig(language_cap_basis=bad)  # type: ignore[arg-type]
 
 
 def test_build_record_carries_the_language_records_provenance(tmp_path: Path) -> None:

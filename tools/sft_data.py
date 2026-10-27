@@ -135,7 +135,7 @@ class BuildConfig:
             raise ValueError("rl_candidates must be a nonnegative integer or None")
         if not isinstance(self.language_cap, float) or not 0 <= self.language_cap < 1:
             raise ValueError("language_cap must be a float in [0, 1)")
-        if self.language_cap_basis not in CAP_BASES:
+        if not isinstance(self.language_cap_basis, str) or self.language_cap_basis not in CAP_BASES:
             raise ValueError(f"language_cap_basis must be one of {sorted(CAP_BASES)}")
 
     @property
