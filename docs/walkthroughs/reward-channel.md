@@ -139,6 +139,7 @@ host: classify the invocation from the frames → validate and decode each row i
   | `resource_kill` | the out-of-memory killer fired during the attempt, or exit 137 after `started` without a report | `passed / total` (killed checks fail), or `0.0` |
   | `malformed_report` | after `started`, the report was lost, malformed or a supervisor error | `0.0` |
   | `oversized` | the attempt is larger than the sandbox input limit; no container started | `0.0` |
+  | `invalid_source` | the code has an unpaired surrogate and cannot be written as UTF-8; no container started | `0.0` |
   | `not_parseable` | the hidden tests are outside the supported forms | `None` |
   | `unavailable` | no docker binary, exit 125, or an unreachable daemon, before `started` | `None` |
   | `host_error` | any other failure before `started`, or a `spawn_failed` report | `None` |

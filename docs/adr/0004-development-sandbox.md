@@ -119,7 +119,10 @@ classifies each invocation from those frames:
   killed calls or cases count as failed and the rest still count. An attempt larger than the
   sandbox input limit (128,000 bytes of candidate code with the call sources or inputs) is
   `oversized` and scores 0.0 on the host without starting a container, as the evaluation
-  runner refuses such input, so it can never exhaust the supervisor before `started`.
+  runner refuses such input, so it can never exhaust the supervisor before `started`. Code
+  with an unpaired surrogate cannot be written as UTF-8 (the evaluation program fails to
+  write it too), so it is `invalid_source` and scores 0.0 the same way, rather than becoming
+  a retried spawn failure inside the supervisor.
 
 Every problem after `started` is scored except those two host failures, so a candidate cannot
 turn its own failure into a skipped, retried attempt. A candidate cannot write the

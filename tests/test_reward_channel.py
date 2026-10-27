@@ -33,6 +33,7 @@ from scratchcoder.sandbox.reward import (
     FUNCTION_BUDGET_SECONDS,
     HOST_ERROR,
     HOST_TIMEOUT,
+    INVALID_SOURCE,
     MALFORMED_REPORT,
     NOT_PARSEABLE,
     OVERSIZED,
@@ -790,6 +791,40 @@ def test_an_oversized_attempt_scores_zero_without_starting_a_container() -> None
     # A host failure is never reported for size: retries do not run it again.
     retried = score_with_host_retries(task, huge, sleep=lambda _: None, container=guard)
     assert retried.status == OVERSIZED and retried.reward == 0.0
+
+
+@pytest.mark.parametrize("mode", ["function", "io"])
+def test_code_that_cannot_be_encoded_scores_zero_without_starting_a_container(mode: str) -> None:
+    # An unpaired surrogate cannot be written as UTF-8, so the supervisor could never start the
+    # candidate: that is the candidate's failure, never a retried host failure.
+    ran = False
+
+    def guard(payload: dict[str, Any]) -> ContainerOutcome:
+        nonlocal ran
+        ran = True
+        return ContainerOutcome(COMPLETED, function_report([row(0, 1)]))
+
+    task = (
+        function_task("assert f() == 1")
+        if mode == "function"
+        else io_task([{"input": "2\n", "output": "4"}])
+    )
+    for code in ("# \ud800\nprint(2 * int(input()))", "x = '\udfff'", "\ud800"):
+        result = score_attempt(task, code, container=guard)
+        assert result.status == INVALID_SOURCE and result.reward == 0.0
+        assert not result.is_host_failure and result.outcomes == (False,) and result.total == 1
+        retried = score_with_host_retries(task, code, sleep=lambda _: None, container=guard)
+        assert retried.status == INVALID_SOURCE and retried.reward == 0.0
+    assert not ran
+    # Characters outside the Basic Multilingual Plane and a valid surrogate pair are text.
+    fine = "# \U0001f600\ndef f():\n    return 1"
+    assert score_attempt(task, fine, container=guard).status == COMPLETED
+    assert ran
+    # An unparseable task is still unparseable first, and the audit does not raise on the string
+    # (code that cannot be written does not run, so only the text scan has anything to say).
+    bad = function_task("assert f() != 1")
+    assert score_attempt(bad, "\ud800 import gc", container=guard).status == NOT_PARSEABLE
+    assert audit_attempt("os._exit(0)  # \ud800") == ("os_exit",)
 
 
 def test_the_supervisor_reports_spawn_failures_only_before_any_candidate_process(

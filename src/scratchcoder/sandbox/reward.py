@@ -36,7 +36,9 @@ candidate's first process could not be started, so none of its code ran) and a d
 still running at the host's stall deadline, which the supervisor's own bound
 (``reward_program.OVERRUN_SECONDS`` past the budget) keeps out of a candidate's reach. An
 attempt too large for the sandbox input limit is scored 0.0 on the host without starting a
-container, so it cannot exhaust the supervisor before ``started`` either.
+container, so it cannot exhaust the supervisor before ``started`` either. Code that cannot be
+written as UTF-8 text (an unpaired surrogate) is likewise scored 0.0 on the host, so a string
+the supervisor could not even encode never becomes a retried host failure.
 """
 
 import ast
@@ -89,6 +91,10 @@ OVERSIZED = "oversized"
 """The attempt (the candidate code with the call sources or case inputs that go with it) is
 larger than the sandbox input limit, so no container was started. Attributed to the
 candidate: the attempt scores 0.0, and it is not audited."""
+INVALID_SOURCE = "invalid_source"
+"""The candidate's code cannot be written as UTF-8 text (it holds an unpaired surrogate), so no
+program could be written or run, and no container was started. Attributed to the candidate:
+the attempt scores 0.0, as the evaluation program fails to write such a file."""
 NOT_PARSEABLE = "not_parseable"
 """The task's hidden tests are outside the supported forms; ``reward`` is ``None``."""
 HOST_TIMEOUT = "host_timeout"
@@ -245,6 +251,15 @@ def _parse_predicate(test: ast.expr) -> Check | None:
 
 def _size(text: str) -> int:
     return len(text.encode("utf-8", errors="surrogatepass"))
+
+
+def _is_utf8_text(text: str) -> bool:
+    """Whether ``text`` can be encoded as UTF-8 (it has no unpaired surrogate)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def parse_function_checks(
@@ -1240,7 +1255,8 @@ def score_attempt(
     of ``None`` (never 0.0), so the RL loop can skip or retry instead of optimising against a
     host problem. Everything that happens after the candidate started is scored: a resource
     kill or a disrupted report counts as a failed attempt. An attempt larger than the
-    sandbox input limit is ``oversized`` and scores 0.0 without starting a container.
+    sandbox input limit is ``oversized``, and code with an unpaired surrogate is
+    ``invalid_source``; each scores 0.0 without starting a container.
 
     ``budget`` defaults to :func:`attempt_budget` (the value used is recorded in the result's
     ``budget_seconds``). ``per_call`` bounds each function-mode call. ``per_case`` bounds each
@@ -1254,14 +1270,19 @@ def score_attempt(
         flags = audit_attempt(code) if _size(code) <= input_bytes else ()
         return RewardResult(NOT_PARSEABLE, None, audit_flags=flags)
     total = parsed.total
+    failed = (False,) * total
     if budget is None:
         budget = attempt_budget(parsed)
     if _attempt_bytes(code, parsed) > input_bytes:
         # Checked here, as ``runner.run`` checks its input, so a huge attempt is the
         # candidate's failure and never exhausts the container's supervisor.
         detail = "attempt larger than the sandbox input limit"
-        failed = (False,) * total
         return RewardResult(OVERSIZED, 0.0, 0, total, (), 0.0, detail, 0, failed, budget)
+    if not _is_utf8_text(code):
+        # The supervisor encodes the source to write and run it; a string it cannot encode
+        # is the candidate's failure, not a spawn failure to retry.
+        detail = "code cannot be written as UTF-8 text (an unpaired surrogate)"
+        return RewardResult(INVALID_SOURCE, 0.0, 0, total, (), 0.0, detail, 0, failed, budget)
     flags = audit_attempt(code)
     run_limits = limits or Limits(timeout_seconds=min(60.0, max(1.0, budget)))
 
@@ -1282,7 +1303,6 @@ def score_attempt(
         return RewardResult(
             outcome.host_status, None, 0, total, flags, elapsed, detail, budget_seconds=budget
         )
-    failed = (False,) * total
     if outcome.report is None:
         status = outcome.host_status
         if status not in (RESOURCE_KILL, MALFORMED_REPORT):
