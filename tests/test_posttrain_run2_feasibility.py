@@ -38,7 +38,7 @@ def test_run_two_fits_its_ceiling_at_the_planning_speeds() -> None:
     assert planned["total_hours"] == pytest.approx(5.89, abs=0.01)
     assert planned["total_usd"] == pytest.approx(3.53, abs=0.01)
     assert planned["fits_lifetime"] and planned["fits_ceiling"]
-    assert report["wait_margin_usd"] == pytest.approx(10_889.5 / 3600 * 0.6)
+    assert report["wait_margin_usd"] == pytest.approx(11_746.5 / 3600 * 0.6)
     slow = report["scenarios"]["planning speeds, Mac twice as slow"]
     assert slow["total_usd"] == pytest.approx(4.88, abs=0.01) and slow["fits_ceiling"]
     assert report["limits"]["watchdog_cost_stop_usd"] == 5.79

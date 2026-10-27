@@ -16,10 +16,11 @@ here (``limits`` prints them), and the receipt and the worker refuse anything we
 
 Run 2 waits on the Mac's RL rewards and dev verdicts through the reward bridge. Its bounds
 on one wait are derived here too, in one place (``bridge_timeouts``): the Pod's reward and
-dev timeouts, the Mac's ``--reward-timeout`` and ``--dev-timeout``, the Mac watchdog's idle
-extension while the heartbeat reads ``awaiting_rewards``, the margin the worker's cost, wall
-and reserve stops keep for one full wait, and the lost-bridge bound that ends a wait whose
-Mac lease went stale before the in-Pod idle rule fires.
+dev timeouts, the Mac's ``--reward-timeout`` and ``--dev-timeout``, the Mac's checks before it
+scores a request (one window pass and the image check), the Mac watchdog's idle extension
+while the heartbeat reads ``awaiting_rewards``, the margin the worker's cost, wall and
+reserve stops keep for one full wait, and the lost-bridge bound that ends a wait whose Mac
+lease went stale before the in-Pod idle rule fires.
 
 ``limits`` (Mac)
     Print a specification's derived limits; with ``--origin`` also the timer deadline, and
@@ -48,7 +49,11 @@ from typing import IO, Any
 
 from scratchcoder.common.records import atomic_json, utc_now
 from scratchcoder.data.shards import file_sha256
-from scratchcoder.rl.bridge_mac import LEASE_SECONDS
+from scratchcoder.rl.bridge_mac import (
+    LEASE_SECONDS,
+    image_check_seconds_bound,
+    window_check_seconds_bound,
+)
 from scratchcoder.rl.rewards import DEFAULT_HOST_RETRIES, DEFAULT_WORKERS
 from scratchcoder.sandbox.budget import io_seconds
 from scratchcoder.sandbox.reward import FUNCTION_BUDGET_SECONDS, HOST_SLACK_SECONDS, MAX_IO_CASES
@@ -254,8 +259,14 @@ class BridgeTimeouts:
     - ``bridge_allowance_seconds``: the bridge's own time on top of the Mac's: one Mac poll,
       one listing, one read and one write over SSH, each tried 5 times to its timeout with
       the backoff waits between, and one Pod poll.
+    - ``window_check_seconds``: one of the Mac's execution-window passes at its worst, run
+      before a request is scored when the last pass is old (every call to its bound,
+      ``scratchcoder.rl.bridge_mac.window_check_seconds_bound``).
+    - ``image_check_seconds``: the Mac's pinned-image check before every request at its
+      worst (every try to its bound and every backoff wait).
     - ``reward_timeout_seconds`` and ``dev_timeout_seconds``: the Pod's, the Mac's plus the
-      allowance, so a Mac-side ``timeout`` reply always reaches a Pod that still waits.
+      allowance and both checks, so a Mac-side ``timeout`` reply always reaches a Pod that
+      still waits, whatever the checks before it took.
     - ``awaiting_*_extension_seconds``: the Mac watchdog's idle limit while the heartbeat
       reads ``awaiting_rewards`` for that kind of request: the Pod's timeout plus the slack.
     - ``wait_margin_seconds``: one full wait (the longer kind); the worker's cost, wall and
@@ -272,6 +283,8 @@ class BridgeTimeouts:
     mac_reward_timeout_seconds: float
     mac_dev_timeout_seconds: float
     bridge_allowance_seconds: float
+    window_check_seconds: float
+    image_check_seconds: float
     reward_timeout_seconds: float
     dev_timeout_seconds: float
     awaiting_slack_seconds: float
@@ -280,6 +293,19 @@ class BridgeTimeouts:
     wait_margin_seconds: float
     lease_seconds: float
     lost_bridge_seconds: float
+
+    @property
+    def mac_check_seconds(self) -> float:
+        """The Mac's checks before it scores one request, at their worst."""
+        return self.window_check_seconds + self.image_check_seconds
+
+    def mac_timeout(self, kind: str) -> float:
+        """The Mac's own bound for a ``reward`` or ``dev`` request (``rl-bridge``)."""
+        if kind == "reward":
+            return self.mac_reward_timeout_seconds
+        if kind == "dev":
+            return self.mac_dev_timeout_seconds
+        raise ValueError(f"unknown bridge request kind {kind!r}")
 
     def timeout(self, kind: str) -> float:
         """The Pod's timeout for a ``reward`` or ``dev`` request."""
@@ -316,7 +342,9 @@ def bridge_timeouts(
     For the rehearsal (256 attempts, 1,800 dev programs, 8 workers): a try is 27 + 15 = 42 s,
     an attempt 4 x 42 + 1 + 2 + 4 = 175 s, the Mac's reward bound 32 x 175 = 5,600 s and its
     dev bound 225 x 42 + 42 = 9,492 s; the allowance 2 + 5 x (30 + 120 + 120) + 3 x 15 + 0.5 =
-    1,397.5 s, so the Pod waits 6,997.5 s for rewards and 10,889.5 s for a dev check.
+    1,397.5 s; the Mac's checks before a request, one window pass of 11 x 60 + 2 x 30 + 10 =
+    730 s and the image check of 4 x 30 + 1 + 2 + 4 = 127 s, so the Pod waits 5,600 + 1,397.5 +
+    857 = 7,854.5 s for rewards and 11,746.5 s for a dev check.
     """
     for name, count in (
         ("attempts_per_request", attempts_per_request),
@@ -349,8 +377,10 @@ def bridge_timeouts(
         + 3 * backoff
         + pod_poll_seconds
     )
-    reward = mac_reward + allowance
-    dev = mac_dev + allowance
+    window_check = window_check_seconds_bound()
+    image_check = image_check_seconds_bound()
+    reward = mac_reward + allowance + window_check + image_check
+    dev = mac_dev + allowance + window_check + image_check
     lost = pod_idle_seconds - LOST_BRIDGE_MARGIN_SECONDS
     if lost <= LEASE_SECONDS:
         raise ValueError("the in-Pod idle limit leaves no room to detect a lost bridge")
@@ -363,6 +393,8 @@ def bridge_timeouts(
         mac_reward_timeout_seconds=mac_reward,
         mac_dev_timeout_seconds=mac_dev,
         bridge_allowance_seconds=allowance,
+        window_check_seconds=window_check,
+        image_check_seconds=image_check,
         reward_timeout_seconds=reward,
         dev_timeout_seconds=dev,
         awaiting_slack_seconds=float(awaiting_slack_seconds),

@@ -188,8 +188,8 @@ def test_the_run_two_receipt_is_exactly_what_the_worker_accepts(tmp_path: Path) 
     assert receipt["limits"]["wall_seconds"] == 34_800
     assert receipt["limits"]["self_destruct_seconds"] == 34_620
     assert receipt["limits"]["watchdog_cost_stop_usd"] == 5.79
-    assert receipt["watchdog_policy"]["awaiting_dev_extension_seconds"] == 10_949.5
-    assert receipt["bridge_timeouts"]["reward_timeout_seconds"] == 6_997.5
+    assert receipt["watchdog_policy"]["awaiting_dev_extension_seconds"] == 11_806.5
+    assert receipt["bridge_timeouts"]["reward_timeout_seconds"] == 7_854.5
     assert receipt["time_fit"]["fits_at_planning"]
     launch = check_readiness(
         json.loads(json.dumps(receipt)),

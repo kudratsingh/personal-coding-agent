@@ -22,10 +22,11 @@ Commands marked **Mac** run on the owner's Mac inside the repository checkout; *
 | Mac `--reward-timeout` | **5,600 s** | ceil(256 attempts / 8 workers) = 32 rounds x 175 s |
 | Mac `--dev-timeout` | **9,492 s** | ceil(1,800 programs / 8 workers) = 225 rounds x 42 s, + 42 s for a program still running |
 | Bridge allowance | 1,397.5 s | one 2 s Mac poll, a listing, a read and a write each tried 5 times to its 30, 120 and 120 s timeout, 3 x (1 + 2 + 4 + 8) s of backoff, one 0.5 s Pod poll |
-| Pod reward timeout | **6,997.5 s** | 5,600 + 1,397.5 |
-| Pod dev timeout | **10,889.5 s** | 9,492 + 1,397.5 |
-| Watchdog idle extension while `awaiting_rewards` | 7,057.5 s (reward), 10,949.5 s (dev) | the Pod's timeout for that wait + 60 s of slack |
-| Wait margin | 10,889.5 s, $1.81 | one full wait (the longer kind) at the quoted rate |
+| The Mac's checks before it scores a request | 857 s | one execution-window pass at its worst, 730 s (11 `docker` calls to their 60 s bound, two `ssh-add -l` to 30 s, one `launchctl getenv` to 10 s), and the image check, 127 s (4 tries of 30 s and 1 + 2 + 4 s of backoff) |
+| Pod reward timeout | **7,854.5 s** | 5,600 + 1,397.5 + 857 |
+| Pod dev timeout | **11,746.5 s** | 9,492 + 1,397.5 + 857 |
+| Watchdog idle extension while `awaiting_rewards` | 7,914.5 s (reward), 11,806.5 s (dev) | the Pod's timeout for that wait + 60 s of slack |
+| Wait margin | 11,746.5 s, $1.96 | one full wait (the longer kind) at the quoted rate |
 | Lost bridge | 600 s | a wait with no Mac lease renewal for this long; 300 s inside the in-Pod idle rule |
 
 **Liveness while the Pod waits on the Mac.** While the bridge client waits, the worker heartbeats `awaiting_rewards` with the request it waits on (`awaiting`: request ID, kind, index, count, start and age). The Mac watchdog, under run 2's policy, then lets the GPU idle for that kind's extension and never more, so a worker that hangs while claiming to wait is still deleted. The Mac's bridge server renews its lease, `server.lease` in the Pod's bridge root and dated by the Pod's own clock, with every poll and every few seconds while it reads, scores or answers a request; the worker stamps the heartbeat's `progress_unix` from a lease renewed within its 60 s, which the in-Pod idle rule counts as progress, and a stale lease counts as nothing. A dead Mac therefore lets the Pod go: the worker gives the wait up 600 s after the last renewal (`bridge_lost`), uploads its weights and finalizes, and if it could not, the in-Pod timer deletes the Pod 900 s after that renewal. `should_stop` is not read during a wait, so before every update and every request the worker stops (`wait_margin`) unless one full wait fits before the cost stop, the wall and the finalization reserve; unlike the cost and wall stops it finalizes in full.
@@ -425,7 +426,7 @@ uv run --locked python -m tools.mac_window_check exec --image-id "$SANDBOX_IMAGE
   --image-id "$SANDBOX_IMAGE_ID" --dotenv .env
 ```
 
-- **The timeouts** are the Mac's bounds, the Pod's less the bridge allowance: 5,600 s for a reward request and 9,492 s for a dev check. A request that runs past its bound gets a `timeout` reply the Pod can still read.
+- **The timeouts** are the Mac's bounds, the Pod's less the bridge allowance and the Mac's checks: 5,600 s for a reward request and 9,492 s for a dev check. A request that runs past its bound gets a `timeout` reply the Pod can still read.
 - **`.env`:** `--dotenv .env` names the file whose variable names the bridge refuses to run with; it refuses to start when no `.env` can be found, so give `--no-dotenv` only if the Mac has none. Exit **2** means it refused to start (a secret in its environment, a missing `.env`, a sealed split or a bad record): read its message, fix the terminal, start it again.
 - **Exit 3** means another bridge server holds this Pod's lease. Stop that one (only one server may score a Pod: two would score each request twice), or wait for its lease to lapse 60 s after its last renewal.
 - **A dead bridge** (the Mac slept, the process crashed, an SSH outage outlasted its retries): start the same command again with the same `--state` at once. A restart over the same state is the same server and takes its lease back at once; every reply it sent is stored there, so nothing is scored twice. It must be back within 600 s of its last lease renewal, or the worker gives the wait up as `bridge_lost` and ends the run; the in-Pod timer would delete the Pod 900 s after that renewal.

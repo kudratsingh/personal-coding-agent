@@ -7,8 +7,13 @@ secret could reach a child process (any ``R2_`` variable, the Runpod key, or a n
 at least one must exist unless ``--no-dotenv``), clears the SSH agent variables, and runs
 ``BridgeServer`` over the rehearsal's SSH options until interrupted, with the required
 Mac-side bounds on a reward request and a dev check. It never opens the sealed test or
-holdout split, whether named directly or reached through a link. See ``docs/rl.md`` and
-``docs/walkthroughs/rl-bridge.md``.
+holdout split, whether named directly or reached through a link.
+
+With ``--image-id`` (the command line requires it) the server repeats the Mac
+execution-window checks (``scratchcoder.sandbox.window``) on its own process: at its start
+and again before scoring a request once its last pass is ``--window-check-interval`` seconds
+old (900 s). A failed or errored pass stops it with exit 4 before anything more is scored.
+See ``docs/rl.md`` and ``docs/walkthroughs/rl-bridge.md``.
 """
 
 from __future__ import annotations
@@ -28,14 +33,20 @@ from scratchcoder.eval.tasks import Task, load_tasks
 from scratchcoder.rl.bridge import DEV, REWARD, BridgeRequest
 from scratchcoder.rl.bridge_mac import (
     AGENT_NAMES,
+    IMAGE_CHECK_RETRIES,
+    IMAGE_CHECK_TIMEOUT_SECONDS,
+    WINDOW_CHECK_INTERVAL_SECONDS,
+    WINDOW_DOCKER_TIMEOUT_SECONDS,
     BridgeServer,
     PodTransport,
     SSHTransport,
+    WindowCheck,
     environment_refusals,
     ssh_command,
     validate_remote_root,
 )
 from scratchcoder.rl.dev import dev_subset
+from scratchcoder.sandbox import window
 from scratchcoder.sandbox.runner import ENDPOINT, IMAGE
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -128,8 +139,43 @@ def load_phase_tasks(
 
 Run = Callable[..., subprocess.CompletedProcess[bytes]]
 
-IMAGE_CHECK_RETRIES = 3
-"""Retries of ``docker image inspect`` after the first try (4 tries, waiting 1, 2 and 4 s)."""
+
+def window_pass(
+    image_id: str,
+    *,
+    dotenv: Path | Sequence[Path] | None,
+    environ: MutableMapping[str, str],
+    session_socket: Callable[[], str | None] = window.launchd_socket,
+    run: window.Run | None = None,
+    run_agent: window.AgentRun | None = None,
+) -> WindowCheck:
+    """One full pass of the execution-window checks on the bridge's own process: its
+    environment (no ``.env`` name, no secret, no SSH agent variable: the child-environment
+    rule under which the Pod's R2 token may stay in ``.env``), every SSH agent the Mac names
+    (the login session's, asked afresh each pass), the pinned image's ID and Docker Desktop's
+    file sharing. ``docker`` runs in the cleaned environment, each call bounded by
+    ``WINDOW_DOCKER_TIMEOUT_SECONDS``. ``run`` and ``run_agent`` replace the ``docker`` and
+    ``ssh-add`` calls in tests."""
+    if not window.IMAGE_ID.fullmatch(image_id):
+        raise ValueError("--image-id must be the local image ID, sha256:<64 hex digits>")
+    files = [dotenv] if isinstance(dotenv, Path) else list(dotenv or ())
+    names = sorted({name for path in files for name in window.dotenv_names(path)})
+
+    def check() -> dict[str, Any]:
+        current = dict(environ)
+        docker = run or window.runner(
+            window.clean_environment(current, names), timeout=WINDOW_DOCKER_TIMEOUT_SECONDS
+        )
+        return window.check(
+            image_id=image_id,
+            environ=current,
+            dotenv=names,
+            run=docker,
+            sockets=window.agent_sockets(current, session_socket()),
+            run_agent=run_agent or window.ssh_add_list(current),
+        )
+
+    return check
 
 
 def image_check(
@@ -155,7 +201,12 @@ def image_check(
         problem = ""
         for attempt in range(retries + 1):
             try:
-                result = runner(command, capture_output=True, timeout=30, check=False)
+                result = runner(
+                    command,
+                    capture_output=True,
+                    timeout=IMAGE_CHECK_TIMEOUT_SECONDS,
+                    check=False,
+                )
             except (subprocess.TimeoutExpired, OSError) as error:
                 problem = f"docker image inspect did not finish ({type(error).__name__})"
             else:
@@ -198,6 +249,8 @@ def serve_command(
     max_polls: int | None = None,
     environ: MutableMapping[str, str] = os.environ,
     transport: PodTransport | None = None,
+    window_check: WindowCheck | None = None,
+    window_check_seconds: float = WINDOW_CHECK_INTERVAL_SECONDS,
 ) -> int:
     """Serve one Pod until interrupted (or for ``max_polls`` polls); 0 on a clean stop.
 
@@ -206,7 +259,9 @@ def serve_command(
     (``docs/rl.md``): the server scores one request at a time, so a request the Pod has
     already withdrawn must not keep the next one waiting. ``dotenv`` lists the ``.env``
     files to check (``resolve_dotenv`` finds them for the command line; ``None`` skips the
-    check and says there is none)."""
+    check and says there is none). With ``image_id`` the server's window passes are
+    ``window_pass`` over this process's environment, unless ``window_check`` gives another
+    (a test's); ``window_check_seconds`` is their interval."""
     for name, bound in (("reward_timeout", reward_timeout), ("dev_timeout", dev_timeout)):
         if isinstance(bound, bool) or not isinstance(bound, (int, float)):
             raise ValueError(f"{name} must be a number of seconds")
@@ -231,6 +286,8 @@ def serve_command(
     }
     inputs["counts"] = {REWARD: len(rewards), DEV: len(dev)}
     inputs["image_id"] = image_id
+    if window_check is None and image_id is not None:
+        window_check = window_pass(image_id, dotenv=dotenv, environ=environ)
     if transport is None:
         transport = SSHTransport(
             ssh_command(host, port, identity_file, known_hosts), remote_root, timeout=ssh_timeout
@@ -247,6 +304,8 @@ def serve_command(
         dev_timeout=dev_timeout,
         transport_retries=ssh_retries,
         inputs=inputs,
+        window_check=window_check,
+        window_check_seconds=window_check_seconds,
     ) as server:
         sys.stderr.write(
             f"rl-bridge: serving {len(rewards)} reward and {len(dev)} dev tasks; "

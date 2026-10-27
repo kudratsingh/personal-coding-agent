@@ -564,14 +564,14 @@ def test_every_dev_check_of_both_arms_generates_at_the_one_dev_batch_of_256(
     generates at one batch, the specification's ``rl.dev_batch_size``, which is 256. The
     control has no batch of its own to drift from it. (The smoke runs at a batch of 3, one
     no other setting uses, so a check generated at any other batch would show.)"""
-    import tools.posttrain_run2 as run2
+    from scratchcoder.rl.bridge import BridgeDevEvaluator
 
     approved = posttrain_approved.run2_specification()
     assert approved["rl"]["dev_batch_size"] == 256 and "dev_batch_size" not in approved["control"]
     assert json.loads(TEMPLATE.read_text())["rl"]["dev_batch_size"] == 256
     seen: list[tuple[str, int, int]] = []
 
-    class Recording(run2.BridgeDevEvaluator):
+    class Recording(BridgeDevEvaluator):
         def evaluate(self, model: Any, check: int) -> Any:
             seen.append((worker[0].stage_name, check, self.pool.batch_size))
             return super().evaluate(model, check)
@@ -581,7 +581,7 @@ def test_every_dev_check_of_both_arms_generates_at_the_one_dev_batch_of_256(
         raw["planning"]["generation_tokens_per_second"]["3"] = 50.0
 
     worker: list[Run2Worker] = []
-    monkeypatch.setattr(run2, "BridgeDevEvaluator", Recording)
+    monkeypatch.setattr("tools.posttrain_run2.BridgeDevEvaluator", Recording)
     ran = execute(
         found,
         tmp_path / "run",
@@ -789,13 +789,13 @@ def test_a_dead_mac_is_a_lost_bridge_and_the_pod_dies_within_the_idle_bound(
 
 
 def test_the_cost_stop_keeps_one_full_wait_free(found: Fixtures2, tmp_path: Path) -> None:
-    """With 1,550 s of spend left before the cost stop, dev check 0 (a dev wait of at most
-    1,523.5 s here) may start, but no update may: the margin is one full wait, 1,572.5 s."""
+    """With 2,400 s of spend left before the cost stop, dev check 0 (a dev wait of at most
+    2,380.5 s here) may start, but no update may: the margin is one full wait, 2,429.5 s."""
     clock = SlowClock()
     probe = make_run2_worker(found, tmp_path / "probe", bucket=MemoryBucket(), clock=clock)
     bounds = probe.timeouts
-    assert (bounds.dev_timeout_seconds, bounds.wait_margin_seconds) == (1_523.5, 1_572.5)
-    window = 1_550.0
+    assert (bounds.dev_timeout_seconds, bounds.wait_margin_seconds) == (2_380.5, 2_429.5)
+    window = 2_400.0
     limits = RunLimits(
         pod_seconds=18_000,
         quoted_total_hourly=0.6,
@@ -809,14 +809,14 @@ def test_the_cost_stop_keeps_one_full_wait_free(found: Fixtures2, tmp_path: Path
     assert report["rl"]["stop_reason"] == "external" and report["rl"]["updates"] == 0
     assert report["rl"]["stop_detail"].startswith("wait_margin: one full wait would pass the cost")
     margin = report["bridge"]["margin_stop"]
-    assert (margin["limit"], margin["wait_seconds"]) == ("cost_limit", 1_572.5)
+    assert (margin["limit"], margin["wait_seconds"]) == ("cost_limit", 2_429.5)
     assert [row["check"] for row in report["rl"]["checks"]] == [0]
     beat = json.loads((ran.worker.root / "heartbeat.json").read_text())
     assert "r2_final" in beat  # Not the cost stop itself: the finalization runs in full.
 
 
 def test_a_wait_that_cannot_fit_never_starts(found: Fixtures2, tmp_path: Path) -> None:
-    """With 1,500 s of spend left before the cost stop, less than a dev wait (1,523.5 s here),
+    """With 2,350 s of spend left before the cost stop, less than a dev wait (2,380.5 s here),
     dev check 0 is refused before its request is written. (The projected-finish rule, against
     the wall, lets the stage start: the wait's own check is what keeps the cost stop.)"""
     clock = SlowClock()
@@ -825,14 +825,14 @@ def test_a_wait_that_cannot_fit_never_starts(found: Fixtures2, tmp_path: Path) -
         quoted_total_hourly=0.6,
         cost_stop_usd=3.0,
         idle_seconds=600,
-        starting_cost_usd=3.0 - 1_500 / 3600 * 0.6,
+        starting_cost_usd=3.0 - 2_350 / 3600 * 0.6,
     )
     ran = execute(found, tmp_path / "run", clock=clock, limits=limits, pod_created=clock())
     report = ran.report
     assert (report["status"], report["stop_reason"]) == ("stopped", WAIT_MARGIN_STOP)
     margin = report["bridge"]["margin_stop"]
     assert (margin["kind"], margin["index"], margin["limit"]) == ("dev", 0, "cost_limit")
-    assert margin["wait_seconds"] == 1_523.5
+    assert margin["wait_seconds"] == 2_380.5
     assert report["bridge"]["requests_sent"] == 0
     assert not list((ran.worker.bridge_root / "outbox").iterdir())
     assert report["rl"]["stop_reason"] == "reward_wait" and report["rl"]["checks"] == []
@@ -1002,7 +1002,7 @@ def test_a_mac_that_dies_during_the_control_is_a_lost_bridge(
 def test_no_control_update_starts_without_one_full_wait_free(
     found: Fixtures2, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RL leaves 1,550 s of spend before the cost stop, less than one full wait (1,572.5 s
+    """RL leaves 2,400 s of spend before the cost stop, less than one full wait (2,429.5 s
     here): the control stops before its first update (``wait_margin``) and finalizes in full."""
     clock = JumpClock()
     window = 10_000.0
@@ -1016,7 +1016,7 @@ def test_no_control_update_starts_without_one_full_wait_free(
     original = Run2Worker.run_more_sft
 
     def after_a_long_rl(self: Run2Worker, stage: Any) -> list[dict[str, Any]]:
-        clock.offset += window - 1_550.0
+        clock.offset += window - 2_400.0
         self.last_activity = self.clock()
         return original(self, stage)
 
@@ -1030,7 +1030,7 @@ def test_no_control_update_starts_without_one_full_wait_free(
     assert (margin["kind"], margin["limit"], margin["wait_seconds"]) == (
         "next update",
         "cost_limit",
-        1_572.5,
+        2_429.5,
     )
 
 

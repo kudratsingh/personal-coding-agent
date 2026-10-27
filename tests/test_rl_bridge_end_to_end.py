@@ -698,6 +698,7 @@ def cli_arguments(tmp_path: Path) -> list[str]:
         f"--state={tmp_path / 'mac'}",
         "--reward-timeout=800",
         "--dev-timeout=400",
+        "--image-id=sha256:" + "d" * 64,
     ]
 
 

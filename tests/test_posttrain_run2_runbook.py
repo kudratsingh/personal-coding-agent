@@ -157,15 +157,16 @@ def test_the_runbooks_bounds_are_the_specifications() -> None:
         "**900 s**",
         "**5,600 s**",
         "**9,492 s**",
-        "**6,997.5 s**",
-        "**10,889.5 s**",
-        "7,057.5 s (reward), 10,949.5 s (dev)",
-        "10,889.5 s, $1.81",
+        "**7,854.5 s**",
+        "**11,746.5 s**",
+        "7,914.5 s (reward), 11,806.5 s (dev)",
+        "11,746.5 s, $1.96",
         "21,302 s",
     ):
         assert phrase in text, phrase
     assert f"{BOUNDS.lost_bridge_seconds:,.0f} s" in text
-    assert "| 1,397.5 s |" in text
+    assert "| 1,397.5 s |" in text and "| 857 s |" in text
+    assert BOUNDS.mac_check_seconds == 857 and BOUNDS.window_check_seconds == 730
     for reason in (BRIDGE_LOST_STOP, WAIT_MARGIN_STOP, "reward_wait", "reward_host_failure"):
         assert reason in text, reason
     assert "60,000 s of the pretraining rehearsal is never used" in text
@@ -178,14 +179,12 @@ def test_the_bridge_runs_in_the_window_with_the_derived_mac_bounds(
     values = options(bridge)
     spec = posttrain_approved.run2_specification()
     assert values["--reward-timeout"] == "5600.0" and values["--dev-timeout"] == "9492.0"
-    assert (
-        float(values["--reward-timeout"])
-        == BOUNDS.reward_timeout_seconds - BOUNDS.bridge_allowance_seconds
-    )
-    assert (
-        float(values["--dev-timeout"])
-        == BOUNDS.dev_timeout_seconds - BOUNDS.bridge_allowance_seconds
-    )
+    for kind in ("reward", "dev"):
+        assert (
+            float(values[f"--{kind}-timeout"])
+            == BOUNDS.timeout(kind) - BOUNDS.bridge_allowance_seconds - BOUNDS.mac_check_seconds
+            == BOUNDS.mac_timeout(kind)
+        )
     assert values["--remote-root"] == spec["bridge"]["root"] == "/workspace/posttrain-bridge"
     assert values["--image-id"] == VALUES["SANDBOX_IMAGE_ID"] and values["--dotenv"] == ".env"
     assert values["--kept"] == "runs/posttrain-shared/screening.json"
@@ -253,8 +252,8 @@ def test_the_pod_and_mac_commands_name_run_twos_paths_and_limits(
     (watchdog,) = base.by("tools.runpod_watchdog")
     flags = options(watchdog)
     assert flags["--max-wall-seconds"] == "34800" and flags["--max-cost-usd"] == "5.79"
-    assert flags["--awaiting-reward-extension-seconds"] == "7057.5"
-    assert flags["--awaiting-dev-extension-seconds"] == "10949.5"
+    assert flags["--awaiting-reward-extension-seconds"] == "7914.5"
+    assert flags["--awaiting-dev-extension-seconds"] == "11806.5"
     assert flags["--policy"] == f"{VALUES['CTRL']}/policy.json"
     (supervisor,) = base.by("tools.pilot_supervisor")
     assert supervisor[:4] == ["--mode", "posttrain", "--run", "2"]

@@ -110,13 +110,13 @@
     "ssh_list_timeout_seconds": 30.0,
     "ssh_retries": 4,
     "awaiting_slack_seconds": 60.0,
-    "reward_timeout_seconds": 6997.5,
-    "dev_timeout_seconds": 10889.5,
+    "reward_timeout_seconds": 7854.5,
+    "dev_timeout_seconds": 11746.5,
     "mac_reward_timeout_seconds": 5600.0,
     "mac_dev_timeout_seconds": 9492.0,
-    "awaiting_reward_extension_seconds": 7057.5,
-    "awaiting_dev_extension_seconds": 10949.5,
-    "wait_margin_seconds": 10889.5,
+    "awaiting_reward_extension_seconds": 7914.5,
+    "awaiting_dev_extension_seconds": 11806.5,
+    "wait_margin_seconds": 11746.5,
     "lost_bridge_seconds": 600.0
   },
   "stages": [
