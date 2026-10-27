@@ -35,6 +35,7 @@ from scratchcoder.sandbox.reward import (
     HOST_TIMEOUT,
     MALFORMED_REPORT,
     NOT_PARSEABLE,
+    OVERSIZED,
     RESOURCE_KILL,
     UNAVAILABLE,
     AuditTally,
@@ -183,6 +184,10 @@ def test_what_enters_the_container_must_fit_the_input_limit() -> None:
     assert not is_parseable(function_task(calls))
     big_input = json.dumps([{"input": "x" * 200000, "output": "1"}])
     assert parse_io_cases(big_input) is None
+    # The inputs together must fit as well: every one of them enters the container.
+    many_inputs = json.dumps([{"input": "x" * 70000, "output": "1"}] * 2)
+    assert parse_io_cases(many_inputs) is None
+    assert parse_io_cases(many_inputs, limits=Limits(input_bytes=150000)) is not None
     # Expected outputs stay on the host, so many large ones are fine.
     big_outputs = json.dumps([{"input": "", "output": "y" * 60000}] * 10)
     assert parse_io_cases(big_outputs) is not None
@@ -248,7 +253,7 @@ def test_the_shared_rule_holds_the_pool_specs_values() -> None:
             budget.io_seconds(bad)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("count", [1, 2, 7, 24, 40, 99, 100])
+@pytest.mark.parametrize("count", range(1, 101))
 def test_pool_verification_and_reward_channel_give_an_io_task_the_same_deadline(
     count: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -343,7 +348,15 @@ def row(index: int, value: object) -> str:
 
 
 def function_report(rows: list[Any], **extra: Any) -> dict[str, Any]:
-    return {"status": "ran", "mode": "function", "n": len(rows), "rows": rows, **extra}
+    return {
+        "status": "ran",
+        "mode": "function",
+        "n": len(rows),
+        "rows": rows,
+        "child_rc": 0,
+        "output_limit": False,
+        **extra,
+    }
 
 
 def report_container(
@@ -715,6 +728,130 @@ def test_not_parseable_returns_none_reward_without_running() -> None:
     assert not ran
 
 
+def test_process_level_failures_fail_every_function_check() -> None:
+    # One process runs the candidate and every call, as in the evaluation program, where
+    # output beyond the cap or a nonzero exit fails the whole run.
+    task = function_task("assert f() == 1\nassert f() == 2")
+    rows = [row(0, 1), row(1, 2)]
+
+    def scored(**extra: Any) -> RewardResult:
+        return score_attempt(task, "c", container=report_container(function_report(rows, **extra)))
+
+    assert scored().reward == 1.0
+    flood = scored(output_limit=True)
+    assert flood.status == COMPLETED and flood.reward == 0.0 and flood.detail == "output limit"
+    for status in (1, -9, None, "0"):
+        exited = scored(child_rc=status)
+        assert exited.reward == 0.0 and exited.detail == f"exit status {status}", status
+    # A report without the output flag is not trusted to have checked it.
+    unflagged = function_report(rows)
+    del unflagged["output_limit"]
+    assert score_attempt(task, "c", container=report_container(unflagged)).reward == 0.0
+    # A process the budget ended before every call reported keeps the calls that did.
+    cut = function_report([row(0, 1), None], child_rc=-9)
+    partial = score_attempt(task, "c", container=report_container(cut))
+    assert partial.reward == 0.5 and partial.unfinished == 1 and partial.detail == ""
+
+
+def test_an_oversized_attempt_scores_zero_without_starting_a_container() -> None:
+    ran = False
+
+    def guard(payload: dict[str, Any]) -> ContainerOutcome:
+        nonlocal ran
+        ran = True
+        return ContainerOutcome(COMPLETED, function_report([row(0, 1)]))
+
+    limit = Limits().input_bytes
+    task = function_task("assert f() == 1")
+    huge = "def f():\n    return 1\n#" + "x" * limit
+    result = score_attempt(task, huge, container=guard)
+    assert not ran
+    assert result.status == OVERSIZED and result.reward == 0.0 and not result.is_host_failure
+    assert result.total == 1 and result.outcomes == (False,) and result.audit_flags == ()
+    # The call sources (or case inputs) count toward the limit with the code.
+    calls = function_task("assert f('" + "y" * (limit // 2) + "') == 1")
+    assert score_attempt(calls, "z" * (limit // 2), container=guard).status == OVERSIZED
+    cases = io_task([{"input": "y" * (limit // 2), "output": "1"}])
+    assert score_attempt(cases, "z" * (limit // 2 + 1), container=guard).status == OVERSIZED
+    assert not ran
+    # Just inside the limit still runs.
+    assert score_attempt(task, "def f():\n    return 1", container=guard).reward == 1.0
+    # A host failure is never reported for size: retries do not run it again.
+    retried = score_with_host_retries(task, huge, sleep=lambda _: None, container=guard)
+    assert retried.status == OVERSIZED and retried.reward == 0.0
+
+
+def test_the_supervisor_reports_spawn_failures_only_before_any_candidate_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing here can start a process: the supervisor's spawning points are replaced.
+    def no_memory(data: bytes) -> int:
+        raise BlockingIOError("EAGAIN")
+
+    monkeypatch.setattr(reward_program, "_memory_file", no_memory)
+    function_payload = {
+        "mode": "function",
+        "code": "c",
+        "setup": "",
+        "calls": ["f()"],
+        "per_call": 1.0,
+        "budget": 1.0,
+        "output_bytes": 65536,
+        "row_bytes": 65536,
+        "site_packages": False,
+    }
+    report = reward_program.run_report(function_payload)
+    assert report == {"status": "spawn_failed", "error_type": "BlockingIOError"}
+    # A malformed payload is the host's own fault too, and nothing of the candidate ran.
+    assert reward_program.run_report({"mode": "function"})["status"] == "spawn_failed"
+
+    class NoForkServer:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            raise OSError("ENOMEM")
+
+    io_payload = {
+        "mode": "io",
+        "code": "c",
+        "cases": ["1", "2"],
+        "per_case": None,
+        "budget": 1.0,
+        "output_bytes": 65536,
+        "site_packages": False,
+    }
+    monkeypatch.setattr(reward_program, "_Zygote", NoForkServer)
+    assert reward_program.run_report(io_payload)["status"] == "spawn_failed"
+
+    class BrokenAfterFirstRequest:
+        built = 0
+
+        def __init__(self, payload: dict[str, Any]) -> None:
+            BrokenAfterFirstRequest.built += 1
+            if BrokenAfterFirstRequest.built > 1:
+                raise OSError("ENOMEM")
+            self.pid = 0
+
+        def run_case(self, text: str, cap: int, case_deadline: float) -> dict[str, Any]:
+            # The request reached the fork server, so a candidate may have run.
+            reward_program._mark_candidate_started()
+            raise ConnectionError("fork server exited")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(reward_program, "_Zygote", BrokenAfterFirstRequest)
+    report = reward_program.run_report(io_payload)
+    # Once a candidate may have run, a failed fork server only fails the cases: scored.
+    assert report["status"] == "ran"
+    assert report["cases"] == [{"ran": False, "e": "runner"}, {"ran": False, "e": "runner"}]
+
+
+def test_the_supervisors_own_overrun_stays_far_inside_the_host_slack() -> None:
+    # The supervisor's longest wait past the budget, plus several seconds for the container
+    # to start and stop under emulation, is still short of the host's stall deadline.
+    assert reward_program.OVERRUN_SECONDS == 7.0
+    assert reward_program.OVERRUN_SECONDS + 5.0 <= reward.HOST_SLACK_SECONDS
+
+
 def test_the_payload_carries_no_expected_values() -> None:
     seen: list[dict[str, Any]] = []
 
@@ -782,7 +919,14 @@ mode = os.environ["FAKE_DOCKER_MODE"]
 payload = json.load(sys.stdin)
 nonce = payload.get("nonce", "")
 row = json.dumps({"i": 0, "ok": True, "v": ["int", 1]}).encode()
-report = {"status": "ran", "mode": "function", "n": 1, "rows": [base64.b64encode(row).decode()]}
+report = {
+    "status": "ran",
+    "mode": "function",
+    "n": 1,
+    "rows": [base64.b64encode(row).decode()],
+    "child_rc": 0,
+    "output_limit": False,
+}
 
 
 def frame(kind, **extra):
@@ -820,6 +964,10 @@ elif mode == "junk_after_start":
 elif mode == "supervisor_error":
     frame("started")
     frame("final", report={"status": "supervisor_error", "error_type": "OSError"})
+    sys.exit(0)
+elif mode == "spawn_failed":
+    frame("started")
+    frame("final", report={"status": "spawn_failed", "error_type": "BlockingIOError"})
     sys.exit(0)
 elif mode == "no_started_frame":
     print(json.dumps(report))
@@ -887,6 +1035,8 @@ def fake_payload() -> dict[str, Any]:
         ("exit_137_after_start", RESOURCE_KILL),
         ("junk_after_start", MALFORMED_REPORT),
         ("supervisor_error", MALFORMED_REPORT),
+        # The supervisor could not start the candidate's first process: nothing ran.
+        ("spawn_failed", HOST_ERROR),
         ("valid_with_noise", COMPLETED),
         ("valid_then_137", COMPLETED),
     ],
@@ -998,6 +1148,33 @@ def test_runner_marks_host_stalls_without_changing_the_status(
     assert result.status == "timeout"
     assert result.host_stalled is stalled
     assert time.monotonic() - started < 10
+
+
+def test_the_pool_verification_retries_what_the_runner_marks_stalled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The pool's elapsed-time stall signature uses the runner's own watchdog constant, and a
+    # result the runner marks stalled is retried whatever its elapsed time.
+    assert task_pool.HOST_DEADLINE_SLACK == runner.HOST_WATCHDOG_SECONDS
+    monkeypatch.setattr(task_pool, "RETRY_DELAY_SECONDS", 0.0)
+    stalls = {"left": 1}
+
+    def execute(code: str, tests: str, mode: str) -> runner.Result:
+        if stalls["left"]:
+            stalls["left"] -= 1
+            return runner.Result("timeout", "", -9, 0.5, host_stalled=True)
+        return runner.Result("passed")
+
+    found, counters = task_pool.verify(
+        [("a", "b", "function")],
+        tmp_path / "cache.jsonl",
+        execute=execute,
+        deadline=lambda tests, mode: 2.0,
+        workers=1,
+        progress=lambda message: None,
+    )
+    assert found[task_pool.call_key("a", "b", "function")].passed
+    assert counters["retried_calls"] == 1
 
 
 # --------------------------------------------------------------------------------------
@@ -1288,25 +1465,63 @@ def test_live_subclasses_are_reported_as_their_base_type() -> None:
 
 
 # (hidden assertion, candidate code, whether the evaluation runner's in-process assertion
-# passes it). The reward channel must agree on every row except the last, the documented
-# residual: a result of a candidate-defined type cannot be reported, so it fails in reward
-# mode even though its own ``__eq__`` lets the in-process assertion pass.
-LIVE_EQUALITY: list[tuple[str, str, bool]] = [
-    ("assert half(4) == 2", "def half(n):\n    return n / 2", True),
-    ("assert is_even(4) == 1", "def is_even(n):\n    return n % 2 == 0", True),
-    ("assert is_even(4) == True", "def is_even(n):\n    return 1", True),
-    ("assert is_even(4) is True", "def is_even(n):\n    return 1", False),
-    ("assert pair() == (1, 2)", "def pair():\n    return [1, 2]", False),
-    ("assert pair() == [1, 2]", "def pair():\n    return [1.0, 2]", True),
-    ("assert nan() == 0.0", "def nan():\n    return float('nan')", False),
-    ("assert zero() == 0", "def zero():\n    return -0.0", True),
-    ("assert big() == 1e999", "def big():\n    return float('inf')", True),
-    ("assert not empty()", "def empty():\n    return 0.0", True),
-    ("assert keys() == {1: 'a'}", "def keys():\n    return {True: 'a'}", True),
+# passes it, whether the reward channel passes it). The two agree on built-in values; the rows
+# where they differ are the documented residuals: a value outside the reported types fails in
+# reward mode (a candidate-defined type, ``complex``, ``Decimal``, ``Fraction``, ``deque``),
+# and a subclass is judged by its base value, not by its own ``__eq__``.
+LIVE_EQUALITY: list[tuple[str, str, bool, bool]] = [
+    ("assert half(4) == 2", "def half(n):\n    return n / 2", True, True),
+    ("assert is_even(4) == 1", "def is_even(n):\n    return n % 2 == 0", True, True),
+    ("assert is_even(4) == True", "def is_even(n):\n    return 1", True, True),
+    ("assert is_even(4) is True", "def is_even(n):\n    return 1", False, False),
+    ("assert pair() == (1, 2)", "def pair():\n    return [1, 2]", False, False),
+    ("assert pair() == [1, 2]", "def pair():\n    return [1.0, 2]", True, True),
+    ("assert nan() == 0.0", "def nan():\n    return float('nan')", False, False),
+    ("assert zero() == 0", "def zero():\n    return -0.0", True, True),
+    ("assert big() == 1e999", "def big():\n    return float('inf')", True, True),
+    ("assert not empty()", "def empty():\n    return 0.0", True, True),
+    ("assert keys() == {1: 'a'}", "def keys():\n    return {True: 'a'}", True, True),
+    # A bytearray is reported as bytes, a keys view as a frozenset: same ``==`` either way.
+    ("assert raw() == b'ab'", "def raw():\n    return bytearray(b'ab')", True, True),
+    ("assert raws() == [b'a']", "def raws():\n    return [bytearray(b'a')]", True, True),
+    ("assert keys() == {1, 2}", "def keys():\n    return {1: 0, 2: 0}.keys()", True, True),
+    ("assert not keys()", "def keys():\n    return {}.keys()", True, True),
+    ("assert keys() == [1]", "def keys():\n    return {1: 0}.keys()", False, False),
+    # Residuals: values the encoding does not carry.
     (
         "assert point() == (1, 2)",
         "class P:\n    def __eq__(self, other):\n        return other == (1, 2)\n"
         "def point():\n    return P()",
+        True,
+        False,
+    ),
+    ("assert c() == 2", "def c():\n    return complex(2, 0)", True, False),
+    (
+        "assert d() == 1.5",
+        "from decimal import Decimal\ndef d():\n    return Decimal('1.5')",
+        True,
+        False,
+    ),
+    (
+        "assert q() == 0.5",
+        "from fractions import Fraction\ndef q():\n    return Fraction(1, 2)",
+        True,
+        False,
+    ),
+    ("assert not d()", "from collections import deque\ndef d():\n    return deque()", True, False),
+    # Residuals: a subclass is judged by its base value, either way.
+    (
+        "assert s() == 'abc'",
+        "class S(str):\n    def __eq__(self, o):\n        return str.lower(self) == str.lower(o)\n"
+        "    __hash__ = str.__hash__\ndef s():\n    return S('ABC')",
+        True,
+        False,
+    ),
+    (
+        "assert n() == 5",
+        "class N(int):\n    def __eq__(self, o):\n        return False\n"
+        "    __hash__ = int.__hash__\ndef n():\n    return N(5)",
+        False,
         True,
     ),
 ]
@@ -1314,22 +1529,35 @@ LIVE_EQUALITY: list[tuple[str, str, bool]] = [
 
 @integration
 def test_live_equality_matches_the_in_process_assertion() -> None:
-    def verdicts(item: tuple[str, str, bool]) -> tuple[str, float | None, bool, bool]:
-        hidden, code, expected = item
-        rewarded = live(function_task(hidden), code).reward
-        return hidden, rewarded, runner.run(code, hidden).passed, expected
+    def verdicts(item: tuple[str, str, bool, bool]) -> tuple[str, float | None, bool, bool, bool]:
+        hidden, code, evaluation, rewarded = item
+        result = live(function_task(hidden), code).reward
+        return hidden, result, runner.run(code, hidden).passed, evaluation, rewarded
 
     with ThreadPoolExecutor(4) as pool:
         rows = list(pool.map(verdicts, LIVE_EQUALITY))
-    for hidden, rewarded, evaluated, expected in rows[:-1]:
-        assert evaluated is expected, hidden
-        assert rewarded == (1.0 if expected else 0.0), hidden
-    hidden, rewarded, evaluated, _ = rows[-1]
-    assert evaluated and rewarded == 0.0, hidden
+    for hidden, result, evaluated, evaluation, rewarded in rows:
+        assert evaluated is evaluation, hidden
+        assert result == (1.0 if rewarded else 0.0), hidden
 
+
+# A candidate that rewinds stdin to read the driver's configuration (the call sources, and a
+# literal written inside one of them) finds it empty, as in the evaluation program.
+REWIND_STDIN = (
+    "import json, os, re, sys\n"
+    "try:\n"
+    "    os.lseek(0, 0, os.SEEK_SET)\n"
+    "    calls = json.loads(sys.stdin.read())['calls']\n"
+    "    NUMS = [float(x) for c in calls for x in re.findall(r'\\d+\\.\\d+', c)]\n"
+    "except Exception:\n"
+    "    NUMS = [0.0]\n"
+    "def f(x):\n"
+    "    return NUMS[0]\n"
+)
 
 # (hidden tests, candidate code, whether the evaluation runner passes it): the candidate runs
-# as the main script, and the hidden tests' imports come after it, in both paths.
+# as the main script ``/tmp/candidate.py`` with an empty stdin, and the hidden tests' imports
+# come after it, in both paths.
 LIVE_MAIN_SCRIPT: list[tuple[str, str, bool]] = [
     (
         "assert db.get('a') == 1",
@@ -1343,6 +1571,27 @@ LIVE_MAIN_SCRIPT: list[tuple[str, str, bool]] = [
     ),
     ("import math\nassert f() == 3", "X = math.floor(3.5)\ndef f():\n    return X", False),
     ("from math import floor\nassert floor(2.5) == 2", "def floor(x):\n    return 99", True),
+    ("assert f() == 3", "def f():\n    return __builtins__.len([1, 2, 3])", True),
+    (
+        "assert f() == 3",
+        "import sys\ndef helper():\n    return 3\n"
+        "def f():\n    return getattr(sys.modules['__main__'], 'helper')()",
+        True,
+    ),
+    ("assert f() == '/tmp/candidate.py'", "import sys\ndef f():\n    return sys.argv[0]", True),
+    (
+        "assert f() == 'def g(): pass\\n'",
+        "import inspect\ndef g(): pass\ndef f():\n    return inspect.getsource(g)",
+        True,
+    ),
+    (
+        "assert f() == 1",
+        "import pickle\nclass A:\n    x = 1\n"
+        "def f():\n    return pickle.loads(pickle.dumps(A())).x",
+        True,
+    ),
+    ("assert f() == ''", "import sys\ndef f():\n    return sys.stdin.read()", True),
+    ("assert f(1) - 2.5 == 0", REWIND_STDIN, False),
 ]
 
 
@@ -1357,6 +1606,36 @@ def test_live_candidate_runs_as_the_main_script_as_in_evaluation() -> None:
         for hidden, rewarded, evaluated, expected in pool.map(verdicts, LIVE_MAIN_SCRIPT):
             assert evaluated is expected, hidden
             assert rewarded == (1.0 if expected else 0.0), hidden
+
+
+# Process-level failures the evaluation program fails as a whole: output beyond the cap, a
+# nonzero exit status, and a process that never ends. The first program is the control.
+LIVE_PROCESS: list[tuple[str, bool]] = [
+    ("def f():\n    print('x' * 1000)\n    return 1", True),
+    ("def f():\n    print('x' * 70000)\n    return 1", False),
+    ("import atexit, os\natexit.register(lambda: os._exit(1))\ndef f():\n    return 1", False),
+    (
+        "import threading, time\nthreading.Thread(target=lambda: time.sleep(100)).start()\n"
+        "def f():\n    return 1",
+        False,
+    ),
+]
+
+
+@integration
+def test_live_process_level_failures_fail_every_check_as_in_evaluation() -> None:
+    hidden = "assert f() == 1"
+
+    def verdicts(item: tuple[str, bool]) -> tuple[str, RewardResult, bool, bool]:
+        code, expected = item
+        result = live(function_task(hidden), code, budget=3.0)
+        return code, result, runner.run(code, hidden).passed, expected
+
+    with ThreadPoolExecutor(4) as pool:
+        for code, result, evaluated, expected in pool.map(verdicts, LIVE_PROCESS):
+            assert evaluated is expected, code
+            assert result.status == COMPLETED, code
+            assert result.reward == (1.0 if expected else 0.0), code
 
 
 @integration
@@ -1474,6 +1753,40 @@ def test_live_io_signals_to_pid_one_are_ignored() -> None:
     code = "import os, signal\nos.kill(1, signal.SIGINT)\nprint(int(input()) + 1)"
     result = live(io_task(THREE_CASES), code)
     assert result.status == COMPLETED and result.reward == 1.0
+
+
+@integration
+@pytest.mark.parametrize(
+    "code",
+    [
+        # Stop the fork server, then finish: its exit-status answer never comes.
+        "import os, signal\nos.kill(os.getppid(), signal.SIGSTOP)\nprint(int(input()) + 1)",
+        # Stop the fork server and keep the case running.
+        "import os, signal, time\nos.kill(os.getppid(), signal.SIGSTOP)\ntime.sleep(100)",
+    ],
+)
+def test_live_a_stopped_fork_server_cannot_push_an_attempt_into_a_host_stall(code: str) -> None:
+    # The supervisor bounds its own waits past the budget (``OVERRUN_SECONDS``), so the
+    # attempt is scored well before the host's stall deadline of budget + 15 s.
+    result = live(io_task(THREE_CASES), code)
+    assert result.status == COMPLETED and result.reward == 0.0
+    assert result.budget_seconds is not None
+    overrun = result.elapsed_seconds - result.budget_seconds
+    assert overrun < reward_program.OVERRUN_SECONDS + 5.0, overrun
+
+
+@integration
+def test_live_io_files_in_tmp_persist_across_cases_as_in_the_pool_verification() -> None:
+    # Cases share the container's /tmp in both paths; no expected value is there to find.
+    code = (
+        "import os\npath = '/tmp/n'\n"
+        "n = int(open(path).read()) if os.path.exists(path) else 0\n"
+        "open(path, 'w').write(str(n + 1))\nprint(n)"
+    )
+    task = io_task([{"input": "", "output": str(n)} for n in range(5)])
+    assert live(task, code).reward == 1.0
+    pool_limits = task_pool.limits_for(pool_verification(), task.hidden_tests, "io")
+    assert runner.run(code, task.hidden_tests, pool_limits, mode="io").passed
 
 
 @integration

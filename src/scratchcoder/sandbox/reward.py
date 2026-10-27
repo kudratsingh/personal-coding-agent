@@ -30,7 +30,13 @@ Host failures are separated from candidate failures by framing: the supervisor w
 exists. A problem before that frame (no docker binary, an unreachable daemon, an absent
 image, a hung CLI) is a host failure that is retried and never scored. Once ``started`` has
 arrived, a lost, malformed or oversized report is attributed to the candidate and scores
-0.0, so a candidate cannot convert its own failure into a skipped attempt.
+0.0, so a candidate cannot convert its own failure into a skipped attempt. Only two outcomes
+after ``started`` are still host failures: the supervisor's ``spawn_failed`` report (the
+candidate's first process could not be started, so none of its code ran) and a docker CLI
+still running at the host's stall deadline, which the supervisor's own bound
+(``reward_program.OVERRUN_SECONDS`` past the budget) keeps out of a candidate's reach. An
+attempt too large for the sandbox input limit is scored 0.0 on the host without starting a
+container, so it cannot exhaust the supervisor before ``started`` either.
 """
 
 import ast
@@ -78,6 +84,10 @@ the candidate started and before it reported (the attempt scores 0.0)."""
 MALFORMED_REPORT = "malformed_report"
 """The candidate started but the report was lost or malformed (for example the candidate
 disrupted the supervisor). Attributed to the candidate: the attempt scores 0.0."""
+OVERSIZED = "oversized"
+"""The attempt (the candidate code with the call sources or case inputs that go with it) is
+larger than the sandbox input limit, so no container was started. Attributed to the
+candidate: the attempt scores 0.0, and it is not audited."""
 NOT_PARSEABLE = "not_parseable"
 """The task's hidden tests are outside the supported forms; ``reward`` is ``None``."""
 HOST_TIMEOUT = "host_timeout"
@@ -86,7 +96,8 @@ UNAVAILABLE = "unavailable"
 """Docker is missing, the daemon is unreachable or the pinned image is absent; a host
 failure."""
 HOST_ERROR = "host_error"
-"""The container never reported that the candidate started; a host failure to retry."""
+"""The container never reported that the candidate started, or the supervisor reported that
+the candidate's first process could not be started; a host failure to retry."""
 
 HOST_FAILURES = frozenset({HOST_TIMEOUT, UNAVAILABLE, HOST_ERROR})
 """Statuses that must be retried and never scored as a reward (not even 0.0)."""
@@ -273,9 +284,9 @@ def parse_function_checks(
 
 def parse_io_cases(hidden_tests: str, *, limits: Limits | None = None) -> IoCases | None:
     """Parse an I/O task's cases; ``None`` when the cases are malformed, more than the
-    evaluation runner allows, an input is larger than the sandbox input limit, or an expected
-    output is larger than the per-case output cap (no stdout could ever match it). Expected
-    outputs never enter the container, so their total size is not limited."""
+    evaluation runner allows, the inputs together are larger than the sandbox input limit,
+    or an expected output is larger than the per-case output cap (no stdout could ever match
+    it). Expected outputs never enter the container, so their total size is not limited."""
     limits = limits or Limits()
     try:
         cases = loads(hidden_tests)
@@ -292,12 +303,12 @@ def parse_io_cases(hidden_tests: str, *, limits: Limits | None = None) -> IoCase
             or not isinstance(case.get("output"), str)
         ):
             return None
-        if _size(case["input"]) > limits.input_bytes:
-            return None
         if _size(case["output"].strip()) > limits.output_bytes:
             return None
         inputs.append(case["input"])
         expected.append(case["output"])
+    if sum(_size(text) for text in inputs) > limits.input_bytes:
+        return None
     return IoCases(tuple(inputs), tuple(expected))
 
 
@@ -657,8 +668,9 @@ def run_reward_container(
     """Run the reward supervisor in the hardened container and classify the host outcome.
 
     - No docker binary, exit 125 or an unreachable daemon before the candidate started:
-      ``unavailable``. Any other failure before the ``started`` frame: ``host_error``. A CLI
-      that has not finished ``budget + HOST_SLACK_SECONDS`` after launch: ``host_timeout``.
+      ``unavailable``. Any other failure before the ``started`` frame, or a final report of
+      ``spawn_failed`` (no candidate process could be started): ``host_error``. A CLI that
+      has not finished ``budget + HOST_SLACK_SECONDS`` after launch: ``host_timeout``.
       These are host failures.
     - After ``started``: a valid final frame is ``completed``; exit 137 without one is
       ``resource_kill``; anything else is ``malformed_report``. These are scored.
@@ -724,6 +736,11 @@ def run_reward_container(
             return ContainerOutcome(HOST_ERROR, None, code, elapsed, "candidate never started")
         if reader.final is not None and reader.final.get("status") == "ran":
             return ContainerOutcome(COMPLETED, reader.final, code, elapsed)
+        if reader.final is not None and reader.final.get("status") == "spawn_failed":
+            # Only PID 1 writes the final frame, and it reports this only when no candidate
+            # process ever existed, so the candidate cannot cause or forge it.
+            detail = "candidate process could not start"
+            return ContainerOutcome(HOST_ERROR, None, code, elapsed, detail)
         if code == 137:
             return ContainerOutcome(RESOURCE_KILL, None, code, elapsed, "container killed")
         detail = "no final report" if reader.final is None else "supervisor failed"
@@ -801,10 +818,15 @@ def _decode_row(raw: object, index: int) -> dict[str, Any] | None:
     return row
 
 
-def _score_function(checks: FunctionChecks, report: dict[str, Any]) -> tuple[list[bool], int]:
+def _score_function(checks: FunctionChecks, report: dict[str, Any]) -> tuple[list[bool], int, str]:
+    """Per-check outcomes, the unfinished count and a detail. As in the evaluation program,
+    where one process runs the candidate and every assertion, two process-level failures
+    fail every check: output beyond the cap, and a nonzero (or missing) exit status once
+    every call has reported (an ``atexit`` exit, a thread that never ends). A process ended
+    by the budget before every call reported keeps the calls that did."""
     rows = report.get("rows")
     if type(rows) is not list or len(rows) != checks.total:
-        return [False] * checks.total, 0
+        return [False] * checks.total, 0, ""
     outcomes: list[bool] = []
     unfinished = 0
     for index, (check, raw) in enumerate(zip(checks.checks, rows, strict=True)):
@@ -815,7 +837,12 @@ def _score_function(checks: FunctionChecks, report: dict[str, Any]) -> tuple[lis
             continue
         unfinished += row.get("e") == "call_timeout"
         outcomes.append(check_passes(check, row))
-    return outcomes, unfinished
+    if report.get("output_limit") is not False:
+        return [False] * checks.total, unfinished, "output limit"
+    child_rc = report.get("child_rc")
+    if all(raw is not None for raw in rows) and (type(child_rc) is not int or child_rc != 0):
+        return [False] * checks.total, unfinished, f"exit status {child_rc}"
+    return outcomes, unfinished, ""
 
 
 def _score_io(cases: IoCases, report: dict[str, Any]) -> tuple[list[bool], int]:
@@ -840,6 +867,14 @@ def _score_io(cases: IoCases, report: dict[str, Any]) -> tuple[list[bool], int]:
             continue
         outcomes.append(stdout.strip() == expected.strip())
     return outcomes, unfinished
+
+
+def _attempt_bytes(code: str, parsed: FunctionChecks | IoCases) -> int:
+    """The bytes an attempt sends into the container besides the fixed supervisor: the
+    candidate code and the call sources with their imports, or the case inputs."""
+    if isinstance(parsed, IoCases):
+        return _size(code) + sum(_size(text) for text in parsed.inputs)
+    return _size(code) + _size(parsed.setup) + sum(_size(check.call) for check in parsed.checks)
 
 
 def attempt_budget(parsed: FunctionChecks | IoCases) -> float:
@@ -873,7 +908,8 @@ def score_attempt(
     ``total`` taken from the task file. Unparseable tasks and host failures return a reward
     of ``None`` (never 0.0), so the RL loop can skip or retry instead of optimising against a
     host problem. Everything that happens after the candidate started is scored: a resource
-    kill or a disrupted report counts as a failed attempt.
+    kill or a disrupted report counts as a failed attempt. An attempt larger than the
+    sandbox input limit is ``oversized`` and scores 0.0 without starting a container.
 
     ``budget`` defaults to :func:`attempt_budget` (the value used is recorded in the result's
     ``budget_seconds``). ``per_call`` bounds each function-mode call. ``per_case`` bounds each
@@ -881,13 +917,21 @@ def score_attempt(
     the pool verification's I/O program does, so a case is never cut short while the budget
     lasts. Without explicit ``limits`` the container's CPU limit is the budget, as in the pool
     verification."""
-    flags = audit_attempt(code)
+    input_bytes = (limits or Limits()).input_bytes
     parsed = parse_task(task, limits=limits)
     if parsed is None:
+        flags = audit_attempt(code) if _size(code) <= input_bytes else ()
         return RewardResult(NOT_PARSEABLE, None, audit_flags=flags)
     total = parsed.total
     if budget is None:
         budget = attempt_budget(parsed)
+    if _attempt_bytes(code, parsed) > input_bytes:
+        # Checked here, as ``runner.run`` checks its input, so a huge attempt is the
+        # candidate's failure and never exhausts the container's supervisor.
+        detail = "attempt larger than the sandbox input limit"
+        failed = (False,) * total
+        return RewardResult(OVERSIZED, 0.0, 0, total, (), 0.0, detail, 0, failed, budget)
+    flags = audit_attempt(code)
     run_limits = limits or Limits(timeout_seconds=min(60.0, max(1.0, budget)))
 
     def default_runner(payload: dict[str, Any]) -> ContainerOutcome:
@@ -915,9 +959,10 @@ def score_attempt(
         return RewardResult(
             status, 0.0, 0, total, flags, elapsed, outcome.detail, 0, failed, budget
         )
+    detail = ""
     try:
         if isinstance(parsed, FunctionChecks):
-            outcomes, unfinished = _score_function(parsed, outcome.report)
+            outcomes, unfinished, detail = _score_function(parsed, outcome.report)
         else:
             outcomes, unfinished = _score_io(parsed, outcome.report)
     except Exception:
@@ -936,7 +981,7 @@ def score_attempt(
         total,
         flags,
         elapsed,
-        "out-of-memory kill" if killed else "",
+        "out-of-memory kill" if killed else detail,
         unfinished,
         tuple(outcomes),
         budget,

@@ -13,23 +13,28 @@ solution would. The supervisor's jobs are framing and containment:
 
 - **Framing.** It writes a ``started`` frame, tagged with the host's random nonce, before
   any candidate process exists, and one ``final`` frame with the report at the end. The
-  host attributes every problem after ``started`` (a lost, malformed or oversized report)
-  to the candidate, so a candidate cannot turn its own failure into a retried host failure.
+  host attributes a lost, malformed or oversized report after ``started`` to the candidate,
+  so a candidate cannot turn its own failure into a retried host failure. Two outcomes after
+  ``started`` remain host failures: a ``spawn_failed`` report, written only when the
+  candidate's first process could not be started (so no candidate code ever ran), and a
+  container that is still running when the host's stall deadline passes.
 - **Hardening.** PID 1 ignores the catchable signals a same-user candidate could send
   (a pid-namespace init never receives signals it has no handler for) and marks itself
   non-dumpable, so a candidate cannot open ``/proc/1/fd``, ``/proc/1/mem`` or
   ``/proc/1/oom_score_adj``.
-- **Bounds.** Every buffer is bounded and every wait is under the per-attempt wall budget
-  (and, in function mode, the per-call limit); report values travel base64-encoded so the
-  report size is fixed by the payload, whatever bytes the candidate produced.
+- **Bounds.** Every buffer is bounded, and every wait ends at the per-attempt wall budget
+  (and, in function mode, the per-call limit) or within ``OVERRUN_SECONDS`` after it, far
+  inside the host's stall slack; report values travel base64-encoded so the report size is
+  fixed by the payload, whatever bytes the candidate produced.
 - **Cleanup.** After the run, and after every I/O case, it kills every other process in
-  the container, so no straggler can hold the pid limit or memory for the next case.
+  the container, so no straggler can hold the pid limit or a pipe into the next case.
 
 I/O cases run from a fork server: a clean interpreter is started once per attempt, and each
-case runs in a fresh fork of it, so a case costs a fork instead of an interpreter start
-while no candidate state survives from one case to the next. As in the evaluation runner's
-I/O program, the cases run in turn under one shared deadline (the attempt budget), unless
-the host sets a per-case limit.
+case runs in a fresh fork of it, so a case costs a fork instead of an interpreter start and
+no case inherits another case's memory. Files a case leaves in ``/tmp`` do persist (and
+count against the container's memory limit), exactly as between the cases of the evaluation
+runner's I/O program. As in that program, the cases run in turn under one shared deadline
+(the attempt budget), unless the host sets a per-case limit.
 """
 
 import base64
@@ -59,6 +64,24 @@ _PR_SET_DUMPABLE = 4
 _READ_BYTES = 16384
 _ROW_PREFIX = b'{"i": '
 """Every honest driver row starts with this; other lines are dropped without parsing."""
+_CANDIDATE_PATH = "/tmp/candidate.py"
+"""Where the evaluation program keeps the candidate's source; the reward channel runs the
+candidate under the same name."""
+
+GRACE_SECONDS = 2.0
+"""How long the supervisor waits for a killed process to be reaped, or for a fork-server
+answer, before giving up on it."""
+SWEEP_SECONDS = 1.0
+"""How long one sweep of leftover processes may take."""
+OVERRUN_SECONDS = 3 * GRACE_SECONDS + SWEEP_SECONDS
+"""The most the supervisor's own work can run past the attempt budget: the I/O path's worst
+case is two missed fork-server answers, closing the fork server and one sweep. The host's
+stall slack (``reward.HOST_SLACK_SECONDS``) is well above this plus container start-up, so a
+candidate cannot push an attempt into a host stall by itself."""
+
+_candidate_started = False
+"""Set once a candidate process may exist. A failure before that point is the host's: the
+supervisor reports ``spawn_failed`` and the host retries the attempt."""
 
 # Source of the per-attempt driver that runs in the candidate child for function mode.
 # It reads its configuration (candidate code, import setup, call expressions, per-call
@@ -67,12 +90,13 @@ _ROW_PREFIX = b'{"i": '
 # convenience for honest candidates; its integrity is not a security assumption, because
 # the host compares every reported value against secret expectations it never shared.
 DRIVER = r"""
-import json, os, signal, sys
+import builtins, io, json, os, signal, sys
 
 _write = os.write
 _dumps = json.dumps
 _result_fd = 2
 _row_bytes = 65536
+_dict_keys = type({}.keys())
 
 
 def _items(values, depth):
@@ -102,6 +126,10 @@ def _encode(value, depth=0):
         return ["str", str.__str__(value)]
     if isinstance(value, bytes):
         return ["bytes", list(bytes.__bytes__(value))]
+    # A bytearray equals a literal exactly when its bytes do (``bytearray(b'ab') == b'ab'``),
+    # so it is reported as bytes.
+    if isinstance(value, bytearray):
+        return ["bytes", list(bytearray.__iter__(value))]
     if isinstance(value, list):
         return ["list", _items(list.__iter__(value), depth)]
     if isinstance(value, tuple):
@@ -115,6 +143,10 @@ def _encode(value, depth=0):
             "dict",
             [[_encode(k, depth + 1), _encode(v, depth + 1)] for k, v in dict.items(value)],
         ]
+    # A keys view compares like the set of its keys (``{1: 0}.keys() == {1}``), so it is
+    # reported as a frozenset; iterating it reads the dict's own storage.
+    if type(value) is _dict_keys:
+        return ["frozenset", _items(iter(value), depth)]
     raise TypeError("unsupported value type")
 
 
@@ -135,6 +167,23 @@ def _row(index, value):
     return line
 
 
+def _empty_stdin():
+    # The configuration arrived on stdin. The candidate gets an empty stdin instead, as in
+    # the evaluation program (whose function-mode stdin is an empty file), so it cannot
+    # rewind stdin to re-read the configuration and its call sources.
+    null = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(null, 0)
+    os.close(null)
+    old = sys.stdin
+    buffer = io.open(0, "rb", -1, closefd=False)
+    buffer.raw.name = "<stdin>"
+    stream = io.TextIOWrapper(
+        buffer, old.encoding, old.errors, "\n", old.line_buffering, old.write_through
+    )
+    stream.mode = "r"
+    sys.stdin = sys.__stdin__ = stream
+
+
 def main():
     global _result_fd, _row_bytes
     config = json.load(sys.stdin)
@@ -142,13 +191,26 @@ def main():
     _row_bytes = config["row_bytes"]
     calls = config["calls"]
     per_call = config["per_call"]
-    # As in the evaluation program: the candidate runs as the main script (its
-    # ``if __name__ == "__main__":`` block runs and ``__file__`` names the script), and the
-    # hidden tests' imports come after it.
-    namespace = {"__name__": "__main__", "__file__": "/tmp/candidate.py", "__cached__": None}
+    code = config["code"]
+    setup = config["setup"]
+    del config
+    _empty_stdin()
+    # As in the evaluation program, the candidate runs as the main script
+    # ``/tmp/candidate.py``: a fresh ``__main__`` module in ``sys.modules`` (so its
+    # ``if __name__ == "__main__":`` block runs and pickling its classes works), ``__file__``,
+    # ``sys.argv`` and the builtins module, with tracebacks and ``inspect`` reading the
+    # source the supervisor wrote there. The hidden tests' imports come after it.
+    driver = sys.modules["__main__"]  # keeps the driver's own module alive
+    script = type(sys)("__main__")
+    script.__file__ = "/tmp/candidate.py"
+    script.__cached__ = None
+    script.__builtins__ = builtins
+    sys.modules["__main__"] = script
+    sys.argv[:] = ["/tmp/candidate.py"]
+    namespace = vars(script)
     try:
-        exec(compile(config["code"], "<candidate>", "exec"), namespace)
-        exec(compile(config["setup"], "<setup>", "exec"), namespace)
+        exec(compile(code, "/tmp/candidate.py", "exec"), namespace)
+        exec(compile(setup, "<setup>", "exec"), namespace)
     except BaseException:
         for index in range(len(calls)):
             _emit(_dumps({"i": index, "ok": False, "e": "candidate_error"}))
@@ -369,7 +431,7 @@ def _reap() -> None:
             return
 
 
-def _kill_others(keep: set[int], *, limit_seconds: float = 1.0) -> None:
+def _kill_others(keep: set[int], *, limit_seconds: float = SWEEP_SECONDS) -> None:
     """Kill every process except PID 1 and ``keep``, then reap orphans. Runs only as PID 1
     of a Linux pid namespace (the container's init); anywhere else it does nothing."""
     if os.getpid() != 1 or not sys.platform.startswith("linux"):
@@ -441,6 +503,24 @@ def _interpreter(site_packages: bool) -> list[str]:
     return [sys.executable, "-I", *([] if site_packages else ["-S"])]
 
 
+def _write_candidate(code: str) -> None:
+    """Write the candidate's source where the evaluation program keeps it, for programs that
+    read their own source (tracebacks, ``inspect``). The candidate itself runs from memory,
+    so a failed write changes nothing else. Only the container's init writes it."""
+    if os.getpid() != 1 or not sys.platform.startswith("linux"):
+        return
+    try:
+        with open(_CANDIDATE_PATH, "w", encoding="utf-8") as handle:
+            handle.write(code)
+    except Exception:
+        pass
+
+
+def _mark_candidate_started() -> None:
+    global _candidate_started
+    _candidate_started = True
+
+
 def _kill(pid: int) -> None:
     try:
         os.kill(pid, signal.SIGKILL)
@@ -455,7 +535,7 @@ def _finish(process: subprocess.Popen[bytes], deadline: float) -> int | None:
     except subprocess.TimeoutExpired:
         process.kill()
     try:
-        return process.wait(timeout=2.0)
+        return process.wait(timeout=GRACE_SECONDS)
     except subprocess.TimeoutExpired:
         return None
 
@@ -469,11 +549,15 @@ def _run_function(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
     calls = payload["calls"]
     count = len(calls)
     per_call = min(payload["per_call"], payload["budget"])
+    cap = payload["output_bytes"]
+    _write_candidate(payload["code"])
     read_fd, write_fd = os.pipe()
     rows: dict[int, bytes] = {}
     lines = LineSplitter(payload["row_bytes"], lambda line: admit_row(rows, count, line))
     process: subprocess.Popen[bytes] | None = None
     child_rc: int | None = None
+    output_bytes = 0
+    output_limit = False
     try:
         try:
             # The driver writes results to the inherited write end at its own descriptor
@@ -501,6 +585,8 @@ def _run_function(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
                 )
             finally:
                 os.close(config_fd)
+            # From here on the candidate may run, so every failure is the candidate's.
+            _mark_candidate_started()
         finally:
             os.close(write_fd)
         assert process.stdout is not None
@@ -509,7 +595,7 @@ def _run_function(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
         selector.register(read_fd, selectors.EVENT_READ, "result")
         exited_at: float | None = None
         try:
-            while selector.get_map():
+            while selector.get_map() and not output_limit:
                 now = time.monotonic()
                 if now >= deadline:
                     break
@@ -523,9 +609,18 @@ def _run_function(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
                         selector.unregister(key.fileobj)
                     elif key.data == "result":
                         lines.feed(block)
-                    # The candidate's own stdout is drained and discarded.
+                    else:
+                        # The candidate's own stdout and stderr are discarded but counted:
+                        # as in the evaluation program, more than the output cap fails the
+                        # whole attempt.
+                        output_bytes += len(block)
+                        if output_bytes > cap:
+                            output_limit = True
+                            break
         finally:
             selector.close()
+        if output_limit:
+            process.kill()
         child_rc = _finish(process, deadline)
     finally:
         os.close(read_fd)
@@ -537,6 +632,7 @@ def _run_function(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
         "n": count,
         "rows": [encode_bytes(rows[index]) if index in rows else None for index in range(count)],
         "child_rc": child_rc,
+        "output_limit": output_limit,
     }
 
 
@@ -620,6 +716,9 @@ class _Zygote:
         read_fd, write_fd = os.pipe()
         try:
             try:
+                # Once the request may have reached the fork server, a forked candidate may
+                # run, so every later failure is the candidate's.
+                _mark_candidate_started()
                 socket.send_fds(self.sock, [b"R"], [stdin_fd, write_fd])
             finally:
                 os.close(stdin_fd)
@@ -631,12 +730,13 @@ class _Zygote:
         if status != "ok":
             _kill(pid)
         try:
-            code = self._receive(b"S", case_deadline if status == "ok" else time.monotonic() + 2)
+            grace = time.monotonic() + GRACE_SECONDS
+            code = self._receive(b"S", case_deadline if status == "ok" else grace)
         except TimeoutError:
             # Output ended but the process kept running past the case deadline.
             _kill(pid)
             status = "case_timeout"
-            code = self._receive(b"S", time.monotonic() + 2)
+            code = self._receive(b"S", time.monotonic() + GRACE_SECONDS)
         if status == "ok" and code == 0:
             return {"ran": True, "rc": code, "out": encode_bytes(captured)}
         return {"ran": False, "rc": code, "e": "exit" if status == "ok" else status}
@@ -646,7 +746,7 @@ class _Zygote:
         if self.process.poll() is None:
             self.process.kill()
         try:
-            self.process.wait(timeout=2.0)
+            self.process.wait(timeout=GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             pass
 
@@ -656,12 +756,7 @@ def _run_io(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
     # None: every case may use whatever the attempt budget has left, as in ``program.py``.
     per_case = payload["per_case"]
     cap = payload["output_bytes"]
-    try:
-        # Informational copy for programs that read their own source; cases run from memory.
-        with open("/tmp/candidate.py", "w", encoding="utf-8") as handle:
-            handle.write(payload["code"])
-    except Exception:
-        pass
+    _write_candidate(payload["code"])
     zygote: _Zygote | None = None
     out: list[dict[str, Any]] = []
     try:
@@ -677,6 +772,9 @@ def _run_io(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
                 )
                 out.append(zygote.run_case(text, cap, case_deadline))
             except Exception:
+                if not _candidate_started:
+                    # No fork server could take a first case: nothing of the candidate ran.
+                    raise
                 # A broken or killed fork server fails this case; the next case gets a new one.
                 out.append({"ran": False, "e": "runner"})
                 if zygote is not None:
@@ -695,10 +793,24 @@ def _run_io(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
 
 
 def supervise(payload: dict[str, Any]) -> dict[str, Any]:
+    global _candidate_started
+    _candidate_started = False
     deadline = time.monotonic() + payload["budget"]
     if payload["mode"] == "function":
         return _run_function(payload, deadline)
     return _run_io(payload, deadline)
+
+
+def run_report(payload: dict[str, Any]) -> dict[str, Any]:
+    """The final report for one attempt. A supervisor failure before any candidate process
+    could exist (the candidate's process or the first fork server could not be started, for
+    example on ``EAGAIN`` or ``ENOMEM``) is ``spawn_failed``, which the host retries as a host
+    failure; a failure after that point is ``supervisor_error``, which the host scores."""
+    try:
+        return supervise(payload)
+    except BaseException as error:
+        status = "supervisor_error" if _candidate_started else "spawn_failed"
+        return {"status": status, "error_type": type(error).__name__}
 
 
 def _write_frame(frame: dict[str, Any]) -> None:
@@ -719,10 +831,7 @@ def main() -> None:
         return
     _write_frame({"frame": "started", "nonce": nonce, "hardened": hardened})
     oom_before = _oom_kills()
-    try:
-        report = supervise(payload)
-    except BaseException as error:
-        report = {"status": "supervisor_error", "error_type": type(error).__name__}
+    report = run_report(payload)
     _kill_others(set())
     oom_after = _oom_kills()
     if oom_before is not None and oom_after is not None:
