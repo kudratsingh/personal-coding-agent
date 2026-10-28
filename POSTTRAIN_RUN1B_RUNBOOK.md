@@ -6,14 +6,14 @@ This page covers only what differs from [run 1's runbook](POSTTRAIN_RUNBOOK.md).
 
 **What differs from run 1.**
 
-1. **Stages:** `probe` (run 1's, the same floors: 8,279 generated tok/s at batch 128, 9,268 at batch 256), `sft`, `format-gate`, `arc-sft`, `eval-sft` (the seven chat-v1 files at batch 128), `screen`, then run 1's finalization. No `arc-base` or `eval-base`: run 1's base results stand.
+1. **Stages:** `probe` (run 1's, the floors re-derived as 10% under the average of the hosts measured so far, now including run 1's: 7,731 generated tok/s at batch 128, 8,733 at batch 256; the SFT speed check's reference is run 1's measured 57,104 slots/s, floor 51,393), `sft`, `format-gate`, `arc-sft`, `eval-sft` (the seven chat-v1 files at batch 128), `screen`, then run 1's finalization. No `arc-base` or `eval-base`: run 1's base results stand.
 2. **SFT:** two passes over the 3,390 rows (212 updates of 16 x 2 rows), peak 6e-5, 3% warmup (6 updates), cosine to 10%, dev loss at updates 53, 106, 159 and 212, the lowest kept. Before the first update the tied embedding rows of IDs 257 to 271 (the chat specials and the reserved tokens; not `<|bos|>`, which pretraining trains) are redrawn from the ordinary rows' mean and per-dimension spread with seed 0, and they train at 10x the learning rate ([special-token rows](docs/walkthroughs/special-token-rows.md)).
 3. **Data:** `runs/sft-data-20261027`, the SFT data tool's rebuild with `--omit-public-tests`: 950 of the 2,871 code train rows and 645 of the 2,000 code dev rows leave their public tests out of the user turn, chosen by a hash of the row ID. The language rows and the RL candidate list are run 1's, byte for byte.
 4. **The format gate on the Pod:** after `sft` and before anything reads the weights, the gate runs on the dev-loss-selected checkpoint (only that one) on the GPU, at the CPU command's thresholds: the first assistant token, the block's close, the separation of `<|assistant_end|>`, `<|python_start|>` and `<|python_end|>` (largest cosine strictly below 0.9) and a greedy smoke of 16 pool dev prompts. A smoke of 8 HumanEval and 8 MBPP+ chat-v1 turns is recorded, not judged. Below any bar the run stops with `format_gate_failed`: the gate record (`format-gate/gate.json`) and the weights (`sft-weights`) are already in R2, the run finalizes in full and nothing paid follows.
 5. **MBPP+ prompts:** the MBPP+ chat-v1 user turn is EvalPlus's prompt, the task text and its first test in a docstring, so the function name is known. The chat-v1 benchmark protocol's record and hash changed with it (run 1's SFT benchmark files were generated under the old one); the base protocols did not ([evaluation](docs/evaluation.md)).
 6. **Limits, all derived from the $1.50 ceiling** (`posttrain_ops.ceiling_limits`): at $0.60/h the worker stops at **$1.50**, the Mac watchdog at **$1.49**, the Pod wall is **9,000 s** and the in-Pod timer fires at **8,820 s**. The 600 s watchdog idle limit, the **900 s** in-Pod idle rule, the 900 s transfer window and the finalization reserve are run 1's.
 
-The projection at the planning speeds is about 1.54 hours and $0.92 (step 4). The launch rule needs 4,468 s at the planning rates, so setup may take up to about 73 minutes of the 8,820 s.
+The projection at the planning speeds is about 1.59 hours and $0.95 (step 4). The launch rule needs 4,646 s at the planning rates, so setup may take up to about 70 minutes of the 8,820 s.
 
 ## 1. Prelaunch checks (Mac, free)
 
@@ -82,7 +82,7 @@ As run 1's step 3, with run 1b's specification:
 uv run --locked python -m tools.pilot_feasibility posttrain --specification "$SPEC" --quoted-gpu-hourly 0.59 --output "$SHARED/feasibility.json"
 ```
 
-Replace `0.59` with the console price; above $0.59, stop and ask the owner. At the planning speeds run 1b is about 1.54 hours and $0.92 against the $1.50 ceiling (setup 0.30 h, probe 0.10, SFT 0.09, the format gate 0.04, ARC 0.02, evaluation 0.67, screening 0.07, finalization 0.25); at half speed the probe stops the run after at most about $0.39. Confirm the account balance covers $1.50 plus a margin and that no network volume exists.
+Replace `0.59` with the console price; above $0.59, stop and ask the owner. At the planning speeds run 1b is about 1.59 hours and $0.95 against the $1.50 ceiling (setup 0.30 h, probe 0.10, SFT 0.09, the format gate 0.04, ARC 0.02, evaluation 0.67, screening 0.07, finalization 0.25); at half speed the probe stops the run after at most about $0.39. Confirm the account balance covers $1.50 plus a margin and that no network volume exists.
 
 ## 5. Exports, benchmarks, binding and staging (Mac, at the go; R2 storage only)
 

@@ -26,8 +26,8 @@
   },
   "planning": {
     "generation_tokens_per_second": {
-      "128": 8279.0,
-      "256": 9268.0
+      "128": 7731.0,
+      "256": 8733.0
     },
     "training_slots_per_second": 56765.0,
     "arc_seconds_per_checkpoint": 54,

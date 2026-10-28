@@ -30,8 +30,9 @@ post-training proposal as approved on 2026-10-26 and the owner's later rulings:
 - **Ceiling:** $3.00 at the quoted $0.59/h GPU and $0.60/h total, so the worker stops at
   $3.00, the watchdog at $2.99 and the in-Pod timer at 17,820 s (``posttrain_ops``).
 - **Probe:** batch 1, 64, 128 and 256 on 256 real chat-v1 prompt lengths around the pool dev
-  median, top-p 0.95 at temperature 0.8, bf16; it stops the run below 8,279 generated tok/s
-  at batch 128 or 9,268 at batch 256 (``GENERATION_FLOORS``).
+  median, top-p 0.95 at temperature 0.8, bf16; it stops the run below 7,731 generated tok/s
+  at batch 128 or 8,733 at batch 256 (``GENERATION_FLOORS``: 10% under the average of the
+  measured hosts, re-derived after each run).
 - **Generation:** evaluation and screening at batch 128, in bf16; run 2's evaluation shares it.
 - **ARC-Easy:** label log-likelihood, float32, on run A's ``stage1-final`` and
   ``stage2-final`` and run B's ``mixed-final``, then on the selected SFT weights.
@@ -41,7 +42,7 @@ post-training proposal as approved on 2026-10-26 and the owner's later rulings:
 - **SFT:** one pass over the 3,390 rows of record, 16 x 2 rows per update, peak 6e-5, 3%
   warmup, cosine to 10%, a fresh AdamW (0.9 / 0.95, weight decay 0.1, clip 1.0), bf16 with
   fused attention and compile; dev loss at each quarter, the lowest kept; a speed check
-  after 50 updates against 90% of 56,765 slots/s.
+  after 50 updates against 90% of the measured hosts' average, 57,103.9 slots/s (51,393.5).
 - **RL screening:** the 1,000 candidates (AceCode excluded), 8 samples at temperature 1.0 and
   top-p 1.0, at most min(256, 1,024 - prompt) new tokens, ``SCREENING_SEED``.
 - **Inputs:** run B's ``mixed-final`` (SHA-256 56339e3f...), run A's two finals (labels and
@@ -81,11 +82,50 @@ LIMITS = {
     "finalization_reserve_seconds": 900,
     "startup_seconds": 1_080,
 }
-GENERATION_FLOORS = {"128": 8_279.0, "256": 9_268.0}
-"""The probe's floors and the planning generation speeds of both runs: 5% under the rates run
-1's first launch measured, rounded down (8,714.9 tok/s at batch 128 and 9,756.7 at batch 256).
-That launch stopped below both of its floors, 4,607 against 5,000 at batch 64 and 9,756.7
-against 10,000 at batch 256; nothing generates at 64 any more."""
+FLOOR_FRACTION = 0.9
+"""The owner's standing rule: every speed floor is 10% under the running average of the
+measured hosts for that batch size (or that stage), re-derived after each run by adding the new
+host's rates to the lists below."""
+MEASURED_HOST_PROBES: tuple[tuple[str, dict[str, float]], ...] = (
+    (
+        "run 1 first launch",
+        {"1": 88.84355048297411, "128": 8714.860743907404, "256": 9756.688216709286},
+    ),
+    ("run 1", {"1": 103.59814084620098, "128": 8873.742387455837, "256": 9722.12863362626}),
+    (
+        "run 1b first launch",
+        {"1": 64.89268282383944, "128": 8184.357066659413, "256": 9631.724110794974},
+    ),
+)
+"""Generated tokens/s the chat-v1 probe measured on each A40 host, one entry per host in the
+order measured (batch 1 is recorded but has no floor). Run 1b's first launch was stopped by its
+host's 8,184 tok/s at batch 128, below the floor then in force, which is what this rule
+replaced. After each run, append the new host's rates here."""
+FLOOR_BATCHES = ("128", "256")
+
+
+def derive_generation_floors(
+    hosts: Sequence[tuple[str, Mapping[str, float]]] = MEASURED_HOST_PROBES,
+    batches: Sequence[str] = FLOOR_BATCHES,
+) -> dict[str, float]:
+    """Each batch's floor: floor(0.9 x the mean of the measured hosts' rates at that batch)."""
+    floors: dict[str, float] = {}
+    for batch in batches:
+        rates = [host_rates[batch] for _, host_rates in hosts]
+        floors[batch] = float(math.floor(FLOOR_FRACTION * (sum(rates) / len(rates))))
+    return floors
+
+
+GENERATION_FLOORS = derive_generation_floors()
+"""The probe's floors and the planning generation speeds of runs 1, 1b and 2: 10% under the
+running average of the measured hosts (``derive_generation_floors``), re-derived after each
+run. Run 1's first launch stopped below its earlier floors at batch 256 and at batch 64
+(nothing generates at 64 any more)."""
+MEASURED_SFT_HOSTS: tuple[tuple[str, float], ...] = (("run 1", 57103.853248428364),)
+"""Slots/s of the SFT speed check on each host that reached it (only run 1's second launch so
+far); the reference below is their mean and the check's floor is ``minimum_speed_fraction`` of
+it, 10% under. Append the new host's rate after each run."""
+SFT_REFERENCE_SLOTS_PER_SECOND = sum(r for _, r in MEASURED_SFT_HOSTS) / len(MEASURED_SFT_HOSTS)
 PLANNING = {
     "generation_tokens_per_second": dict(GENERATION_FLOORS),
     "training_slots_per_second": 56_765.0,
@@ -136,7 +176,7 @@ SFT = {
     "dev_batch_size": 16,
     "speed_check_updates": 50,
     "speed_check_warmup_updates": 2,
-    "reference_slots_per_second": 56_765.0,
+    "reference_slots_per_second": SFT_REFERENCE_SLOTS_PER_SECOND,
     "minimum_speed_fraction": 0.9,
 }
 SCREENING = {

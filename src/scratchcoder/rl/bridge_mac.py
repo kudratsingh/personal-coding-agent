@@ -126,7 +126,7 @@ WINDOW_CHECK_INTERVAL_SECONDS = 900.0
 """How old the bridge's last full execution-window pass may be when it scores a request: an
 older one is repeated first (``BridgeServer.window_check``). A pass is 11 ``docker`` calls (five
 container starts that fail to mount) and three local calls, seconds on an idle Docker
-Desktop. At the planning rates RL sends a reward request about every 60 s (7 s of rollouts at
+Desktop. At the planning rates RL sends a reward request about every 60 s (8 s of rollouts at
 batch 256, 5 s of training, 48 s of scoring), so between its dev checks a pass runs before about
 one request in fifteen and costs the Mac about 1% of its time; one before every request would
 add its seconds to each of RL's 100 reward waits. A change to the Mac's sharing, agents, image

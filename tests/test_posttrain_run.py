@@ -117,33 +117,56 @@ def test_the_specification_file_is_the_approved_run_one() -> None:
     assert "private/" not in text and "D-3" not in text
 
 
-FIRST_LAUNCH_PROBE = {
-    "64": 4_606.988824354963,
-    "128": 8_714.860743907404,
-    "256": 9_756.688216709286,
+RECORDED_HOSTS = {
+    "run 1 first launch": {"128": 8_714.860743907404, "256": 9_756.688216709286},
+    "run 1": {"128": 8_873.742387455837, "256": 9_722.12863362626},
+    "run 1b first launch": {"128": 8_184.357066659413, "256": 9_631.724110794974},
 }
-"""Generated tokens a second at the probe of run 1's first launch, from its verified report. It
-stopped below that launch's floors (5,000 at batch 64, 10,000 at batch 256)."""
+"""Generated tokens a second at the batches that have floors, from the three hosts' verified
+reports. Run 1b's first launch stopped at the probe on 8,184 tok/s at batch 128, below the
+floor then in force."""
 
 
-def test_run_one_generates_at_batch_128_with_floors_5_percent_under_the_first_probe() -> None:
-    """Evaluation and screening generate at batch 128, which the probe measures against a
-    floor; each floor is 5% under the first launch's rate at its batch, rounded down, and the
-    planning speeds are the floors. Nothing generates at batch 64, so it has no floor."""
+def test_the_floors_are_10_percent_under_the_average_of_the_recorded_hosts() -> None:
+    """Every speed floor is 10% under the running average of the measured hosts for its batch
+    size, re-derived after each run. The recorded hosts are the module's, the floors are the
+    derivation from them, and the planning speeds are the floors; nothing generates at
+    batch 64, so it has no floor."""
+    recorded = {label: rates for label, rates in posttrain_approved.MEASURED_HOST_PROBES}
+    assert list(recorded) == list(RECORDED_HOSTS)
+    for label, rates in RECORDED_HOSTS.items():
+        assert all(recorded[label][batch] == rate for batch, rate in rates.items()), label
+    expected = {
+        batch: float(math.floor(0.9 * sum(h[batch] for h in RECORDED_HOSTS.values()) / 3))
+        for batch in ("128", "256")
+    }
+    assert expected == {"128": 7_731.0, "256": 8_733.0}
+    assert posttrain_approved.GENERATION_FLOORS == expected
+    assert posttrain_approved.derive_generation_floors(
+        [("only", {"128": 1_000.0, "256": 2_000.0})]
+    ) == {"128": 900.0, "256": 1_800.0}
     raw = json.loads(SPEC.read_text())
     assert raw["generation"] == {"batch_size": 128, "precision": "bfloat16"}
     floors = raw["probe"]["minimum_tokens_per_second"]
-    assert floors == {
-        batch: float(math.floor(0.95 * FIRST_LAUNCH_PROBE[batch])) for batch in ("128", "256")
-    }
-    assert floors == {"128": 8_279.0, "256": 9_268.0}
+    assert floors == expected
     assert 128 in raw["probe"]["batch_sizes"] and str(raw["generation"]["batch_size"]) in floors
     assert raw["planning"]["generation_tokens_per_second"] == floors
     spec = Specification.from_dict(raw)
     assert spec.generation_batch == 128
-    assert Rates.planning(spec).generation_tokens_per_second == 8_279.0
-    # The first launch's rates pass every floor now.
-    assert all(FIRST_LAUNCH_PROBE[batch] >= floor for batch, floor in floors.items())
+    assert Rates.planning(spec).generation_tokens_per_second == 7_731.0
+    # The slowest recorded host is above both floors, by construction of the average.
+    assert all(h[batch] >= floors[batch] for h in RECORDED_HOSTS.values() for batch in floors)
+
+
+def test_the_sft_speed_reference_is_the_average_of_the_recorded_hosts() -> None:
+    """Only run 1's second launch reached the SFT speed check (57,103.85 slots/s); the
+    reference is the hosts' average and the check's floor is 90% of it."""
+    assert posttrain_approved.MEASURED_SFT_HOSTS == (("run 1", 57_103.853248428364),)
+    sft = json.loads(SPEC.read_text())["sft"]
+    assert sft["reference_slots_per_second"] == 57_103.853248428364
+    assert sft["minimum_speed_fraction"] * sft["reference_slots_per_second"] == pytest.approx(
+        51_393.4679
+    )
 
 
 @pytest.mark.parametrize(
@@ -181,14 +204,14 @@ def test_the_pool_test_pin_may_be_filled_only_at_the_go() -> None:
 def test_the_launch_plan_fits_the_ceiling_with_the_setup_allowance() -> None:
     spec = Specification.load(SPEC)
     plan = planned_seconds(spec, Rates.planning(spec))
-    # Base and SFT evaluation price 18.6M and 18.8M tokens at cap at 8,279 tok/s (batch 128).
-    assert plan["stages"]["eval-base"] == pytest.approx(7 * 20 + 18_612_480 / 8_279)
-    assert plan["stages"]["eval-sft"] == pytest.approx(7 * 20 + 18_792_960 / 8_279)
-    assert plan["stages"]["screen"] == pytest.approx(20 + 1_000 * 8 * 256 / 8_279)
+    # Base and SFT evaluation price 18.6M and 18.8M tokens at cap at 7,731 tok/s (batch 128).
+    assert plan["stages"]["eval-base"] == pytest.approx(7 * 20 + 18_612_480 / 7_731)
+    assert plan["stages"]["eval-sft"] == pytest.approx(7 * 20 + 18_792_960 / 7_731)
+    assert plan["stages"]["screen"] == pytest.approx(20 + 1_000 * 8 * 256 / 7_731)
     lifetime = spec.ceiling.self_destruct_seconds
     fit = launch_fit(spec, remaining_seconds=lifetime - spec.limits["startup_seconds"])
     assert fit["fits_at_planning"]
-    assert fit["planning_seconds_needed"] == pytest.approx(6_878, abs=1)
+    assert fit["planning_seconds_needed"] == pytest.approx(7_215, abs=1)
     assert not launch_fit(spec, remaining_seconds=6_800)["fits_at_planning"]
 
 

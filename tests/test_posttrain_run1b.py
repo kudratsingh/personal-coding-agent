@@ -181,7 +181,7 @@ def test_the_projection_and_launch_rule_price_the_gate() -> None:
     rates = Rates.planning(spec)
     assert stage_seconds(spec, spec.stage("format-gate"), rates) == 20 + 120
     planned = posttrain_report(SPEC_1B, quoted_gpu_hourly=0.59)["scenarios"]["1x generation"]
-    assert round(planned["total_hours"], 2) == 1.54 and round(planned["total_usd"], 2) == 0.92
+    assert round(planned["total_hours"], 2) == 1.59 and round(planned["total_usd"], 2) == 0.95
     assert planned["fits_lifetime"] and planned["fits_ceiling"]
     fit = launch_fit(spec, remaining_seconds=spec.ceiling.self_destruct_seconds)
     assert fit["fits_at_planning"]
