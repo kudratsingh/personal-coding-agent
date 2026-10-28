@@ -191,6 +191,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "pass is this many seconds old (default and maximum 900)",
     )
     rl_bridge.add_argument("--max-polls", type=int)
+    gate = subparsers.add_parser(
+        "sft-format-gate",
+        help="CPU check that SFT weights emit the chat-v1 format; exits 0 on pass, 1 on "
+        "a measured failure, 2 when the gate could not measure",
+    )
+    gate.add_argument("--checkpoint", type=Path, required=True)
+    gate.add_argument("--tokenizer", type=Path, required=True)
+    gate.add_argument("--rows", type=Path, required=True, help="the SFT code dev rows")
+    gate.add_argument("--tasks", type=Path, required=True, help="the pool dev tasks or export")
+    gate.add_argument("--output", type=Path, required=True, help="the new JSON record")
+    gate.add_argument("--threads", type=int, default=4, help="torch CPU threads (default 4)")
     from scratchcoder.eval import pipeline_cli
 
     pipeline_cli.add_parsers(subparsers)
@@ -294,6 +305,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         except WindowCheckFailed as error:
             sys.stderr.write(f"rl-bridge: {error}\n")
             return 4
+    if args.command == "sft-format-gate":
+        import json
+
+        from scratchcoder.eval.format_gate import run_gate
+        from scratchcoder.eval.format_gate import summary as gate_summary
+
+        try:
+            record = run_gate(
+                checkpoint=args.checkpoint,
+                tokenizer_path=args.tokenizer,
+                rows_path=args.rows,
+                tasks_path=args.tasks,
+                output=args.output,
+                threads=args.threads,
+            )
+        except Exception as error:  # Exit 1 means measured and failed; 2 means not measured.
+            sys.stderr.write(f"sft-format-gate: not measured: {type(error).__name__}: {error}\n")
+            return 2
+        brief = gate_summary(record)
+        sys.stdout.write(json.dumps(brief, indent=2, sort_keys=True, allow_nan=False) + "\n")
+        return 0 if record["passed"] else 1
     if args.command == "generation-benchmark":
         import json
 
