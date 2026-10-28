@@ -8,6 +8,7 @@
 - **The language intake is approved.** On 2026-10-26 the owner accepted the dataset card's Apache-2.0 label plus the dataset paper as the [terms of record](#terms-of-record), for human-written conversation paths only. The `download`, `language` and `build` stages run end to end. No build of record has been made yet.
 - **The language cap is on loss tokens.** On 2026-10-26 the owner ruled that the 30% language cap applies to the tokens the SFT loss is computed on, with the shares recorded both ways. See [language rows](#build).
 - **AceCode is flagged** and left out of every source list by default. It is used only with `--include-acecode`.
+- **Builds of record.** `runs/sft-data-20261026` (run 1's SFT) and `runs/sft-data-20261027` (run 1b's, with `--omit-public-tests`, from the same pool train and dev splits and language conversations). See [the 2026-10-27 build](#the-2026-10-27-build).
 
 ## Build
 
@@ -27,7 +28,7 @@ Run it from the main checkout, where the ignored `runs/` tree and the frozen tok
    - **Selection:** within each source, the tasks with the lowest `sha256("rl-candidate-v1|" + task ID)` are taken.
    - **Pool counts:** for the 2026-10-25 pool this gives OpenCodeInstruct 540, TACO 391 and MBPP 69. With AceCode it gives AceCode 1,085, OpenCodeInstruct 494, TACO 358 and MBPP 63.
    - **Use:** these tasks never become SFT rows.
-3. **Code rows.** Every other selected task's verified reference is rendered in chat-v1. Code is never subsampled: every task with a reference whose row fits becomes a row. A task without a reference, or whose row has more than 1,024 input/target pairs, is dropped and counted.
+3. **Code rows.** Every other selected task's verified reference is rendered in chat-v1. Code is never subsampled: every task with a reference whose row fits becomes a row. A task without a reference, or whose row has more than 1,024 input/target pairs, is dropped and counted. With `--omit-public-tests` (`BuildConfig.omit_public_tests`), a row leaves its public tests out of the user turn when the first eight bytes of `sha256("public-tests-omitted-v1|" + row ID)`, read as a big-endian integer, are 0 modulo 3 (`scratchcoder.data.sft.omits_public_tests`): about one row in three, the same rows in every build, so SFT also sees a task stated as a benchmark states it. The assistant turn, and so the row's loss tokens and the language cap, are unchanged; the record names the rule and counts the rows (`code.public_tests_omitted`).
 4. **Language rows.** Each conversation is rendered in chat-v1, and rows over 1,024 pairs are dropped and counted.
    - **Dev set:** the 300 conversations with the lowest `sha256("language-dev-v1|" + ID)` become the language dev set.
    - **Training rows:** language is sized to the code. The share is measured in loss tokens (`language_cap_basis: loss_tokens`), the tokens the SFT loss is computed on. If all the remaining conversations together keep the language share of the training rows' loss tokens at or below 30%, all of them are used. Otherwise they are taken in that hash order until the next one would take the share past 30%. That conversation and every later one are dropped and counted as `over_share`, so the training rows are a prefix of the hash order.
@@ -36,7 +37,7 @@ Run it from the main checkout, where the ignored `runs/` tree and the frozen tok
    - **Other basis:** `BuildConfig(language_cap_basis="all_tokens")` measures the cap in every token of a row (assistant plus context) instead. The default is loss tokens, and the CLI always uses the default.
    - **No count cap:** there is none by default. `BuildConfig(language_train_max=N)` adds one; conversations past it count as `over_train_max`.
    - **Provenance:** the language stage's `record.json` must sit beside `conversations.jsonl`. The build refuses the conversations unless that record is completed, of this schema, lists their SHA-256, names what its screens used and carries the owner's approval. It then copies the record's `provenance` and `screened_against` into the build record.
-5. **Code dev rows.** The pool's dev tasks are rendered with their references for the assistant-only dev loss.
+5. **Code dev rows.** The pool's dev tasks are rendered with their references for the assistant-only dev loss, under the same omission rule as the training rows when it is on, so the dev loss covers both forms. (The SFT format gate measures only the dev rows that carry their tests, which are the evaluation's prompts.)
 
 ### Outputs
 
@@ -69,6 +70,19 @@ Run it from the main checkout, where the ignored `runs/` tree and the frozen tok
   - `loss_tokens` and `all_tokens`: for each basis, the `code` and `language` counts, `language_share` and `code_share`. The cap bounds the share in `language_cap_basis`; the other is reported for information;
   - `cap_bound` (whether the cap dropped any conversation) and `cap_dropped` (how many);
 - each output file's SHA-256, rows and bytes.
+
+### The 2026-10-27 build
+
+Run 1b's data, built with `--omit-public-tests` by the tool at the commit its record names, from the inputs of run 1's build (the pool train split `03bdbe91...`, the dev split `b8a6f630...` and the screened conversations `5a23c9cd...`):
+
+| File | Rows | Bytes | SHA-256 |
+| --- | ---: | ---: | --- |
+| `train.jsonl` | 3,390 (2,871 code, 519 language) | 6,662,216 | `240a0b7e108a737242c6c3632e3841992438646e4200533eb556539b59b88c78` |
+| `code_dev.jsonl` | 2,000 | 3,416,562 | `6c972efa17f64f7d668849a11ae5276d18bb8bbb5317a3e8e328d7f56290f717` |
+| `language_dev.jsonl` | 300 | 573,795 | `22c84bf3a3a28e079818c9ce4ba81fb16495935b98c4b58952f4592d2d6dbe99` (run 1's) |
+| `rl_candidates.jsonl` | 1,000 | 102,662 | `8301ff29d7d5e854f8d75050f3d0e0a43a4ac8cd0375d92a5c63e5da893005fe` (run 1's) |
+
+950 of the 2,871 code training rows and 645 of the 2,000 code dev rows leave their public tests out. No row was dropped; the code rows' loss tokens (400,105) and the language share (29.97% of loss tokens) are run 1's, so the same 519 language conversations are kept. The rows hold 1,374,163 tokens in all (run 1's 1,397,967), and the dev sets 813,765 (run 1's 827,850).
 
 ## Language intake: OpenAssistant oasst2
 
