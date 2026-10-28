@@ -2,6 +2,7 @@
 derived ``awaiting_rewards`` extensions and the Mac's copy of run 1's SFT weights, in exactly
 the form the run-2 worker accepts. Authored evidence; no Pod, no R2."""
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -17,6 +18,17 @@ from tools.posttrain_readiness import DEFAULT_HEARTBEAT, build_receipt
 from tools.posttrain_run import SFT_RESULTS, Specification, check_readiness
 
 PIN = {"size_bytes": 4_000_000, "sha256": "7" * 64}
+GATE_RECORD = (
+    json.dumps(
+        {
+            "format": "scratchcoder-sft-format-gate",
+            "passed": True,
+            "inputs": {"checkpoint_sha256": PIN["sha256"]},
+        }
+    )
+    + "\n"
+).encode()
+"""The SFT weights' passing format-gate record, as the Mac holds it (``--sft-gate``)."""
 FILES = {
     "rl-tasks": "rl-tasks.jsonl",
     "rl-dev": "rl-dev.jsonl",
@@ -42,6 +54,13 @@ def gated() -> dict[str, Any]:
             "pool-test": dict(PIN),
             "sft-results": {
                 name: {"key": f"posttrain-runs/1/{POD}/{name}", **PIN} for name in SFT_RESULTS
+            },
+            "sft-gate": {
+                "key": f"posttrain-runs/1/{POD}/format-gate/gate.json",
+                "size_bytes": len(GATE_RECORD),
+                "sha256": hashlib.sha256(GATE_RECORD).hexdigest(),
+                "checkpoint_sha256": PIN["sha256"],
+                "passed": True,
             },
         }
     )
@@ -152,6 +171,7 @@ def evidence(
         },
         "pod-connection.json": {"pod_id": POD, "cost_usd_per_hour": 0.59},
         "revision.json": REVISION,
+        "gate.json": GATE_RECORD,
     }
     for name, change in changes.items():
         if callable(change):
@@ -182,6 +202,7 @@ def evidence(
         "revision": files["revision.json"],
         "connection": files["pod-connection.json"],
         "billing_origin_unix": float(origin),
+        "sft_gate": files["gate.json"],
     }
 
 
@@ -244,6 +265,26 @@ def test_the_run_two_receipt_refuses_a_wrong_extension_or_a_missing_copy(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         build_receipt(**evidence(tmp_path, **{name: change}), now=NOW)
+
+
+@pytest.mark.parametrize(
+    ("record", "message"),
+    [
+        (None, "needs --sft-gate"),
+        (GATE_RECORD.replace(b"true", b"false"), "not the format-gate record"),
+        (b"{}", "not the format-gate record"),
+    ],
+)
+def test_the_run_two_receipt_refuses_weights_without_their_passing_gate_record(
+    tmp_path: Path, record: bytes | None, message: str
+) -> None:
+    arguments = evidence(tmp_path)
+    if record is None:
+        arguments["sft_gate"] = None
+    else:
+        arguments["sft_gate"].write_bytes(record)
+    with pytest.raises(ValueError, match=message):
+        build_receipt(**arguments, now=NOW)
 
 
 def test_the_template_and_unapproved_values_are_refused(tmp_path: Path) -> None:

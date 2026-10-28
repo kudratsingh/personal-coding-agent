@@ -125,14 +125,15 @@ def smoke_model(tokenizer: ByteBPE) -> ModelConfig:
     )
 
 
-def fixtures(root: Path) -> Fixtures:
-    """Write every run-1 input of the smoke under ``root``; return their paths."""
+def fixtures(root: Path, *, config: ModelConfig | None = None) -> Fixtures:
+    """Write every run-1 input of the smoke under ``root``; return their paths. The parents
+    are of ``config`` (default ``smoke_model``)."""
     tokenizer = smoke_tokenizer()
     inputs: dict[str, Path] = {}
     tokenizer_path = root / "tokenizer" / "tokenizer.json"
     tokenizer.save(tokenizer_path)
     inputs["tokenizer"] = tokenizer_path
-    config = smoke_model(tokenizer)
+    config = smoke_model(tokenizer) if config is None else config
     for name, seed in PARENTS.items():
         path = root / name / "checkpoint.pt"
         _parent(path, config, tokenizer, seed, name)
@@ -263,10 +264,10 @@ EXISTING = {
 }
 
 
-def smoke_specification(found: Fixtures) -> dict[str, Any]:
+def smoke_specification(found: Fixtures, kinds: Mapping[str, str] = KINDS) -> dict[str, Any]:
     """Run 1's specification at the smoke's scale: the stages of record on tiny inputs."""
     inputs = {}
-    for name, kind in KINDS.items():
+    for name, kind in kinds.items():
         path = found.inputs[name]
         inputs[name] = {
             "kind": kind,
@@ -430,3 +431,149 @@ def summary(report: Mapping[str, Any], bucket: MemoryBucket) -> dict[str, Any]:
         "probe_rates": (report.get("probe") or {}).get("measured_tokens_per_second"),
         "sft_selected": (report.get("sft") or {}).get("selected"),
     }
+
+
+# Run 1b ------------------------------------------------------------------------------------
+
+SMOKE_POD_ID_1B = "smoke-posttrain-1b"
+KINDS_1B = {name: kind for name, kind in KINDS.items() if not name.startswith("a-stage")}
+SMOKE_SFT_1B = {
+    "learning_rate": 3e-3,
+    "passes": 30,
+    "weight_decay": 0.0,
+}
+"""The smoke's SFT trains its 1-layer model hard enough on the fixture rows to learn the
+chat-v1 format, so the real format gate passes on it; ``failing_gate`` undoes this."""
+
+
+def smoke_model_1b(tokenizer: ByteBPE) -> ModelConfig:
+    """Run 1b's smoke model: two layers of width 64, enough to learn where the fixture's
+    code ends, which the real format gate's close check needs."""
+    return ModelConfig(
+        vocab_size=tokenizer.vocab_size, width=64, layers=2, heads=2, context=192, qk_norm=False
+    )
+
+
+def omit_rows_like_run_1b(found: Fixtures) -> None:
+    """Rewrite the fixture's SFT train and code dev rows as run 1b's data build does: the
+    rows ``omits_public_tests`` names leave their public tests out."""
+    from scratchcoder.data.sft import omits_public_tests
+
+    for name, split in (("sft-train", "train"), ("sft-code-dev", "dev")):
+        path = found.inputs[name]
+        tasks = list(load_tasks(found.full_tasks[split]))
+        if split == "train":
+            tasks = tasks[:12]
+        path.unlink()
+        write_rows(
+            path,
+            [
+                SFTRow.of(
+                    task.id,
+                    task.source,
+                    chat.render_code_task(
+                        found.tokenizer, task, public_tests=not omits_public_tests(task.id)
+                    ),
+                )
+                for task in tasks
+            ],
+        )
+
+
+def fixtures_1b(root: Path) -> Fixtures:
+    """Run 1b's smoke inputs: run 1's fixtures without run A's parents, the SFT rows built
+    with the public-test omission rule and the MBPP+ fixtures under MBPP+ IDs."""
+    found = fixtures(root, config=smoke_model_1b(smoke_tokenizer()))
+    omit_rows_like_run_1b(found)
+    mbpp = found.inputs["mbpp-plus"]
+    tasks = [
+        Task(**{**task.__dict__, "id": f"mbpp/{index + 2}"})
+        for index, task in enumerate(load_tasks(mbpp))
+    ]
+    mbpp.unlink()
+    save_tasks(mbpp, tasks)
+    inputs = {name: path for name, path in found.inputs.items() if name in KINDS_1B}
+    return Fixtures(found.root, found.tokenizer, inputs, found.full_tasks)
+
+
+def smoke_specification_1b(found: Fixtures) -> dict[str, Any]:
+    """Run 1b's specification at the smoke's scale: run 1b's stages, the special rows and
+    the format gate of record on tiny inputs, the gate's counts the fixture's."""
+    from scratchcoder.data.sft import omits_public_tests, read_rows
+    from tools.posttrain_approved import RUN1B_SFT, run1b_stages
+
+    raw = smoke_specification(Fixtures(found.root, found.tokenizer, found.inputs, {}), KINDS_1B)
+    stages = run1b_stages()
+    with_tests = sum(
+        not omits_public_tests(row.id) for row in read_rows(found.inputs["sft-code-dev"])
+    )
+    for stage in stages:
+        for entry in stage.get("files", []):
+            entry["planned_tasks"] = SMOKE_TASKS[entry["suite"]]
+        if stage["kind"] == "format-gate":
+            stage.update(row_count=max(1, with_tests), smoke_prompts=3, benchmark_prompts=2)
+    raw.update(
+        run="1b",
+        model=asdict(smoke_model_1b(found.tokenizer)),
+        stages=stages,
+        limits={**raw["limits"], "ceiling_usd": 1.5},
+        planning={**raw["planning"], "format_gate_seconds": 5},
+        sft={
+            **raw["sft"],
+            **{key: RUN1B_SFT[key] for key in ("special_rows_init", "special_rows_seed")},
+            "special_rows_lr_scale": RUN1B_SFT["special_rows_lr_scale"],
+            **SMOKE_SFT_1B,
+        },
+    )
+    return raw
+
+
+def failing_gate(raw: dict[str, Any]) -> None:
+    """The smoke's SFT at run 1's peak rate for one pass: too little to learn the format,
+    so the format gate fails and the run stops before anything reads the weights."""
+    raw["sft"].update(learning_rate=6e-05, passes=1, weight_decay=0.1)
+
+
+def make_worker_1b(
+    found: Fixtures,
+    root: Path,
+    *,
+    bucket: MemoryBucket,
+    changes: Callable[[dict[str, Any]], None] | None = None,
+    limits: RunLimits | None = None,
+    pod_created: float | None = None,
+    **options: Any,
+) -> Worker:
+    """A CPU worker for run 1b on its smoke fixtures; ``changes`` edits the specification."""
+    raw = smoke_specification_1b(found)
+    if changes is not None:
+        changes(raw)
+    spec = Specification.from_dict(raw)
+    return Worker(
+        spec,
+        root,
+        inputs=found.inputs,
+        store=bucket.store(SMOKE_CREDENTIALS),
+        pod_id=SMOKE_POD_ID_1B,
+        pod_created=time.time() if pod_created is None else pod_created,
+        limits=limits,
+        **options,
+    )
+
+
+def smoke_1b(
+    output: Path,
+    *,
+    bucket: MemoryBucket | None = None,
+    changes: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Run 1b on CPU, offline, into an in-memory bucket; return a summary."""
+    torch.set_num_threads(1)
+    if output.exists() or output.is_symlink():
+        raise FileExistsError("smoke output must be a new directory")
+    found = fixtures_1b(output / "inputs")
+    bucket = MemoryBucket() if bucket is None else bucket
+    worker = make_worker_1b(found, output / "run", bucket=bucket, changes=changes)
+    with patched_benchmarks():
+        report = worker.execute()
+    return {**summary(report, bucket), "format_gate": report.get("format_gate")}

@@ -20,6 +20,12 @@
     Then the pretraining rehearsal's finalization: drain, HEAD checks, ``report.json`` and
     ``r2_final``.
 
+    Run 1b (the SFT re-run) runs ``probe``, ``sft`` (two passes, the special-token rows
+    redrawn and trained at 10x), ``format-gate`` (the SFT format gate on the selected
+    weights, on the GPU: below its bars the run stops with ``format_gate_failed`` after the
+    gate record and the weights are in R2, and nothing paid follows), ``arc-sft``,
+    ``eval-sft`` and ``screen``; run 1's base results stand, so no base stage runs.
+
     Run 2 (RL with the Mac in the loop, the more-SFT control and their evaluation) runs:
 
     1. ``rl``: ``run_rl`` from run 1's selected SFT weights on the withheld kept tasks, its
@@ -40,8 +46,9 @@
     While the bridge client waits the heartbeat reads ``awaiting_rewards``, and a Mac lease
     renewed on the Pod counts as progress for the in-Pod idle rule (``RUN2_LIVENESS``).
 ``smoke`` (CPU)
-    Run 1 (or, with ``--run 2``, run 2 with a Mac bridge server thread) end to end on a tiny
-    model, fixture tasks and an in-memory bucket.
+    Run 1 (or, with ``--run 1b``, run 1b with its format gate; with ``--run 2``, run 2 with a
+    Mac bridge server thread) end to end on a tiny model, fixture tasks and an in-memory
+    bucket.
 
 Every stage start checks the wall, cost and idle limits and applies the projected-finish
 rule (``PROJECTED_FINISH_RULE``); during a stage the worker stops at the finalization reserve
@@ -83,6 +90,8 @@ from scratchcoder.eval.checkpoint import load_checkpoint
 from scratchcoder.eval.choice_command import checkpoint_choice_scorer
 from scratchcoder.eval.choices import evaluate_choices, load_choices
 from scratchcoder.eval.completions import Sampling
+from scratchcoder.eval.format_gate import BENCHMARK_SMOKE_SUITES, gate_record
+from scratchcoder.eval.format_gate import summary as gate_summary
 from scratchcoder.eval.generate import generate_completions
 from scratchcoder.eval.protocols import (
     BENCHMARK_SPLIT,
@@ -127,10 +136,10 @@ SCHEMA_VERSION = 1
 SPECIFICATION_KIND = "posttrain-run-specification"
 REPORT_KIND = posttrain_ops.REPORT_KIND
 DEFAULT_REVISION = Path("/workspace/posttrain/revision.json")
-STAGE_KINDS = ("probe", "arc", "eval", "sft", "screen", "rl", "more-sft")
+STAGE_KINDS = ("probe", "arc", "eval", "sft", "screen", "format-gate", "rl", "more-sft")
 """The stage kinds, each run by ``PosttrainWorker.run_<kind>`` (``-`` read as ``_``): run 1's
-first five, and run 2's ``rl`` and ``more-sft`` (its ARC and evaluation stages are ``arc``
-and ``eval`` stages of the selected checkpoints)."""
+first five, run 1b's ``format-gate``, and run 2's ``rl`` and ``more-sft`` (its ARC and
+evaluation stages are ``arc`` and ``eval`` stages of the selected checkpoints)."""
 CHECKPOINT_KINDS = frozenset({"checkpoint"})
 SFT_REFERENCE = "sft"
 """A stage's checkpoint reference to the weights the ``sft`` stage selected."""
@@ -142,6 +151,17 @@ place of an input (the SFT stage's lowest dev loss; RL's and the control's selec
 PROBE_STOP = "generation_below_planning_speed"
 SPEED_STOP = "sft_throughput_below_limit"
 PROJECTED_STOP = "projected_finish_after_deadline"
+FORMAT_GATE_STOP = "format_gate_failed"
+"""Run 1b: the selected SFT weights failed the SFT format gate. The gate record and the
+weights are already in R2; the run finalizes in full and no later stage (nothing paid)
+starts from those weights."""
+FORMAT_GATE_RULE = (
+    "the format gate runs on the dev-loss-selected SFT checkpoint only, after the sft stage "
+    "and before any stage that reads the SFT weights; it judges the first assistant token, "
+    "the block's close, the separation of the three output specials (largest cosine "
+    "strictly below 0.9) and a greedy smoke of pool dev prompts, at "
+    "scratchcoder.eval.format_gate's thresholds; the benchmark smoke is recorded, not judged"
+)
 WAIT_MARGIN_STOP = "wait_margin"
 """Run 2: the next bridge wait would pass the cost stop, the wall or the finalization reserve.
 ``should_stop`` is not read during a wait, so the worker stops before one while the time and
@@ -201,6 +221,8 @@ PLANNING_KEYS = {
     "compile_seconds",
     "weights_save_seconds",
 }
+GATE_PLANNING_KEY = "format_gate_seconds"
+"""Run 1b's planning: the format gate's seconds on the GPU, load excluded (an estimate)."""
 PROBE_KEYS = {
     "batch_sizes",
     "prompt_lengths",
@@ -240,6 +262,9 @@ SFT_KEYS = {
     "reference_slots_per_second",
     "minimum_speed_fraction",
 }
+SFT_SPECIAL_KEYS = {"special_rows_init", "special_rows_seed", "special_rows_lr_scale"}
+"""Run 1b's SFT adds these (``TrainConfig.special_rows_*``); run 1's has none and trains the
+embedding as it always did."""
 SCREENING_KEYS = {
     "samples",
     "temperature",
@@ -268,6 +293,17 @@ STAGE_KEYS = {
     "eval": {"name", "kind", "checkpoint", "files"},
     "sft": {"name", "kind", "parent", "train", "dev"},
     "screen": {"name", "kind", "checkpoint", "tasks", "candidates"},
+    "format-gate": {
+        "name",
+        "kind",
+        "checkpoint",
+        "rows",
+        "tasks",
+        "benchmarks",
+        "row_count",
+        "smoke_prompts",
+        "benchmark_prompts",
+    },
 }
 RUN2_TOP_KEYS = {
     "schema_version",
@@ -283,6 +319,7 @@ RUN2_TOP_KEYS = {
     "stages",
     "inputs",
     "sft_results",
+    "sft_gate",
     "r2",
 }
 RUN2_PLANNING_KEYS = {
@@ -357,6 +394,11 @@ its seven completions files, ``<label>/<name>`` in run 1's prefix), each pinned 
 R2 key, size and SHA-256 like an input. An arm whose selected weights are the SFT weights
 reuses them instead of a duplicate evaluation (the owner's run 2 gate rulings); the pins make
 that reuse verifiable. They never reach the Pod."""
+SFT_GATE_ARTIFACT = "format-gate/gate.json"
+SFT_GATE_KEYS = ("key", "size_bytes", "sha256", "checkpoint_sha256", "passed")
+"""Run 2's ``sft_gate``: the passing format-gate record of its SFT weights, the SFT run's
+``format-gate`` artifact beside them, pinned at the gate by R2 key, size and SHA-256, with
+the weights' SHA-256 it measured and its verdict. Run 2 refuses SFT weights without one."""
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,47}\Z")
 
 
@@ -367,6 +409,7 @@ def gate_nulls(raw: Mapping[str, Any]) -> list[str]:
     fields = [
         *RUN2_GATE_FIELDS,
         *(("sft_results", name, key) for name in SFT_RESULTS for key in sorted(INPUT_PIN_KEYS)),
+        *(("sft_gate", key) for key in SFT_GATE_KEYS),
     ]
     for path in fields:
         if path[-1] == "kind":
@@ -407,6 +450,34 @@ def check_sft_results(raw: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
             raise ValueError(f"sft_results {name} needs a SHA-256")
         checked[name] = dict(pin)
     return checked
+
+
+def check_sft_gate(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Run 2's ``sft_gate`` (``SFT_GATE_KEYS``, every value ``null`` before the gate); once
+    filled, the SFT run's ``format-gate/gate.json`` beside the ``sft-weights`` input, with a
+    size and SHA-256, the weights' own SHA-256 as the checkpoint it measured, and passed."""
+    pin = raw.get("sft_gate")
+    if not isinstance(pin, Mapping) or set(pin) != set(SFT_GATE_KEYS):
+        raise ValueError(f"sft_gate must give exactly {list(SFT_GATE_KEYS)}")
+    if all(pin[key] is None for key in SFT_GATE_KEYS):
+        return dict(pin)
+    weights = (raw.get("inputs") or {}).get("sft-weights") or {}
+    key = weights.get("key")
+    if not isinstance(key, str) or not key.endswith("/sft-weights/checkpoint.pt"):
+        raise ValueError("sft_gate needs the sft-weights input's R2 key")
+    if pin["key"] != key.removesuffix("sft-weights/checkpoint.pt") + SFT_GATE_ARTIFACT:
+        raise ValueError("sft_gate is not the format-gate record beside the SFT weights")
+    if type(pin["size_bytes"]) is not int or pin["size_bytes"] < 1:
+        raise ValueError("sft_gate needs a positive size")
+    for name in ("sha256", "checkpoint_sha256"):
+        digest = pin[name]
+        if not isinstance(digest, str) or len(digest) != 64 or digest.strip("0123456789abcdef"):
+            raise ValueError(f"sft_gate {name} must be 64 lowercase hex digits")
+    if pin["checkpoint_sha256"] != weights.get("sha256"):
+        raise ValueError("the format gate measured other weights than run 2's sft-weights")
+    if pin["passed"] is not True:
+        raise ValueError("run 2's SFT weights did not pass the format gate")
+    return dict(pin)
 
 
 def rl_config_of(rl: Mapping[str, Any]) -> RLConfig:
@@ -616,9 +687,13 @@ class Specification:
         model = ModelConfig(**_exact(top["model"], set(ModelConfig.__dataclass_fields__), "model"))
         limits = posttrain_ops.read_limits(top["limits"])
         posttrain_ops.specification_limits(top)  # The derived limits must exist.
-        planning = _exact(top["planning"], PLANNING_KEYS, "planning")
+        gated = any(
+            isinstance(item, dict) and item.get("kind") == "format-gate" for item in top["stages"]
+        )
+        planning_keys = PLANNING_KEYS | ({GATE_PLANNING_KEY} if gated else set())
+        planning = _exact(top["planning"], planning_keys, "planning")
         rates = _rates(planning["generation_tokens_per_second"], "planning rates")
-        for name in PLANNING_KEYS - {"generation_tokens_per_second"}:
+        for name in planning_keys - {"generation_tokens_per_second"}:
             _positive(planning[name], f"planning.{name}")
         probe = _exact(top["probe"], PROBE_KEYS, "probe")
         sizes = probe["batch_sizes"]
@@ -638,7 +713,11 @@ class Specification:
             raise ValueError("the generation batch must be probed and have a planning rate")
         if generation["precision"] not in ("float32", "bfloat16"):
             raise ValueError("generation.precision must be float32 or bfloat16")
-        sft = _exact(top["sft"], SFT_KEYS, "sft")
+        special = isinstance(top["sft"], dict) and bool(SFT_SPECIAL_KEYS & set(top["sft"]))
+        sft = _exact(top["sft"], SFT_KEYS | (SFT_SPECIAL_KEYS if special else set()), "sft")
+        if special:
+            # TrainConfig's rules: the initialization, a nonnegative seed, a positive scale.
+            TrainConfig(**{key: sft[key] for key in SFT_SPECIAL_KEYS})
         for name in (
             "train_rows",
             "planned_dev_tokens",
@@ -680,12 +759,24 @@ class Specification:
         if stages[0].kind != "probe":
             raise ValueError("the probe is the first stage: every rate after it is measured")
         produced: set[str] = set()
+        gate_seen = False
         for stage in stages:
             for reference in stage.checkpoint_references():
                 if reference == SFT_REFERENCE and SFT_REFERENCE not in produced:
                     raise ValueError(f"{stage.name} reads the SFT weights before the sft stage")
+                if reference == SFT_REFERENCE and gated and not gate_seen:
+                    if stage.kind != "format-gate":
+                        raise ValueError(
+                            f"{stage.name} reads the SFT weights before the format gate passed"
+                        )
             if stage.kind == "sft":
                 produced.add(SFT_REFERENCE)
+            if stage.kind == "format-gate":
+                gate_seen = True
+        if gated and [stage.kind for stage in stages].count("format-gate") != 1:
+            raise ValueError("a specification gates its SFT weights with one format-gate stage")
+        if top["run"] == "1b" and not gated:
+            raise ValueError("run 1b's SFT weights go through the format gate before any use")
         r2 = _exact(top["r2"], {"storage_cap_usd_per_month"}, "r2")
         _positive(r2["storage_cap_usd_per_month"], "r2.storage_cap_usd_per_month")
         return cls(
@@ -789,6 +880,7 @@ class Specification:
                     "whose results an arm with the SFT weights reuses"
                 )
         sft_results = check_sft_results(top)
+        check_sft_gate(top)
         r2 = _exact(top["r2"], {"storage_cap_usd_per_month"}, "r2")
         _positive(r2["storage_cap_usd_per_month"], "r2.storage_cap_usd_per_month")
         return cls(
@@ -865,6 +957,22 @@ class Specification:
                 raise ValueError("the sft stage lists its dev sets")
             for reference in dev:
                 input_of(reference, {"sft-rows"})
+        elif kind == "format-gate":
+            if settings["checkpoint"] != SFT_REFERENCE:
+                raise ValueError("the format gate reads the SFT stage's selected weights")
+            input_of(settings["rows"], {"sft-rows"})
+            input_of(settings["tasks"], {"pool-export"})
+            benchmarks = settings["benchmarks"]
+            if not isinstance(benchmarks, list) or len(set(benchmarks)) != len(benchmarks):
+                raise ValueError("the format gate lists its benchmark smoke inputs once each")
+            for reference in benchmarks:
+                input_of(reference, {"benchmark"})
+                if reference not in BENCHMARK_SMOKE_SUITES:
+                    raise ValueError(
+                        f"the format gate's benchmark smoke reads {BENCHMARK_SMOKE_SUITES}"
+                    )
+            for name in ("row_count", "smoke_prompts", "benchmark_prompts"):
+                _count(settings[name], f"format-gate {name}")
         elif kind in ("rl", "more-sft"):
             input_of(settings["parent"], CHECKPOINT_KINDS)
             input_of(settings["tasks"], {"rl-tasks"})
@@ -902,6 +1010,8 @@ class Rates:
     """Run 2: the Mac's time for one update's rewards and one dev check's verdicts."""
     rl_busy_seconds: float | None = None
     """Run 2: RL's measured GPU-busy seconds, the control's budget, once RL has run."""
+    format_gate_seconds: float | None = None
+    """Run 1b: the format gate on the GPU (planned, then measured), load excluded."""
 
     def recorded(self) -> dict[str, float]:
         """The rates as a report records them (run 1's keys only for run 1)."""
@@ -944,6 +1054,9 @@ class Rates:
             compile_seconds=float(plan["compile_seconds"]),
             weights_save_seconds=float(plan["weights_save_seconds"]),
             basis={name: "planning" for name in ("generation", "training", "arc")},
+            format_gate_seconds=(
+                float(plan[GATE_PLANNING_KEY]) if GATE_PLANNING_KEY in plan else None
+            ),
         )
 
 
@@ -1003,6 +1116,9 @@ def stage_seconds(spec: Specification, stage: StagePlan, rates: Rates) -> float:
         return math.fsum(control_parts(spec, rates).values())
     if stage.kind == "probe":
         return rates.probe_seconds
+    if stage.kind == "format-gate":
+        assert rates.format_gate_seconds is not None
+        return load + rates.format_gate_seconds
     if stage.kind == "arc":
         return len(stage.settings["checkpoints"]) * (load + rates.arc_seconds_per_checkpoint)
     if stage.kind == "eval":
@@ -1451,6 +1567,7 @@ class PosttrainWorker(Worker):
             "projections": [],
             "probe": None,
             "sft": None,
+            "format_gate": None,
             "limits": {
                 **asdict(derived),
                 "pod_seconds": self.limits.pod_seconds,
@@ -1929,6 +2046,7 @@ class PosttrainWorker(Worker):
                 schedule=str(settings["schedule"]),
                 compile=bool(settings["compile"]),
                 loss_normalization="update_targets",
+                **{key: settings[key] for key in SFT_SPECIAL_KEYS if key in settings},
             ),
             data_mix={"sft": 1.0},
             parent_checkpoint=str(parent),
@@ -1957,6 +2075,8 @@ class PosttrainWorker(Worker):
             "order_sha256": loader.order_sha256,
             "quarters": [],
             "speed_check": {"status": "pending", "after_updates": settings["speed_check_updates"]},
+            "special_rows": trainer.special_rows,
+            "special_rows_lr_scale": float(settings.get("special_rows_lr_scale", 1.0)),
             "selected": None,
         }
         self.report["sft"] = record
@@ -2102,6 +2222,66 @@ class PosttrainWorker(Worker):
         record["quarters"].append(entry)
         self.phase = stage.name
         self.publish()
+
+    def run_format_gate(self, stage: StagePlan) -> list[dict[str, Any]]:
+        """The SFT format gate on the dev-loss-selected weights (``FORMAT_GATE_RULE``).
+
+        The gate reads the code dev rows, the pool dev export and the benchmark releases on
+        the Pod, runs on this worker's device and runs no generated code. Its record is
+        uploaded at once; below its bars the run stops (``FORMAT_GATE_STOP``) and finalizes,
+        so the weights (uploaded by the sft stage) and the record are in R2 and nothing
+        paid starts from those weights."""
+        settings = stage.settings
+        weights = self.checkpoint_path(stage.settings["checkpoint"])
+        model, tokenizer = self.load(stage.settings["checkpoint"])
+        self.phase = stage.name
+        self.tick()
+        started = synchronized_time(self.device)
+        record = gate_record(
+            model,
+            tokenizer,
+            checkpoint=weights,
+            tokenizer_path=self.tokenizer_path,
+            rows_path=self.inputs[settings["rows"]],
+            tasks_path=self.inputs[settings["tasks"]],
+            benchmarks={name: self.inputs[name] for name in settings["benchmarks"]},
+            device=str(self.device),
+            row_count=int(settings["row_count"]),
+            smoke_prompts=int(settings["smoke_prompts"]),
+            benchmark_prompts=int(settings["benchmark_prompts"]),
+        )
+        seconds = synchronized_time(self.device) - started
+        self.tick()
+        if record["inputs"]["checkpoint_sha256"] != file_sha256(weights):
+            raise RuntimeError("the format gate measured other weights than the selected ones")
+        record["rule"] = FORMAT_GATE_RULE
+        path = self.write_artifact(stage, "gate.json", record)
+        brief = gate_summary(record)
+        self.report["format_gate"] = {
+            "passed": record["passed"],
+            "failed_checks": record["failed_checks"],
+            "checkpoint_sha256": record["inputs"]["checkpoint_sha256"],
+            "rows_without_public_tests_skipped": len(record["rows_without_public_tests_skipped"]),
+            "checks": brief["checks"],
+            "benchmark_smoke": {
+                suite: {key: entry[key] for key in ("prompts", "opened", "closed", "programs")}
+                for suite, entry in record["benchmark_smoke"].items()
+            },
+            "seconds": seconds,
+            "rule": FORMAT_GATE_RULE,
+        }
+        outputs = self.export_label(stage.name, [("gate.json", path)])
+        self.rates = replace(
+            self.rates,
+            format_gate_seconds=seconds,
+            basis={**self.rates.basis, "format_gate": "measured"},
+        )
+        del model
+        self.release()
+        if not record["passed"]:
+            self.stop_reason = FORMAT_GATE_STOP
+            raise PilotStop(FORMAT_GATE_STOP)
+        return outputs
 
     def run_screen(self, stage: StagePlan) -> list[dict[str, Any]]:
         settings = self.plan.screening
@@ -2363,10 +2543,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     smoke_parser = commands.add_parser("smoke", help="run 1 or 2 end to end on tiny fixtures, CPU")
     smoke_parser.add_argument("--output", type=Path, required=True)
     smoke_parser.add_argument(
-        "--run", choices=posttrain_ops.RUNS, default="1", help="1 (default) or 2"
+        "--run", choices=posttrain_ops.RUNS, default="1", help="1 (default), 1b or 2"
     )
     args = parser.parse_args(argv)
     if args.command == "smoke":
+        if args.run == "1b":
+            from tools.posttrain_smoke import smoke_1b
+
+            print(json.dumps(smoke_1b(args.output), indent=1, sort_keys=True))
+            return 0
         if args.run == "2":
             from tools.posttrain_smoke2 import smoke as smoke2
 

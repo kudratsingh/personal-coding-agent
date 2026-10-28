@@ -59,6 +59,13 @@ def fixtures(root: Path, *, rl: str = "reuse") -> dict[str, Path]:
             "rl-facts": dict(pin),
             "pool-test": dict(pin),
             "sft-results": pins,
+            "sft-gate": {
+                "key": f"posttrain-runs/1/{RUN1}/format-gate/gate.json",
+                "size_bytes": 1,
+                "sha256": "c" * 64,
+                "checkpoint_sha256": "a" * 64,
+                "passed": True,
+            },
         }
     )
     run1_rows = [
@@ -76,7 +83,7 @@ def fixtures(root: Path, *, rl: str = "reuse") -> dict[str, Path]:
         "pod_id": RUN1,
         "status": "completed",
         "inputs": {"b-mixed-final": "1" * 64},
-        "sft": {"selected": {"sha256": "2" * 64}},
+        "sft": {"selected": {"sha256": "a" * 64}},
         "artifacts": run1_rows,
     }
     reused = {
@@ -301,3 +308,42 @@ def test_the_command_line_writes_once_and_lists_for_the_runbooks_loops(
     assert posttrain_endpoints.main(["unseal", "--plan", str(output), "--output", str(unseal)]) == 0
     assert UnsealRecord.load(unseal).reused_by("sft") == ["rl"]
     assert posttrain_endpoints.main(["unseal", "--plan", str(output), "--output", str(unseal)]) == 1
+
+
+def run_1b_fixtures(root: Path) -> dict[str, Path]:
+    """The same reports with the SFT weights and results under run 1b's prefix: base stays
+    run 1's, the SFT endpoint is run 1b's (run 1's SFT files were withdrawn)."""
+    paths = fixtures(root)
+    for name in ("specification", "run2_report"):
+        text = paths[name].read_text().replace("posttrain-runs/1/", "posttrain-runs/1b/")
+        paths[name].write_text(text)
+    sft = json.loads(
+        paths["run1_report"].read_text().replace("posttrain-runs/1/", "posttrain-runs/1b/")
+    )
+    sft["run"] = "1b"
+    paths["sft_report"] = root / "r1b.json"
+    paths["sft_report"].write_text(json.dumps(sft))
+    return paths
+
+
+def test_the_sft_endpoint_is_run_1bs_when_its_report_is_given(tmp_path: Path) -> None:
+    paths = run_1b_fixtures(tmp_path)
+    value = posttrain_endpoints.plan(**paths)
+    endpoints = value["endpoints"]
+    assert endpoints["base"]["source"] == "run 1" and endpoints["sft"]["source"] == "run 1b"
+    assert endpoints["rl"]["source"] == "reuses-run-1-sft"
+    assert all(item["key"].startswith("posttrain-runs/1b/") for item in endpoints["rl"]["checked"])
+    assert value["sources"]["sft_report_sha256"] == file_sha256(paths["sft_report"])
+
+
+def test_an_sft_report_of_other_weights_or_another_run_is_refused(tmp_path: Path) -> None:
+    paths = run_1b_fixtures(tmp_path)
+    sft = json.loads(paths["sft_report"].read_text())
+    sft["sft"]["selected"]["sha256"] = "9" * 64
+    paths["sft_report"].write_text(json.dumps(sft))
+    with pytest.raises(ValueError, match="other SFT weights"):
+        posttrain_endpoints.plan(**paths)
+    sft["run"] = "2"
+    paths["sft_report"].write_text(json.dumps(sft))
+    with pytest.raises(ValueError, match="SFT run"):
+        posttrain_endpoints.plan(**paths)

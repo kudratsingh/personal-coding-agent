@@ -51,6 +51,9 @@ VALUES = {
     "RUN1_SHARED": "runs/posttrain-shared",
     "RUN1_CTRL": "runs/posttrain-controller/1/podpost01",
     "RUN1_REPORT": "runs/posttrain-controller/1/podpost01/supervisor/final/report.json",
+    "SFT_SHARED": "runs/posttrain-shared-1b",
+    "SFT_CTRL": "runs/posttrain-controller/1b/podpost1b",
+    "SFT_REPORT": "runs/posttrain-controller/1b/podpost1b/supervisor/final/report.json",
     "RL_EXPORT": "runs/posttrain-shared-2/rl-pod-export",
     "BRIDGE_STATE": "runs/posttrain-shared-2/bridge-state",
     "LEDGER": "runs/posttrain-shared/seal/ledger.jsonl",
@@ -77,6 +80,7 @@ VALUES = {
 }
 PLACEHOLDERS = {
     "<run 1 pod id>": "podpost01",
+    "<run 1b pod id>": "podpost1b",
     "<the owner's ceiling in dollars>": "5.80",
     "<reviewed binding sha256>": base.BINDING_SHA256,
     "<the Pod's host>": "203.0.113.7",
@@ -158,6 +162,13 @@ def test_the_runbooks_bounds_are_the_specifications() -> None:
                 name: {"key": f"posttrain-runs/1/p/{name}", "size_bytes": 1, "sha256": "a" * 64}
                 for name in SFT_RESULTS
             },
+            "sft-gate": {
+                "key": "posttrain-runs/1/p/format-gate/gate.json",
+                "size_bytes": 1,
+                "sha256": "c" * 64,
+                "checkpoint_sha256": "a" * 64,
+                "passed": True,
+            },
         }
     )
     derived = posttrain_ops.specification_bridge_timeouts(filled)
@@ -220,7 +231,7 @@ def test_the_bridge_runs_in_the_window_with_the_derived_mac_bounds(
         )
     assert values["--remote-root"] == spec["bridge"]["root"] == "/workspace/posttrain-bridge"
     assert values["--image-id"] == VALUES["SANDBOX_IMAGE_ID"] and values["--dotenv"] == ".env"
-    assert values["--kept"] == "runs/posttrain-shared/screening.json"
+    assert values["--kept"] == "runs/posttrain-shared-1b/screening.json"  # Run 1b's screening.
     assert values["--pod-reward-sha256"] == VALUES["POD_REWARD_SHA256"]
     namespace = base.parse("scratchcoder.cli", bridge, monkeypatch)
     assert namespace.workers == 8 and namespace.poll_seconds == spec["bridge"]["mac_poll_seconds"]
@@ -354,12 +365,19 @@ def test_the_pod_and_mac_commands_name_run_twos_paths_and_limits(
     ]
     assert sorted(test) == sorted(
         [
-            " ".join(
-                f"eval-{arm}-pool-test-{d}" for arm in ("base", "sft") for d in ("greedy", "n8")
+            *(
+                " ".join(f"eval-{arm}-pool-test-{d}" for d in ("greedy", "n8"))
+                for arm in ("base", "sft")
             ),
             f"$(uv run --locked python -m {listing} run2-pool-test)",
         ]
     )
+    # Base's test files are run 1's; SFT's are run 1b's (run 1's were withdrawn).
+    for body, names in loops.items():
+        if names.startswith("eval-sft-pool-test"):
+            assert '"$SFT_SHARED/artifacts/$name/completions.jsonl"' in body
+        if names.startswith("eval-base-pool-test"):
+            assert '"$RUN1_SHARED/artifacts/$name/completions.jsonl"' in body
     for body in loops:
         if "test.jsonl" in body:
             assert "--seal-ledger" in body and '--unseal "$SHARED/unseal.json"' in body
@@ -367,7 +385,8 @@ def test_the_pod_and_mac_commands_name_run_twos_paths_and_limits(
         assert kind in posttrain_endpoints.LISTS
     (plan,) = base.by("tools.posttrain_endpoints", "plan")
     assert options(plan)["--specification"] == VALUES["SPEC"]
-    assert options(plan)["--run1-artifacts"] == "runs/posttrain-shared/artifacts"
+    assert options(plan)["--run1-artifacts"] == "runs/posttrain-shared-1b/artifacts"
+    assert options(plan)["--sft-report"] == VALUES["SFT_REPORT"]
     (unseal,) = base.by("tools.posttrain_endpoints", "unseal")
     assert options(unseal)["--output"] == "runs/posttrain-shared-2/unseal.json"
     (inputs,) = base.by("tools.posttrain_endpoints", "scorecard-inputs")

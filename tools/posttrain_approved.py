@@ -1,4 +1,15 @@
-"""The owner-approved definitions of post-training runs 1 and 2, in one place.
+"""The owner-approved definitions of post-training runs 1, 1b and 2, in one place.
+
+Run 1b (after run 1's values): ``run1b_specification()`` is
+``configs/rehearsal-a40-s-post-1b.json`` and ``check_run1b`` what the readiness receipt
+applies to it. Run 1's SFT weights failed the SFT format gate (their chat special rows were
+nearly collinear), so run 1b re-runs SFT under the owner's approval of 2026-10-27: a $1.50
+ceiling; the special-token rows redrawn from the ordinary rows' statistics and trained at 10x
+the learning rate; two passes over the rebuilt SFT data (a hash-chosen third of the code rows
+without their public tests); the format gate on the selected weights on the Pod, stopping the
+run below its bars; then ARC, the seven chat-v1 evaluation files and the RL screening of the
+new weights. Run 1's base results stand, so no base stage runs; the probe, its floors, the
+generation batch and every other protocol are run 1's.
 
 Run 2 (below run 1's values): ``run2_specification()`` is the tracked template
 ``configs/rehearsal-a40-s-post-2.json``, every gate value ``null`` (the ceiling, the gate's
@@ -43,7 +54,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -341,15 +352,27 @@ def check_run1(raw: Mapping[str, Any]) -> None:
     the approved ones; every input pin the approved specification holds must be equal, and
     the pool test export's pin may be filled in at the go only.
     """
-    approved = run1_specification()
-    if raw.get("run") != "1" or raw.get("kind") != approved["kind"]:
-        raise ValueError("not a run-1 post-training specification")
+    _check_approved(raw, run1_specification(), "1")
+
+
+def check_run1b(raw: Mapping[str, Any]) -> None:
+    """``check_run1`` for run 1b: its approved sections, rates and pins, its format gate's
+    planning seconds among them, and the pool test export pinned only at the go."""
+    _check_approved(raw, run1b_specification(), "1b", rates=("format_gate_seconds",))
+
+
+def _check_approved(
+    raw: Mapping[str, Any], approved: Mapping[str, Any], run: str, *, rates: Sequence[str] = ()
+) -> None:
+    if raw.get("run") != run or raw.get("kind") != approved["kind"]:
+        raise ValueError(f"not a run-{run} post-training specification")
     differ = [name for name in APPROVED_SECTIONS if raw.get(name) != approved[name]]
     planning = raw.get("planning", {})
     for name in (
         "generation_tokens_per_second",
         "training_slots_per_second",
         "forward_tokens_per_second",
+        *rates,
     ):
         if planning.get(name) != approved["planning"][name]:
             differ.append(f"planning.{name}")
@@ -364,13 +387,106 @@ def check_run1(raw: Mapping[str, Any]) -> None:
                     differ.append(f"inputs.{name}.{field}")
                 elif value is None and name != "pool-test" and given.get(field) is not None:
                     differ.append(f"inputs.{name}.{field}")
+    if set(planning) != set(approved["planning"]):
+        differ.append("planning")
     if differ:
-        raise ValueError(f"the specification differs from the approved run 1 in {differ}")
+        raise ValueError(f"the specification differs from the approved run {run} in {differ}")
 
 
 def write_specification(path: Path = SPECIFICATION_PATH) -> None:
     """Write ``run1_specification()`` in the repository's JSON style."""
     path.write_text(json.dumps(run1_specification(), indent=2) + "\n", encoding="utf-8")
+
+
+# Run 1b ------------------------------------------------------------------------------------
+
+SPECIFICATION_PATH_1B = SPECIFICATION_PATH.with_name("rehearsal-a40-s-post-1b.json")
+RUN1B_LIMITS = {**LIMITS, "ceiling_usd": 1.5}
+"""Run 1b's limits: run 1's, at the owner's $1.50 ceiling. At $0.60/h the worker stops at
+$1.50, the watchdog at $1.49, the Pod wall is 9,000 s and the in-Pod timer 8,820 s."""
+FORMAT_GATE_PLANNING_SECONDS = 120
+"""The format gate on the A40, load excluded: 64 forward passes of code dev rows, 16 greedy
+chat-v1 pool generations and 16 benchmark ones of up to 512 tokens at batch 16 in float32
+(an estimate for the launch rule and the projection; the gate's seconds are measured)."""
+RUN1B_PLANNING = {**PLANNING, "format_gate_seconds": FORMAT_GATE_PLANNING_SECONDS}
+SPECIAL_ROWS_SEED = 0
+"""The seed of the special rows' fresh draw (``scratchcoder.train.special_rows``)."""
+RUN1B_SFT = {
+    **SFT,
+    "planned_dev_tokens": 813_765,
+    "passes": 2,
+    "special_rows_init": "ordinary-mean-noise",
+    "special_rows_seed": SPECIAL_ROWS_SEED,
+    "special_rows_lr_scale": 10.0,
+}
+"""Run 1's SFT protocol with two passes (212 updates of 16 x 2 rows over the same 3,390
+rows; the peak, warmup fraction and cosine floor are run 1's), the rebuilt data's dev
+tokens, and the special rows redrawn and trained at ten times the learning rate (the named
+``special_rows.SPECIAL_ROW_LR_SCALE``)."""
+RUN1B_FORMAT_GATE = {
+    "name": "format-gate",
+    "kind": "format-gate",
+    "checkpoint": "sft",
+    "rows": "sft-code-dev",
+    "tasks": "pool-dev",
+    "benchmarks": ["humaneval", "mbpp-plus"],
+    "row_count": 32,
+    "smoke_prompts": 16,
+    "benchmark_prompts": 8,
+}
+"""The gate of record: 32 code dev rows with their public tests, 16 greedy pool dev
+prompts, the separation of the three output specials; a recorded smoke of 8 HumanEval and
+8 MBPP+ chat-v1 turns. It reads the dev-loss-selected checkpoint only."""
+SFT_DATA_1B = {
+    "sft-train": {
+        "size_bytes": 6_662_216,
+        "sha256": ("240a0b7e108a737242c6c3632e3841992438646e4200533eb556539b59b88c78"),
+    },
+    "sft-code-dev": {
+        "size_bytes": 3_416_562,
+        "sha256": ("6c972efa17f64f7d668849a11ae5276d18bb8bbb5317a3e8e328d7f56290f717"),
+    },
+}
+"""The rebuilt SFT data (``tools.sft_data build --omit-public-tests``, 2026-10-27, from run
+1's pool train and dev splits and language conversations): 950 of the 2,871 code train rows
+and 645 of the 2,000 code dev rows without their public tests. The language dev rows and the
+RL candidate list are byte for byte run 1's, so their pins are run 1's."""
+RUN1B_INPUTS: dict[str, dict[str, Any]] = {
+    name: {**json.loads(json.dumps(pin)), **SFT_DATA_1B.get(name, {})}
+    for name, pin in INPUTS.items()
+    if name not in ("a-stage1-final", "a-stage2-final")
+}
+
+
+def run1b_stages() -> list[dict[str, Any]]:
+    """Run 1b's stages in order: no base stage (run 1's base results stand)."""
+    stages = {stage["name"]: stage for stage in run1_stages()}
+    return [
+        stages["probe"],
+        stages["sft"],
+        dict(RUN1B_FORMAT_GATE),
+        stages["arc-sft"],
+        stages["eval-sft"],
+        stages["screen"],
+    ]
+
+
+def run1b_specification() -> dict[str, Any]:
+    """The run-1b specification of record."""
+    return {
+        **run1_specification(),
+        "run": "1b",
+        "limits": dict(RUN1B_LIMITS),
+        "planning": json.loads(json.dumps(RUN1B_PLANNING)),
+        "sft": dict(RUN1B_SFT),
+        "stages": run1b_stages(),
+        "inputs": json.loads(json.dumps(RUN1B_INPUTS)),
+    }
+
+
+def write_specification_1b(path: Path = SPECIFICATION_PATH_1B) -> None:
+    """Write ``run1b_specification()`` in the repository's JSON style."""
+    path.write_text(json.dumps(run1b_specification(), indent=2) + "\n", encoding="utf-8")
 
 
 # Run 2 --------------------------------------------------------------------------------------
@@ -562,6 +678,7 @@ def run2_specification(gate: Mapping[str, Any] | None = None) -> dict[str, Any]:
         "stages": run2_stages(),
         "inputs": json.loads(json.dumps(RUN2_INPUTS)),
         "sft_results": sft_results_template(),
+        "sft_gate": dict.fromkeys(SFT_GATE_KEYS_TEMPLATE),
         "r2": {"storage_cap_usd_per_month": 5.0},
     }
     return raw if gate is None else fill_gate(raw, gate)
@@ -573,9 +690,14 @@ def _sha256_hex(value: object, name: str) -> str:
     return value
 
 
-GATE_KEYS = ("ceiling_usd", "gate_estimate_usd", *GATED_INPUTS, "sft-results")
-"""What the gate gives: the owner's ceiling, the projection's estimate, each gated pin and run
-1's SFT evaluation artifacts (``sft-results``)."""
+GATE_KEYS = ("ceiling_usd", "gate_estimate_usd", *GATED_INPUTS, "sft-results", "sft-gate")
+"""What the gate gives: the owner's ceiling, the projection's estimate, each gated pin, the
+SFT run's evaluation artifacts (``sft-results``) and its passing format-gate record
+(``sft-gate``)."""
+SFT_GATE_KEYS_TEMPLATE = ("key", "size_bytes", "sha256", "checkpoint_sha256", "passed")
+SFT_RUNS = ("1", "1b")
+"""The runs whose SFT weights run 2 may start from, once they passed the format gate: run
+1b's (run 1's failed it)."""
 
 
 def fill_gate(raw: Mapping[str, Any], gate: Mapping[str, Any]) -> dict[str, Any]:
@@ -621,10 +743,15 @@ def fill_gate(raw: Mapping[str, Any], gate: Mapping[str, Any]) -> dict[str, Any]
             raise ValueError(f"the gate's sft-results {name} gives key, size_bytes and sha256")
         _sha256_hex(pin["sha256"], f"the gate's sft-results {name} SHA-256")
         filled["sft_results"][name] = dict(pin)
+    gate_pin = gate["sft-gate"]
+    if not isinstance(gate_pin, Mapping) or set(gate_pin) != set(SFT_GATE_KEYS_TEMPLATE):
+        raise ValueError(f"the gate's sft-gate pin gives exactly {list(SFT_GATE_KEYS_TEMPLATE)}")
+    filled["sft_gate"] = dict(gate_pin)
     from tools.posttrain_ops import specification_limits
-    from tools.posttrain_run import check_sft_results
+    from tools.posttrain_run import check_sft_gate, check_sft_results
 
-    check_sft_results(filled)  # Each pin is run 1's artifact beside its SFT weights.
+    check_sft_results(filled)  # Each pin is the SFT run's artifact beside its SFT weights.
+    check_sft_gate(filled)  # The weights passed the format gate, this record says so.
     specification_limits(filled)  # The limits the cost limit derives must exist.
     fit = gate_launch_fit(filled)
     if not fit["fits"]:
@@ -718,6 +845,9 @@ def check_run2(raw: Mapping[str, Any]) -> None:
         raise ValueError(f"the specification differs from the approved run 2 in {differ}")
     specification_limits(raw)
     check_sft_results(raw)
+    from tools.posttrain_run import check_sft_gate
+
+    check_sft_gate(raw)
 
 
 def write_specification_2(path: Path = SPECIFICATION_PATH_2) -> None:
@@ -725,28 +855,37 @@ def write_specification_2(path: Path = SPECIFICATION_PATH_2) -> None:
     path.write_text(json.dumps(run2_specification(), indent=2) + "\n", encoding="utf-8")
 
 
-def run1_sft_weights(report_path: Path) -> dict[str, Any]:
-    """The pin of run 1's selected SFT weights from its verified ``report.json``: the R2 key,
-    size and SHA-256 of the ``sft-weights`` label's ``checkpoint.pt``."""
-    from tools.posttrain_ops import REPORT_KIND, SUCCESS_STATUSES, report_artifacts, run_prefix
+def _sft_report(report_path: Path) -> dict[str, Any]:
+    from tools.posttrain_ops import REPORT_KIND
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     if (
         not isinstance(report, dict)
         or report.get("kind") != REPORT_KIND
-        or report.get("run") != "1"
+        or report.get("run") not in SFT_RUNS
     ):
-        raise ValueError(f"{report_path} is not post-training run 1's report")
+        raise ValueError(f"{report_path} is not the report of an SFT run ({list(SFT_RUNS)})")
+    return report
+
+
+def run1_sft_weights(report_path: Path) -> dict[str, Any]:
+    """The pin of an SFT run's selected weights from its verified ``report.json`` (run 1b's;
+    run 1's for the record): the R2 key, size and SHA-256 of the ``sft-weights`` label's
+    ``checkpoint.pt``."""
+    from tools.posttrain_ops import SUCCESS_STATUSES, report_artifacts, run_prefix
+
+    report = _sft_report(report_path)
+    run = str(report["run"])
     if report.get("status") not in SUCCESS_STATUSES:
-        raise ValueError(f"run 1's report is {report.get('status')!r}, not completed")
-    prefix = run_prefix("1", str(report.get("pod_id")))
+        raise ValueError(f"run {run}'s report is {report.get('status')!r}, not completed")
+    prefix = run_prefix(run, str(report.get("pod_id")))
     rows = [
         row
         for row in report_artifacts(report, prefix=prefix)
         if (row["label"], row["name"]) == ("sft-weights", "checkpoint.pt")
     ]
     if len(rows) != 1:
-        raise ValueError("run 1's report lists no single sft-weights/checkpoint.pt")
+        raise ValueError(f"run {run}'s report lists no single sft-weights/checkpoint.pt")
     row = rows[0]
     return {"key": row["key"], "size_bytes": row["bytes"], "sha256": row["sha256"]}
 
@@ -758,12 +897,12 @@ def run1_sft_results(report_path: Path) -> dict[str, dict[str, Any]]:
     from tools.posttrain_ops import report_artifacts, run_prefix
     from tools.posttrain_run import SFT_RESULTS
 
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    prefix = run_prefix("1", str(report.get("pod_id")))
+    report = _sft_report(report_path)
+    prefix = run_prefix(str(report["run"]), str(report.get("pod_id")))
     rows = {f"{row['label']}/{row['name']}": row for row in report_artifacts(report, prefix=prefix)}
     missing = [name for name in SFT_RESULTS if name not in rows]
     if missing:
-        raise ValueError(f"run 1's report lists none of {missing}")
+        raise ValueError(f"run {report['run']}'s report lists none of {missing}")
     return {
         name: {
             "key": rows[name]["key"],
@@ -771,6 +910,46 @@ def run1_sft_results(report_path: Path) -> dict[str, dict[str, Any]]:
             "sha256": rows[name]["sha256"],
         }
         for name in SFT_RESULTS
+    }
+
+
+def sft_gate_pin(report_path: Path, gate_path: Path) -> dict[str, Any]:
+    """The pin of the SFT run's passing format-gate record: its ``format-gate/gate.json`` in
+    the verified report (R2 key, size, SHA-256), checked against the Mac's copy at
+    ``gate_path`` (same bytes), which must be a passing gate record of the report's selected
+    SFT weights. Weights without one are refused."""
+    from scratchcoder.data.shards import file_sha256
+    from scratchcoder.eval.format_gate import FORMAT
+    from tools.posttrain_ops import report_artifacts, run_prefix
+    from tools.posttrain_run import SFT_GATE_ARTIFACT
+
+    report = _sft_report(report_path)
+    run = str(report["run"])
+    rows = {
+        f"{row['label']}/{row['name']}": row
+        for row in report_artifacts(report, prefix=run_prefix(run, str(report.get("pod_id"))))
+    }
+    row = rows.get(SFT_GATE_ARTIFACT)
+    if row is None:
+        raise ValueError(
+            f"run {run}'s report holds no format-gate record: its SFT weights never passed the "
+            "format gate, and run 2 does not start from them"
+        )
+    if (gate_path.stat().st_size, file_sha256(gate_path)) != (row["bytes"], row["sha256"]):
+        raise ValueError(f"{gate_path} is not the format-gate record run {run}'s report lists")
+    record = json.loads(gate_path.read_text(encoding="utf-8"))
+    weights = run1_sft_weights(report_path)
+    measured = (record.get("inputs") or {}).get("checkpoint_sha256")
+    if record.get("format") != FORMAT or measured != weights["sha256"]:
+        raise ValueError("the format-gate record is not of the SFT run's selected weights")
+    if record.get("passed") is not True:
+        raise ValueError(f"run {run}'s SFT weights failed the format gate")
+    return {
+        "key": row["key"],
+        "size_bytes": row["bytes"],
+        "sha256": row["sha256"],
+        "checkpoint_sha256": measured,
+        "passed": True,
     }
 
 
@@ -844,26 +1023,35 @@ def gate_values(
     run1_report: Path,
     rl_pod_export: Path,
     pool_test_export: Path,
+    sft_report: Path | None = None,
+    sft_gate: Path | None = None,
 ) -> dict[str, Any]:
     """Every run-2 gate value from the gate's own files: the owner's ceiling, the run 2
-    projection's estimate, run 1's verified report (its SFT weights and its SFT evaluation
-    artifacts), the ``rl-pod-export`` directory and the pool test export."""
+    projection's estimate (at run 1's measured rates), the SFT run's verified report (run
+    1b's: its SFT weights, its SFT evaluation artifacts and its passing format-gate record,
+    whose Mac copy is ``sft_gate``), the ``rl-pod-export`` directory and the pool test
+    export. Without ``sft_report`` the SFT run is run 1, whose weights have no gate record
+    and are refused."""
     from scratchcoder.data.shards import file_sha256
     from tools.posttrain_binding import require_export
 
     count = require_export("pool-test", "pool-export", pool_test_export)
     if count != POOL_TASKS:
         raise ValueError(f"the pool test export holds {count} tasks, not {POOL_TASKS}")
+    source = run1_report if sft_report is None else sft_report
+    if sft_gate is None:
+        raise ValueError("run 2 needs the SFT weights' passing format-gate record (--sft-gate)")
     return {
         "ceiling_usd": ceiling_usd,
         "gate_estimate_usd": gate_estimate(feasibility, run1_report=run1_report),
-        "sft-weights": run1_sft_weights(run1_report),
+        "sft-weights": run1_sft_weights(source),
         **pod_export_pins(rl_pod_export),
         "pool-test": {
             "size_bytes": pool_test_export.stat().st_size,
             "sha256": file_sha256(pool_test_export),
         },
-        "sft-results": run1_sft_results(run1_report),
+        "sft-results": run1_sft_results(source),
+        "sft-gate": sft_gate_pin(source, sft_gate),
     }
 
 
@@ -883,7 +1071,21 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="the run 2 projection's --output at run 1's measured rates (its estimate)",
     )
-    gate.add_argument("--run1-report", type=Path, required=True, help="run 1's verified report")
+    gate.add_argument(
+        "--run1-report", type=Path, required=True, help="run 1's verified report (the rates)"
+    )
+    gate.add_argument(
+        "--sft-report",
+        type=Path,
+        required=True,
+        help="the SFT run's verified report (run 1b's): the weights, results and gate record",
+    )
+    gate.add_argument(
+        "--sft-gate",
+        type=Path,
+        required=True,
+        help="the Mac's copy of that run's format-gate/gate.json",
+    )
     gate.add_argument("--rl-pod-export", type=Path, required=True, help="the rl-pod-export dir")
     gate.add_argument("--pool-test-export", type=Path, required=True)
     gate.add_argument("--output", type=Path, required=True, help="the new launch specification")
@@ -902,6 +1104,8 @@ def main(argv: list[str] | None = None) -> int:
             run1_report=args.run1_report,
             rl_pod_export=args.rl_pod_export,
             pool_test_export=args.pool_test_export,
+            sft_report=args.sft_report,
+            sft_gate=args.sft_gate,
         )
         filled = run2_specification(values)
         check_run2(filled)

@@ -9,6 +9,7 @@ reference BPE encoder is disabled so every prompt goes through the cached encode
 """
 
 import copy
+import hashlib
 import json
 import math
 import os
@@ -227,6 +228,13 @@ def gate_values() -> dict[str, Any]:
         "sft-results": {
             name: {"key": f"posttrain-runs/1/podpost01/{name}", **pin} for name in SFT_RESULTS
         },
+        "sft-gate": {
+            "key": "posttrain-runs/1/podpost01/format-gate/gate.json",
+            "size_bytes": 1,
+            "sha256": "c" * 64,
+            "checkpoint_sha256": "a" * 64,
+            "passed": True,
+        },
     }
 
 
@@ -441,6 +449,30 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
     }
     run1 = tmp_path / "report.json"
     run1.write_text(json.dumps(report))
+    # The SFT weights come from run 1b, whose report also lists the passing gate record.
+    gate = tmp_path / "gate.json"
+    gate.write_text(
+        json.dumps(
+            {
+                "format": "scratchcoder-sft-format-gate",
+                "passed": True,
+                "inputs": {"checkpoint_sha256": "b" * 64},
+            }
+        )
+    )
+    sft = json.loads(json.dumps(report).replace("posttrain-runs/1/", "posttrain-runs/1b/"))
+    sft["run"] = "1b"
+    sft["artifacts"].append(
+        {
+            "label": "format-gate",
+            "name": "gate.json",
+            "key": "posttrain-runs/1b/podpost01/format-gate/gate.json",
+            "sha256": hashlib.sha256(gate.read_bytes()).hexdigest(),
+            "bytes": gate.stat().st_size,
+        }
+    )
+    sft_report = tmp_path / "sft-report.json"
+    sft_report.write_text(json.dumps(sft))
     test = [_function_task(f"smoke2/test/{i}", "test", i, str(i)) for i in range(2_000)]
     save_tasks(tmp_path / "test.jsonl", test)
     pool_test = tmp_path / "test-export.jsonl"
@@ -469,6 +501,10 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
         str(projection),
         "--run1-report",
         str(run1),
+        "--sft-report",
+        str(sft_report),
+        "--sft-gate",
+        str(gate),
         "--rl-pod-export",
         str(found.root / "rl-pod-export"),
         "--pool-test-export",
@@ -495,16 +531,24 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
     assert printed["planning_seconds_needed"] == round(fit["planning_seconds_needed"])
     assert filled["inputs"]["sft-weights"] == {
         "kind": "checkpoint",
-        "key": "posttrain-runs/1/podpost01/sft-weights/checkpoint.pt",
+        "key": "posttrain-runs/1b/podpost01/sft-weights/checkpoint.pt",
         "size_bytes": 541_142_400,
         "sha256": "b" * 64,
     }
     record = json.loads((found.root / "rl-pod-export" / "rl-pod-export.json").read_text())
     for name in ("rl-tasks", "rl-dev", "rl-facts"):
         assert filled["inputs"][name]["sha256"] == record["files"][name]["sha256"]
-    # Run 1's SFT evaluation artifacts, pinned from its verified report as an input is.
+    # Run 1b's SFT evaluation artifacts and gate record, pinned from its verified report.
     listed: dict[str, Any] = {
-        f"{row['label']}/{row['name']}": row for row in json.loads(run1.read_text())["artifacts"]
+        f"{row['label']}/{row['name']}": row
+        for row in json.loads(sft_report.read_text())["artifacts"]
+    }
+    assert filled["sft_gate"] == {
+        "key": listed["format-gate/gate.json"]["key"],
+        "size_bytes": listed["format-gate/gate.json"]["bytes"],
+        "sha256": listed["format-gate/gate.json"]["sha256"],
+        "checkpoint_sha256": "b" * 64,
+        "passed": True,
     }
     assert filled["sft_results"] == {
         name: {
@@ -518,7 +562,7 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
     posttrain_approved.check_run2(filled)
     for name, edit in (
         ("arc-sft-sft/arc.json", {"sha256": None}),
-        ("eval-sft-pool-test-n8/completions.jsonl", {"key": "posttrain-runs/1/other/x"}),
+        ("eval-sft-pool-test-n8/completions.jsonl", {"key": "posttrain-runs/1b/other/x"}),
     ):
         broken = copy.deepcopy(filled)
         broken["sft_results"][name].update(edit)
@@ -526,8 +570,6 @@ def test_the_gate_command_takes_its_values_from_the_gates_own_files(
             posttrain_approved.check_run2(broken)
         with pytest.raises(ValueError):
             Specification.from_dict(broken)
-    import hashlib
-
     assert printed["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
     assert posttrain_approved.main(argv) == 1  # A launch specification is never rewritten.
     other = [*argv[:-1], str(tmp_path / "other.json")]
