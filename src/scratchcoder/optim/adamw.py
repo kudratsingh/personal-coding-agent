@@ -32,6 +32,24 @@ def _validate_hyperparameters(lr: Any, betas: Any, eps: Any, weight_decay: Any) 
         raise ValueError("invalid optimizer hyperparameters")
 
 
+def _broadcasts(scale: Tensor, parameter: Tensor) -> bool:
+    """Whether ``scale`` broadcasts to ``parameter``'s shape without growing it."""
+    if scale.ndim > parameter.ndim:
+        return False
+    return all(
+        size in (1, full)
+        for size, full in zip(reversed(scale.shape), reversed(parameter.shape), strict=False)
+    )
+
+
+def _scaled(moment: Tensor, scale: Tensor | None) -> Tensor:
+    """The first moment a parameter steps by: itself, or times its learning-rate scale.
+
+    Multiplying by 1.0 is exact in floating point, so a scale of ones gives the plain step
+    bit for bit; ``None`` skips the multiply altogether."""
+    return moment if scale is None else moment * scale
+
+
 def cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
     """Stable mean next-token loss without delegating to a loss framework.
 
@@ -156,7 +174,14 @@ class AdamW:
         weight_decay: float = 0.1,
         decay_mask: list[bool] | None = None,
         foreach: bool = False,
+        lr_scales: list[Tensor | None] | None = None,
     ) -> None:
+        """``lr_scales`` gives a parameter its own per-element learning-rate multiplier: a
+        finite, nonnegative tensor broadcastable to the parameter (``[V, 1]`` scales the rows
+        of a ``[V, D]`` embedding), or ``None`` for the plain update. Only a parameter without
+        weight decay may carry one, so decoupled decay never needs rescaling. Like
+        ``foreach`` it is a construction setting, not optimizer state: a resumed trainer
+        builds it again from its configuration."""
         _validate_hyperparameters(learning_rate, betas, eps, weight_decay)
         if type(foreach) is not bool:
             raise ValueError("foreach must be a boolean")
@@ -172,6 +197,30 @@ class AdamW:
         self.lr, self.eps, self.weight_decay = learning_rate, eps, weight_decay
         self.betas = (betas[0], betas[1])
         self.decay_mask = list(mask)
+        scales = lr_scales if lr_scales is not None else [None] * len(self.parameters)
+        if not isinstance(scales, (list, tuple)) or len(scales) != len(self.parameters):
+            raise ValueError("learning-rate scales must give one entry per parameter")
+        owned: list[Tensor | None] = []
+        for scale, parameter, decayed in zip(scales, self.parameters, mask, strict=True):
+            if scale is None:
+                owned.append(None)
+                continue
+            if (
+                not isinstance(scale, Tensor)
+                or not scale.is_floating_point()
+                or scale.layout != torch.strided
+                or not _broadcasts(scale, parameter)
+                or not bool(torch.isfinite(scale).all())
+                or bool((scale < 0).any())
+            ):
+                raise ValueError(
+                    "a learning-rate scale is a finite nonnegative float tensor that "
+                    "broadcasts to its parameter"
+                )
+            if decayed:
+                raise ValueError("a learning-rate scale applies only to a parameter without decay")
+            owned.append(scale.detach().to(device=parameter.device, dtype=parameter.dtype).clone())
+        self.lr_scales = owned
         self.m = [torch.zeros_like(parameter) for parameter in self.parameters]
         self.v = [torch.zeros_like(parameter) for parameter in self.parameters]
         self.steps = [0] * len(self.parameters)
@@ -199,7 +248,11 @@ class AdamW:
             self.m[i].mul_(beta1).add_(gradient, alpha=1 - beta1)
             self.v[i].mul_(beta2).addcmul_(gradient, gradient, value=1 - beta2)
             denominator = self.v[i].sqrt() / math.sqrt(1 - beta2**step) + self.eps
-            parameter.addcdiv_(self.m[i], denominator, value=-self.lr / (1 - beta1**step))
+            parameter.addcdiv_(
+                _scaled(self.m[i], self.lr_scales[i]),
+                denominator,
+                value=-self.lr / (1 - beta1**step),
+            )
 
     @torch.no_grad()
     def _step_foreach(self) -> None:
@@ -209,7 +262,8 @@ class AdamW:
         instead of once per tensor, which removes most launch overhead on a GPU.
         ``tests/test_optimizer.py`` checks the result against the per-tensor
         loop exactly. Bias corrections stay per tensor because a parameter
-        that skipped an update keeps its own step count.
+        that skipped an update keeps its own step count. A parameter with a
+        learning-rate scale steps by its scaled first moment, as in ``step``.
         """
         beta1, beta2 = self.betas
         indices = [i for i, parameter in enumerate(self.parameters) if parameter.grad is not None]
@@ -236,8 +290,14 @@ class AdamW:
         denominators = torch._foreach_sqrt(second)
         torch._foreach_div_(denominators, [math.sqrt(1 - beta2 ** self.steps[i]) for i in indices])
         torch._foreach_add_(denominators, self.eps)
+        numerators = [
+            _scaled(moment, self.lr_scales[i]) for i, moment in zip(indices, first, strict=True)
+        ]
         torch._foreach_addcdiv_(
-            params, first, denominators, [-self.lr / (1 - beta1 ** self.steps[i]) for i in indices]
+            params,
+            numerators,
+            denominators,
+            [-self.lr / (1 - beta1 ** self.steps[i]) for i in indices],
         )
 
     def state_dict(self) -> dict[str, Any]:

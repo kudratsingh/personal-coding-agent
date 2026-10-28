@@ -1184,3 +1184,59 @@ def test_a_rejected_ruling_never_downloads(tmp_path: Path) -> None:
         sft_data.fetch(spec, tmp_path / "intake", hub_factory=lambda _: hub)
     assert hub.calls == 0 and not (tmp_path / "intake").exists()
     assert asdict(BuildConfig())["language_dev"] == 300
+
+
+def test_build_can_omit_public_tests_from_a_hash_named_third_of_code_rows(
+    tmp_path: Path,
+) -> None:
+    """With ``omit_public_tests`` the rows ``omits_public_tests`` names, train and code dev
+    alike, have the prompt alone as their user turn; every other row, the language rows,
+    the candidates and the loss tokens are as without it."""
+    from scratchcoder.data.sft import PUBLIC_TESTS_OMITTED_RULE, omits_public_tests
+
+    dev = [task(OCI, 200 + index, split="dev") for index in range(9)]
+    save_tasks(tmp_path / "dev.jsonl", dev)
+    records = {}
+    for name, omit in (("plain", False), ("omitted", True)):
+        root = tmp_path / name
+        root.mkdir()
+        records[name] = build(
+            pool_train=pool(root),
+            pool_dev=tmp_path / "dev.jsonl",
+            language=conversations(root),
+            output=root / "sft",
+            encoder=TOKENIZER,
+            tokenizer_identity=IDENTITY,
+            config=BuildConfig(
+                sequence_length=400, rl_candidates=5, language_dev=3, omit_public_tests=omit
+            ),
+        )
+    plain, omitted = records["plain"], records["omitted"]
+    assert plain["code"]["public_tests_omitted"] == {"rule": None, "train_rows": 0, "dev_rows": 0}
+    summary = omitted["code"]["public_tests_omitted"]
+    assert summary["rule"] == PUBLIC_TESTS_OMITTED_RULE
+    for split, file in (("train_rows", "train.jsonl"), ("dev_rows", "code_dev.jsonl")):
+        before = {row.id: row for row in read_rows(tmp_path / "plain" / "sft" / file)}
+        after = {row.id: row for row in read_rows(tmp_path / "omitted" / "sft" / file)}
+        assert set(before) == set(after)
+        named = [
+            rid
+            for rid in after
+            if rid.startswith(("nvidia", "BAAI", "google")) and omits_public_tests(rid)
+        ]
+        assert summary[split] == len(named) > 0
+        for identifier, row in after.items():
+            assert row.assistant_tokens == before[identifier].assistant_tokens
+            if identifier in named:
+                source = next(
+                    t
+                    for t in [*dev, *(task(s, i) for s in (OCI, TACO, MBPP) for i in range(13))]
+                    if t.id == identifier
+                )
+                expected = render_code_task(TOKENIZER, source, public_tests=False)
+                assert row.ids == expected.ids and len(row.ids) < len(before[identifier].ids)
+            else:
+                assert row == before[identifier]
+    assert plain["files"]["rl_candidates.jsonl"] == omitted["files"]["rl_candidates.jsonl"]
+    assert plain["shares"]["loss_tokens"] == omitted["shares"]["loss_tokens"]
+    assert omitted["config"]["omit_public_tests"] is True

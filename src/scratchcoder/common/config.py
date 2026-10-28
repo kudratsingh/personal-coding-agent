@@ -87,6 +87,13 @@ class TrainConfig:
     # How microbatches with IGNORE targets are divided: by the update's full capacity
     # (the default, as in every pretraining run) or by the update's real target count.
     loss_normalization: str = "capacity"
+    # The special-token rows of the tied embedding (``scratchcoder.train.special_rows``):
+    # ``ordinary-mean-noise`` redraws them from the ordinary rows' statistics with this seed
+    # before training, and the scale multiplies their learning rate. The defaults leave
+    # the embedding and every update exactly as before.
+    special_rows_init: str = "none"
+    special_rows_seed: int = 0
+    special_rows_lr_scale: float = 1.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -133,6 +140,12 @@ class TrainConfig:
             raise ValueError("loss_normalization must be capacity or update_targets")
         if self.loss_normalization == "update_targets" and self.z_loss:
             raise ValueError("update_targets loss normalization does not support z-loss")
+        if self.special_rows_init not in {"none", "ordinary-mean-noise"}:
+            raise ValueError("special_rows_init must be none or ordinary-mean-noise")
+        if type(self.special_rows_seed) is not int or self.special_rows_seed < 0:
+            raise ValueError("special_rows_seed must be a nonnegative integer")
+        if not 0 < finite_number(self.special_rows_lr_scale, "special_rows_lr_scale") < 1e6:
+            raise ValueError("special_rows_lr_scale must be positive and finite")
 
 
 @dataclass(frozen=True)

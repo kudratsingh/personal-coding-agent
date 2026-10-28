@@ -9,7 +9,14 @@ A conversation is rendered to token IDs as::
 
 For a code task the user text is the task prompt, a blank line and the public test,
 and the assistant content is one python block,
-``<|python_start|>{code}<|python_end|>``. A language turn's content is its text.
+``<|python_start|>{code}<|python_end|>``. A training row may leave the public test out
+(``public_tests=False``: the prompt alone, as a benchmark presents a task); evaluation
+prompts always include it. A language turn's content is its text.
+
+A benchmark task's user turn is its prompt. For MBPP+ it is the prompt as EvalPlus
+presents MBPP+ to a model, the task text and its first original test in a docstring
+(``mbpp_plus_user_text``), so the function name is known; HumanEval prompts already
+carry their signature.
 
 Message text is encoded without special-token injection, so a literal
 ``"<|user_end|>"`` inside a message stays ordinary bytes.
@@ -125,17 +132,53 @@ def program_text(code: str) -> str:
     return text
 
 
-def task_user_text(task: Task) -> str:
+def task_user_text(task: Task, *, public_tests: bool = True) -> str:
     """The chat-v1 user turn of a pool task: prompt, a blank line, the public test.
 
     Function-mode public tests are the assertion text; I/O-mode public tests are the
     stored JSON list of input/output cases. Surrounding whitespace is stripped from both.
+    With ``public_tests=False`` (training rows only) the turn is the stripped prompt alone.
     """
+    if not public_tests:
+        return task.prompt.strip()
     return task.prompt.strip() + "\n\n" + task.public_tests.strip()
 
 
+MBPP_PLUS_PREFIX = "mbpp/"
+"""The task IDs of MBPP+ (``scratchcoder.data.evalplus``: ``mbpp/<original id>``)."""
+
+
+def mbpp_plus_first_test(task: Task) -> str:
+    """The first original MBPP test of an MBPP+ task: the first line of its public tests
+    after the import preamble (``evalplus.origin_task`` writes the imports, a newline,
+    then one assertion per line)."""
+    for line in task.public_tests.split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("import ", "from ")):
+            continue
+        if not stripped.startswith("assert"):
+            raise ValueError(f"{task.id}: the first public test is not an assertion")
+        return stripped
+    raise ValueError(f"{task.id}: no public test to name the function")
+
+
+def mbpp_plus_user_text(task: Task) -> str:
+    """EvalPlus's MBPP+ prompt, stripped: the task text and the first test in a docstring.
+
+    EvalPlus builds an MBPP+ prompt as three double quotes, a newline, the original prompt,
+    a newline, ``test_list[0]``, a newline, three double quotes and a newline
+    (``tools/mbpp/init_plus.py`` in the EvalPlus repository). The pinned OriginFmt release
+    keeps the bare task text in ``prompt`` and the tests in ``test_list``, so the first
+    assertion is taken from the task's public tests; the result equals EvalPlus's prompt,
+    stripped, for all 378 tasks of the pinned release."""
+    return '"""\n' + task.prompt.strip() + "\n" + mbpp_plus_first_test(task) + '\n"""'
+
+
 def benchmark_user_text(task: Task) -> str:
-    """The chat-v1 user turn of a HumanEval, HumanEval+ or MBPP+ task: its prompt alone."""
+    """The chat-v1 user turn of a HumanEval, HumanEval+ or MBPP+ task: its prompt, and for
+    MBPP+ the prompt as EvalPlus renders it (``mbpp_plus_user_text``)."""
+    if task.id.startswith(MBPP_PLUS_PREFIX):
+        return mbpp_plus_user_text(task)
     return task.prompt.strip()
 
 
@@ -163,12 +206,15 @@ def render_conversation(encoder: TextEncoder, messages: Sequence[Message]) -> Re
     return Rendered(tuple(ids), tuple(mask))
 
 
-def render_code_task(encoder: TextEncoder, task: Task, code: str | None = None) -> Rendered:
-    """A pool task and its code (the reference solution by default) as one exchange."""
+def render_code_task(
+    encoder: TextEncoder, task: Task, code: str | None = None, *, public_tests: bool = True
+) -> Rendered:
+    """A pool task and its code (the reference solution by default) as one exchange; with
+    ``public_tests=False`` the user turn is the prompt alone (``task_user_text``)."""
     source = task.solution if code is None else code
     if source is None:
         raise ValueError("a code-task row needs a reference solution or explicit code")
-    ids, mask = _turns(encoder, [Message("user", task_user_text(task))])
+    ids, mask = _turns(encoder, [Message("user", task_user_text(task, public_tests=public_tests))])
     reply = [PYTHON_START, *_content(encoder, program_text(source)), PYTHON_END, ASSISTANT_END]
     ids.extend([ASSISTANT_START, *reply])
     mask.extend([False] + [True] * len(reply))
@@ -234,6 +280,17 @@ def protocol(user_turn: str = "pool") -> dict[str, Any]:
                 "task prompt.strip() + blank line + public test.strip()"
                 if user_turn == "pool"
                 else "benchmark prompt.strip()"
+            ),
+            **(
+                {}
+                if user_turn == "pool"
+                else {
+                    "mbpp_plus_user_turn": (
+                        "EvalPlus's MBPP+ prompt, stripped: triple quote, newline, task "
+                        "prompt.strip(), newline, the first original test, newline, triple "
+                        "quote"
+                    )
+                }
             ),
             "stop_tokens": [SPECIAL_TOKENS[token - 256] for token in CODE_STOP_IDS],
             "candidate_assembly": "first-closed-python-block-else-no-program",

@@ -136,6 +136,22 @@ def read_rows(path: Path) -> Iterator[SFTRow]:
             yield row
 
 
+PUBLIC_TESTS_OMITTED_SALT = "public-tests-omitted-v1"
+PUBLIC_TESTS_OMITTED_MODULUS = 3
+PUBLIC_TESTS_OMITTED_RULE = (
+    "a code row omits its public tests from the user turn when the first eight bytes of "
+    f"sha256('{PUBLIC_TESTS_OMITTED_SALT}|' + row ID), read as a big-endian integer, are 0 "
+    f"modulo {PUBLIC_TESTS_OMITTED_MODULUS}"
+)
+
+
+def omits_public_tests(identifier: str) -> bool:
+    """Whether a code row of this ID leaves its public tests out (``PUBLIC_TESTS_OMITTED_
+    RULE``): about one row in three, the same in every build and in train and dev alike."""
+    digest = hashlib.sha256(f"{PUBLIC_TESTS_OMITTED_SALT}|{identifier}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") % PUBLIC_TESTS_OMITTED_MODULUS == 0
+
+
 def pass_key(seed: int, epoch: int, identifier: str) -> tuple[int, str]:
     digest = hashlib.sha256(f"{seed}|{epoch}|{identifier}".encode()).digest()
     return int.from_bytes(digest[:8], "big"), identifier
