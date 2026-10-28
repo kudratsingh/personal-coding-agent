@@ -22,6 +22,7 @@ from test_rehearsal_runbook import comment_lines
 from tools import posttrain_ops
 from tools.pilot_feasibility import posttrain_report
 from tools.posttrain_run import FORMAT_GATE_STOP, Specification, launch_fit
+from tools.rehearsal_run import quarter_updates
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "POSTTRAIN_RUN1B_RUNBOOK.md"
@@ -113,6 +114,9 @@ def test_the_limits_and_figures_are_the_specifications() -> None:
     assert f"The launch rule needs {needed:,.0f} s" in body
     assert f"about {(lifetime - needed) / 60:.0f} minutes of the 8,820 s" in body
     assert FORMAT_GATE_STOP in body and "212 updates" in body
+    checks = [update for _, update in quarter_updates(212)] + [212]
+    named = ", ".join(str(update) for update in checks[:-1]) + f" and {checks[-1]}"
+    assert f"four dev-loss checks, at updates {named}" in body and len(checks) == 4
     floors = spec.probe["minimum_tokens_per_second"]
     assert f"{floors['128']:,.0f} generated tok/s at batch 128, {floors['256']:,.0f}" in body
 
@@ -181,3 +185,47 @@ def test_every_block_parses_in_the_operators_shells(shell: str, tmp_path: Path) 
 def test_the_sections_are_numbered_in_order() -> None:
     sections = re.findall(r"^## (\d+)\. ", text(), re.M)
     assert sections == [str(number) for number in range(1, len(sections) + 1)]
+
+
+def withdrawal_block() -> str:
+    (block,) = [block for block in base.blocks() if "eval-withdraw" in block]
+    lines = block.splitlines()
+    assert lines[-1].startswith("uv run --locked scratchcoder eval-withdraw ")
+    return "\n".join([*lines[:-1], 'printf "%s\\n" "$RUN1_REPORT" "$RUN1_SFT_SHA256"', ""])
+
+
+def run_1_report(root: Path, pod: str, status: str) -> Path:
+    report = root / "1" / pod / "supervisor" / "final" / "report.json"
+    report.parent.mkdir(parents=True)
+    body: dict[str, object] = {"status": status, "run": "1", "sft": None}
+    if status == "completed":
+        body["sft"] = {"selected": {"sha256": "6b" * 32}}
+    report.write_text(json.dumps(body))
+    return report
+
+
+@pytest.mark.parametrize("shell", [name for name in ("bash", "zsh") if shutil.which(name)])
+def test_the_withdrawal_block_finds_run_1s_one_completed_report(shell: str, tmp_path: Path) -> None:
+    """Pasted as written, the block names run 1's completed report: the launch that stopped
+    at its probe has a final report too. Two completed reports give no path."""
+
+    def pasted(root: Path) -> subprocess.CompletedProcess[str]:
+        argv = ["zsh", "-f"] if shell == "zsh" else ["bash"]
+        return subprocess.run(
+            argv,
+            input=withdrawal_block(),
+            env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "CTRL_ROOT": str(root)},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    root = tmp_path / "controller"
+    run_1_report(root, "podfirst", "stopped")
+    completed = run_1_report(root, "podsecond", "completed")
+    result = pasted(root)
+    assert result.stdout.splitlines() == [str(completed), "6b" * 32], result.stderr
+    run_1_report(root, "podthird", "completed")
+    result = pasted(root)
+    assert "2 completed run 1 reports, expected exactly one" in result.stderr
+    assert result.stdout.splitlines()[:1] == [""]

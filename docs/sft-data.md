@@ -73,7 +73,7 @@ Run it from the main checkout, where the ignored `runs/` tree and the frozen tok
 
 ### The 2026-10-27 build
 
-Run 1b's data, built with `--omit-public-tests` by the tool at the commit its record names, from the inputs of run 1's build (the pool train split `03bdbe91...`, the dev split `b8a6f630...` and the screened conversations `5a23c9cd...`):
+Run 1b's data, built with `--omit-public-tests` from the inputs of run 1's build (the pool train split `03bdbe91...`, the dev split `b8a6f630...` and the screened conversations `5a23c9cd...`). Its record names the build's commit, `01e23a95ef2589ab8cb18608a12c4127c5ac7ca5`, a commit of the pull request that added run 1b; a squash merge leaves it reachable only through that pull request's head. No module the tool imports changed after that commit in the change, and a rebuild with the tool at the change's head reproduced all four SHA-256 below, so the tool at the merged commit rebuilds the files byte for byte:
 
 | File | Rows | Bytes | SHA-256 |
 | --- | ---: | ---: | --- |
