@@ -1287,8 +1287,8 @@ def rehearsal_main(argv: Sequence[str]) -> int:
 
 POSTTRAIN_DISCLAIMER = (
     "Post-training figures are projections: generation at the planning speeds (the probe's "
-    "floors, 5% under the rates run 1's first launch measured), pool attempts priced at their "
-    "token caps, SFT at run B's measured 56,765 slots/s; run 1's probe measures generation "
+    "floors, 10% under the average of the hosts measured so far), pool attempts priced at their "
+    "token caps, SFT at run B's measured 56,765 slots/s; the probe measures generation "
     "again before anything else runs"
 )
 POSTTRAIN_STORAGE_BYTES = 1_500_000_000

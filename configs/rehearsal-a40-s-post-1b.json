@@ -24,8 +24,8 @@
   },
   "planning": {
     "generation_tokens_per_second": {
-      "128": 8279.0,
-      "256": 9268.0
+      "128": 7731.0,
+      "256": 8733.0
     },
     "training_slots_per_second": 56765.0,
     "forward_tokens_per_second": 94862.0,
@@ -51,8 +51,8 @@
     "seed": 0,
     "repeats": 1,
     "minimum_tokens_per_second": {
-      "128": 8279.0,
-      "256": 9268.0
+      "128": 7731.0,
+      "256": 8733.0
     }
   },
   "generation": {
@@ -83,7 +83,7 @@
     "dev_batch_size": 16,
     "speed_check_updates": 50,
     "speed_check_warmup_updates": 2,
-    "reference_slots_per_second": 56765.0,
+    "reference_slots_per_second": 57103.853248428364,
     "minimum_speed_fraction": 0.9,
     "special_rows_init": "ordinary-mean-noise",
     "special_rows_seed": 0,
