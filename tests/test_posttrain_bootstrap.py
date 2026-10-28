@@ -118,8 +118,9 @@ def test_posttrain_arms_the_derived_lifetime_and_idle_rule_first(tmp_path: Path)
         for path in (ROOT / "tests").glob("test_posttrain_*.py")
         if not path.name.startswith("test_posttrain_run2")
     }
-    assert expected - {"tests/test_posttrain_runbook.py"} <= set(listed)
-    assert "tests/test_posttrain_runbook.py" not in listed
+    mac_only = {"tests/test_posttrain_runbook.py", "tests/test_posttrain_run1b_runbook.py"}
+    assert expected - mac_only <= set(listed)
+    assert not mac_only & set(listed)
     assert not [name for name in listed if "posttrain_run2" in name]
     for name in listed:
         path = ROOT / name
