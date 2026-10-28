@@ -193,7 +193,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     rl_bridge.add_argument("--max-polls", type=int)
     gate = subparsers.add_parser(
         "sft-format-gate",
-        help="CPU check that SFT weights emit the chat-v1 format; exits 1 on failure",
+        help="CPU check that SFT weights emit the chat-v1 format; exits 0 on pass, 1 on "
+        "a measured failure, 2 when the gate could not measure",
     )
     gate.add_argument("--checkpoint", type=Path, required=True)
     gate.add_argument("--tokenizer", type=Path, required=True)
@@ -308,24 +309,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         import json
 
         from scratchcoder.eval.format_gate import run_gate
+        from scratchcoder.eval.format_gate import summary as gate_summary
 
-        record = run_gate(
-            checkpoint=args.checkpoint,
-            tokenizer_path=args.tokenizer,
-            rows_path=args.rows,
-            tasks_path=args.tasks,
-            output=args.output,
-            threads=args.threads,
-        )
-        summary = {
-            "passed": record["passed"],
-            "failed_checks": record["failed_checks"],
-            "checks": {
-                label: {key: value for key, value in check.items() if key != "cosines"}
-                for label, check in record["checks"].items()
-            },
-        }
-        sys.stdout.write(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n")
+        try:
+            record = run_gate(
+                checkpoint=args.checkpoint,
+                tokenizer_path=args.tokenizer,
+                rows_path=args.rows,
+                tasks_path=args.tasks,
+                output=args.output,
+                threads=args.threads,
+            )
+        except Exception as error:  # Exit 1 means measured and failed; 2 means not measured.
+            sys.stderr.write(f"sft-format-gate: not measured: {type(error).__name__}: {error}\n")
+            return 2
+        brief = gate_summary(record)
+        sys.stdout.write(json.dumps(brief, indent=2, sort_keys=True, allow_nan=False) + "\n")
         return 0 if record["passed"] else 1
     if args.command == "generation-benchmark":
         import json

@@ -12,8 +12,9 @@ gate measures those tokens directly and runs no generated code. Four checks:
 - ``close``: teacher-forced on the same rows, ``<|python_end|>`` at the true end of the
   code must have a mean probability of at least ``MIN_P_PYTHON_END``, and
   ``<|assistant_end|>`` right after it at least ``MIN_P_ASSISTANT_END``.
-- ``separation``: the largest pairwise cosine among the tied embedding rows of the seven
-  special tokens chat-v1 uses must be below ``MAX_SPECIAL_COSINE``.
+- ``separation``: the largest pairwise cosine among the tied embedding rows of the three
+  specials the model must choose between as outputs (``OUTPUT_SPECIALS``) must be below
+  ``MAX_SPECIAL_COSINE``. The cosines of all seven chat-v1 specials are recorded too.
 - ``greedy_smoke``: greedy chat-v1 generation through ``generate_many`` (the evaluation's
   length-sorted, left-padded batches) on ``SMOKE_PROMPTS`` pool dev tasks chosen by the
   same key must extract a nonempty program from at least ``MIN_SMOKE_SHARE`` of them.
@@ -64,16 +65,24 @@ SMOKE_PROMPTS = 16
 SMOKE_BATCH_SIZE = 16
 MIN_P_PYTHON_START = 0.9
 """Every code row's first assistant token is ``<|python_start|>``: a learned format puts
-nearly all its mass there, so 0.9 is reachable with margin and a coin flip between two
-specials (the failure this gate exists for) is far below it."""
-MIN_P_PYTHON_END = 0.5
-"""Where code ends is genuinely uncertain (another function could follow), so the bar is
-that closing is the more likely choice on average, not a near-certainty."""
+nearly all its mass there, so 0.9 leaves room, and a coin flip between two specials (the
+failure this gate exists for) is far below it. No healthy SFT model at this scale has been
+measured yet; every bar here is set from the data or from trained rows."""
+MIN_P_PYTHON_END = 0.2
+"""Where code ends is genuinely uncertain: in the SFT code rows, of the points where code
+could end (the last line, or a line whose next nonempty line is at indent 0), the code
+ends at 26% in train and 34% in code dev, since example usage often follows a function.
+A model that closes at the data's rate scores about 0.3 at the true end; 0.2 sits below
+that, and a model that never learned to close scores near 0 (run 1's SFT weights: 0.011).
+Whether greedy decoding actually closes is the smoke's job."""
 MIN_P_ASSISTANT_END = 0.5
 """After ``<|python_end|>`` the turn always ends in training; 0.5 is a loose floor."""
 MAX_SPECIAL_COSINE = 0.9
 """Trained rows of distinct tokens point in clearly different directions; rows that never
 received a useful gradient drift together toward one shared direction."""
+OUTPUT_SPECIALS = (ASSISTANT_END, PYTHON_START, PYTHON_END)
+"""The specials that are assistant targets, so the output layer must tell them apart. The
+others are only ever inputs under assistant-only loss, and nothing in SFT separates them."""
 MIN_SMOKE_SHARE = 0.75
 """12 of 16 prompts: a format failure gives about none, an imperfect model most."""
 CHAT_SPECIALS = (
@@ -98,6 +107,7 @@ def thresholds() -> dict[str, Any]:
         "min_p_assistant_end": MIN_P_ASSISTANT_END,
         "max_special_cosine": MAX_SPECIAL_COSINE,
         "special_cosine_comparison": "strictly below",
+        "separation_tokens": [name(token) for token in OUTPUT_SPECIALS],
         "min_smoke_share": MIN_SMOKE_SHARE,
     }
 
@@ -124,7 +134,7 @@ def assistant_index(row: SFTRow) -> int:
     if (
         ids[:2] != (BOS, USER_START)
         or ids[start - 1] != USER_END
-        or start + 4 > len(ids)
+        or start + 5 > len(ids)  # At least one code token.
         or ids[start + 1] != PYTHON_START
         or ids[-2:] != (PYTHON_END, ASSISTANT_END)
         or any(is_special(token) for token in ids[start + 2 : -2])
@@ -192,18 +202,24 @@ def judge_close(python_end: Sequence[float], assistant_end: Sequence[float]) -> 
     }
 
 
-def judge_separation(cosines: Sequence[Sequence[float]]) -> dict[str, Any]:
-    size = len(CHAT_SPECIALS)
-    if len(cosines) != size or any(len(row) != size for row in cosines):
+def largest_cosine(cosines: Sequence[Sequence[float]], tokens: Sequence[int]) -> dict[str, Any]:
+    """The largest and mean off-diagonal entries of the cosine matrix of ``tokens``."""
+    size = len(tokens)
+    if size < 2 or len(cosines) != size or any(len(row) != size for row in cosines):
         raise ValueError(f"separation needs a {size} x {size} cosine matrix")
     pairs = [(cosines[i][j], i, j) for i in range(size) for j in range(i + 1, size)]
     largest, left, right = max(pairs)
     return {
         "max_cosine": largest,
-        "max_pair": [name(CHAT_SPECIALS[left]), name(CHAT_SPECIALS[right])],
+        "max_pair": [name(tokens[left]), name(tokens[right])],
         "mean_cosine": _mean([value for value, _, _ in pairs]),
-        "passed": largest < MAX_SPECIAL_COSINE,
     }
+
+
+def judge_separation(cosines: Sequence[Sequence[float]]) -> dict[str, Any]:
+    """Judged on the cosine matrix of ``OUTPUT_SPECIALS`` only."""
+    result = largest_cosine(cosines, OUTPUT_SPECIALS)
+    return {**result, "passed": result["max_cosine"] < MAX_SPECIAL_COSINE}
 
 
 def judge_smoke(extracted: Sequence[bool]) -> dict[str, Any]:
@@ -247,9 +263,9 @@ def measure_rows(model: GPT, rows: Sequence[SFTRow]) -> list[dict[str, Any]]:
 
 
 @torch.no_grad()
-def special_cosines(model: GPT) -> list[list[float]]:
-    """Pairwise cosines of the tied embedding rows of ``CHAT_SPECIALS``."""
-    rows = model.embedding.weight.detach().float()[list(CHAT_SPECIALS)]
+def special_cosines(model: GPT, tokens: Sequence[int] = CHAT_SPECIALS) -> list[list[float]]:
+    """Pairwise cosines of the tied embedding rows of ``tokens``."""
+    rows = model.embedding.weight.detach().float()[list(tokens)]
     unit = torch.nn.functional.normalize(rows, dim=-1)
     return [[float(value) for value in row] for row in unit @ unit.T]
 
@@ -327,25 +343,27 @@ def evaluate_gate(
 ) -> dict[str, Any]:
     """Every check's measurements and verdict; ``passed`` only if all four pass.
 
-    Each smoke task's prompt that also names a chosen row must equal that row's prompt,
-    so the rows and the tasks are known to come from the same tokenizer and renderer.
+    Every chosen row must have a task of the same ID whose chat-v1 evaluation prompt equals
+    the row's prompt token for token, so the first-token check reads the evaluation's own
+    prompt and the rows and tasks are known to share one tokenizer and renderer.
     """
     model.eval()
     context = model.config.context
     chosen = select_rows(rows, row_count, context)
-    measured = measure_rows(model, chosen)
-    tasks_chosen = select_tasks(tasks, smoke_prompts, encoder, context)
+    task_list = list(tasks)
     protocol = protocol_for(CHAT, "pool")
-    by_id = {row.id: row for row in chosen}
-    matched = 0
-    for task in tasks_chosen:
-        if task.id in by_id:
-            row = by_id[task.id]
-            if list(row.ids[: assistant_index(row) + 1]) != protocol.prompt_ids(encoder, task):
-                raise ValueError(f"row {task.id} and its task render different prompts")
-            matched += 1
+    by_id = {task.id: task for task in task_list}
+    for row in chosen:
+        if row.id not in by_id:
+            raise ValueError(f"row {row.id} has no task in the task file")
+        prompt = protocol.prompt_ids(encoder, by_id[row.id])
+        if list(row.ids[: assistant_index(row) + 1]) != prompt:
+            raise ValueError(f"row {row.id} and its task render different prompts")
+    measured = measure_rows(model, chosen)
+    tasks_chosen = select_tasks(task_list, smoke_prompts, encoder, context)
     smoke = greedy_smoke(model, encoder, decoder, tasks_chosen, batch_size=batch_size)
-    cosines = special_cosines(model)
+    cosines = special_cosines(model, OUTPUT_SPECIALS)
+    all_cosines = special_cosines(model)
     checks = {
         "first_token": judge_first_token(
             [row["argmax"] for row in measured], [row["p_python_start"] for row in measured]
@@ -356,9 +374,14 @@ def evaluate_gate(
         ),
         "separation": {
             **judge_separation(cosines),
-            **special_geometry(model),
-            "tokens": [name(token) for token in CHAT_SPECIALS],
+            "tokens": [name(token) for token in OUTPUT_SPECIALS],
             "cosines": cosines,
+            "all_specials": {  # Recorded, not judged.
+                **largest_cosine(all_cosines, CHAT_SPECIALS),
+                **special_geometry(model),
+                "tokens": [name(token) for token in CHAT_SPECIALS],
+                "cosines": all_cosines,
+            },
         },
         "greedy_smoke": {
             **judge_smoke([row["program_extracted"] for row in smoke]),
@@ -379,12 +402,29 @@ def evaluate_gate(
         "thresholds": thresholds(),
         "row_ids": [row.id for row in chosen],
         "smoke_task_ids": [task.id for task in tasks_chosen],
-        "smoke_prompts_matching_rows": matched,
+        "rows_matching_task_prompts": len(chosen),
         "rows": measured,
         "smoke": smoke,
         "protocol_sha256": protocol.sha256(),
         "selection": f"ascending sha256('{SELECTION_SALT}|' + id) among rows and tasks that "
         "fit the model context",
+    }
+
+
+def _without_matrices(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: _without_matrices(item) if isinstance(item, dict) else item
+        for key, item in value.items()
+        if key != "cosines"
+    }
+
+
+def summary(record: dict[str, Any]) -> dict[str, Any]:
+    """The verdicts and each check's values, without the cosine matrices."""
+    return {
+        "passed": record["passed"],
+        "failed_checks": record["failed_checks"],
+        "checks": {label: _without_matrices(check) for label, check in record["checks"].items()},
     }
 
 

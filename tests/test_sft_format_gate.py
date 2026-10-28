@@ -73,12 +73,12 @@ def trained() -> GPT:
     return train(ROWS)
 
 
-def collinear(model: GPT) -> GPT:
-    """The model with every chat-v1 special row replaced by their mean."""
+def collinear(model: GPT, tokens: tuple[int, ...] = gate.CHAT_SPECIALS) -> GPT:
+    """The model with the rows of ``tokens`` (default: every chat-v1 special) set to their mean."""
     broken = copy.deepcopy(model)
     with torch.no_grad():
-        rows = broken.embedding.weight[list(gate.CHAT_SPECIALS)]
-        broken.embedding.weight[list(gate.CHAT_SPECIALS)] = rows.mean(dim=0)
+        rows = broken.embedding.weight[list(tokens)]
+        broken.embedding.weight[list(tokens)] = rows.mean(dim=0)
     return broken
 
 
@@ -91,11 +91,19 @@ def test_a_model_that_learned_the_format_passes_every_check(trained: GPT) -> Non
     assert checks["close"]["mean_p_python_end"] >= gate.MIN_P_PYTHON_END
     assert checks["close"]["mean_p_assistant_end_after_python_end"] >= gate.MIN_P_ASSISTANT_END
     assert checks["separation"]["max_cosine"] < gate.MAX_SPECIAL_COSINE
-    assert checks["separation"]["min_pair_distance"] > 0.1
-    assert len(checks["separation"]["norms"]) == len(gate.CHAT_SPECIALS)
+    assert checks["separation"]["tokens"] == [
+        "<|assistant_end|>",
+        "<|python_start|>",
+        "<|python_end|>",
+    ]
+    every = checks["separation"]["all_specials"]
+    assert every["min_pair_distance"] > 0.1 and len(every["norms"]) == len(gate.CHAT_SPECIALS)
+    assert len(every["cosines"]) == len(gate.CHAT_SPECIALS)
     assert checks["greedy_smoke"]["programs"] == gate.SMOKE_PROMPTS
     assert len(result["row_ids"]) == gate.ROWS and len(result["smoke_task_ids"]) == 16
-    assert result["smoke_prompts_matching_rows"] == 16  # Same tasks, same chosen order.
+    assert result["rows_matching_task_prompts"] == gate.ROWS
+    # Both are chosen by the same key, so the smoke tasks are the first chosen rows.
+    assert result["smoke_task_ids"] == result["row_ids"][:16]
     assert all(row["program_sha256"] for row in result["smoke"])
 
 
@@ -108,8 +116,22 @@ def test_collinear_special_rows_fail_first_token_and_separation(trained: GPT) ->
     assert checks["first_token"]["rows_argmax_python_start"] == 0
     assert checks["first_token"]["mean_p_python_start"] < 1 / len(gate.CHAT_SPECIALS)
     assert checks["separation"]["max_cosine"] == pytest.approx(1.0, abs=1e-6)
-    assert checks["separation"]["min_pair_distance"] == pytest.approx(0.0, abs=1e-5)
+    every = checks["separation"]["all_specials"]
+    assert every["max_cosine"] == pytest.approx(1.0, abs=1e-6)
+    assert every["min_pair_distance"] == pytest.approx(0.0, abs=1e-5)
     assert checks["greedy_smoke"]["programs"] == 0 and not checks["greedy_smoke"]["passed"]
+
+
+def test_collinear_input_only_specials_are_recorded_but_not_judged(trained: GPT) -> None:
+    # Under assistant-only loss <|user_start|> and <|user_end|> are never targets, so
+    # nothing in SFT separates them; only the three output specials are judged.
+    inputs_only = collinear(trained, (chat.USER_START, chat.USER_END))
+    separation = gate.evaluate_gate(inputs_only, TOKENIZER, TOKENIZER, ROWS, TASKS)["checks"][
+        "separation"
+    ]
+    assert separation["passed"] and separation["max_cosine"] < gate.MAX_SPECIAL_COSINE
+    assert separation["all_specials"]["max_cosine"] == pytest.approx(1.0, abs=1e-6)
+    assert separation["all_specials"]["max_pair"] == ["<|user_start|>", "<|user_end|>"]
 
 
 def test_rows_are_chosen_by_key_not_by_file_order() -> None:
@@ -140,13 +162,35 @@ def test_a_row_that_is_not_a_chat_v1_code_row_is_refused() -> None:
         gate.select_rows([SFTRow.of("language", "oasst", language), *ROWS], 2, CONFIG.context)
 
 
-def test_a_row_whose_prompt_differs_from_its_task_is_refused(trained: GPT) -> None:
-    first = gate.select_rows(ROWS, gate.ROWS, CONFIG.context)[0].id
-    edited = replace(next(item for item in TASKS if item.id == first), prompt="Other text.")
-    rows = [row for row in ROWS if row.id != first]
-    rows.append(SFTRow.of(first, "synthetic", chat.render_code_task(TOKENIZER, edited)))
+@pytest.mark.parametrize("position", [0, gate.ROWS - 1])
+def test_a_row_whose_prompt_differs_from_its_task_is_refused(trained: GPT, position: int) -> None:
+    # Position 31 is a measured row that is not a smoke task: every chosen row is compared.
+    chosen = gate.select_rows(ROWS, gate.ROWS, CONFIG.context)[position].id
+    assert position < 16 or chosen not in [
+        item.id for item in gate.select_tasks(TASKS, 16, TOKENIZER, CONFIG.context)
+    ]
+    edited = replace(next(item for item in TASKS if item.id == chosen), prompt="Other text.")
+    rows = [row for row in ROWS if row.id != chosen]
+    rows.append(SFTRow.of(chosen, "synthetic", chat.render_code_task(TOKENIZER, edited)))
     with pytest.raises(ValueError, match="render different prompts"):
         gate.evaluate_gate(trained, TOKENIZER, TOKENIZER, rows, TASKS)
+
+
+def test_a_chosen_row_without_a_task_is_refused(trained: GPT) -> None:
+    last = gate.select_rows(ROWS, gate.ROWS, CONFIG.context)[-1].id
+    tasks = [item for item in TASKS if item.id != last]
+    with pytest.raises(ValueError, match="has no task"):
+        gate.evaluate_gate(trained, TOKENIZER, TOKENIZER, ROWS, tasks)
+
+
+def test_a_code_row_with_an_empty_block_is_refused() -> None:
+    row = ROWS[0]
+    start = row.ids.index(chat.ASSISTANT_START)
+    ids = (*row.ids[: start + 2], chat.PYTHON_END, chat.ASSISTANT_END)  # The renderer refuses this.
+    empty = SFTRow("empty", "synthetic", ids, (*row.mask[: start + 2], True, True))
+    with pytest.raises(ValueError, match="not a one-exchange chat-v1 code row"):
+        gate.assistant_index(empty)
+    assert gate.assistant_index(row) == start
 
 
 def test_first_token_threshold_edges() -> None:
@@ -159,29 +203,32 @@ def test_first_token_threshold_edges() -> None:
 
 
 def test_close_threshold_edges() -> None:
-    assert gate.judge_close([0.5, 0.5], [0.5, 0.5])["passed"]
-    assert not gate.judge_close([0.5, 0.4999999], [1.0, 1.0])["passed"]
+    assert gate.MIN_P_PYTHON_END == 0.2 and gate.MIN_P_ASSISTANT_END == 0.5
+    assert gate.judge_close([0.2, 0.2], [0.5, 0.5])["passed"]
+    assert not gate.judge_close([0.2, 0.1999999], [1.0, 1.0])["passed"]
     assert not gate.judge_close([1.0, 1.0], [0.5, 0.4999999])["passed"]
     # The bar is on the mean: one low row is allowed when the others make up for it.
-    result = gate.judge_close([0.25, 0.75], [1.0, 0.0])
-    assert result["mean_p_python_end"] == 0.5 and result["passed"]
+    result = gate.judge_close([0.1, 0.3], [1.0, 0.0])
+    assert result["mean_p_python_end"] == 0.2 and result["passed"]
     assert result["min_p_assistant_end_after_python_end"] == 0.0
 
 
 def test_separation_threshold_edge_is_strict() -> None:
-    size = len(gate.CHAT_SPECIALS)
+    size = len(gate.OUTPUT_SPECIALS)
 
     def matrix(value: float) -> list[list[float]]:
         rows = [[1.0 if i == j else 0.0 for j in range(size)] for i in range(size)]
-        rows[3][5] = rows[5][3] = value  # assistant_start and python_start
+        rows[1][2] = rows[2][1] = value  # python_start and python_end
         return rows
 
     assert gate.judge_separation(matrix(0.8999999))["passed"]
     below = gate.judge_separation(matrix(0.9))
     assert not below["passed"]
-    assert below["max_pair"] == ["<|assistant_start|>", "<|python_start|>"]
+    assert below["max_pair"] == ["<|python_start|>", "<|python_end|>"]
     with pytest.raises(ValueError):
         gate.judge_separation([[1.0]])
+    with pytest.raises(ValueError):  # The seven-token matrix is recorded, not judged.
+        gate.judge_separation([[1.0] * 7] * 7)
 
 
 def test_smoke_threshold_edges() -> None:
@@ -254,8 +301,9 @@ def test_cli_writes_the_record_and_exits_zero_on_pass(
     for name in ("checkpoint_sha256", "tokenizer_sha256", "rows_sha256", "tasks_sha256"):
         assert len(inputs[name]) == 64
     assert record["torch_threads"] == 1
-    with pytest.raises(FileExistsError):
-        main(arguments)
+    capsys.readouterr()
+    assert main(arguments) == 2  # Not measured: an existing record is never replaced.
+    assert "not measured: FileExistsError" in capsys.readouterr().err
 
 
 def test_cli_exits_nonzero_when_the_gate_fails(
@@ -268,12 +316,13 @@ def test_cli_exits_nonzero_when_the_gate_fails(
 
 
 def test_the_gate_refuses_a_task_file_that_is_not_the_dev_split(
-    trained: GPT, tmp_path: Path
+    trained: GPT, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     arguments = gate_arguments(tmp_path, trained)
     other = tmp_path / "test.jsonl"
     save_tasks(other, [replace(TASKS[0], split="test")])
     arguments[arguments.index("--tasks") + 1] = str(other)
-    with pytest.raises(ValueError, match="only dev tasks"):
-        main(arguments)
+    # Exit 2, not 1: a gate that could not measure is not a measured failure.
+    assert main(arguments) == 2
+    assert "only dev tasks" in capsys.readouterr().err
     assert not (tmp_path / "gate.json").exists()
