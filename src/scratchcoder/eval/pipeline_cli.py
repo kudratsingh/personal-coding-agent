@@ -10,6 +10,7 @@ COMMANDS = (
     "eval-generate",
     "eval-execute",
     "eval-seal",
+    "eval-withdraw",
     "eval-baseline",
     "eval-test-baseline",
     "scorecard",
@@ -60,6 +61,14 @@ def add_parsers(subparsers: Any) -> None:
     )
     seal.add_argument("--completions", type=Path, required=True)
     seal.add_argument("--ledger", type=Path, required=True)
+    withdraw = subparsers.add_parser(
+        "eval-withdraw",
+        help="withdraw every sealed test file of one endpoint's checkpoint, for good",
+    )
+    withdraw.add_argument("--ledger", type=Path, required=True)
+    withdraw.add_argument("--endpoint", required=True, help="base, sft, rl or more-sft")
+    withdraw.add_argument("--checkpoint-sha256", required=True)
+    withdraw.add_argument("--reason", required=True, help="recorded in the ledger")
     baseline = subparsers.add_parser(
         "eval-baseline",
         help="constant-answer baseline of the pool dev split (the test split is sealed)",
@@ -167,6 +176,18 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         from scratchcoder.eval.seal import seal_completions
 
         _print(seal_completions(args.completions, args.ledger))
+        return 0
+    if args.command == "eval-withdraw":
+        from scratchcoder.eval.seal import withdraw_endpoint
+
+        _print(
+            withdraw_endpoint(
+                args.ledger,
+                endpoint=args.endpoint,
+                checkpoint_sha256=args.checkpoint_sha256,
+                reason=args.reason,
+            )
+        )
         return 0
     if args.command == "eval-baseline":
         from scratchcoder.eval.baseline import pool_baseline_report, save_baseline

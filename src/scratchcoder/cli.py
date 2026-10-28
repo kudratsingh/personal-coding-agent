@@ -202,6 +202,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     gate.add_argument("--tasks", type=Path, required=True, help="the pool dev tasks or export")
     gate.add_argument("--output", type=Path, required=True, help="the new JSON record")
     gate.add_argument("--threads", type=int, default=4, help="torch CPU threads (default 4)")
+    gate.add_argument(
+        "--benchmark",
+        action="append",
+        default=[],
+        metavar="SUITE=PATH",
+        help="humaneval or mbpp-plus and its pinned release: a recorded, unjudged smoke of "
+        "its chat-v1 turns; repeat for each",
+    )
     from scratchcoder.eval import pipeline_cli
 
     pipeline_cli.add_parsers(subparsers)
@@ -312,6 +320,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         from scratchcoder.eval.format_gate import summary as gate_summary
 
         try:
+            benchmarks: dict[str, Path] = {}
+            for item in args.benchmark:
+                suite, separator, path = item.partition("=")
+                if not separator or not path or suite in benchmarks:
+                    raise ValueError("--benchmark takes SUITE=PATH, each suite once")
+                benchmarks[suite] = Path(path)
             record = run_gate(
                 checkpoint=args.checkpoint,
                 tokenizer_path=args.tokenizer,
@@ -319,6 +333,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 tasks_path=args.tasks,
                 output=args.output,
                 threads=args.threads,
+                benchmarks=benchmarks,
             )
         except Exception as error:  # Exit 1 means measured and failed; 2 means not measured.
             sys.stderr.write(f"sft-format-gate: not measured: {type(error).__name__}: {error}\n")

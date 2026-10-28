@@ -8,7 +8,9 @@ gate measures those tokens directly and runs no generated code. Four checks:
 - ``first_token``: on ``ROWS`` code-dev rows chosen by ``selection_key``, the generation
   prompt (the row up to and including ``<|assistant_start|>``, which is exactly what
   chat-v1 renders for the task) must have ``<|python_start|>`` as its argmax in every
-  row, with a mean probability of at least ``MIN_P_PYTHON_START``.
+  row, with a mean probability of at least ``MIN_P_PYTHON_START``. A dev row that left its
+  public tests out (``render_code_task(public_tests=False)``) is not an evaluation prompt,
+  so it is skipped and counted; the next row by key takes its place.
 - ``close``: teacher-forced on the same rows, ``<|python_end|>`` at the true end of the
   code must have a mean probability of at least ``MIN_P_PYTHON_END``, and
   ``<|assistant_end|>`` right after it at least ``MIN_P_ASSISTANT_END``.
@@ -20,7 +22,10 @@ gate measures those tokens directly and runs no generated code. Four checks:
   same key must extract a nonempty program from at least ``MIN_SMOKE_SHARE`` of them.
   The programs are hashed, never run.
 
-The gate passes only if all four pass. ``run_gate`` writes one JSON record with every
+The gate passes only if all four pass. Recorded, never judged: a greedy smoke of
+``BENCHMARK_SMOKE_PROMPTS`` HumanEval and MBPP+ tasks each under their chat-v1 benchmark
+turns (``benchmark_smoke``), when the benchmark files are given. ``run_gate`` (the CPU
+command) and ``gate_record`` (the Pod worker, on its GPU) write one JSON record with every
 measurement, the thresholds and the SHA-256 of each input. See
 ``docs/walkthroughs/sft-format-gate.md``.
 """
@@ -30,7 +35,7 @@ from __future__ import annotations
 import hashlib
 import math
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -45,20 +50,33 @@ from scratchcoder.data.chat import (
     PYTHON_START,
     USER_END,
     USER_START,
+    Message,
     TextDecoder,
     TextEncoder,
+    generation_prompt,
     is_special,
+    task_user_text,
 )
 from scratchcoder.data.sft import SFTRow, read_rows
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.engine.generation import generate_many
-from scratchcoder.eval.protocols import CHAT, load_suite_tasks, protocol_for
+from scratchcoder.eval.protocols import (
+    BENCHMARK_SPLIT,
+    CHAT,
+    HUMANEVAL,
+    MBPP_PLUS,
+    load_suite_tasks,
+    protocol_for,
+)
 from scratchcoder.eval.tasks import Task
 from scratchcoder.model.gpt import GPT
 from scratchcoder.tokenizer.bpe import SPECIAL_TOKENS
 
 FORMAT = "scratchcoder-sft-format-gate"
-VERSION = 1
+VERSION = 2
+"""2 skips code dev rows without their public tests, may run on a GPU and records a
+benchmark smoke; on a dev file whose rows all carry their tests it chooses version 1's
+rows and judges them alike."""
 SELECTION_SALT = "sft-format-gate-1"
 ROWS = 32
 SMOKE_PROMPTS = 16
@@ -85,6 +103,10 @@ OUTPUT_SPECIALS = (ASSISTANT_END, PYTHON_START, PYTHON_END)
 others are only ever inputs under assistant-only loss, and nothing in SFT separates them."""
 MIN_SMOKE_SHARE = 0.75
 """12 of 16 prompts: a format failure gives about none, an imperfect model most."""
+BENCHMARK_SMOKE_SUITES = (HUMANEVAL, MBPP_PLUS)
+BENCHMARK_SMOKE_PROMPTS = 8
+"""Per suite, recorded and not judged: the bare benchmark turns (a HumanEval signature,
+EvalPlus's MBPP+ docstring) are a prompt shape the code dev rows only partly share."""
 CHAT_SPECIALS = (
     BOS,
     USER_START,
@@ -237,13 +259,14 @@ def judge_smoke(extracted: Sequence[bool]) -> dict[str, Any]:
 
 @torch.no_grad()
 def measure_rows(model: GPT, rows: Sequence[SFTRow]) -> list[dict[str, Any]]:
-    """First-token and close probabilities of each row, in float32."""
+    """First-token and close probabilities of each row, in float32, on the model's device."""
+    device = model.embedding.weight.device
     measured = []
     for row in rows:
         start = assistant_index(row)
-        prompt = torch.tensor([list(row.ids[: start + 1])])
+        prompt = torch.tensor([list(row.ids[: start + 1])], device=device)
         first = torch.softmax(model(prompt)[0, -1].float(), dim=-1)
-        inputs = torch.tensor([list(row.ids[:-1])])
+        inputs = torch.tensor([list(row.ids[:-1])], device=device)
         forced = torch.softmax(model(inputs)[0].float(), dim=-1)
         end = len(row.ids) - 2  # The index of <|python_end|>; logits at t predict ids[t + 1].
         measured.append(
@@ -330,6 +353,116 @@ def greedy_smoke(
     return results
 
 
+def choose_rows(
+    rows: Iterable[SFTRow],
+    tasks_by_id: Mapping[str, Task],
+    encoder: TextEncoder,
+    count: int,
+    context: int,
+) -> tuple[list[SFTRow], list[str]]:
+    """The first ``count`` code rows by ``selection_key`` whose prompt is the evaluation's.
+
+    Every row must be a chat-v1 code row (``assistant_index``); rows over the context are
+    dropped. In key order, each row's prefix up to ``<|assistant_start|>`` must equal its
+    task's chat-v1 evaluation prompt (it is chosen) or the same task rendered without its
+    public tests (it is skipped, and its ID returned); anything else, or a row without a
+    task, stops the gate."""
+    items = list(rows)
+    for row in items:
+        assistant_index(row)
+    protocol = protocol_for(CHAT, "pool")
+    fitting = sorted(
+        (row for row in items if len(row.ids) - 1 <= context),
+        key=lambda row: selection_key(row.id),
+    )
+    chosen: list[SFTRow] = []
+    skipped: list[str] = []
+    for row in fitting:
+        if len(chosen) == count:
+            break
+        task = tasks_by_id.get(row.id)
+        if task is None:
+            raise ValueError(f"row {row.id} has no task in the task file")
+        prefix = list(row.ids[: assistant_index(row) + 1])
+        if prefix == protocol.prompt_ids(encoder, task):
+            chosen.append(row)
+        elif prefix == generation_prompt(
+            encoder, [Message("user", task_user_text(task, public_tests=False))]
+        ):
+            skipped.append(row.id)
+        else:
+            raise ValueError(f"row {row.id} and its task render different prompts")
+    if len(chosen) != count:
+        raise ValueError(
+            f"the format gate needs {count} code rows that fit the context and carry their "
+            "public tests"
+        )
+    return chosen, skipped
+
+
+def benchmark_smoke(
+    model: GPT,
+    encoder: TextEncoder,
+    decoder: TextDecoder,
+    tasks: Sequence[Task],
+    *,
+    suite: str,
+    count: int = BENCHMARK_SMOKE_PROMPTS,
+    batch_size: int = SMOKE_BATCH_SIZE,
+) -> dict[str, Any]:
+    """Recorded, not judged: greedy chat-v1 completions of ``count`` tasks of a benchmark,
+    chosen by ``selection_key`` among those with room to generate, under the benchmark's
+    own user turn. Programs are hashed, never run."""
+    protocol = protocol_for(CHAT, suite)
+    context = model.config.context
+    runnable = [
+        task
+        for task in tasks
+        if protocol.budget(len(protocol.prompt_ids(encoder, task)), context) >= 1
+    ]
+    chosen = sorted(runnable, key=lambda task: selection_key(task.id))[:count]
+    if not chosen:
+        raise ValueError(f"the {suite} smoke has no task with room to generate")
+    prompts = [protocol.prompt_ids(encoder, task) for task in chosen]
+    completions = generate_many(
+        model,
+        prompts,
+        batch_size=batch_size,
+        max_new_tokens=protocol.cap,
+        stops=[protocol.stop_ids] * len(prompts),
+        precision="float32",
+    )
+    results = []
+    for task, prompt, completion in zip(chosen, prompts, completions, strict=True):
+        tokens = list(completion.tokens)
+        program = protocol.candidate(task, tokens=tokens, completion="", decoder=decoder)
+        results.append(
+            {
+                "task_id": task.id,
+                "prompt_tokens": len(prompt),
+                "generated_tokens": len(tokens),
+                "first_tokens": tokens[:8],
+                "stop_reason": completion.finish_reason,
+                "opened": PYTHON_START in tokens,
+                "closed": program is not None,
+                "program_extracted": program is not None and bool(program.strip()),
+                "program_sha256": None
+                if program is None
+                else hashlib.sha256(program.encode()).hexdigest(),
+            }
+        )
+    return {
+        "judged": False,
+        "suite": suite,
+        "prompts": len(results),
+        "opened": sum(row["opened"] for row in results),
+        "closed": sum(row["closed"] for row in results),
+        "programs": sum(row["program_extracted"] for row in results),
+        "protocol_sha256": protocol.sha256(),
+        "results": results,
+    }
+
+
 def evaluate_gate(
     model: GPT,
     encoder: TextEncoder,
@@ -340,25 +473,22 @@ def evaluate_gate(
     row_count: int = ROWS,
     smoke_prompts: int = SMOKE_PROMPTS,
     batch_size: int = SMOKE_BATCH_SIZE,
+    benchmarks: Mapping[str, Sequence[Task]] | None = None,
+    benchmark_prompts: int = BENCHMARK_SMOKE_PROMPTS,
 ) -> dict[str, Any]:
     """Every check's measurements and verdict; ``passed`` only if all four pass.
 
     Every chosen row must have a task of the same ID whose chat-v1 evaluation prompt equals
-    the row's prompt token for token, so the first-token check reads the evaluation's own
-    prompt and the rows and tasks are known to share one tokenizer and renderer.
+    the row's prompt token for token (``choose_rows``), so the first-token check reads the
+    evaluation's own prompt and the rows and tasks are known to share one tokenizer and
+    renderer. ``benchmarks`` (suite to its tasks) adds the recorded benchmark smoke.
     """
     model.eval()
     context = model.config.context
-    chosen = select_rows(rows, row_count, context)
     task_list = list(tasks)
     protocol = protocol_for(CHAT, "pool")
     by_id = {task.id: task for task in task_list}
-    for row in chosen:
-        if row.id not in by_id:
-            raise ValueError(f"row {row.id} has no task in the task file")
-        prompt = protocol.prompt_ids(encoder, by_id[row.id])
-        if list(row.ids[: assistant_index(row) + 1]) != prompt:
-            raise ValueError(f"row {row.id} and its task render different prompts")
+    chosen, skipped = choose_rows(rows, by_id, encoder, row_count, context)
     measured = measure_rows(model, chosen)
     tasks_chosen = select_tasks(task_list, smoke_prompts, encoder, context)
     smoke = greedy_smoke(model, encoder, decoder, tasks_chosen, batch_size=batch_size)
@@ -395,19 +525,33 @@ def evaluate_gate(
     checks["first_token"]["mean_p_assistant_end"] = _mean(
         [row["p_assistant_end"] for row in measured]
     )
+    recorded = {
+        suite: benchmark_smoke(
+            model,
+            encoder,
+            decoder,
+            suite_tasks,
+            suite=suite,
+            count=benchmark_prompts,
+            batch_size=batch_size,
+        )
+        for suite, suite_tasks in sorted((benchmarks or {}).items())
+    }
     return {
         "passed": all(check["passed"] for check in checks.values()),
         "failed_checks": [label for label, check in checks.items() if not check["passed"]],
         "checks": checks,
         "thresholds": thresholds(),
         "row_ids": [row.id for row in chosen],
+        "rows_without_public_tests_skipped": skipped,
         "smoke_task_ids": [task.id for task in tasks_chosen],
         "rows_matching_task_prompts": len(chosen),
         "rows": measured,
         "smoke": smoke,
+        "benchmark_smoke": recorded,
         "protocol_sha256": protocol.sha256(),
         "selection": f"ascending sha256('{SELECTION_SALT}|' + id) among rows and tasks that "
-        "fit the model context",
+        "fit the model context; rows without their public tests are skipped",
     }
 
 
@@ -428,30 +572,50 @@ def summary(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def run_gate(
+def load_benchmarks(paths: Mapping[str, Path]) -> dict[str, list[Task]]:
+    """The scored tasks of each benchmark file (``BENCHMARK_SMOKE_SUITES`` only)."""
+    loaded = {}
+    for suite, path in sorted(paths.items()):
+        if suite not in BENCHMARK_SMOKE_SUITES:
+            raise ValueError(f"the benchmark smoke reads {list(BENCHMARK_SMOKE_SUITES)}")
+        loaded[suite] = load_suite_tasks(suite, BENCHMARK_SPLIT, path)[0]
+    return loaded
+
+
+def gate_record(
+    model: GPT,
+    tokenizer: Any,
     *,
     checkpoint: Path,
     tokenizer_path: Path,
     rows_path: Path,
     tasks_path: Path,
-    output: Path,
-    threads: int = 4,
+    benchmarks: Mapping[str, Path] | None = None,
+    device: str = "cpu",
+    row_count: int = ROWS,
+    smoke_prompts: int = SMOKE_PROMPTS,
+    benchmark_prompts: int = BENCHMARK_SMOKE_PROMPTS,
+    started: float | None = None,
 ) -> dict[str, Any]:
-    """Load the checkpoint on CPU, evaluate the gate, write ``output``; return the record."""
-    from scratchcoder.eval.checkpoint import load_checkpoint
+    """Evaluate the gate on a loaded model and return the full record (not written)."""
     from scratchcoder.tokenizer.bulk import FastEncoder
 
-    if type(threads) is not int or threads < 1:
-        raise ValueError("threads must be a positive integer")
-    if output.exists():
-        raise FileExistsError(f"{output} already exists; gate records are not replaced")
-    started = time.perf_counter()
-    model, tokenizer = load_checkpoint(checkpoint, tokenizer_path)
-    torch.set_num_threads(threads)  # load_checkpoint leaves one thread.
+    began = time.perf_counter() if started is None else started
     tasks, _ = load_suite_tasks("pool", "dev", tasks_path)
-    gate = evaluate_gate(model, FastEncoder(tokenizer), tokenizer, read_rows(rows_path), tasks)
+    benchmark_files = dict(benchmarks or {})
+    gate = evaluate_gate(
+        model,
+        FastEncoder(tokenizer),
+        tokenizer,
+        read_rows(rows_path),
+        tasks,
+        row_count=row_count,
+        smoke_prompts=smoke_prompts,
+        benchmarks=load_benchmarks(benchmark_files),
+        benchmark_prompts=benchmark_prompts,
+    )
     commit, dirty = git_state()
-    record = {
+    return {
         "format": FORMAT,
         "version": VERSION,
         **gate,
@@ -462,6 +626,9 @@ def run_gate(
             "tokenizer_identity": tokenizer.sha256,
             "rows_sha256": file_sha256(rows_path),
             "tasks_sha256": file_sha256(tasks_path),
+            "benchmarks_sha256": {
+                suite: file_sha256(path) for suite, path in sorted(benchmark_files.items())
+            },
             "model": {
                 "vocab_size": model.config.vocab_size,
                 "width": model.config.width,
@@ -469,12 +636,44 @@ def run_gate(
                 "context": model.config.context,
             },
         },
-        "device": "cpu",
+        "device": device,
         "torch_threads": torch.get_num_threads(),
-        "seconds": time.perf_counter() - started,
+        "seconds": time.perf_counter() - began,
         "created_at": utc_now(),
         "git_commit": commit,
         "dirty": dirty,
     }
+
+
+def run_gate(
+    *,
+    checkpoint: Path,
+    tokenizer_path: Path,
+    rows_path: Path,
+    tasks_path: Path,
+    output: Path,
+    threads: int = 4,
+    benchmarks: Mapping[str, Path] | None = None,
+) -> dict[str, Any]:
+    """Load the checkpoint on CPU, evaluate the gate, write ``output``; return the record."""
+    from scratchcoder.eval.checkpoint import load_checkpoint
+
+    if type(threads) is not int or threads < 1:
+        raise ValueError("threads must be a positive integer")
+    if output.exists():
+        raise FileExistsError(f"{output} already exists; gate records are not replaced")
+    started = time.perf_counter()
+    model, tokenizer = load_checkpoint(checkpoint, tokenizer_path)
+    torch.set_num_threads(threads)  # load_checkpoint leaves one thread.
+    record = gate_record(
+        model,
+        tokenizer,
+        checkpoint=checkpoint,
+        tokenizer_path=tokenizer_path,
+        rows_path=rows_path,
+        tasks_path=tasks_path,
+        benchmarks=benchmarks,
+        started=started,
+    )
     atomic_json(output, record)
     return record

@@ -20,7 +20,7 @@ from scratchcoder.data.onepass import IGNORE
 from scratchcoder.data.sft import SFTRow, write_rows
 from scratchcoder.engine.generation import Completion
 from scratchcoder.eval import format_gate as gate
-from scratchcoder.eval.tasks import Task, save_tasks
+from scratchcoder.eval.tasks import Task, load_tasks, save_tasks
 from scratchcoder.model.gpt import GPT
 from scratchcoder.optim.adamw import AdamW, cross_entropy_sum
 from scratchcoder.tokenizer.bpe import ByteBPE
@@ -326,3 +326,131 @@ def test_the_gate_refuses_a_task_file_that_is_not_the_dev_split(
     assert main(arguments) == 2
     assert "only dev tasks" in capsys.readouterr().err
     assert not (tmp_path / "gate.json").exists()
+
+
+def omitted_rows() -> list[SFTRow]:
+    """The dev rows with every third (by position) rendered without its public tests."""
+    return [
+        SFTRow.of(
+            item.id,
+            item.source,
+            chat.render_code_task(TOKENIZER, item, public_tests=bool(index % 3)),
+        )
+        for index, item in enumerate(TASKS)
+    ]
+
+
+def test_rows_without_public_tests_are_skipped_not_measured(trained: GPT) -> None:
+    rows = omitted_rows()
+    without = {row.id for index, row in enumerate(rows) if index % 3 == 0}
+    many = TASKS + [task(index) for index in range(40, 60)]
+    rows += [
+        SFTRow.of(item.id, item.source, chat.render_code_task(TOKENIZER, item))
+        for item in many[40:]
+    ]
+    result = gate.evaluate_gate(trained, TOKENIZER, TOKENIZER, rows, many)
+    assert len(result["row_ids"]) == gate.ROWS and not set(result["row_ids"]) & without
+    skipped = result["rows_without_public_tests_skipped"]
+    assert skipped and set(skipped) <= without
+    # Every chosen row is the next with-tests row in key order.
+    ordered = sorted((row.id for row in rows), key=gate.selection_key)
+    with_tests = [identifier for identifier in ordered if identifier not in without]
+    assert result["row_ids"] == with_tests[: gate.ROWS]
+    assert set(skipped) == {
+        i for i in ordered[: ordered.index(result["row_ids"][-1])] if i in without
+    }
+
+
+def test_too_few_rows_with_public_tests_are_refused(trained: GPT) -> None:
+    with pytest.raises(ValueError, match="carry their public tests"):
+        gate.evaluate_gate(trained, TOKENIZER, TOKENIZER, omitted_rows(), TASKS)
+
+
+def test_an_all_with_tests_file_chooses_version_ones_rows(trained: GPT) -> None:
+    chosen, skipped = gate.choose_rows(
+        ROWS, {item.id: item for item in TASKS}, TOKENIZER, gate.ROWS, CONFIG.context
+    )
+    assert chosen == gate.select_rows(ROWS, gate.ROWS, CONFIG.context) and skipped == []
+
+
+def benchmark_tasks() -> dict[str, list[Task]]:
+    common = {"source": "fixture", "license": "fixture", "written_by": "human", "split": "eval"}
+    humaneval = [
+        Task(
+            id=f"humaneval/{index}",
+            prompt=f"def f{index}():\n",
+            public_tests=f"assert callable(f{index})",
+            hidden_tests="assert True",
+            entry_point=f"f{index}",
+            **common,
+        )
+        for index in range(10)
+    ]
+    mbpp = [
+        Task(
+            id=f"mbpp/{index}",
+            prompt=f"Task {index}: write f.",
+            public_tests="\nassert f() == 1",
+            hidden_tests="assert f() == 1",
+            **common,
+        )
+        for index in range(10)
+    ]
+    return {"humaneval": humaneval, "mbpp-plus": mbpp}
+
+
+def test_the_benchmark_smoke_is_recorded_and_never_judged(trained: GPT) -> None:
+    result = gate.evaluate_gate(
+        collinear(trained, (chat.USER_START, chat.USER_END)),
+        TOKENIZER,
+        TOKENIZER,
+        ROWS,
+        TASKS,
+        benchmarks=benchmark_tasks(),
+    )
+    recorded = result["benchmark_smoke"]
+    assert set(recorded) == {"humaneval", "mbpp-plus"}
+    for suite, entry in recorded.items():
+        assert entry["judged"] is False and entry["prompts"] == gate.BENCHMARK_SMOKE_PROMPTS
+        expected = sorted((t.id for t in benchmark_tasks()[suite]), key=gate.selection_key)
+        assert [row["task_id"] for row in entry["results"]] == expected[:8]
+    assert "benchmark_smoke" not in result["checks"] and result["passed"]
+    # A broken model fails the gate on its four checks, never on the recorded smoke.
+    broken = gate.evaluate_gate(
+        collinear(trained), TOKENIZER, TOKENIZER, ROWS, TASKS, benchmarks=benchmark_tasks()
+    )
+    assert set(broken["failed_checks"]) <= {"first_token", "close", "separation", "greedy_smoke"}
+    assert broken["benchmark_smoke"]["mbpp-plus"]["programs"] == 0
+
+
+def test_the_benchmark_smoke_reads_only_humaneval_and_mbpp_plus(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="benchmark smoke reads"):
+        gate.load_benchmarks({"humaneval-plus": tmp_path / "x"})
+
+
+def test_cli_records_the_benchmark_smoke(
+    trained: GPT,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scratchcoder.eval import protocols
+
+    arguments = gate_arguments(tmp_path, trained)
+    files = {}
+    for suite, items in benchmark_tasks().items():
+        files[suite] = tmp_path / f"{suite}.jsonl"
+        save_tasks(files[suite], items)
+        arguments += ["--benchmark", f"{suite}={files[suite]}"]
+    monkeypatch.setattr(protocols, "read_humaneval", lambda path: list(load_tasks(path)))
+    monkeypatch.setattr(protocols, "read_release", lambda path, release: list(load_tasks(path)))
+    assert main(arguments) == 0
+    record = json.loads((tmp_path / "gate.json").read_text())
+    assert record["version"] == gate.VERSION == 2
+    assert set(record["benchmark_smoke"]) == {"humaneval", "mbpp-plus"}
+    assert set(record["inputs"]["benchmarks_sha256"]) == {"humaneval", "mbpp-plus"}
+    capsys.readouterr()
+    arguments[-1] = "mbpp-plus"  # No path: refused before anything is measured.
+    (tmp_path / "gate.json").unlink()
+    assert main(arguments) == 2
+    assert "SUITE=PATH" in capsys.readouterr().err
