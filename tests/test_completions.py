@@ -43,7 +43,9 @@ from scratchcoder.eval.protocols import (
 # under the old record are then refused, so update these only with a deliberate amendment.
 PROTOCOL_SHA256 = {
     (CHAT, "pool"): "45d44b52a51aca900d361b7da8256744b17dab4addb7e5c0a5434602188f3c6b",
-    (CHAT, "benchmark"): "3c42f7e24fe2a198b34f4696b678556de676462749d3b56d4efa5c41c1e4b18f",
+    # Amended for run 1b: the MBPP+ user turn is EvalPlus's prompt (task text and first
+    # test), so the record names it; it was 3c42f7e2... under run 1's rendering.
+    (CHAT, "benchmark"): "fd7b8604ee7dce9de66ba1c27aaa92cbb77aa63d204a3041484ca37853cce5ed",
     (BASE_POOL, "pool"): "88a93535c2528bab4ad2e6fb9fc47d3c105401b480cdb3e0ca4ee0f203bfed8b",
     (BASE_BENCHMARK, "benchmark"): (
         "3033d99f2319566b96f8f80a215bab215e5281cf43ac585c6f1caa9d88136a9a"

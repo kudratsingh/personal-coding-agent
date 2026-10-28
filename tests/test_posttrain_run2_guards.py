@@ -39,6 +39,13 @@ def gated() -> dict[str, Any]:
             "sft-results": {
                 name: {"key": f"posttrain-runs/1/podpost01/{name}", **pin} for name in SFT_RESULTS
             },
+            "sft-gate": {
+                "key": "posttrain-runs/1/podpost01/format-gate/gate.json",
+                "size_bytes": 1,
+                "sha256": "c" * 64,
+                "checkpoint_sha256": "a" * 64,
+                "passed": True,
+            },
         }
     )
 

@@ -9,7 +9,9 @@ verified reports once, records each endpoint's source in one plan file, and ever
 reads that plan, so a reused arm is never presented as an independent measurement:
 
 ``plan`` (Mac)
-    From the launch specification and both verified reports: ``base`` and ``sft`` are run 1's;
+    From the launch specification and the verified reports: ``base`` is run 1's, ``sft`` the
+    SFT run's (``--sft-report``: run 1b's, whose weights passed the format gate; run 1's when
+    omitted), its checkpoint the specification's ``sft-weights``;
     each arm is ``pod`` (its seven files and its ARC report in run 2's R2 prefix),
     ``reuses-run-1-sft`` or ``not-evaluated``, as run 2's ``selection.endpoints`` records. A
     reuse is checked three ways: run 2's record of the run 1 artifacts it stands on equals the
@@ -120,21 +122,40 @@ def check_reuse(
     return checked
 
 
+SFT_RUNS = ("1", "1b")
+"""The runs whose SFT weights may be an endpoint: run 1b's replaced run 1's, whose sealed
+test files were withdrawn as a formatting failure."""
+
+
+def _sft_report(path: Path) -> tuple[dict[str, Any], str]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    run = value.get("run") if isinstance(value, dict) else None
+    if run not in SFT_RUNS:
+        raise ValueError(f"{path} is not the report of an SFT run ({list(SFT_RUNS)})")
+    return _report(path, str(run)), str(run)
+
+
 def plan(
     *,
     specification: Path,
     run1_report: Path,
     run2_report: Path,
     run1_artifacts: Path,
+    sft_report: Path | None = None,
 ) -> dict[str, Any]:
-    """The four endpoints and their sources (see the module docstring)."""
+    """The four endpoints and their sources (see the module docstring). ``run1_artifacts``
+    holds the SFT run's fetched labels (run 1b's when ``sft_report`` is run 1b's)."""
     raw = json.loads(specification.read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or raw.get("run") != "2" or gate_nulls(raw):
         raise ValueError(f"{specification} is not run 2's filled launch specification")
     run1, run2 = _report(run1_report, "1"), _report(run2_report, "2")
+    sft, sft_run = (run1, "1") if sft_report is None else _sft_report(sft_report)
     if run2.get("specification") != raw:
         raise ValueError("run 2's report ran another specification than the one given")
+    if sft["sft"]["selected"]["sha256"] != raw["inputs"]["sft-weights"]["sha256"]:
+        raise ValueError(f"run 2 started from other SFT weights than run {sft_run}'s selected")
     run1_rows, run2_rows = _artifacts(run1, "1"), _artifacts(run2, "2")
+    sft_rows = _artifacts(sft, sft_run)
     tests = POOL["test"]
     endpoints: dict[str, dict[str, Any]] = {
         "base": {
@@ -144,10 +165,10 @@ def plan(
             "test_completions_sha256": _completions(run1_rows, "eval-base", tests),
         },
         "sft": {
-            "source": "run 1",
-            "checkpoint_sha256": run1["sft"]["selected"]["sha256"],
+            "source": f"run {sft_run}",
+            "checkpoint_sha256": sft["sft"]["selected"]["sha256"],
             "stage": "eval-sft",
-            "test_completions_sha256": _completions(run1_rows, "eval-sft", tests),
+            "test_completions_sha256": _completions(sft_rows, "eval-sft", tests),
         },
     }
     recorded = (run2.get("selection") or {}).get("endpoints") or {}
@@ -197,7 +218,7 @@ def plan(
                     entry,
                     arm=arm,
                     specification=raw,
-                    run1_rows=run1_rows,
+                    run1_rows=sft_rows,
                     run1_artifacts=run1_artifacts,
                 ),
             }
@@ -213,6 +234,7 @@ def plan(
         "sources": {
             "specification_sha256": file_sha256(specification),
             "run1_report_sha256": file_sha256(run1_report),
+            "sft_report_sha256": file_sha256(run1_report if sft_report is None else sft_report),
             "run2_report_sha256": file_sha256(run2_report),
         },
         "run2_pod_id": run2["pod_id"],
@@ -264,7 +286,12 @@ def _one_benchmark(directory: Path) -> str:
 
 
 def scorecard_inputs(
-    plan_value: Mapping[str, Any], *, run1_shared: Path, shared: Path, artifacts: Path
+    plan_value: Mapping[str, Any],
+    *,
+    run1_shared: Path,
+    shared: Path,
+    artifacts: Path,
+    sft_shared: Path | None = None,
 ) -> dict[str, Any]:
     """The scorecard's inputs for a plan, every path checked to exist, laid out as the two
     runbooks write them: run 1's base and SFT dev results, benchmark artifacts and ARC reports
@@ -273,13 +300,14 @@ def scorecard_inputs(
     on the Pod's dev results and benchmark results under ``shared`` and its ARC report under
     ``artifacts``; a reused arm as a reuse of ``sft``, with no inputs of its own."""
     endpoints = plan_value["endpoints"]
+    sft_root = run1_shared if sft_shared is None else sft_shared
     checkpoints, reuses = {}, {}
     results: list[str] = []
     benchmarks: list[str] = []
     arc: list[str] = []
     sources = {
         "base": (run1_shared, run1_shared / "artifacts" / "arc-base-b-mixed-final" / "arc.json"),
-        "sft": (run1_shared, run1_shared / "artifacts" / "arc-sft-sft" / "arc.json"),
+        "sft": (sft_root, sft_root / "artifacts" / "arc-sft-sft" / "arc.json"),
         **{arm: (shared, artifacts / f"arc-post-{arm}" / "arc.json") for arm in ARMS},
     }
     for name, entry in endpoints.items():
@@ -330,7 +358,10 @@ def build_parser() -> argparse.ArgumentParser:
     made.add_argument("--specification", type=Path, required=True, help="the launch specification")
     made.add_argument("--run1-report", type=Path, required=True)
     made.add_argument("--run2-report", type=Path, required=True)
-    made.add_argument("--run1-artifacts", type=Path, required=True, help="run 1's fetched labels")
+    made.add_argument(
+        "--run1-artifacts", type=Path, required=True, help="the SFT run's fetched labels"
+    )
+    made.add_argument("--sft-report", type=Path, help="the SFT run's verified report (run 1b's)")
     made.add_argument("--output", type=Path, required=True)
     listed = commands.add_parser("list", help="print one label per line (for the runbook)")
     listed.add_argument("--plan", type=Path, required=True)
@@ -341,6 +372,7 @@ def build_parser() -> argparse.ArgumentParser:
     inputs = commands.add_parser("scorecard-inputs", help="write the scorecard's inputs file")
     inputs.add_argument("--plan", type=Path, required=True)
     inputs.add_argument("--run1-shared", type=Path, required=True)
+    inputs.add_argument("--sft-shared", type=Path, help="the SFT run's shared directory (1b)")
     inputs.add_argument("--shared", type=Path, required=True)
     inputs.add_argument("--artifacts", type=Path, required=True, help="run 2's fetched labels")
     inputs.add_argument("--output", type=Path, required=True)
@@ -356,6 +388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run1_report=args.run1_report,
                 run2_report=args.run2_report,
                 run1_artifacts=args.run1_artifacts,
+                sft_report=args.sft_report,
             )
             atomic_json(_new(args.output), value)
             print(
@@ -383,7 +416,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps({name: sorted(entry) for name, entry in record["endpoints"].items()}))
             return 0
         value = scorecard_inputs(
-            found, run1_shared=args.run1_shared, shared=args.shared, artifacts=args.artifacts
+            found,
+            run1_shared=args.run1_shared,
+            shared=args.shared,
+            artifacts=args.artifacts,
+            sft_shared=args.sft_shared,
         )
         atomic_json(_new(args.output), value)
         print(json.dumps({"checkpoints": sorted(value["checkpoints"]), "reuses": value["reuses"]}))

@@ -16,7 +16,9 @@ Three stages, each refusing to overwrite a completed result:
 
     - hold out RL candidates by ID hash, stratified by source in train proportions;
     - render the verified reference of every other train task that fits in chat-v1
-      (code is never subsampled);
+      (code is never subsampled); with ``--omit-public-tests`` the rows a fixed ID hash
+      names (``scratchcoder.data.sft.PUBLIC_TESTS_OMITTED_RULE``, about one in three,
+      train and code dev alike) leave the public tests out of the user turn;
     - hold out a language dev set by ID hash, and take a hash-order prefix of the
       rest only if all of it would pass the language share cap, measured by default in
       loss tokens (``scratchcoder.data.sft.loss_tokens``);
@@ -62,7 +64,14 @@ from scratchcoder.data.oasst import (
     has_email,
 )
 from scratchcoder.data.pool import SimilarityIndex
-from scratchcoder.data.sft import SFTRow, fits, loss_tokens, write_rows
+from scratchcoder.data.sft import (
+    PUBLIC_TESTS_OMITTED_RULE,
+    SFTRow,
+    fits,
+    loss_tokens,
+    omits_public_tests,
+    write_rows,
+)
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.choices import ChoiceTask
 from scratchcoder.eval.tasks import Task, load_tasks
@@ -120,10 +129,16 @@ class BuildConfig:
     language_cap_basis: str = "loss_tokens"
     """``loss_tokens`` (the default: the tokens the SFT loss is computed on) or
     ``all_tokens`` (every token of a row); see ``CAP_BASES``."""
+    omit_public_tests: bool = False
+    """With it, the code rows (train and dev) that ``scratchcoder.data.sft.omits_public_tests``
+    names, about one in three, leave their public tests out of the user turn, so SFT also
+    sees a task stated as a benchmark states it. Loss tokens are unchanged."""
 
     def __post_init__(self) -> None:
         if type(self.include_acecode) is not bool:
             raise ValueError("include_acecode must be a boolean")
+        if type(self.omit_public_tests) is not bool:
+            raise ValueError("omit_public_tests must be a boolean")
         _positive(self.sequence_length, "sequence_length")
         if self.language_train_max is not None:
             _positive(self.language_train_max, "language_train_max")
@@ -262,6 +277,13 @@ def language_source(conversations: Path) -> dict[str, Any]:
     }
 
 
+def _code_row(encoder: TextEncoder, task: Task, config: BuildConfig) -> tuple[SFTRow, bool]:
+    """A task's chat-v1 code row and whether it left its public tests out."""
+    omitted = config.omit_public_tests and omits_public_tests(task.id)
+    rendered = render_code_task(encoder, task, public_tests=not omitted)
+    return SFTRow.of(task.id, task.source, rendered), omitted
+
+
 def build(
     *,
     pool_train: Path,
@@ -291,17 +313,19 @@ def build(
 
     code_rows: list[SFTRow] = []
     code_drops: Counter[str] = Counter()
+    omitted_train = omitted_dev = 0
     for task in sorted(allowed, key=lambda item: item.id):
         if task.id in held:
             continue
         if task.solution is None:
             code_drops["no_reference"] += 1
             continue
-        row = SFTRow.of(task.id, task.source, render_code_task(encoder, task))
+        row, omitted = _code_row(encoder, task, config)
         if not fits(row, config.sequence_length):
             code_drops["over_length"] += 1
             continue
         code_rows.append(row)
+        omitted_train += omitted
 
     language_rows: list[SFTRow] = []
     dev_rows: list[SFTRow] = []
@@ -353,11 +377,12 @@ def build(
         for task in sorted(load_tasks(pool_dev), key=lambda item: item.id):
             if task.split != "dev" or task.solution is None:
                 raise ValueError("the pool dev file must hold dev tasks with references")
-            row = SFTRow.of(task.id, task.source, render_code_task(encoder, task))
+            row, omitted = _code_row(encoder, task, config)
             if not fits(row, config.sequence_length):
                 code_dev_drops["over_length"] += 1
                 continue
             code_dev_rows.append(row)
+            omitted_dev += omitted
 
     train = sorted(code_rows + language_rows, key=lambda row: row.id)
     if len({row.id for row in train}) != len(train):
@@ -409,6 +434,11 @@ def build(
             "dropped": dict(sorted(code_drops.items())),
             "dev_rows": len(code_dev_rows),
             "dev_dropped": dict(sorted(code_dev_drops.items())),
+            "public_tests_omitted": {
+                "rule": PUBLIC_TESTS_OMITTED_RULE if config.omit_public_tests else None,
+                "train_rows": omitted_train,
+                "dev_rows": omitted_dev,
+            },
         },
         "language": {**dict(sorted(language_counts.items())), "salt": LANGUAGE_SALT},
         "tokens": {"code": code, "language": words},
@@ -800,6 +830,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, help="new SFT data directory")
     parser.add_argument("--include-acecode", action="store_true", help="use the flagged source")
     parser.add_argument("--rl-candidates", type=int)
+    parser.add_argument(
+        "--omit-public-tests",
+        action="store_true",
+        help="leave the public tests out of about one code row in three (train and dev)",
+    )
     args = parser.parse_args(argv)
     if args.stage == "download":
         if args.language_spec is None or args.directory is None:
@@ -838,7 +873,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         output=args.output,
         encoder=encoder,
         tokenizer_identity=identity,
-        config=BuildConfig(include_acecode=args.include_acecode, rl_candidates=args.rl_candidates),
+        config=BuildConfig(
+            include_acecode=args.include_acecode,
+            rl_candidates=args.rl_candidates,
+            omit_public_tests=args.omit_public_tests,
+        ),
     )
     print(json.dumps({key: record[key] for key in ("code", "language", "shares")}, indent=1))
     return 0

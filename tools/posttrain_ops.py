@@ -71,9 +71,11 @@ from tools.rehearsal_binding import r2_credentials
 from tools.rehearsal_ops import ObjectStore, head_sha256
 
 RUN_ROOT = "posttrain-runs"
-RUNS = ("1", "2")
-"""The post-training runs this code drives: run 1 (probe, ARC, evaluation, SFT, screening)
-and run 2 (RL with the Mac in the loop, the more-SFT control and their evaluation)."""
+RUNS = ("1", "1b", "2")
+"""The post-training runs this code drives: run 1 (probe, ARC, evaluation, SFT, screening),
+run 1b (the SFT re-run after run 1's weights failed the format gate: probe, SFT, the format
+gate, ARC, evaluation and screening of the new SFT weights) and run 2 (RL with the Mac in the
+loop, the more-SFT control and their evaluation)."""
 ABSOLUTE_LIFETIME_SECONDS = 60_000
 """The in-Pod timer's absolute cap (``pod_self_destruct.ABSOLUTE_DEADLINE_SECONDS``)."""
 SELF_DESTRUCT_MARGIN_SECONDS = 180
@@ -808,6 +810,7 @@ def run_summary(
         "stages": stages,
         "probe": report.get("probe"),
         "sft": report.get("sft"),
+        "format_gate": report.get("format_gate"),
         "cost": report.get("cost"),
         "timings": report.get("timings"),
         "limits": report.get("limits"),

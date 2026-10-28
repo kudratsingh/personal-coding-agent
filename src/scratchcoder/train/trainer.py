@@ -29,6 +29,7 @@ from scratchcoder.optim.adamw import (
     cross_entropy_sum,
     learning_rate,
 )
+from scratchcoder.train.special_rows import reinitialize_special_rows, row_scale
 from scratchcoder.train.validation import ValidationWindow, validate
 
 
@@ -59,7 +60,12 @@ def synchronized_time(device: torch.device) -> float:
 
 
 # Train options added after checkpoints already existed, with the value those checkpoints used.
-ADDED_TRAIN_DEFAULTS = {"loss_normalization": "capacity"}
+ADDED_TRAIN_DEFAULTS = {
+    "loss_normalization": "capacity",
+    "special_rows_init": "none",
+    "special_rows_seed": 0,
+    "special_rows_lr_scale": 1.0,
+}
 
 
 def _with_added_defaults(saved: Any) -> Any:
@@ -122,7 +128,14 @@ class Trainer:
                 raise ValueError("parent checkpoint tokenizer differs")
             self.model.load_state_dict(parent["model"])
             parent_run = parent["run_id"]
+        self.special_rows: dict[str, Any] | None = None
+        """The special rows' fresh draw (``special_rows.reinitialize_special_rows``), if any."""
+        if config.train.special_rows_init == "ordinary-mean-noise":
+            self.special_rows = reinitialize_special_rows(
+                self.model.embedding.weight, seed=config.train.special_rows_seed
+            )
         named = list(self.model.named_parameters())
+        scale = config.train.special_rows_lr_scale
         self.optimizer = AdamW(
             [parameter for _, parameter in named],
             learning_rate=config.train.learning_rate,
@@ -133,6 +146,13 @@ class Trainer:
                 parameter.ndim >= 2 and name != "embedding.weight" for name, parameter in named
             ],
             foreach=config.train.optimizer_foreach,
+            # Scale 1 passes no scale at all, so the update is the plain one bit for bit.
+            lr_scales=[
+                row_scale(config.model.vocab_size, scale=scale)
+                if name == "embedding.weight" and scale != 1.0
+                else None
+                for name, _ in named
+            ],
         )
         self.step = 0
         self.record = RunRecord.start(run_id, config, data_hash, tokenizer_hash, parent_run)

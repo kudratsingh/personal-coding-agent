@@ -4,9 +4,10 @@ Built on the Mac from the Pod's own evidence and the owner's confirmations, in e
 form ``tools.posttrain_run run`` accepts (its ``check_readiness`` is applied before anything
 is written). Besides the pretraining rehearsal's owner gates and termination checks it requires:
 
-- the specification to be the approved run 1 or run 2 (``posttrain_approved.check_run1``,
-  ``check_run2``; for run 2 with every gate value filled) and the binding to name exactly its
-  inputs at every pinned value;
+- the specification to be the approved run 1, 1b or 2 (``posttrain_approved.check_run1``,
+  ``check_run1b``, ``check_run2``; for run 2 with every gate value filled, its SFT weights'
+  passing format-gate record given with ``--sft-gate`` and matching its pin) and the binding
+  to name exactly its inputs at every pinned value;
 - a watchdog policy at least as strict as the ceiling-derived limits (mode ``posttrain``,
   wall and cost stop from ``posttrain_ops.ceiling_limits``, the 900 s transfer window), with
   run 2's ``awaiting_rewards`` idle extensions exactly the derived bounds (run 1: none);
@@ -43,15 +44,16 @@ from tools.pilot_readiness_receipt import (
     round_trip_passed,
     self_destruct_live,
 )
-from tools.posttrain_approved import PARENTS, check_run1, check_run2
+from tools.posttrain_approved import PARENTS, check_run1, check_run1b, check_run2
 from tools.posttrain_run import Specification, check_policy, check_readiness, launch_fit
 from tools.rehearsal_run import lifetime_end
 from tools.runpod_watchdog import PodIdentity, Policy, parse_timestamp
 
-MAC_COPIES = {"1": PARENTS, "2": ("sft-weights",)}
+MAC_COPIES = {"1": PARENTS, "1b": ("b-mixed-final",), "2": ("sft-weights",)}
 """The inputs the Mac must hold its own pinned copy of before the Pod exists: run 1's three
-parent checkpoints, run 2's SFT weights (run 1's selected checkpoint)."""
-APPROVED_CHECKS = {"1": check_run1, "2": check_run2}
+parent checkpoints, run 1b's one (run B's ``mixed-final``), run 2's SFT weights (the
+selected checkpoint that passed the format gate)."""
+APPROVED_CHECKS = {"1": check_run1, "1b": check_run1b, "2": check_run2}
 DEFAULT_HEARTBEAT = "/workspace/posttrain-run/heartbeat.json"
 """The worker's heartbeat on the Pod (its ``--output``), which the in-Pod timer must watch."""
 
@@ -61,6 +63,25 @@ def _load(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return value
+
+
+def check_sft_gate_file(spec: Specification, path: Path | None) -> dict[str, Any] | None:
+    """Run 2: the Mac's copy of its SFT weights' format-gate record is the pinned one, a pass,
+    and of exactly those weights; other runs take none."""
+    if spec.run != "2":
+        if path is not None:
+            raise ValueError("--sft-gate is run 2's: its SFT weights' format-gate record")
+        return None
+    if path is None:
+        raise ValueError("run 2 needs --sft-gate, the passing format-gate record of its weights")
+    pin = spec.raw["sft_gate"]
+    if (path.stat().st_size, file_sha256(path)) != (pin["size_bytes"], pin["sha256"]):
+        raise ValueError(f"{path} is not the format-gate record the specification pins")
+    record = _load(path)
+    measured = (record.get("inputs") or {}).get("checkpoint_sha256")
+    if record.get("passed") is not True or measured != spec.inputs["sft-weights"]["sha256"]:
+        raise ValueError("the SFT weights have no passing format-gate record of their own")
+    return {"path": str(path), "sha256": pin["sha256"], "checkpoint_sha256": measured}
 
 
 def check_verification(record: dict[str, Any], binding: dict[str, Any]) -> None:
@@ -91,10 +112,12 @@ def build_receipt(
     billing_origin_unix: float,
     heartbeat: str = DEFAULT_HEARTBEAT,
     now: float | None = None,
+    sft_gate: Path | None = None,
 ) -> dict[str, Any]:
     created_at = time.time() if now is None else now
     spec = Specification.load(specification)
     APPROVED_CHECKS[spec.run](spec.raw)  # Run 2 also refuses any gate value still null.
+    gate_record = check_sft_gate_file(spec, sft_gate)
     bound = posttrain_binding.load_binding(binding, expected_sha256=binding_sha256)
     posttrain_binding.require_specification(bound, spec.raw)
     pod_identity = PodIdentity.from_dict(_load(identity))
@@ -209,6 +232,8 @@ def build_receipt(
     bridge = spec.bridge_timeouts
     if bridge is not None:
         receipt["bridge_timeouts"] = asdict(bridge)  # Run 2's derived wait bounds.
+    if gate_record is not None:
+        receipt["sft_format_gate"] = gate_record  # Run 2's weights passed the gate.
     for gate in posttrain_ops.OWNER_GATES:
         receipt[gate] = owner.get(gate)
     # Exactly the worker's own acceptance check, so a written receipt is one it accepts.
@@ -249,6 +274,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--heartbeat", default=DEFAULT_HEARTBEAT)
     parser.add_argument("--connection", type=Path, help="default: next to --identity")
     parser.add_argument("--revision", type=Path, help="default: next to --identity")
+    parser.add_argument(
+        "--sft-gate", type=Path, help="run 2: its SFT weights' passing format-gate record"
+    )
     args = parser.parse_args(argv)
     try:
         receipt = build_receipt(
@@ -268,6 +296,7 @@ def main(argv: list[str]) -> int:
             connection=args.connection or args.identity.with_name("pod-connection.json"),
             billing_origin_unix=args.billing_origin_unix,
             heartbeat=args.heartbeat,
+            sft_gate=args.sft_gate,
         )
     except (OSError, ValueError, TypeError, KeyError) as error:
         print(f"posttrain-readiness-receipt: {type(error).__name__}: {error}", file=sys.stderr)

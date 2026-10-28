@@ -1,6 +1,6 @@
 # Post-training runbook: run 2 on one A40 (RL with the Mac in the loop, the more-SFT control, evaluation)
 
-Operational sequence for post-training run 2 of the 135M-parameter S rehearsal model, on one Runpod A40 Pod, from run 1's selected SFT weights. Run 1's [runbook](POSTTRAIN_RUNBOOK.md) is the base: the Pod creation, the bootstrap, the receipt, the supervisor, the teardown and the billing reads are its steps with run 2's values, and this page says so where they are. The worker (`tools/posttrain_run.py`, run 2's stages in `tools/posttrain_run2.py`) runs five stages in order and uploads every artifact to R2 under `posttrain-runs/2/<pod id>/` as soon as it exists:
+Operational sequence for post-training run 2 of the 135M-parameter S rehearsal model, on one Runpod A40 Pod, from run 1b's selected SFT weights (run 1's failed the SFT format gate; run 1b re-ran SFT and its weights must have passed it). Run 1's [runbook](POSTTRAIN_RUNBOOK.md) is the base: the Pod creation, the bootstrap, the receipt, the supervisor, the teardown and the billing reads are its steps with run 2's values, and this page says so where they are. The worker (`tools/posttrain_run.py`, run 2's stages in `tools/posttrain_run2.py`) runs five stages in order and uploads every artifact to R2 under `posttrain-runs/2/<pod id>/` as soon as it exists:
 
 1. **rl:** 100 updates of 32 kept tasks x 8 samples at temperature 1.0 and top-p 1.0, at most min(256, 1,024 - prompt) new tokens, a fresh AdamW at 3e-6 after 5 warmup updates, no KL; dev checks at updates 0, 12, 25, 50, 75 and 100 on the fixed 200-task dev subset, each generated at batch 256. Rewards and dev verdicts come from the Mac through the reward bridge (step 11); each check's weights are uploaded at once as `rl-check-<update>`.
 2. **more-sft:** the compute-matched control from the same SFT weights on the kept tasks' references, its GPU-busy budget RL's measured busy seconds, checks after 1, 2, 4 and 8 passes and at the budget's end (batch 256, as RL's), through the bridge; each check's weights uploaded as `more-sft-check-<step>`.
@@ -9,7 +9,7 @@ Operational sequence for post-training run 2 of the 135M-parameter S rehearsal m
 
 Then run 1's finalization, with the bridge directories uploaded as one label (`bridge`) first, so a late reply is kept. Any RL stop that is a result (completed, collapse, dev patience, leakage, non-finite) lets the control run.
 
-**Same weights.** When an arm's selected checkpoint holds the SFT weights the run loaded, every tensor compared bit for bit (a file's SHA-256 differs between two saves of one model), the arm is not evaluated again: no `arc-post-<arm>` report and no `eval-<arm>` files. The control starts from RL's update-0 check, the SFT weights, so this is what happens when neither arm beats its start. `report.json`'s `selection.endpoints.<arm>` records the comparison and that run 1's SFT results stand for the arm, each pinned in the launch specification's `sft_results` (R2 key, size and SHA-256, fixed at the gate). Step 18 executes each distinct checkpoint once and maps the arm to SFT's results; the scorecard marks its rows as not an independent measurement.
+**Same weights.** When an arm's selected checkpoint holds the SFT weights the run loaded, every tensor compared bit for bit (a file's SHA-256 differs between two saves of one model), the arm is not evaluated again: no `arc-post-<arm>` report and no `eval-<arm>` files. The control starts from RL's update-0 check, the SFT weights, so this is what happens when neither arm beats its start. `report.json`'s `selection.endpoints.<arm>` records the comparison and that the SFT results (run 1b's) stand for the arm, each pinned in the launch specification's `sft_results` (R2 key, size and SHA-256, fixed at the gate). Step 18 executes each distinct checkpoint once and maps the arm to SFT's results; the scorecard marks its rows as not an independent measurement.
 
 **An arm's stop is not the run's.** A wall or cost stop ends the run. A stop of the Mac's side in either arm (`reward_wait`, a timeout on either side; `reward_host_failure`; `bridge_lost`) and a margin stop (`wait_margin`) end only that arm's training, after its latest weights reach R2: its endpoint is selected from the dev checks already scored, and the stages that need no Mac wait run under the projected-finish rule, the finalization reserve and every limit. After such a stop in RL the control is skipped (its dev checks need the Mac) and RL's endpoint is evaluated; after a stop of the Mac's side in the control the control is not evaluated and RL's is; after a margin stop in the control both are, each as the projected-finish rule admits it (when both do not fit at `arc-post`, before any of the control's evaluation runs, but RL's alone does, RL's; a refusal at a later stage stops the run on the projected finish). With no RL dev check scored there is nothing to select and the run finalizes at once. The run then ends `stopped` with the arm's reason (`report.json` `arm_stop`). While that evaluation runs the heartbeat reads `running`, never `awaiting_rewards`, so the watchdog's 600 s idle rule and the in-Pod 900 s rule apply as to any stage.
 
@@ -80,24 +80,28 @@ export TOKENIZER=runs/tokenizer-freeze-65536-20261020/tokenizer.json
 export RUN1_SHARED=runs/posttrain-shared
 export RUN1_CTRL=$CTRL_ROOT/1/<run 1 pod id>
 export RUN1_REPORT=$RUN1_CTRL/supervisor/final/report.json
+export SFT_SHARED=runs/posttrain-shared-1b
+export SFT_CTRL=$CTRL_ROOT/1b/<run 1b pod id>
+export SFT_REPORT=$SFT_CTRL/supervisor/final/report.json
 export RL_EXPORT=$SHARED/rl-pod-export
 export BINDING=$SHARED/binding.json
 export BRIDGE_STATE=$SHARED/bridge-state
 export LEDGER=$RUN1_SHARED/seal/ledger.jsonl
 ```
 
-The loop prints names, never values. `RUN1_REPORT` is run 1's verified report, which its supervisor archived; `RUN1_SHARED` holds run 1's exports, artifacts, screening record, results and seal ledger (run 1's steps 4 and 17). Keep this terminal open on AC power for the whole run.
+The loop prints names, never values. `RUN1_REPORT` is run 1's verified report, which its supervisor archived; `RUN1_SHARED` holds run 1's exports, artifacts, results and the seal ledger (run 1's steps 4 and 17). Run 2 starts from **run 1b's** SFT weights, the re-run whose weights passed the format gate (run 1's failed it): `SFT_REPORT` is run 1b's verified report and `SFT_SHARED` holds its artifacts (its format-gate record among them), its screening record and its SFT dev results ([run 1b's runbook](POSTTRAIN_RUN1B_RUNBOOK.md), step 8). Run 1's report still gives the measured rates. Keep this terminal open on AC power for the whole run.
 
-## 3. Run 1's records (Mac, free)
+## 3. Run 1's and run 1b's records (Mac, free)
 
-Run 1's step 17 fetched its artifacts pinned to the verified report, scored the screening attempts and executed the dev completions. Check that the files run 2 reads are there and that the screening kept enough tasks:
+Run 1's step 17 fetched its artifacts pinned to the verified report and executed the dev completions; run 1b's step 8 did the same for its SFT weights and scored their screening attempts. Check that the files run 2 reads are there, that run 1b's SFT weights passed the format gate and that the screening kept enough tasks:
 
 ```sh
-python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["outcome"], r["counts"]["kept"])' "$RUN1_SHARED/screening.json"
-shasum -a 256 "$RUN1_SHARED/artifacts/sft-weights/checkpoint.pt" "$RUN1_SHARED/exports/test-export.jsonl" "$RUN1_SHARED/exports/dev-export.jsonl"
+python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r["outcome"], r["counts"]["kept"])' "$SFT_SHARED/screening.json"
+python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print("format gate passed" if r.get("passed") is True else "FORMAT GATE NOT PASSED", r["inputs"]["checkpoint_sha256"])' "$SFT_SHARED/artifacts/format-gate/gate.json"
+shasum -a 256 "$SFT_SHARED/artifacts/sft-weights/checkpoint.pt" "$RUN1_SHARED/exports/test-export.jsonl" "$RUN1_SHARED/exports/dev-export.jsonl"
 ```
 
-The first line must print `kept` and a count of at least 320; `floor` goes to the owner, and run 2 does not start.
+The first line must print `kept` and a count of at least 320; `floor` goes to the owner, and run 2 does not start. The second must print `format gate passed` with the SHA-256 the third prints for the weights; anything else means run 2 has no SFT weights to start from (the gate step refuses them too).
 
 ## 4. The gate (Mac, the owner decides; free)
 
@@ -105,8 +109,8 @@ The first line must print `kept` and a count of at least 320; `floor` goes to th
 
 ```sh
 uv run --locked python -m tools.pilot_feasibility posttrain --specification "$SPEC_TEMPLATE" --ceiling-usd 5.80 --quoted-gpu-hourly 0.59 \
-  --run1-report "$RUN1_REPORT" --screening "$RUN1_SHARED/screening.json" \
-  --dev-results "$RUN1_SHARED/results/eval-sft-pool-dev-greedy.jsonl" --dev-results "$RUN1_SHARED/results/eval-sft-pool-dev-n8.jsonl" \
+  --run1-report "$RUN1_REPORT" --screening "$SFT_SHARED/screening.json" \
+  --dev-results "$SFT_SHARED/results/eval-sft-pool-dev-greedy.jsonl" --dev-results "$SFT_SHARED/results/eval-sft-pool-dev-n8.jsonl" \
   --output "$SHARED/feasibility.json"
 ```
 
@@ -119,15 +123,15 @@ export CEILING=<the owner's ceiling in dollars>
 **The Pod's RL files.** Write the withheld RL task file, the withheld dev subset and the facts file from the full train and dev splits and the screening record's kept list. It never opens the test split or the holdouts:
 
 ```sh
-uv run --locked scratchcoder rl-pod-export --train-tasks "$POOL/train.jsonl" --kept "$RUN1_SHARED/screening.json" --dev-tasks "$POOL/dev.jsonl" --output "$RL_EXPORT"
+uv run --locked scratchcoder rl-pod-export --train-tasks "$POOL/train.jsonl" --kept "$SFT_SHARED/screening.json" --dev-tasks "$POOL/dev.jsonl" --output "$RL_EXPORT"
 ```
 
 It prints each file's name, SHA-256 and size; the same inputs always give the same bytes.
 
-**The launch specification.** Fill the template's gate values from the gate's own files: the ceiling, the projection's estimate and the cost limit they give, run 1's selected SFT weights (key, size and SHA-256 of the `sft-weights` label in run 1's verified report), run 1's SFT evaluation artifacts (`sft_results`: the key, size and SHA-256 of its `arc-sft-sft` report and its seven `eval-sft-<file>` completions files, which an arm with the SFT weights reuses), the three files just written (hashed from their bytes, cross-checked with their record) and run 1's pool test export:
+**The launch specification.** Fill the template's gate values from the gate's own files: the ceiling, the projection's estimate and the cost limit they give, run 1b's selected SFT weights (key, size and SHA-256 of the `sft-weights` label in run 1b's verified report), run 1b's SFT evaluation artifacts (`sft_results`: the key, size and SHA-256 of its `arc-sft-sft` report and its seven `eval-sft-<file>` completions files, which an arm with the SFT weights reuses), run 1b's format-gate record (`sft_gate`: its key, size and SHA-256, the weights it measured and its verdict; the step refuses weights whose record is missing, failed, of other weights or other bytes than the report lists), the three files just written (hashed from their bytes, cross-checked with their record) and run 1's pool test export:
 
 ```sh
-uv run --locked python -m tools.posttrain_approved run2-gate --ceiling-usd "$CEILING" --feasibility "$SHARED/feasibility.json" --run1-report "$RUN1_REPORT" --rl-pod-export "$RL_EXPORT" --pool-test-export "$RUN1_SHARED/exports/test-export.jsonl" --output "$SPEC"
+uv run --locked python -m tools.posttrain_approved run2-gate --ceiling-usd "$CEILING" --feasibility "$SHARED/feasibility.json" --run1-report "$RUN1_REPORT" --sft-report "$SFT_REPORT" --sft-gate "$SFT_SHARED/artifacts/format-gate/gate.json" --rl-pod-export "$RL_EXPORT" --pool-test-export "$RUN1_SHARED/exports/test-export.jsonl" --output "$SPEC"
 uv run --locked python -m tools.posttrain_binding check-exports --specification "$SPEC" --input pool-dev="$RUN1_SHARED/exports/dev-export.jsonl" --input pool-test="$RUN1_SHARED/exports/test-export.jsonl"
 ```
 
@@ -151,11 +155,11 @@ The last line prints the limits derived from the cost limit the gate wrote. At a
 
 ## 5. Binding and staging (Mac, at the go; R2 storage only)
 
-Bind every input by R2 key, size and SHA-256. The tokenizer and run 1's SFT weights are already in R2 at the keys the launch specification pins (the Mac's copy of the weights is checked against the pin); every other input is staged under `posttrain-inputs/<sha256>/<file>`:
+Bind every input by R2 key, size and SHA-256. The tokenizer and run 1b's SFT weights are already in R2 at the keys the launch specification pins (the Mac's copy of the weights is checked against the pin); every other input is staged under `posttrain-inputs/<sha256>/<file>`:
 
 ```sh
 uv run --locked python -m tools.posttrain_binding build --specification "$SPEC" --run 2 --output "$BINDING" \
-  --input sft-weights="$RUN1_SHARED/artifacts/sft-weights/checkpoint.pt" \
+  --input sft-weights="$SFT_SHARED/artifacts/sft-weights/checkpoint.pt" \
   --input rl-tasks="$RL_EXPORT/rl-tasks.jsonl" --input rl-dev="$RL_EXPORT/rl-dev.jsonl" --input rl-facts="$RL_EXPORT/rl-facts.json" \
   --input pool-dev="$RUN1_SHARED/exports/dev-export.jsonl" --input pool-test="$RUN1_SHARED/exports/test-export.jsonl" \
   --input arc-easy-test="$RUN1_SHARED/exports/arc-easy-test.jsonl" \
@@ -187,7 +191,7 @@ Open the third terminal and **never source `.env` in it**. Export only what the 
 ```sh
 export RUN=2
 export SHARED=runs/posttrain-shared-2
-export RUN1_SHARED=runs/posttrain-shared
+export SFT_SHARED=runs/posttrain-shared-1b
 export POOL=runs/task-pool-20261025/pool
 export BRIDGE_STATE=$SHARED/bridge-state
 export KNOWN_HOSTS=~/.ssh/posttrain_2_known_hosts
@@ -392,7 +396,7 @@ Expected as run 1's step 9: `BOOTSTRAP_EXIT=0`, an armed timer at `SELF_DESTRUCT
 
 ## 10. Readiness receipt (Mac, billable)
 
-Run 1's step 10 with run 2's specification and the Mac's copy of the SFT weights. The receipt requires the launch specification to be the approved run 2 with every gate value filled, the policy's idle extensions to be exactly the derived bounds, and refuses anything the worker would refuse:
+Run 1's step 10 with run 2's specification, the Mac's copy of the SFT weights and their format-gate record. The receipt requires the launch specification to be the approved run 2 with every gate value filled, the gate record to be the pinned one (a pass, of exactly these weights), the policy's idle extensions to be exactly the derived bounds, and refuses anything the worker would refuse:
 
 ```sh
 cat > "$CTRL/confirmations.json" <<'EOF'
@@ -409,7 +413,8 @@ uv run --locked python -m tools.pilot_readiness_receipt posttrain --specificatio
   --self-destruct-receipt "$CTRL/self-destruct.json" --confirmations "$CTRL/confirmations.json" \
   --data-fetch "$CTRL/data-fetch.json" --data-verification "$CTRL/data-verification.json" \
   --round-trip "$CTRL/r2-round-trip.json" --mac-copy "$SHARED/mac-copy.json" \
-  --revision "$CTRL/revision.json" --billing-origin-unix "$ORIGIN" --output "$CTRL/readiness-receipt.json"
+  --revision "$CTRL/revision.json" --sft-gate "$SFT_SHARED/artifacts/format-gate/gate.json" \
+  --billing-origin-unix "$ORIGIN" --output "$CTRL/readiness-receipt.json"
 podscp "$CTRL/readiness-receipt.json" root@$POD_HOST:/workspace/posttrain/readiness-receipt.json
 watchdog
 ```
@@ -425,7 +430,7 @@ export POD_HOST=<the Pod's host>
 export POD_PORT=<the Pod's port>
 uv run --locked python -m tools.mac_window_check exec --image-id "$SANDBOX_IMAGE_ID" --dotenv .env -- uv run --locked scratchcoder rl-bridge \
   --host root@$POD_HOST --port $POD_PORT --identity-file "$POD_SSH_KEY" --known-hosts "$KNOWN_HOSTS" \
-  --remote-root /workspace/posttrain-bridge --train-tasks "$POOL/train.jsonl" --kept "$RUN1_SHARED/screening.json" \
+  --remote-root /workspace/posttrain-bridge --train-tasks "$POOL/train.jsonl" --kept "$SFT_SHARED/screening.json" \
   --dev-tasks "$POOL/dev.jsonl" --pod-reward-sha256 "$POD_REWARD_SHA256" --pod-dev-sha256 "$POD_DEV_SHA256" \
   --state "$BRIDGE_STATE" --reward-timeout "$MAC_REWARD_TIMEOUT" --dev-timeout "$MAC_DEV_TIMEOUT" \
   --image-id "$SANDBOX_IMAGE_ID" --window-check-interval 900 --dotenv .env
@@ -549,13 +554,13 @@ uv run --locked python -m tools.posttrain_ops fetch-artifacts --report "$RUN2_RE
 uv run --locked python -m tools.mac_window_check check --image-id "$SANDBOX_IMAGE_ID" --dotenv .env --receipt "$SHARED/window-check.json"
 ```
 
-**Each endpoint's source, recorded once.** An arm is `pod` (evaluated on run 2's Pod), `reuses-run-1-sft` (its selected weights were the SFT weights, so run 1's SFT results stand for it) or `not-evaluated` (the run stopped before it was evaluated), as the verified report's `selection.endpoints` records. The plan checks a reuse three ways before anything executes: run 2's record of the run 1 artifacts it stands on equals the launch specification's `sft_results` pins, those pins equal run 1's verified report, and the copies run 1's step 17 fetched to `$RUN1_SHARED/artifacts` have the pinned size and SHA-256. Every later command reads this plan, so a reused arm is executed once, as SFT, and never as a measurement of its own:
+**Each endpoint's source, recorded once.** Base is run 1's and SFT is run 1b's (run 1's SFT test files were withdrawn from the ledger as a formatting failure). An arm is `pod` (evaluated on run 2's Pod), `reuses-run-1-sft` (its selected weights were the SFT weights, so run 1b's SFT results stand for it; the label keeps its name) or `not-evaluated` (the run stopped before it was evaluated), as the verified report's `selection.endpoints` records. The plan checks a reuse three ways before anything executes: run 2's record of the SFT artifacts it stands on equals the launch specification's `sft_results` pins, those pins equal run 1b's verified report, and the copies run 1b's step 8 fetched to `$SFT_SHARED/artifacts` have the pinned size and SHA-256. Every later command reads this plan, so a reused arm is executed once, as SFT, and never as a measurement of its own:
 
 ```sh
-uv run --locked python -m tools.posttrain_endpoints plan --specification "$SPEC" --run1-report "$RUN1_REPORT" --run2-report "$RUN2_REPORT" --run1-artifacts "$RUN1_SHARED/artifacts" --output "$SHARED/endpoints.json"
+uv run --locked python -m tools.posttrain_endpoints plan --specification "$SPEC" --run1-report "$RUN1_REPORT" --sft-report "$SFT_REPORT" --run2-report "$RUN2_REPORT" --run1-artifacts "$SFT_SHARED/artifacts" --output "$SHARED/endpoints.json"
 ```
 
-It prints each endpoint's source, for example `{"base": "run 1", "sft": "run 1", "rl": "pod", "more-sft": "reuses-run-1-sft (sft)"}`. The plan is never rewritten.
+It prints each endpoint's source, for example `{"base": "run 1", "sft": "run 1b", "rl": "pod", "more-sft": "reuses-run-1-sft (sft)"}`. The plan is never rewritten.
 
 Execute the dev completions of the arms evaluated on the Pod (about 18,000 calls, about 0.85 hours, per arm):
 
@@ -566,7 +571,7 @@ for name in $(uv run --locked python -m tools.posttrain_endpoints list --plan "$
 done
 ```
 
-Seal their test completions in run 1's ledger, beside run 1's four:
+Seal their test completions in run 1's ledger, beside run 1's base files and run 1b's SFT files:
 
 ```sh
 for name in $(uv run --locked python -m tools.posttrain_endpoints list --plan "$SHARED/endpoints.json" --list run2-pool-test); do
@@ -593,18 +598,21 @@ uv run --locked python -m tools.posttrain_endpoints unseal --plan "$SHARED/endpo
 Then execute the test completions of every endpoint that executes, one logged read each, in the window (about 18,000 calls, about 0.85 hours, per endpoint). This is the one read of the sealed test split; a read of SFT's file stands for an arm that reuses it, and the ledger's `opened` event names that arm (`reused_by`). Each `eval-execute` exits 3 while an attempt is unresolved, and running the same line again continues its read:
 
 ```sh
-for name in eval-base-pool-test-greedy eval-base-pool-test-n8 eval-sft-pool-test-greedy eval-sft-pool-test-n8; do
+for name in eval-base-pool-test-greedy eval-base-pool-test-n8; do
   uv run --locked python -m tools.mac_window_check exec --image-id "$SANDBOX_IMAGE_ID" --dotenv .env -- uv run --locked scratchcoder eval-execute --completions "$RUN1_SHARED/artifacts/$name/completions.jsonl" --tasks "$POOL/test.jsonl" --results "$SHARED/results/$name.jsonl" --tokenizer "$TOKENIZER" --workers 8 --seal-ledger "$LEDGER" --unseal "$SHARED/unseal.json"
+done
+for name in eval-sft-pool-test-greedy eval-sft-pool-test-n8; do
+  uv run --locked python -m tools.mac_window_check exec --image-id "$SANDBOX_IMAGE_ID" --dotenv .env -- uv run --locked scratchcoder eval-execute --completions "$SFT_SHARED/artifacts/$name/completions.jsonl" --tasks "$POOL/test.jsonl" --results "$SHARED/results/$name.jsonl" --tokenizer "$TOKENIZER" --workers 8 --seal-ledger "$LEDGER" --unseal "$SHARED/unseal.json"
 done
 for name in $(uv run --locked python -m tools.posttrain_endpoints list --plan "$SHARED/endpoints.json" --list run2-pool-test); do
   uv run --locked python -m tools.mac_window_check exec --image-id "$SANDBOX_IMAGE_ID" --dotenv .env -- uv run --locked scratchcoder eval-execute --completions "$ART/$name/completions.jsonl" --tasks "$POOL/test.jsonl" --results "$SHARED/results/$name.jsonl" --tokenizer "$TOKENIZER" --workers 8 --seal-ledger "$LEDGER" --unseal "$SHARED/unseal.json"
 done
 ```
 
-Build the scorecard. Its inputs file records the names, each reuse with its reason, and every results file, benchmark artifact and ARC report of both runs, each checked to exist (each benchmark dispatch wrote one `benchmark-<suite>-<completions sha256>.json` into its directory, which the file names directly). It reads base's and SFT's dev results, benchmark results and ARC reports from `$RUN1_SHARED`, where run 1's step 17 wrote them, and every endpoint's pool-test results from `$SHARED/results`, where the reads above wrote them:
+Build the scorecard. Its inputs file records the names, each reuse with its reason, and every results file, benchmark artifact and ARC report of both runs, each checked to exist (each benchmark dispatch wrote one `benchmark-<suite>-<completions sha256>.json` into its directory, which the file names directly). It reads base's dev results, benchmark results and ARC reports from `$RUN1_SHARED`, where run 1's step 17 wrote them, SFT's from `$SFT_SHARED`, where run 1b's step 8 wrote them, and every endpoint's pool-test results from `$SHARED/results`, where the reads above wrote them:
 
 ```sh
-uv run --locked python -m tools.posttrain_endpoints scorecard-inputs --plan "$SHARED/endpoints.json" --run1-shared "$RUN1_SHARED" --shared "$SHARED" --artifacts "$ART" --output "$SHARED/scorecard-inputs.json"
+uv run --locked python -m tools.posttrain_endpoints scorecard-inputs --plan "$SHARED/endpoints.json" --run1-shared "$RUN1_SHARED" --sft-shared "$SFT_SHARED" --shared "$SHARED" --artifacts "$ART" --output "$SHARED/scorecard-inputs.json"
 uv run --locked scratchcoder scorecard --inputs "$SHARED/scorecard-inputs.json" --arc-tasks "$RUN1_SHARED/exports/arc-easy-test.jsonl" \
   --pool-baseline "$RUN1_SHARED/results/pool-dev-baseline.json" --output "$SHARED/scorecard.json" --markdown "$SHARED/scorecard.md"
 ```

@@ -67,7 +67,8 @@ from tools.posttrain_smoke import (
 from tools.rehearsal_run import SMOKE_CREDENTIALS, MemoryBucket
 
 SMOKE2_POD_ID = "smoke-posttrain-2"
-RUN1_SFT_KEY = "posttrain-runs/1/smoke-posttrain-1/sft-weights/checkpoint.pt"
+RUN1_SFT_KEY = "posttrain-runs/1b/smoke-posttrain-1b/sft-weights/checkpoint.pt"
+"""The SFT weights run 2 starts from: run 1b's, whose format gate passed."""
 HIDDEN_MARKERS = tuple(str(4_242_400 + index) for index in range(12))
 """Each fixture task's hidden tests carry one of these numbers, found nowhere else: a scan of
 every file the Pod side holds for them finds a leaked hidden test."""
@@ -327,6 +328,13 @@ def smoke_specification2(
         "stages": stages,
         "inputs": inputs,
         "sft_results": sft_results,
+        "sft_gate": {  # The SFT run's passing gate record, authored like sft_results.
+            "key": run1 + "format-gate/gate.json",
+            "size_bytes": 1,
+            "sha256": hashlib.sha256(b"format-gate/gate.json").hexdigest(),
+            "checkpoint_sha256": inputs["sft-weights"]["sha256"],
+            "passed": True,
+        },
         "r2": {"storage_cap_usd_per_month": 5.0},
     }
 

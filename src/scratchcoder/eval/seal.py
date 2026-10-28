@@ -11,6 +11,11 @@ removed line is detected on the next read. Events:
 - ``resumed``: the same read continued after an interruption (same results ID).
 - ``completed``: every attempt of the read was resolved (the results file's SHA-256).
 - ``baseline``: the test split's constant-answer baseline was computed inside a read.
+- ``withdrawn``: every sealed file of one endpoint's checkpoint was withdrawn, with the
+  reason (run 1's SFT weights: a formatting failure), so a re-run's checkpoint can stand
+  for that endpoint. A withdrawn file can never be sealed again, listed in an unseal record
+  or executed, and nothing more of that checkpoint can be sealed. It is written only before
+  any read has opened, and it is final.
 
 Execution of a test completions file needs an *unseal record*, a JSON file the lead writes
 once all four endpoints (``base``, ``sft``, ``rl``, ``more-sft``) are frozen::
@@ -73,7 +78,7 @@ weights it started from (the owner's run 2 gate rulings), never base or the othe
 UNSEAL_KIND = "unseal"
 LEDGER_FORMAT = "scratchcoder-seal-ledger"
 GENESIS = "0" * 64
-EVENTS = ("sealed", "opened", "resumed", "completed", "baseline")
+EVENTS = ("sealed", "opened", "resumed", "completed", "baseline", "withdrawn")
 HEAD_FORMAT = "scratchcoder-seal-ledger-head"
 HEAD_SUFFIX = ".head"
 
@@ -347,12 +352,19 @@ class SealLedger:
         """Record a pool-test completions file; sealing the same file again is a no-op.
 
         Once any read has opened, no new file can be sealed: the unseal record that opened it
-        fixed the set of files, and a regenerated file would be a second look.
+        fixed the set of files, and a regenerated file would be a second look. A withdrawn
+        file, or any file of a withdrawn checkpoint, is refused.
         """
         header = completions.header
         if header.suite != "pool" or header.split != "test":
             raise SealError("only pool test-split completions are sealed")
         with self._locked() as (events, handle):
+            files, checkpoints = self._withdrawn(events)
+            if completions.sha256 in files or header.checkpoint_sha256 in checkpoints:
+                raise SealError(
+                    "these completions, or their checkpoint, were withdrawn from this ledger; "
+                    "they can never be sealed again"
+                )
             for event in events:
                 if event["event"] == "sealed" and event["completions_sha256"] == completions.sha256:
                     return event
@@ -376,6 +388,54 @@ class SealLedger:
             )
 
     @staticmethod
+    def _withdrawn(events: list[dict[str, Any]]) -> tuple[set[str], set[str]]:
+        """The withdrawn completions files and checkpoints."""
+        files: set[str] = set()
+        checkpoints: set[str] = set()
+        for event in events:
+            if event["event"] == "withdrawn":
+                files.update(event["completions_sha256"])
+                checkpoints.add(event["checkpoint_sha256"])
+        return files, checkpoints
+
+    def withdraw(self, *, endpoint: str, checkpoint_sha256: str, reason: str) -> dict[str, Any]:
+        """Withdraw every sealed file of ``checkpoint_sha256`` (``endpoint``'s), for ``reason``.
+
+        Refused once any read has opened (the unseal record fixed the files then), when the
+        checkpoint has no sealed file, and when it was withdrawn already. Withdrawing is final:
+        nothing undoes it, and the files it names are refused by every later seal and read.
+        """
+        if endpoint not in ENDPOINTS:
+            raise SealError(f"the endpoint must be one of {ENDPOINTS}")
+        if not isinstance(checkpoint_sha256, str) or not SHA256.fullmatch(checkpoint_sha256):
+            raise SealError("the checkpoint SHA-256 must be 64 lowercase hex digits")
+        if not isinstance(reason, str) or not reason.strip():
+            raise SealError("a withdrawal records its reason")
+        with self._locked() as (events, handle):
+            if any(event["event"] == "opened" for event in events):
+                raise SealError(
+                    "a read of the test split has already opened; nothing can be withdrawn"
+                )
+            if checkpoint_sha256 in self._withdrawn(events)[1]:
+                raise SealError("this checkpoint's files were withdrawn already")
+            files = sorted(
+                event["completions_sha256"]
+                for event in events
+                if event["event"] == "sealed" and event["checkpoint_sha256"] == checkpoint_sha256
+            )
+            if not files:
+                raise SealError("this checkpoint has no sealed completions in this ledger")
+            return self._append(
+                events,
+                handle,
+                "withdrawn",
+                endpoint=endpoint,
+                checkpoint_sha256=checkpoint_sha256,
+                completions_sha256=files,
+                reason=reason.strip(),
+            )
+
+    @staticmethod
     def _sealed(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         return {
             event["completions_sha256"]: event for event in events if event["event"] == "sealed"
@@ -387,6 +447,14 @@ class SealLedger:
     ) -> dict[str, dict[str, Any]]:
         """Checks that depend on the unseal record and the sealed files, not on one read."""
         sealed = cls._sealed(events)
+        files, checkpoints = cls._withdrawn(events)
+        for endpoint in unseal.endpoints:
+            if endpoint.checkpoint_sha256 in checkpoints:
+                raise SealError(
+                    f"endpoint {endpoint.name}: its checkpoint was withdrawn from this ledger"
+                )
+            if any(listed in files for listed in endpoint.completions_sha256):
+                raise SealError(f"endpoint {endpoint.name}: the record lists withdrawn files")
         missing = [
             listed
             for endpoint in unseal.endpoints
@@ -423,6 +491,8 @@ class SealLedger:
         cls, events: list[dict[str, Any]], completions: Completions, unseal: UnsealRecord
     ) -> tuple[Endpoint, list[dict[str, Any]]]:
         digest = completions.sha256
+        if digest in cls._withdrawn(events)[0]:
+            raise SealError("these test completions were withdrawn; they are never executed")
         if digest not in cls._sealed(events):
             raise SealError("these test completions were never sealed in this ledger")
         cls._check_record(events, unseal)
@@ -541,6 +611,15 @@ class SealLedger:
                 raise SealError("the listed test completions name different task files")
             last = [event for event in events if event["event"] == "completed"][-1]
             return {"task_file_sha256": task_files.pop(), "results_id": last["results_id"]}
+
+
+def withdraw_endpoint(
+    ledger_path: Path, *, endpoint: str, checkpoint_sha256: str, reason: str
+) -> dict[str, Any]:
+    """Withdraw a checkpoint's sealed files from the ledger (``SealLedger.withdraw``)."""
+    return SealLedger(ledger_path).withdraw(
+        endpoint=endpoint, checkpoint_sha256=checkpoint_sha256, reason=reason
+    )
 
 
 def seal_completions(completions_path: Path, ledger_path: Path) -> dict[str, Any]:

@@ -118,8 +118,9 @@ def test_posttrain_arms_the_derived_lifetime_and_idle_rule_first(tmp_path: Path)
         for path in (ROOT / "tests").glob("test_posttrain_*.py")
         if not path.name.startswith("test_posttrain_run2")
     }
-    assert expected - {"tests/test_posttrain_runbook.py"} <= set(listed)
-    assert "tests/test_posttrain_runbook.py" not in listed
+    mac_only = {"tests/test_posttrain_runbook.py", "tests/test_posttrain_run1b_runbook.py"}
+    assert expected - mac_only <= set(listed)
+    assert not mac_only & set(listed)
     assert not [name for name in listed if "posttrain_run2" in name]
     for name in listed:
         path = ROOT / name
@@ -150,6 +151,7 @@ def test_run_two_arms_its_own_lifetime_and_runs_its_worker_tests_too(tmp_path: P
         "tests/test_posttrain_runbook.py",
         "tests/test_posttrain_run2_runbook.py",
         "tests/test_posttrain_run2_sandbox.py",
+        "tests/test_posttrain_run1b_runbook.py",
     }
     assert expected - mac_only <= set(listed) and not mac_only & set(listed)
     for name in listed:
@@ -160,9 +162,35 @@ def test_run_two_arms_its_own_lifetime_and_runs_its_worker_tests_too(tmp_path: P
     assert "R2 environment loaded for run 2 (names only)" in result.stdout
 
 
+def test_run_1b_arms_its_ceilings_lifetime_and_runs_the_gate_tests(tmp_path: Path) -> None:
+    """Run 1b's Pod arms the 8,820 s timer of its $1.50 ceiling, round-trips under its own
+    prefix and runs the special-row, format-gate and run-1b worker tests with run 1's."""
+    paths = posttrain_setup(tmp_path)
+    change = {"--run": "1b", "--deadline-unix": "1800008820", "--lifetime-seconds": "8820"}
+    result = run(paths, arguments(paths, **change))
+    assert result.returncode == 0, result.stderr
+    lines = calls(paths)
+    timer = lines[index(lines, "pod_self_destruct.py")]
+    assert "--max-lifetime-seconds 8820" in timer and "--deadline-unix 1800008820" in timer
+    assert "--run 1b" in lines[index(lines, "tools.posttrain_ops round-trip")]
+    listed = lines[index(lines, "-m pytest")].split()
+    for name in (
+        "tests/test_special_rows.py",
+        "tests/test_sft_format_gate.py",
+        "tests/test_posttrain_run1b.py",
+        "tests/test_posttrain_run1b_integration.py",
+        "tests/test_posttrain_run.py",
+    ):
+        assert name in listed, name
+    assert "tests/test_posttrain_run1b_runbook.py" not in listed
+    assert "R2 environment loaded for run 1b (names only)" in result.stdout
+
+
 @pytest.mark.parametrize(
     "change",
     [
+        {"--run": "1bb"},
+        {"--run": "b1"},
         {"--lifetime-seconds": ""},
         {"--lifetime-seconds": "60001"},
         {"--idle-seconds": ""},

@@ -33,7 +33,7 @@
 # then the same revision, key and environment steps, an R2 round trip under the run's
 # posttrain-runs/ prefix, the pinned fetch and re-verification of every bound input
 # (tools.posttrain_binding), the CPU tests and the A40 preflight with its compile check:
-#   bash tools/pilot_pod_bootstrap.sh --mode posttrain --run 1 --deadline-unix <unix> \
+#   bash tools/pilot_pod_bootstrap.sh --mode posttrain --run 1|1b|2 --deadline-unix <unix> \
 #        --lifetime-seconds 17820 --idle-seconds 900 --workspace /workspace/posttrain \
 #        --repo /workspace/repo --revision /workspace/revision.json \
 #        --archive /workspace/repo.tar.gz --r2-env /workspace/posttrain/r2-pod.env \
@@ -117,7 +117,7 @@ case "$MODE" in
     fi
     ;;
   posttrain)
-    if [[ ! "$RUN" =~ ^[1-9]$ || -z "$R2_ENV" || -z "$BINDING" || -z "$DATA_ROOT" \
+    if [[ ! "$RUN" =~ ^[1-9][a-z]?$ || -z "$R2_ENV" || -z "$BINDING" || -z "$DATA_ROOT" \
           || ! "$BINDING_SHA256" =~ ^[0-9a-f]{64}$ || -z "$REVISION" || -z "$ARCHIVE" \
           || ! "$LIFETIME" =~ ^[1-9][0-9]*$ || ! "$IDLE" =~ ^[1-9][0-9]*$ \
           || -z "$HEARTBEAT" || -n "$INIT_KEY$INIT_SHA256$INIT_SIZE" ]]; then
@@ -395,7 +395,9 @@ if [[ "$RUN_TESTS" == "1" ]]; then
       tests/test_posttrain_run.py tests/test_posttrain_guards.py
       tests/test_posttrain_binding.py tests/test_posttrain_integration.py
       tests/test_posttrain_readiness.py
-      tests/test_posttrain_bootstrap.py tests/test_posttrain_feasibility.py)
+      tests/test_posttrain_bootstrap.py tests/test_posttrain_feasibility.py
+      tests/test_special_rows.py tests/test_sft_format_gate.py
+      tests/test_posttrain_run1b.py tests/test_posttrain_run1b_integration.py)
     if [[ "$RUN" == "2" ]]; then
       # Run 2's worker over the reward bridge's directory transport, its bounds and its
       # receipt; the bridge itself. None needs a container runtime or the network.

@@ -47,3 +47,5 @@ Implemented: [post-training run worker, runs 1 and 2](posttrain-run.md).
 Implemented: [the RL reward bridge between the Pod and the Mac](rl-bridge.md).
 
 Implemented: [the SFT format gate](sft-format-gate.md).
+
+Implemented: [special-token rows: a fresh draw and their own learning rate](special-token-rows.md).

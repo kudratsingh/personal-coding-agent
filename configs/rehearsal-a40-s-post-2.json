@@ -440,6 +440,13 @@
       "sha256": null
     }
   },
+  "sft_gate": {
+    "key": null,
+    "size_bytes": null,
+    "sha256": null,
+    "checkpoint_sha256": null,
+    "passed": null
+  },
   "r2": {
     "storage_cap_usd_per_month": 5.0
   }
