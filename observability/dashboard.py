@@ -12,15 +12,20 @@ import os
 import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any
+from typing import Any, TypeGuard
 
 RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 METRIC_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:-]{0,95}\Z")
 SENSITIVE = re.compile(r"password|secret|api.?key|access.?token|authorization|credential", re.I)
 METRIC_PREFIXES = ("validation/",)
 METRIC_FIELDS = {
-    "loss", "learning_rate", "gradient_norm", "tokens",
-    "step_seconds", "tokens_per_second", "z_loss",
+    "loss",
+    "learning_rate",
+    "gradient_norm",
+    "tokens",
+    "step_seconds",
+    "tokens_per_second",
+    "z_loss",
 }
 MAX_RUNS = 40
 MAX_METRICS = 120
@@ -28,8 +33,8 @@ MAX_SAMPLES = 2400
 MAX_LOG_BYTES = 32 * 1024 * 1024
 
 
-def _numeric(value: object) -> bool:
-    return type(value) in (int, float) and math.isfinite(value)
+def _numeric(value: object) -> TypeGuard[int | float]:
+    return (type(value) is int or type(value) is float) and math.isfinite(value)
 
 
 def _valid_metric(key: object) -> bool:

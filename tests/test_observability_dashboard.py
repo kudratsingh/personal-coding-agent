@@ -3,13 +3,14 @@
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from observability.dashboard import load_runs, write_dashboard
 
 
-def _run(root: Path, name: str, events: list[dict], **meta: object) -> Path:
+def _run(root: Path, name: str, events: list[dict[str, Any]], **meta: object) -> Path:
     folder = root / name
     folder.mkdir(parents=True)
     (folder / "record.json").write_text(json.dumps({"status": "completed", **meta}))
@@ -17,21 +18,25 @@ def _run(root: Path, name: str, events: list[dict], **meta: object) -> Path:
     return folder
 
 
-def _metric(step: int, **values: object) -> dict:
+def _metric(step: int, **values: object) -> dict[str, Any]:
     return {"event": "metrics", "fields": {"step": step, "metrics": values}}
 
 
 def test_collects_training_and_domain_validation(tmp_path: Path) -> None:
     folder = _run(
-        tmp_path, "runA",
+        tmp_path,
+        "runA",
         [
             _metric(1, loss=2.5, gradient_norm=0.9),
-            {"event": "validation", "fields": {
-                "step": 1, "metrics": {"validation/python/bits_per_byte": 1.2}
-            }},
+            {
+                "event": "validation",
+                "fields": {"step": 1, "metrics": {"validation/python/bits_per_byte": 1.2}},
+            },
             _metric(2, loss=1.8, tokens_per_second=46000),
         ],
-        actual_cost_usd=3.25, git_commit="a" * 40, seed=42,
+        actual_cost_usd=3.25,
+        git_commit="a" * 40,
+        seed=42,
     )
     (folder / "events-rank1.jsonl").write_text(json.dumps(_metric(3, loss=999.0)))
     records = load_runs(tmp_path)
@@ -43,18 +48,28 @@ def test_collects_training_and_domain_validation(tmp_path: Path) -> None:
 
 
 def test_filters_private_text_secrets_and_nonfinite_values(tmp_path: Path) -> None:
-    folder = _run(tmp_path, "r1", [
-        _metric(0, loss=1.0, prompt="PRIVATE PROMPT", bad=float("inf")),
-        {"event": "training_failed", "fields": {"traceback": "PRIVATE TRACE"}},
-        _metric(1, loss=0.5, **{"secret_token": 4.0, "bad<script>": 3.0}),
-    ], config={"password": "PRIVATE CONFIG"})
+    folder = _run(
+        tmp_path,
+        "r1",
+        [
+            _metric(0, loss=1.0, prompt="PRIVATE PROMPT", bad=float("inf")),
+            {"event": "training_failed", "fields": {"traceback": "PRIVATE TRACE"}},
+            _metric(1, loss=0.5, **{"secret_token": 4.0, "bad<script>": 3.0}),
+        ],
+        config={"password": "PRIVATE CONFIG"},
+    )
     with (folder / "events-rank0.jsonl").open("a") as f:
         f.write("{incomplete\n")
     output = tmp_path / "observability/index.html"
     assert write_dashboard(tmp_path, output) == 1
     html = output.read_text()
-    for private in ("PRIVATE PROMPT", "PRIVATE TRACE", "PRIVATE CONFIG",
-                    "secret_token", "bad<script>"):
+    for private in (
+        "PRIVATE PROMPT",
+        "PRIVATE TRACE",
+        "PRIVATE CONFIG",
+        "secret_token",
+        "bad<script>",
+    ):
         assert private not in html
     match = re.search(r'<script id="data" type="application/json">(.*?)</script>', html)
     assert match is not None
