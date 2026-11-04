@@ -1,8 +1,8 @@
-# Personal Coding Agent
+# Personal Coding Agent — From-Scratch Coding LLM
 
-A small language model and Python coding agent built from scratch: byte-level BPE, a decoder-only transformer, AdamW, resumable training, cached generation, supervised fine-tuning, on-policy RL and isolated code evaluation.
+A **coding language model and agent-training stack built from scratch**, from byte-level BPE and a **RoPE/RMSNorm decoder-only transformer** to AdamW, exact-resume distributed training, **KV-cached generation**, supervised fine-tuning and **reinforcement learning from verifiable rewards (RLVR)**.
 
-The aim is to follow the whole path from training data to an agent that writes and repairs code, with core learning components implemented here and checked against reference implementations. **Real-corpus base-model pretraining has run at rehearsal scale. Trained coding-agent capability and post-training acceptance remain open.**
+Provenance-aware data pipelines, reference-tested numerical components and sandboxed Python evaluation connect pretraining to executable-code feedback. The implementation exposes the tokenizer, model, optimizer, training, sampling and post-training logic directly, alongside checkpoint lineage, held-out validation and controlled recipe comparisons.
 
 ## Measured so far
 
