@@ -624,8 +624,12 @@ RUN2_LIMITS: dict[str, Any] = {
 from run 1's measured rates, and the cost limit every other limit derives from is the lower of
 the ceiling and 120% of the estimate (the owner's run 2 gate rulings); setup fetches only the
 541 MB SFT weights, so its allowance is 900 s."""
+RUN2_FLOORS = {"128": 7_991.0, "256": 9_049.0}
+"""Run 2's planning generation speeds, fixed in its second specification: the standing rule
+over the four hosts measured before it was written (``GENERATION_FLOORS`` then). A later host
+changes ``GENERATION_FLOORS`` but not this template; its floors go to a new specification."""
 RUN2_PLANNING = {
-    "generation_tokens_per_second": dict(GENERATION_FLOORS),
+    "generation_tokens_per_second": dict(RUN2_FLOORS),
     "training_slots_per_second": 56_765.0,
     "arc_seconds_per_checkpoint": 54,
     "checkpoint_load_seconds": 20,

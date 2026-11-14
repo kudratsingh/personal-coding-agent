@@ -304,7 +304,13 @@ def test_run_two_generates_as_run_one_and_plans_at_the_standing_floors() -> None
     assert batches | {str(rl["dev_batch_size"])} == {"128", "256"}
     planning = run2["planning"]["generation_tokens_per_second"]
     assert set(planning) == set(run1["probe"]["minimum_tokens_per_second"]) == batches
-    assert planning == posttrain_approved.GENERATION_FLOORS == {"128": 7_991.0, "256": 9_049.0}
+    assert planning == posttrain_approved.RUN2_FLOORS == {"128": 7_991.0, "256": 9_049.0}
+    # The standing rule over the four hosts measured before run 2's second specification was
+    # written; a host appended later leaves this template's speeds as they are.
+    hosts_before = posttrain_approved.MEASURED_HOST_PROBES[:4]
+    assert posttrain_approved.RUN2_FLOORS == posttrain_approved.derive_generation_floors(
+        hosts_before
+    )
 
 
 def test_the_gate_fills_every_null_and_the_approved_check_refuses_any_other_change() -> None:
