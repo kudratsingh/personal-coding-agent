@@ -54,19 +54,30 @@ Case(name, mode, prompt, code, tests, solves,
 
 - **Record verdicts** are sets of `runner.Result.status` values: `passed`, `failed`,
   `timeout`, `output_limit` or `resource_limit`. Host failures (`unavailable`,
-  `infrastructure_error`, a host stall) are never an expected verdict. A gated test treats one
-  as a test failure, not a skip.
+  `infrastructure_error`, a host stall) are never an expected catalogue verdict. A gated test
+  treats one as a test failure, not a skip. The one exception is the dedicated supervisor
+  stdout-injection test, which allows `infrastructure_error` because a candidate can cause it.
 - **Reward verdicts** are sets of `(RewardResult.status, reward)` pairs, for example
   `("completed", 0.5)`, or `("not_parseable", None)` for a task the channel refuses.
 - **Labels** take the form `kind` or `kind: reason`. The kind is one of `control`,
-  `known_weakness`, `intended_divergence`, `refused` or `nondeterministic`. The unit tests
-  check that each label agrees with its verdict:
+  `known_weakness`, `intended_divergence`, `refused`, `nondeterministic` or
+  `known_false_negative`. The unit tests check that each label agrees with its verdict:
   - a `control` passes a solution and fails a non-solution;
   - a `known_weakness` gives a non-solution credit;
+  - a `known_false_negative` rejects a solution that meets the prompt, and names its cause:
+    `defective_tests` (the task's own tests contradict or go beyond the prompt, so no scorer
+    can accept the honest solution) or `evaluator_rejects_honest` (the tests are sound, but
+    this path cannot accept a solution they would accept);
   - `refused` means exactly `not_parseable`;
   - only `nondeterministic` may allow more than one outcome.
+- **Uncertain predictions** (`UNCERTAIN_CASES`) still declare one outcome per path and say
+  `prediction uncertain` in a label. `nondeterministic` is never used to hide uncertainty.
+- **Failure classes.** `FAILURE_CLASSES` maps six verifier failure classes to the cases that
+  exercise them: contradictory contracts, reference-dependent tests, nondeterministic
+  references, missing side-effect assertions, zero-check admission and marker (or in-process
+  verdict) forgery.
 
-The catalogue has 28 cases in eight groups:
+Catalogue version 1 had 28 cases in eight groups:
 
 - **Controls:** a correct program, a return-`None` stub, a `pass` body, a program that defines
   nothing, a constant return and an echo of the argument.
@@ -92,6 +103,37 @@ The catalogue has 28 cases in eight groups:
   record, full credit within the reward channel's 4 s per-call deadline), plus a correct I/O
   program and a constant I/O program.
 
+Version 2 (`evaluator-conformance-v2`) adds 23 cases, each new attack paired with an honest
+control on the same task:
+
+- **Candidate-independent checks:** `assert abs(-1) == 1` never calls the candidate, so a stub
+  passes on both paths. Only a host-side count of checks that call the candidate closes it.
+- **More in-process forgery:** a line-trace hook that jumps over the tests to the module's last
+  line (the real marker then prints without being read); a truthy non-`bool` `__eq__` against a
+  string, with an honest twin that the reward channel also rejects because a custom object
+  cannot be encoded (an `evaluator_rejects_honest` false negative); and a flagged but harmless
+  `__eq__` that the tests never call, which shows that an audit flag is not a verdict.
+- **Redefining the outer call of an `is True` check:** a module-level `isinstance`, a patched
+  `math.isclose` and a patched `builtins.isinstance`. The reward channel evaluates each call in
+  the candidate's own namespace, after the candidate has run, so it is predicted to accept
+  these checks as written.
+- **I/O supervisor introspection:** an I/O candidate that tries to read the expected output
+  from the supervisor's memory (`/proc/1/maps`, `/proc/1/mem`) and prints a branch tag when it
+  cannot. A paired honest I/O program checks the same task.
+- **A slow but in-limit honest solution** (one 0.5 s pause), which every hardening must keep.
+- **Hash order with a two-element result**, plus its sorted honest control. A dedicated test
+  runs this pair several times in fresh containers as a witness that string-hash
+  randomisation is live. A passing witness does not prove that any task is deterministic.
+- **A contradictory contract:** the prompt asks for 2 decimal places, the test expects the
+  unrounded value. A consistent twin shows the failure is in the tests.
+- **A reference-dependent order:** the prompt says order does not matter, the test fixes one.
+  A twin that wraps the call in `sorted(...)` passes on both paths.
+- **Side effects:** a required `ValueError` that no test checks (a stub passes), and an
+  in-place sort observed through one sequenced expression, which both paths can check today.
+
+A second dedicated test writes a forged result line to the path-of-record supervisor's own
+standard output. It is never allowed to pass.
+
 ## Design choices and common mistakes
 
 - **Characterize, do not aspire.** An expected verdict says what the current code does. When a
@@ -110,9 +152,10 @@ The catalogue has 28 cases in eight groups:
 - **Refusal is not a pass.** The reward channel refuses a task with no supported assertion
   (`not_parseable`, reward `None`). The tests confirm that it never starts a container for one.
 - **Predicted, then observed.** The expected verdicts were first derived by reading the
-  runner, the supervisors and the reward channel. A local gated run of this catalogue
+  runner, the supervisors and the reward channel. A local gated run of catalogue version 1
   against the pinned container, inside a passing execution window, then matched every
-  declared verdict on both paths. A future mismatch is a finding to investigate: correct
+  declared verdict on both paths. Version 2 verdicts stay predictions until a gated run
+  observes them. A future mismatch is a finding to investigate: correct
   the catalogue only in a separate, reviewed change that cites the observation.
 - **Out of scope:** NumPy-backed benchmark scoring (the EvalPlus image), benchmark suites
   (none of them is parseable on the reward channel), and the sealed test split.
@@ -128,9 +171,20 @@ The catalogue has 28 cases in eight groups:
 
 ```sh
 env -u SSH_AUTH_SOCK uv run --locked python -m tools.mac_window_check exec \
-  --image-id <recorded stdlib image ID> --dotenv .env -- \
-  env SCRATCHCODER_SANDBOX_TESTS=1 uv run --locked pytest tests/test_evaluator_conformance.py
+  --image-id <recorded stdlib image ID> --dotenv <absolute path to .env> \
+  --receipt <run directory>/window-receipt.json -- \
+  env SCRATCHCODER_SANDBOX_TESTS=1 \
+  SCRATCHCODER_CONFORMANCE_RECORD=<run directory>/observed-verdicts.jsonl \
+  uv run --locked pytest tests/test_evaluator_conformance.py
 ```
+
+With `SCRATCHCODER_CONFORMANCE_RECORD` set, each gated test appends one JSON row per observed
+verdict, beside the declared one and before any assertion, so a mismatch is recorded as well
+as reported. Rows carry the status, the reward and its per-check outcomes, the exit code and a
+bounded diagnostic; standard output is kept, truncated, only for the few cases whose branch it
+names. Keep the file outside the repository. Run the suite once; repeat a run only after an
+infrastructure failure, in a new run directory, never to obtain a different outcome for a
+nondeterministic or uncertain case.
 
 The gated tests do not need the NumPy (EvalPlus) image.
 

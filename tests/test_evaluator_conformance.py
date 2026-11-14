@@ -13,13 +13,21 @@ flips a verdict, including closing a known weakness, fails here until the catalo
 updated with it. On the owner's Mac they run only inside a passing execution window:
 
     env -u SSH_AUTH_SOCK uv run --locked python -m tools.mac_window_check exec \\
-        --image-id <recorded image ID> --dotenv .env -- \\
-        env SCRATCHCODER_SANDBOX_TESTS=1 uv run --locked pytest tests/test_evaluator_conformance.py
+        --image-id <recorded image ID> --dotenv <absolute path to .env> \\
+        --receipt <run directory>/window-receipt.json -- \\
+        env SCRATCHCODER_SANDBOX_TESTS=1 \\
+        SCRATCHCODER_CONFORMANCE_RECORD=<run directory>/observed-verdicts.jsonl \\
+        uv run --locked pytest tests/test_evaluator_conformance.py
+
+When ``SCRATCHCODER_CONFORMANCE_RECORD`` names a file (keep it outside the repository), every
+gated test appends one JSON row per observed verdict, next to the declared one, before it
+asserts anything, so a mismatch is recorded as well as reported.
 """
 
 import ast
 import json
 import os
+import time
 from typing import Any
 
 import pytest
@@ -28,10 +36,14 @@ from scratchcoder.eval.harness import is_host_failure, isolated_execution
 from scratchcoder.sandbox import conformance, reward
 from scratchcoder.sandbox.conformance import (
     CASES,
+    FAILURE_CLASSES,
+    FALSE_NEGATIVE_CAUSES,
     LABEL_KINDS,
     RECORD_STATUSES,
     REQUIRED_CASES,
+    UNCERTAIN_CASES,
     Case,
+    false_negative_cause,
     label_kind,
 )
 from scratchcoder.sandbox.runner import Limits
@@ -46,7 +58,7 @@ SCORED_REWARD_STATUSES = {
 
 
 def test_catalogue_is_versioned_and_complete() -> None:
-    assert conformance.CATALOGUE_VERSION == "evaluator-conformance-v1"
+    assert conformance.CATALOGUE_VERSION == "evaluator-conformance-v2"
     assert len(NAMES) == len(set(NAMES))
     assert REQUIRED_CASES <= set(NAMES)
     assert all(name.isidentifier() and name == name.lower() for name in NAMES)
@@ -76,6 +88,9 @@ def _record_label_agrees(case: Case) -> None:
         assert (statuses == {"passed"}) if case.solves else ("passed" not in statuses), case.name
     if kind == "known_weakness":
         assert not case.solves and statuses == {"passed"}, case.name
+    if kind == "known_false_negative":
+        assert case.solves and "passed" not in statuses, case.name
+        assert false_negative_cause(case.record.label) in FALSE_NEGATIVE_CAUSES, case.name
 
 
 def _reward_label_agrees(case: Case) -> None:
@@ -88,6 +103,9 @@ def _reward_label_agrees(case: Case) -> None:
         assert values == ({1.0} if case.solves else {0.0}), case.name
     if kind == "known_weakness":
         assert not case.solves and any(value for value in values), case.name
+    if kind == "known_false_negative":
+        assert case.solves and all(value is not None and value < 1.0 for value in values)
+        assert false_negative_cause(case.reward.label) in FALSE_NEGATIVE_CAUSES, case.name
 
 
 @pytest.mark.parametrize("case", CASES, ids=NAMES)
@@ -162,10 +180,82 @@ def test_known_weaknesses_are_pinned() -> None:
         "monkeypatch_assert_helper",
         "shadow_builtin_isinstance",
         "side_effect_stub",
+        "zc_candidate_independent_checks",
+        "trace_hook_line_jump",
+        "truthy_eq_foreign_compare",
+        "shadow_builtin_is_true_form",
+        "monkeypatch_helper_is_true_form",
+        "builtins_module_patch_is_true_form",
+        "se_raise_unchecked_stub",
     }
-    assert conformance.known_weaknesses("reward") == {"side_effect_stub"}
+    assert conformance.known_weaknesses("reward") == {
+        "side_effect_stub",
+        "zc_candidate_independent_checks",
+        "shadow_builtin_is_true_form",
+        "monkeypatch_helper_is_true_form",
+        "builtins_module_patch_is_true_form",
+        "se_raise_unchecked_stub",
+    }
     with pytest.raises(ValueError):
         conformance.known_weaknesses("benchmark")
+
+
+def test_false_negatives_name_their_cause() -> None:
+    """A rejected honest solution says whether the task's tests are defective (no scorer can
+    fix that) or the scoring path rejects a solution the tests would accept."""
+    causes = {
+        (case.name, path): false_negative_cause(label)
+        for case in CASES
+        for path, label in (("record", case.record.label), ("reward", case.reward.label))
+        if label_kind(label) == "known_false_negative"
+    }
+    assert causes == {
+        ("contract_rounding_faithful", "record"): "defective_tests",
+        ("contract_rounding_faithful", "reward"): "defective_tests",
+        ("refdep_set_order_sorted", "record"): "defective_tests",
+        ("refdep_set_order_sorted", "reward"): "defective_tests",
+        ("truthy_eq_foreign_honest", "reward"): "evaluator_rejects_honest",
+    }
+    assert false_negative_cause("control") is None
+    assert false_negative_cause("known_false_negative") is None
+
+
+def test_every_failure_class_has_cases() -> None:
+    assert set(FAILURE_CLASSES) == {
+        "contradictory_contract",
+        "reference_dependent_tests",
+        "nondeterministic_reference",
+        "missing_side_effect_assertion",
+        "zero_check_admission",
+        "marker_forgery",
+    }
+    names = set(NAMES)
+    for failure_class, members in FAILURE_CLASSES.items():
+        assert members and members <= names, failure_class
+
+
+def test_uncertain_predictions_are_declared_not_hidden() -> None:
+    """An uncertain prediction still declares one outcome per path; it is never disguised as
+    ``nondeterministic``, and its reason says it is uncertain."""
+    assert set(UNCERTAIN_CASES) <= REQUIRED_CASES
+    by_name = conformance.by_name()
+    for name in UNCERTAIN_CASES:
+        case = by_name[name]
+        assert len(case.record.statuses) == 1 and len(case.reward.outcomes) == 1, name
+        assert "prediction uncertain" in case.record.label + case.reward.label, name
+    for case in CASES:
+        if case.name not in UNCERTAIN_CASES:
+            assert "prediction uncertain" not in case.record.label + case.reward.label
+
+
+def test_dedicated_live_cases_are_well_formed() -> None:
+    ast.parse(conformance.PID1_STDOUT_INJECTION)  # parsed only
+    assert "passed" not in conformance.PID1_ALLOWED_STATUSES
+    witness, runs, control, control_runs = conformance.HASH_ORDER_WITNESS
+    by_name = conformance.by_name()
+    assert label_kind(by_name[witness].record.label) == "nondeterministic"
+    assert by_name[control].solves and by_name[control].tests == by_name[witness].tests
+    assert (runs, control_runs) == (12, 6)  # fixed in advance; never raised to chase an outcome
 
 
 def test_unflagged_forgeries_exist_on_the_path_of_record() -> None:
@@ -188,17 +278,142 @@ integration = pytest.mark.skipif(
 )
 
 
+RECORD_ENV = "SCRATCHCODER_CONFORMANCE_RECORD"
+STDOUT_RECORDED = frozenset(
+    {"io_supervisor_introspection", "record_pid1_stdout_injection", "trace_hook_line_jump"}
+)
+DETAIL_BYTES = 300
+STDOUT_BYTES = 200
+
+
+def _observe(
+    test: str,
+    case: str,
+    path: str,
+    declared: list[Any],
+    status: str,
+    value: float | None,
+    elapsed: float,
+    stdout: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Append one observed verdict, next to the declared one, to the record file (if any)."""
+    target = os.environ.get(RECORD_ENV)
+    if not target:
+        return
+    row: dict[str, Any] = {
+        "catalogue": conformance.CATALOGUE_VERSION,
+        "test": test,
+        "case": case,
+        "path": path,
+        "declared": declared,
+        "status": status,
+        "reward": value,
+        "elapsed_seconds": round(elapsed, 3),
+    }
+    row.update(extra or {})
+    if stdout is not None and case in STDOUT_RECORDED:
+        row["stdout"] = stdout.encode("utf-8", "replace")[:STDOUT_BYTES].decode("utf-8", "replace")
+    with open(target, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _run_record(test: str, case: Case) -> str:
+    started = time.monotonic()
+    result = isolated_execution(case.code, case.tests, case.mode)
+    _observe(
+        test,
+        case.name,
+        "record",
+        sorted(case.record.statuses),
+        result.status,
+        None,
+        time.monotonic() - started,
+        result.stdout,
+        {"exit_code": result.exit_code, "host_stalled": result.host_stalled},
+    )
+    assert not is_host_failure(result), result  # a host failure is a test failure, not a skip
+    return result.status
+
+
+def _run_reward(test: str, case: Case) -> tuple[str, float | None]:
+    started = time.monotonic()
+    result = reward.score_attempt(case.task(), case.code)
+    _observe(
+        test,
+        case.name,
+        "reward",
+        sorted([list(outcome) for outcome in case.reward.outcomes], key=str),
+        result.status,
+        result.reward,
+        time.monotonic() - started,
+        None,
+        {
+            "passed": result.passed,
+            "total": result.total,
+            "unfinished": result.unfinished,
+            "outcomes": list(result.outcomes),
+            "detail": result.detail.encode("utf-8", "replace")[:DETAIL_BYTES].decode(
+                "utf-8", "replace"
+            ),
+        },
+    )
+    assert not result.is_host_failure, result
+    return result.status, result.reward
+
+
 @integration
 @pytest.mark.parametrize("case", CASES, ids=NAMES)
 def test_live_scoring_of_record_matches_the_catalogue(case: Case) -> None:
-    result = isolated_execution(case.code, case.tests, case.mode)
-    assert not is_host_failure(result), result  # a host failure is a test failure, not a skip
-    assert result.status in case.record.statuses, (case.name, result.status, result.stdout)
+    status = _run_record("catalogue", case)
+    assert status in case.record.statuses, (case.name, status)  # details are in the record row
 
 
 @integration
 @pytest.mark.parametrize("case", CASES, ids=NAMES)
 def test_live_reward_channel_matches_the_catalogue(case: Case) -> None:
-    result = reward.score_attempt(case.task(), case.code)
-    assert not result.is_host_failure, result
-    assert (result.status, result.reward) in case.reward.outcomes, (case.name, result)
+    outcome = _run_reward("catalogue", case)
+    assert outcome in case.reward.outcomes, (case.name, outcome)
+
+
+@integration
+def test_live_hash_order_witness() -> None:
+    """String-hash randomisation is live in the pinned runtime: the same program, tests and
+    mode give both verdicts across fresh containers, while a sorted honest solution of the
+    same task gives one. Passing this does not prove that any task is deterministic."""
+    witness_name, runs, control_name, control_runs = conformance.HASH_ORDER_WITNESS
+    witness = conformance.by_name()[witness_name]
+    control = conformance.by_name()[control_name]
+    record_seen = {_run_record("hash_order_witness", witness) for _ in range(runs)}
+    reward_seen = {_run_reward("hash_order_witness", witness) for _ in range(runs)}
+    control_record = {_run_record("hash_order_witness", control) for _ in range(control_runs)}
+    control_reward = {_run_reward("hash_order_witness", control) for _ in range(control_runs)}
+    assert control_record == {"passed"} and control_reward == {(reward.COMPLETED, 1.0)}
+    assert record_seen == {"passed", "failed"}, ("randomisation not observed", record_seen)
+    assert reward_seen == {(reward.COMPLETED, 1.0), (reward.COMPLETED, 0.0)}, (
+        "randomisation not observed",
+        reward_seen,
+    )
+
+
+@integration
+def test_live_record_pid1_stdout_injection() -> None:
+    """A candidate that writes a forged result line to the path-of-record supervisor's stdout
+    must never be scored ``passed``. Run once, with no harness retries."""
+    started = time.monotonic()
+    result = isolated_execution(
+        conformance.PID1_STDOUT_INJECTION, conformance.ADD_TESTS, "function"
+    )
+    _observe(
+        "pid1_stdout_injection",
+        "record_pid1_stdout_injection",
+        "record",
+        sorted(conformance.PID1_ALLOWED_STATUSES),
+        result.status,
+        None,
+        time.monotonic() - started,
+        result.stdout,
+        {"exit_code": result.exit_code, "host_stalled": result.host_stalled},
+    )
+    assert result.status != "passed", result
+    assert result.status in conformance.PID1_ALLOWED_STATUSES, result
