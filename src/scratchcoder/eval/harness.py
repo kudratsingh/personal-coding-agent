@@ -147,7 +147,13 @@ def evaluate(
                 result = Result("context_limit")
                 code_hash = None
             if result.status != "context_limit" and is_host_failure(result):
-                raise RuntimeError("evaluation aborted: isolation is unavailable or failed")
+                raise RuntimeError(
+                    "evaluation aborted: isolation is unavailable or failed "
+                    f"({task.id}: {result.status}"
+                    + (f", {result.detail}" if result.detail else "")
+                    + (", host stalled" if result.host_stalled else "")
+                    + ")"
+                )
             successes.append(result.passed)
             outcomes.append({"seed": seed, "status": result.status, "code_hash": code_hash})
         attempts.append(successes)

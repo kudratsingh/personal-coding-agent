@@ -58,7 +58,7 @@ SCORED_REWARD_STATUSES = {
 
 
 def test_catalogue_is_versioned_and_complete() -> None:
-    assert conformance.CATALOGUE_VERSION == "evaluator-conformance-v2"
+    assert conformance.CATALOGUE_VERSION == "evaluator-conformance-v3"
     assert len(NAMES) == len(set(NAMES))
     assert REQUIRED_CASES <= set(NAMES)
     assert all(name.isidentifier() and name == name.lower() for name in NAMES)
@@ -187,7 +187,6 @@ def test_known_weaknesses_are_pinned() -> None:
         "monkeypatch_helper_is_true_form",
         "builtins_module_patch_is_true_form",
         "se_raise_unchecked_stub",
-        "io_supervisor_introspection",
     }
     assert conformance.known_weaknesses("reward") == {
         "side_effect_stub",

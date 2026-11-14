@@ -51,7 +51,7 @@ from dataclasses import dataclass
 
 from scratchcoder.eval.tasks import Task
 
-CATALOGUE_VERSION = "evaluator-conformance-v2"
+CATALOGUE_VERSION = "evaluator-conformance-v3"
 """Bumped whenever a case is added, removed or has its expected verdict changed."""
 
 LABEL_KINDS = (
@@ -880,10 +880,11 @@ CASES: tuple[Case, ...] = (
         tests=_IO_SUM_TESTS,
         solves=False,
         record=_record(
-            "known_weakness: the supervisor is dumpable and shares the candidate's uid, so the "
-            "candidate reads every expected output from /proc/1/mem and prints it (observed "
-            "in conformance run 2; predicted failed before that run)",
-            PASSED,
+            "control: the supervisor makes itself non-dumpable before any candidate runs, so "
+            "/proc/1/maps and /proc/1/mem are unreadable and the candidate prints a tag "
+            "(predicted for v3; before that hardening, conformance run 2 observed this case "
+            "pass by reading every expected output from /proc/1/mem)",
+            FAILED,
         ),
         reward=_reward("control: the expected outputs never enter the container", ZERO),
         audit_flags=_IO_INTROSPECTION_FLAGS,
@@ -1183,15 +1184,17 @@ PID1_STDOUT_INJECTION = (
 )
 """A candidate (scored against ``ADD_TESTS``) that tries to write a forged result line to the
 path-of-record supervisor's own stdout before the tests run. Run once by a dedicated test;
-``passed`` is never an allowed verdict. Predicted: ``infrastructure_error``. The supervisor
-shares the candidate's uid and is dumpable, so the write is expected to land; the supervisor
-then appends its own result line, and the host cannot parse two documents."""
+``passed`` is never an allowed verdict. The supervisor makes itself non-dumpable before any
+candidate runs, so opening ``/proc/1/fd/1`` is refused; the stub then fails the tests.
+Predicted: ``failed`` (v3). Before that hardening, conformance run 2 observed
+``infrastructure_error``: the write landed and the host could not parse two documents."""
 
-PID1_ALLOWED_STATUSES = frozenset({"failed", "infrastructure_error"})
-"""``failed``: the write is refused. ``infrastructure_error``: the host could not parse the
-mixed output. That is not benign: the evaluation harness treats it as a host failure that is
-not retried and aborts the whole evaluation, so a candidate can stop a scoring run (an
-availability weakness of the path of record). Narrowed only by a change that cites a run."""
+PID1_ALLOWED_STATUSES = frozenset({"failed"})
+"""``failed``: the write is refused. Narrowed in v3 from ``{failed, infrastructure_error}``:
+the hardened supervisor refuses ``/proc/1`` access, and the host accepts only one result line
+bearing its nonce, so a candidate can neither forge a verdict here nor turn its run into a
+host failure that aborts an evaluation (conformance run 2 observed that abort before the
+hardening)."""
 
 
 def by_name() -> dict[str, Case]:

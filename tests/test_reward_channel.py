@@ -1260,10 +1260,12 @@ import json, os, sys, time
 
 if "rm" in sys.argv[1:]:
     sys.exit(0)
-sys.stdin.read()
+payload = json.loads(sys.stdin.read())
 if os.environ["FAKE_DOCKER_MODE"] == "stall":
     time.sleep(60)
-print(json.dumps({"status": "timeout", "stdout": "", "exit_code": -9}))
+print(json.dumps({"status": "timeout", "stdout": "", "exit_code": -9, "nonce": payload["nonce"],
+                  "protections": {"container_init": True, "signal_handlers": True,
+                                  "non_dumpable": True}}))
 """
 
 

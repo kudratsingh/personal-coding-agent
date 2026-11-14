@@ -55,8 +55,9 @@ Case(name, mode, prompt, code, tests, solves,
 - **Record verdicts** are sets of `runner.Result.status` values: `passed`, `failed`,
   `timeout`, `output_limit` or `resource_limit`. Host failures (`unavailable`,
   `infrastructure_error`, a host stall) are never an expected catalogue verdict. A gated test
-  treats one as a test failure, not a skip. The one exception is the dedicated supervisor
-  stdout-injection test, which allows `infrastructure_error` because a candidate can cause it.
+  treats one as a test failure, not a skip. Catalogue v2 let the dedicated supervisor
+  stdout-injection test accept `infrastructure_error`, because a candidate could cause it;
+  v3 (the hardened supervisor) allows only `failed`.
 - **Reward verdicts** are sets of `(RewardResult.status, reward)` pairs, for example
   `("completed", 0.5)`, or `("not_parseable", None)` for a task the channel refuses.
 - **Labels** take the form `kind` or `kind: reason`. The kind is one of `control`,
@@ -140,14 +141,23 @@ These are properties of the current evaluators, shown with synthetic cases. They
 what a candidate *could* do. They do not mean that any recorded run contained such a
 program, and historical result files are unchanged.
 
-- **Path of record, function mode:** verdicts are decided inside the candidate's process. A
-  candidate can forge the completion marker, skip the tests with a line-trace hook, replace
-  or shadow the helpers the tests call, return objects whose `==` always holds, or read the
-  expected values from its own program text.
-- **Path of record, I/O mode:** the supervisor runs as the candidate's user and is dumpable,
-  so a candidate can read the expected outputs from the supervisor's memory
-  (`/proc/1/mem`) and print them. A candidate can also write to the supervisor's standard
-  output; the host then cannot parse the result, and the evaluation harness aborts the run.
+- **Path of record, function mode (unresolved):** verdicts are decided inside the
+  candidate's process. A candidate can forge the completion marker, skip the tests with a
+  line-trace hook, replace or shadow the helpers the tests call, return objects whose `==`
+  always holds, or read the expected values from its own program text. This is a
+  scorer-integrity limitation of every function-mode score the project uses now: dev
+  scores, checkpoint and model selection, and the run reports, not only a future published
+  number. No recorded run has been shown to contain such a program. Weak tests (for example a
+  task whose only check is `is None`) are a separate exposure: they let a wrong but ordinary
+  solution pass, which is not a forged pass.
+- **Path of record, I/O mode (fixed in v3):** before the hardening, the supervisor ran as
+  the candidate's user and was dumpable. Conformance run 2 showed a candidate reading the
+  expected outputs from the supervisor's memory (`/proc/1/mem`) and printing them, and a
+  candidate writing to the supervisor's standard output so the host could not parse the
+  result and the evaluation harness aborted. The supervisor now refuses to run a candidate
+  unless it is non-dumpable and handles the catchable signals, and the host accepts only one
+  result line that carries its random nonce. Both cases are catalogue controls that must
+  fail.
 - **Reward channel:** the host-side comparison resists marker forgery and expected-value
   reads, but each call is evaluated in the candidate's own namespace after the candidate has
   run. A candidate that redefines the outer call of an `is True`-type check (a module-level

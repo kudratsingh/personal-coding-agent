@@ -14,6 +14,8 @@ An explicit dependency profile can instead use an owner-controlled locally built
 
 The default input cap remains 128,000 bytes. Larger benchmark scripts require an explicit bounded `Limits.input_bytes` (maximum 8 MiB); the file bound follows that declaration. Reports using another runtime or limits must record them and cannot claim identical upstream timing/memory policy merely because the same tests run. Dedicated NumPy CI builds the pinned image and exercises both functionality and isolation before benchmark use.
 
+The evaluation supervisor runs as PID 1 under the candidate's user. Since 2026-11-14 it refuses to run a candidate unless it has made itself non-dumpable and given the catchable signals a no-op handler, and the host accepts only one result line bearing the nonce it sent; any other output is an unresolved `infrastructure_error`, never a verdict. In function mode the verdict is still decided inside the candidate's own process, so a candidate can forge it: an unresolved scorer-integrity limitation of every function-mode score used now (development scores and model selection, not only published numbers). See the [walkthrough](walkthroughs/sandbox.md) and the [ADR amendment](adr/0004-development-sandbox.md#amendment-2026-11-14-path-of-record-supervisor-protections).
+
 ## Reward channel for reinforcement learning
 
 Reinforcement-learning rewards and RL candidate screening use a separate grading path in `scratchcoder.sandbox.reward` that never sends the expected test values into the container. Evaluation scoring of record is unchanged and still runs hidden tests in-process through the runner above.

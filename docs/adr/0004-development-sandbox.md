@@ -227,3 +227,34 @@ are out of scope here.
   exceeds its budget still loses the cases it did not reach (reported in each result's
   `unfinished` count). With the per-case rule an I/O attempt can take up to 27 s at 100 cases,
   so the reward time per RL update is a measured quantity, not a fixed bound.
+
+## Amendment (2026-11-14): path-of-record supervisor protections
+
+Conformance run 2 (a local gated run of synthetic cases) showed two weaknesses of the
+evaluation supervisor, which ran as PID 1 under the candidate's uid and was dumpable: an I/O
+candidate read every expected output from `/proc/1/mem` and printed it, and a candidate that
+wrote a line to `/proc/1/fd/1` made the host unable to parse the result, which aborted the
+evaluation harness. No recorded result is known to contain either program; historical result
+files are unchanged.
+
+**Decision.** Before any candidate process exists, the supervisor gives `SIGINT`, `SIGTERM`,
+`SIGHUP`, `SIGQUIT`, `SIGUSR1` and `SIGUSR2` a no-op handler and sets `PR_SET_DUMPABLE` to 0,
+confirmed with `PR_GET_DUMPABLE`: the protections the reward supervisor already applied. If
+either cannot be established it runs nothing and reports `unprotected`. The host sends a
+random nonce and accepts exactly one ASCII line with that nonce, the expected fields and
+types, and both protections reported as held. Any other output is `infrastructure_error`
+with a diagnostic `detail`, and host-side exceptions of any type are too: unresolved, never a
+candidate failure. A failure before the first candidate process starts is `spawn_failed`
+(a host failure); after that it is the candidate's. The candidate file is created once, before any candidate runs (`O_EXCL | O_NOFOLLOW`), and never reopened, so a symlink or FIFO a candidate plants in `/tmp` cannot redirect a later supervisor write; every other process is killed after each case. The execution-policy identity moves to
+version 2 and records the protections, so a results file started under the unprotected
+supervisor cannot be resumed.
+
+**Residual (availability).** A same-uid candidate can lower PID 1's scheduling priority. A gated control (nice 19 with CPU-bound processes) records whether that still ends as the candidate's `timeout` or becomes a host stall; see the run record.
+
+**Residual.** Function mode still runs the tests and the completion marker in the
+candidate's process, so a candidate can forge its verdict (marker forgery, a trace hook that
+skips the tests, shadowed helpers, always-equal objects). This is an unresolved
+scorer-integrity limitation of every function-mode score in use: development scores,
+checkpoint and model selection, and run reports. Weak tests, such as a check that a result
+`is None`, are a separate exposure: they admit wrong but ordinary solutions, which is not a
+demonstrated forged pass.
