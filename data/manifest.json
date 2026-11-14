@@ -1,5 +1,5 @@
 {
   "schema_version": 1,
   "sources": [],
-  "note": "No external dataset has been approved or downloaded. Add pinned, license-verified entries before ingestion."
+  "note": "Full-build source list, empty by design: no source is approved for a full (M or L) build yet. Sources downloaded for the S rehearsal, the task pool, SFT and evaluation record their own pinned provenance; see docs/data-card.md. Add pinned, license-verified entries here before any full-build ingestion."
 }

@@ -25,7 +25,7 @@ The isolated HumanEval harness was also checked with a **third-party reference m
 - **Generation and post-training code:** cached autoregressive sampling, SFT and an on-policy group-advantage RL loop, plus development checks and bounded stopping rules.
 - **Evaluation:** isolated Python execution, task admission and canonical-solution preflight, code and multiple-choice metrics, and explicit context-limit accounting.
 
-Implementation, synthetic smoke runs and measured model capability are tracked separately in the [public status](docs/status.md). SFT/RL rehearsal results, full-suite acceptance, released weights and a hosted coding service are not claimed.
+Implementation, synthetic smoke runs and measured model capability are tracked separately in the [public status](docs/status.md). SFT has run at rehearsal scale and has diagnostic evaluation results only; RL has not run. Coding capability, full-suite acceptance, released weights and a hosted coding service are not claimed.
 
 ## Run locally
 
