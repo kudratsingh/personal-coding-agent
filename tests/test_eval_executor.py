@@ -19,13 +19,15 @@ from eval_fixtures import (
 )
 
 from scratchcoder.cli import main
-from scratchcoder.eval import executor, harness
+from scratchcoder.eval import execution_policy, executor, harness, parallel
 from scratchcoder.eval.completions import Sampling, read_completions
 from scratchcoder.eval.executor import execute_completions, read_results, run_test_baseline
 from scratchcoder.eval.parallel import HostUnavailableError
+from scratchcoder.eval.scorecard import run_from_results
 from scratchcoder.eval.seal import SealError, SealLedger, UnsealRecord, seal_completions
 from scratchcoder.eval.tasks import Task, load_tasks
-from scratchcoder.sandbox.runner import Result
+from scratchcoder.sandbox import budget, runner
+from scratchcoder.sandbox.runner import Limits, Result
 from scratchcoder.tokenizer.bpe import ByteBPE
 
 GOOD = "def add_one(x):\n    return x + 1  # good"
@@ -33,16 +35,26 @@ BAD = "def add_one(x):\n    return x"
 
 
 class FakeSandbox:
-    """Passes programs marked ``# good``; can stall or fail the host for chosen programs."""
+    """Passes programs marked ``# good``; can stall or fail the host for chosen programs, or
+    raise ``KeyboardInterrupt`` on the call after ``interrupt_after`` calls."""
 
-    def __init__(self, *, stall: int = 0, down: Callable[[str], bool] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        stall: int = 0,
+        down: Callable[[str], bool] | None = None,
+        interrupt_after: int | None = None,
+    ) -> None:
         self.calls: list[str] = []
         self.stall = stall
         self.down = down or (lambda code: False)
+        self.interrupt_after = interrupt_after
         self.lock = threading.Lock()
 
     def __call__(self, code: str, tests: str, mode: str) -> Result:
         with self.lock:
+            if self.interrupt_after is not None and len(self.calls) >= self.interrupt_after:
+                raise KeyboardInterrupt
             self.calls.append(code)
             if self.down(code):
                 return Result("unavailable")
@@ -138,15 +150,9 @@ def test_an_interrupted_run_resumes_from_the_last_complete_line(tmp_path: Path) 
     completions = tmp_path / "completions.jsonl"
     write_fixture_completions(completions, tasks_path, tasks, lambda *_: GOOD)
     results = tmp_path / "results.jsonl"
-    seen = 0
-
-    def interrupted(code: str, tests: str, mode: str) -> Result:
-        nonlocal seen
-        seen += 1
-        if seen > 5:
-            raise KeyboardInterrupt
-        return Result("passed")
-
+    # The resumed run must use the same execute as the interrupted one: here both are a
+    # FakeSandbox, so the execution policy matches.
+    interrupted = FakeSandbox(interrupt_after=5)
     with pytest.raises(KeyboardInterrupt):
         execute_completions(
             completions, tasks_path, results, tokenizer=TOKENIZER, execute=interrupted, workers=1
@@ -807,11 +813,17 @@ def test_the_test_split_needs_the_tokenizer_before_a_read_is_spent(tmp_path: Pat
     assert not (tmp_path / "r.jsonl").exists()
 
 
-def test_a_resumed_run_refuses_another_execution_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    completions, tasks_path, _ = dev_fixture(tmp_path)
-    results = tmp_path / "results.jsonl"
+def constant_hostile(code: str, tests: str, mode: str) -> Result:
+    """Passes candidates marked ``# good``; the sandbox is down for constant-answer programs."""
+    if "# good" in code:
+        return Result("passed")
+    return Result("unavailable")
+
+
+def half_done(root: Path) -> tuple[Path, Path, Path]:
+    """A results file with two scored attempts and one unresolved (the host was down for it)."""
+    completions, tasks_path, _ = dev_fixture(root)
+    results = root / "results.jsonl"
     execute_completions(
         completions,
         tasks_path,
@@ -820,20 +832,121 @@ def test_a_resumed_run_refuses_another_execution_environment(
         execute=FakeSandbox(down=lambda code: code == BAD),
         sleep=no_sleep,
     )
+    return completions, tasks_path, results
+
+
+def edit_sources(monkeypatch: pytest.MonkeyPatch, edits: dict[str, list[tuple[str, str]]]) -> None:
+    """Make the policy see edited source for some modules, as if the files had been changed."""
+    original = execution_policy.module_source
+
+    def source(name: str) -> str:
+        text = original(name)
+        for old, new in edits.get(name, []):
+            assert text.count(old) == 1, (name, old)
+            text = text.replace(old, new)
+        return text
+
+    monkeypatch.setattr(execution_policy, "module_source", source)
+
+
+HARNESS, PARALLEL = "scratchcoder.eval.harness", "scratchcoder.eval.parallel"
+RUNNER, PROGRAM = "scratchcoder.sandbox.runner", "scratchcoder.sandbox.program"
+BUDGET, REWARD = "scratchcoder.sandbox.budget", "scratchcoder.sandbox.reward"
+
+Change = Callable[[pytest.MonkeyPatch], dict[str, Any]]
+
+
+def patched(target: object, name: str, value: object) -> Change:
+    """Replace ``target.name`` in memory; no extra options for the run."""
+
+    def apply(mp: pytest.MonkeyPatch) -> dict[str, Any]:
+        mp.setattr(target, name, value)
+        return {}
+
+    return apply
+
+
+def source_edit(module: str, old: str, new: str) -> Change:
+    """Make the policy see ``module``'s file with ``old`` replaced by ``new``."""
+
+    def apply(mp: pytest.MonkeyPatch) -> dict[str, Any]:
+        edit_sources(mp, {module: [(old, new)]})
+        return {}
+
+    return apply
+
+
+POLICY_CHANGES: dict[str, tuple[Change, str]] = {
+    "function timeout": (
+        patched(harness, "execution_limits", lambda tests, mode: Limits(timeout_seconds=60.0)),
+        r"\(deadline_rule; limits differ",
+    ),
+    "I/O budget": (patched(harness, "io_seconds", lambda cases: 30.0), r"\(limits differ"),
+    "I/O deadline constant": (
+        patched(budget, "IO_SECONDS_PER_CASE", 0.5),
+        r"\(deadline_rule differ",
+    ),
+    "scored statuses": (
+        patched(harness, "SCORED_STATUSES", frozenset({"passed", "failed"})),
+        r"\(scored_statuses differ",
+    ),
+    "input limit": (patched(parallel, "INPUT_LIMIT", 10), r"\(input_limit differ"),
+    "image": (patched(runner, "IMAGE", "python@sha256:" + "0" * 64), r"\(image differ"),
+    "host retries": (lambda mp: {"retries": 1}, r"host_backoff_seconds; host_retries differ"),
+    "execute": (lambda mp: {"execute": constant_hostile}, r"\(execute differ"),
+    "host-status rule code": (
+        source_edit(
+            HARNESS,
+            "return result.host_stalled or result.status not in SCORED_STATUSES",
+            "return result.status not in SCORED_STATUSES",
+        ),
+        r"\(code: scratchcoder\.eval\.harness differ",
+    ),
+    "oversized rule code": (
+        source_edit(
+            PARALLEL,
+            "if _size(call.code + call.tests) > input_limit:",
+            "if _size(call.code + call.tests) >= input_limit:",
+        ),
+        r"\(code: scratchcoder\.eval\.parallel differ",
+    ),
+    "supervisor code": (
+        source_edit(
+            PROGRAM,
+            "if not last_output.rstrip().endswith(marker):",
+            "if marker not in last_output:",
+        ),
+        r"\(code: scratchcoder\.sandbox\.program differ",
+    ),
+    "runner code": (
+        source_edit(RUNNER, "HOST_WATCHDOG_SECONDS = 10.0", "HOST_WATCHDOG_SECONDS = 20.0"),
+        r"\(code: scratchcoder\.sandbox\.runner differ",
+    ),
+    "budget code": (
+        source_edit(
+            BUDGET,
+            "seconds += seconds_per_case * cases",
+            "seconds += 2 * seconds_per_case * cases",
+        ),
+        r"\(code: scratchcoder\.sandbox\.budget differ",
+    ),
+}
+
+
+@pytest.mark.parametrize("change", sorted(POLICY_CHANGES))
+def test_a_resumed_run_refuses_another_execution_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    completions, tasks_path, results = half_done(tmp_path)
     before = results.read_bytes()
+    apply, message = POLICY_CHANGES[change]
     with monkeypatch.context() as other:
-        other.setattr(executor, "DEADLINE_RULE", "function: 9 s")
-        with pytest.raises(ValueError, match=r"another execution environment \(deadline_rule"):
+        options: dict[str, Any] = {"execute": FakeSandbox(), **apply(other)}
+        with pytest.raises(ValueError, match=message):
             execute_completions(
-                completions, tasks_path, results, tokenizer=TOKENIZER, execute=FakeSandbox()
+                completions, tasks_path, results, tokenizer=TOKENIZER, sleep=no_sleep, **options
             )
-    with monkeypatch.context() as other:
-        other.setattr(executor, "IMAGE", "python@sha256:" + "0" * 64)
-        with pytest.raises(ValueError, match="image differ"):
-            execute_completions(
-                completions, tasks_path, results, tokenizer=TOKENIZER, execute=FakeSandbox()
-            )
-    assert results.read_bytes() == before  # The refused runs appended nothing.
+    assert results.read_bytes() == before  # The refused run appended nothing.
     healthy = FakeSandbox()
     execute_completions(
         completions, tasks_path, results, tokenizer=TOKENIZER, execute=healthy, sleep=no_sleep
@@ -841,11 +954,140 @@ def test_a_resumed_run_refuses_another_execution_environment(
     assert healthy.calls == [BAD] and read_results(results).complete
 
 
-def constant_hostile(code: str, tests: str, mode: str) -> Result:
-    """Passes candidates marked ``# good``; the sandbox is down for constant-answer programs."""
-    if "# good" in code:
-        return Result("passed")
-    return Result("unavailable")
+def test_documentation_and_unlisted_code_changes_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    completions, tasks_path, results = half_done(tmp_path)
+    recorded = read_results(results).header["execution"]["policy_sha256"]
+    edit_sources(
+        monkeypatch,
+        {
+            HARNESS: [
+                ("A result that says nothing about", "A result that tells nothing about"),
+                ("def host_backoff(", "# A new comment.\ndef host_backoff("),
+                # evaluate() is not a listed unit: it never runs in eval-execute.
+                ("nonempty unique tasks", "distinct tasks"),
+            ],
+            PARALLEL: [("Run sandbox calls in parallel", "Run the sandbox calls in parallel")],
+            PROGRAM: [("executed ONLY inside", "run ONLY inside")],
+            BUDGET: [("The largest deadline the runner", "The longest deadline the runner")],
+        },
+    )
+    healthy = FakeSandbox()
+    execute_completions(
+        completions, tasks_path, results, tokenizer=TOKENIZER, execute=healthy, sleep=no_sleep
+    )
+    final = read_results(results)
+    assert healthy.calls == [BAD] and final.complete
+    assert final.header["execution"]["policy_sha256"] == recorded
+    starts = [window for window in final.windows if window["kind"] == "window"]
+    assert [window["execution_policy_sha256"] for window in starts] == [recorded] * 2
+
+
+def test_an_audit_change_resumes_and_is_recorded_per_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    completions, tasks_path, results = half_done(tmp_path)
+    assert len(read_results(results).audit_policies) == 1
+    edit_sources(monkeypatch, {REWARD: [("def audit_attempt(", "def audit_attempt_(")]})
+    execute_completions(
+        completions, tasks_path, results, tokenizer=TOKENIZER, execute=FakeSandbox()
+    )
+    final = read_results(results)
+    assert final.complete and len(final.audit_policies) == 2  # Flag counts mix two audits.
+
+
+def test_a_moved_verdict_definition_is_an_error_not_a_silent_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    completions, tasks_path, _ = dev_fixture(tmp_path)
+    edit_sources(monkeypatch, {HARNESS: [("def is_host_failure(", "def is_host_error(")]})
+    with pytest.raises(ValueError, match="is_host_failure not found"):
+        execute_completions(
+            completions,
+            tasks_path,
+            tmp_path / "r.jsonl",
+            tokenizer=TOKENIZER,
+            execute=FakeSandbox(),
+        )
+    assert not (tmp_path / "r.jsonl").exists()
+
+
+def test_an_interrupted_and_resumed_run_equals_an_uninterrupted_one(tmp_path: Path) -> None:
+    tasks = [pool_task(f"t/{index:02}") for index in range(12)] + [io_task("t/io")]
+    tasks_path = save_task_file(tmp_path / "dev.jsonl", tasks)
+    programs = {task.id: [GOOD, BAD, None][index % 3] for index, task in enumerate(tasks)}
+    completions = tmp_path / "completions.jsonl"
+    write_fixture_completions(completions, tasks_path, tasks, lambda task, _: programs[task.id])
+    whole = tmp_path / "whole.jsonl"
+    execute_completions(
+        completions, tasks_path, whole, tokenizer=TOKENIZER, execute=FakeSandbox(), workers=1
+    )
+    pieces = tmp_path / "pieces.jsonl"
+    for stop in (2, 3):
+        with pytest.raises(KeyboardInterrupt):
+            execute_completions(
+                completions,
+                tasks_path,
+                pieces,
+                tokenizer=TOKENIZER,
+                execute=FakeSandbox(interrupt_after=stop),
+                workers=1,
+            )
+    execute_completions(
+        completions, tasks_path, pieces, tokenizer=TOKENIZER, execute=FakeSandbox(), workers=1
+    )
+    one, resumed = read_results(whole), read_results(pieces)
+    assert one.complete and resumed.complete
+    assert resumed.attempts == one.attempts
+    assert sum(window["kind"] == "window" for window in resumed.windows) == 3
+    assert resumed.header["execution"] == one.header["execution"]
+    assert {window.get("execution_policy_sha256") for window in resumed.windows} == {
+        one.header["execution"]["policy_sha256"],
+        None,  # window_end records carry counts only.
+    }
+
+
+def schema_one(results: Path) -> None:
+    """Rewrite a results header the way schema 1 wrote it (four compared fields)."""
+    lines = results.read_bytes().splitlines(keepends=True)
+    header = json.loads(lines[0])
+    header["schema_version"] = 1
+    header["execution"] = {
+        "execute": "scratchcoder.eval.harness.isolated_execution",
+        "image": runner.IMAGE,
+        "deadline_rule": "function: 2 s; I/O: 2 s + 0.25 s per case, at most 60 s; 128 MiB",
+        "runner_sha256": "1" * 64,
+        "program_sha256": "2" * 64,
+        "host_retries": 3,
+        "host_backoff": "2 s doubling, at most 30 s",
+        "audit": "scratchcoder.sandbox.reward.audit_attempt on passing attempts",
+    }
+    lines[0] = json.dumps(header, sort_keys=True).encode() + b"\n"
+    for number, line in enumerate(lines[1:], 1):
+        record = json.loads(line)
+        if record["kind"] == "window":
+            del record["execution_policy_sha256"], record["audit_policy_sha256"]
+            lines[number] = json.dumps(record, sort_keys=True).encode() + b"\n"
+    results.write_bytes(b"".join(lines))
+
+
+def test_a_schema_one_file_stays_readable_but_is_never_resumed(tmp_path: Path) -> None:
+    completions, tasks_path, results = half_done(tmp_path)
+    schema_one(results)
+    before = results.read_bytes()
+    old = read_results(results)
+    assert old.schema_version == 1 and old.audit_policies == set()
+    assert len(old.attempts) == 2 and set(old.unresolved) == {("t/2", 0)}
+    run = run_from_results(results)  # The scorecard still reads it.
+    assert run.outcomes["t/1"] == [True] and run.unresolved == {"t/2": 1}
+    sandbox = FakeSandbox()
+    with pytest.raises(ValueError, match="schema 1, which recorded no execution-policy"):
+        execute_completions(completions, tasks_path, results, tokenizer=TOKENIZER, execute=sandbox)
+    assert results.read_bytes() == before and sandbox.calls == []
+    fresh = tmp_path / "fresh.jsonl"
+    execute_completions(completions, tasks_path, fresh, tokenizer=TOKENIZER, execute=sandbox)
+    assert read_results(fresh).schema_version == 2 and read_results(fresh).complete
 
 
 def test_an_unlogged_test_baseline_is_retried_after_every_read_finished(tmp_path: Path) -> None:
