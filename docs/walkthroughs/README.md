@@ -51,3 +51,5 @@ Implemented: [the SFT format gate](sft-format-gate.md).
 Implemented: [special-token rows: a fresh draw and their own learning rate](special-token-rows.md).
 
 Implemented: [evaluator conformance catalogue](evaluator-conformance.md).
+
+Implemented: [static verifier scan](verifier-scan.md).

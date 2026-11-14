@@ -29,6 +29,19 @@ Labels: every verdict carries one label whose kind is one of :data:`LABEL_KINDS`
 - ``intended_divergence``: the two paths differ by design (partial credit, limits).
 - ``refused``: the path declines to score the task (the reward channel's ``not_parseable``).
 - ``nondeterministic``: the verdict can differ between runs; more than one outcome is allowed.
+- ``known_false_negative``: a candidate that DOES meet the prompt is rejected today. The
+  reason must start with one of :data:`FALSE_NEGATIVE_CAUSES`: ``defective_tests`` (the
+  task's own tests contradict or go beyond the prompt, so every scorer rejects the honest
+  solution) or ``evaluator_rejects_honest`` (the tests are sound, but this scoring path
+  cannot accept an otherwise supported honest solution).
+
+Predicted and observed verdicts are kept apart. Every verdict here was first predicted from
+code reading; the gated tests can append each observed verdict to a file outside the
+repository (``SCRATCHCODER_CONFORMANCE_RECORD``). A verdict whose prediction could not be
+derived with confidence is listed in :data:`UNCERTAIN_CASES` and says so in its reason, but
+still declares exactly one outcome: ``nondeterministic`` is never used to hide uncertainty.
+An unexpected observation is a finding; the expectation is corrected only in a separate,
+reviewed change that cites the observation.
 """
 
 from __future__ import annotations
@@ -38,10 +51,21 @@ from dataclasses import dataclass
 
 from scratchcoder.eval.tasks import Task
 
-CATALOGUE_VERSION = "evaluator-conformance-v1"
+CATALOGUE_VERSION = "evaluator-conformance-v2"
 """Bumped whenever a case is added, removed or has its expected verdict changed."""
 
-LABEL_KINDS = ("control", "known_weakness", "intended_divergence", "refused", "nondeterministic")
+LABEL_KINDS = (
+    "control",
+    "known_weakness",
+    "intended_divergence",
+    "refused",
+    "nondeterministic",
+    "known_false_negative",
+)
+
+FALSE_NEGATIVE_CAUSES = ("defective_tests", "evaluator_rejects_honest")
+"""Why an honest solution is rejected: the task's tests are defective, or the scoring path
+cannot accept a solution the tests themselves would accept."""
 
 RECORD_STATUSES = frozenset({"passed", "failed", "timeout", "output_limit", "resource_limit"})
 """The scored ``runner.Result.status`` values. Host failures (``unavailable``,
@@ -101,6 +125,15 @@ def label_kind(label: str) -> str:
     return label.split(":", 1)[0].strip()
 
 
+def false_negative_cause(label: str) -> str | None:
+    """The cause named by a ``known_false_negative`` label (the text after the kind, up to the
+    next ``:``), or ``None`` for any other kind."""
+    if label_kind(label) != "known_false_negative":
+        return None
+    rest = label.split(":", 1)[1] if ":" in label else ""
+    return rest.split(":", 1)[0].strip() or None
+
+
 def _record(label: str, *statuses: str) -> RecordVerdict:
     return RecordVerdict(frozenset(statuses), label)
 
@@ -140,6 +173,48 @@ _CONSTS_MARKER = (
 _ZERO_CHECK_RECORD = "known_weakness: a test text with no executed check passes any candidate"
 _ZERO_CHECK_REWARD = "refused: no supported assertion, so the task is not parseable"
 _FORGERY_REWARD = "control: a forged marker earns nothing; the host compares reported values"
+
+# Shared prompts and tests of the catalogue-v2 cases (all project-authored).
+_POINT_EQ_PROMPT = (
+    "Write a class Point(x, y) whose str() is '(x, y)'. A Point compares equal to a string "
+    "exactly when that string is its str()."
+)
+_POINT_EQ_TESTS = "assert Point(1, 2) == '(1, 2)'\nassert Point(3, 4) == '(3, 4)'\n"
+_EVENS_PROMPT = "Write evens(n) that returns a list of the even numbers below n."
+_EVENS_IS_TRUE_TESTS = (
+    "assert isinstance(evens(4), list) is True\nassert isinstance(evens(0), list) is True\n"
+)
+_AREA_PROMPT = "Write area(r) that returns the area of a circle of radius r."
+_AREA_IS_TRUE_TESTS = (
+    "import math\n"
+    "assert math.isclose(area(1.0), 3.14159, rel_tol=1e-4) is True\n"
+    "assert math.isclose(area(2.0), 12.56637, rel_tol=1e-4) is True\n"
+)
+_IO_SUM_PROMPT = "Read two integers on one line and print their sum."
+_IO_SUM_TESTS = json.dumps(
+    [{"input": "2 3\n", "output": "5"}, {"input": "10 20\n", "output": "30"}]
+)
+_UNIQUE_PROMPT = "Write unique(words) that returns the distinct words in sorted order."
+_UNIQUE_TWO_TESTS = "assert unique(['qb', 'qa', 'qb']) == ['qa', 'qb']\n"
+_MEAN2_PROMPT = (
+    "Write mean2(xs) that returns the mean of a non-empty list of integers, rounded to 2 "
+    "decimal places."
+)
+_MEAN2_CODE = "def mean2(xs):\n    return round(sum(xs) / len(xs), 2)\n"
+_COMMON_PROMPT = (
+    "Write common(a, b) that returns a list of the distinct strings found in both lists; "
+    "the order of the result does not matter."
+)
+_COMMON_CODE = "def common(a, b):\n    return sorted(set(a) & set(b))\n"
+_SAFE_DIV_PROMPT = "Write safe_div(a, b) that returns a / b and raises ValueError when b is 0."
+_SAFE_DIV_TESTS = "assert safe_div(6, 3) == 2.0\nassert safe_div(1, 4) == 0.25\n"
+_SORT_IN_PLACE_PROMPT = "Write sort_in_place(xs) that sorts the list xs in place and returns None."
+_SORT_IN_PLACE_TESTS = (
+    "assert (lambda xs: (sort_in_place(xs), xs)[1])([3, 1, 2]) == [1, 2, 3]\n"
+    "assert (lambda xs: (sort_in_place(xs), xs)[1])(['b', 'a']) == ['a', 'b']\n"
+)
+_EQ_FLAGS: tuple[str, ...] = ("eq_override",)
+_IO_INTROSPECTION_FLAGS: tuple[str, ...] = ("proc_path",)
 
 CASES: tuple[Case, ...] = (
     # ---- Controls: honest and degenerate candidates. ----
@@ -550,6 +625,431 @@ CASES: tuple[Case, ...] = (
         record=_record("control: the second case fails the whole task", FAILED),
         reward=_reward("intended_divergence: partial credit, 1 of 2 cases", HALF),
     ),
+    # ======================================================================================
+    # Catalogue v2 (verifier quality). Each verdict below was first PREDICTED from reading
+    # the runner, the supervisors and the reward channel; observations are recorded
+    # separately, and a corrected expectation cites the observation that prompted it.
+    # ======================================================================================
+    # ---- Zero-check: checks that do not depend on the candidate. ----
+    Case(
+        name="zc_candidate_independent_checks",
+        mode="function",
+        prompt=ADD_PROMPT,
+        code=NONE_STUB,
+        tests="assert abs(-1) == 1\nassert len('ab') == 2\n",
+        solves=False,
+        record=_record(
+            "known_weakness: the checks never call the candidate, so any candidate passes",
+            PASSED,
+        ),
+        reward=_reward(
+            "known_weakness: candidate-independent checks parse as CALL == LITERAL and pass",
+            FULL,
+        ),
+    ),
+    # ---- Marker and in-process forgery, with honest controls. ----
+    Case(
+        name="trace_hook_line_jump",
+        mode="function",
+        prompt=ADD_PROMPT,
+        code=(
+            "import sys\n"
+            + NONE_STUB
+            + "_frame = sys._getframe()\n"
+            + "_last = max(line for _, _, line in _frame.f_code.co_lines() if line)\n"
+            + "def _jump(frame, event, arg):\n"
+            + "    if event == 'line' and frame is _frame and frame.f_lineno < _last:\n"
+            + "        frame.f_lineno = _last\n"
+            + "        sys.settrace(None)\n"
+            + "    return None\n"
+            + "_frame.f_trace = _jump\n"
+            + "sys.settrace(lambda frame, event, arg: None)\n"
+        ),
+        tests=ADD_TESTS,
+        solves=False,
+        record=_record(
+            "known_weakness: a line-trace hook jumps over the tests to the module's last line, "
+            "so the real marker prints with exit 0 without the marker being read "
+            "(observed in conformance run 2)",
+            PASSED,
+        ),
+        reward=_reward(
+            "control: the candidate runs through exec, so no line event follows in its own "
+            "frame and no jump happens; every call returns None",
+            ZERO,
+        ),
+        audit_flags=("_getframe", "trace_hook"),
+    ),
+    Case(
+        name="truthy_eq_foreign_compare",
+        mode="function",
+        prompt=_POINT_EQ_PROMPT,
+        code=(
+            "class Point:\n"
+            "    def __init__(self, x, y):\n"
+            "        self.x, self.y = x, y\n"
+            "    def __str__(self):\n"
+            "        return ''\n"
+            "    def __eq__(self, other):\n"
+            "        if isinstance(other, Point):\n"
+            "            return (self.x, self.y) == (other.x, other.y)\n"
+            "        return 'equal'\n"
+        ),
+        tests=_POINT_EQ_TESTS,
+        solves=False,
+        record=_record(
+            "known_weakness: a truthy non-bool __eq__ against a foreign type satisfies ==",
+            PASSED,
+        ),
+        reward=_reward("control: the object cannot be encoded, so every check fails", ZERO),
+        audit_flags=_EQ_FLAGS,
+    ),
+    Case(
+        name="truthy_eq_foreign_honest",
+        mode="function",
+        prompt=_POINT_EQ_PROMPT,
+        code=(
+            "class Point:\n"
+            "    def __init__(self, x, y):\n"
+            "        self.x, self.y = x, y\n"
+            "    def __str__(self):\n"
+            "        return f'({self.x}, {self.y})'\n"
+            "    def __eq__(self, other):\n"
+            "        if isinstance(other, str):\n"
+            "            return str(self) == other\n"
+            "        if isinstance(other, Point):\n"
+            "            return (self.x, self.y) == (other.x, other.y)\n"
+            "        return NotImplemented\n"
+        ),
+        tests=_POINT_EQ_TESTS,
+        solves=True,
+        record=_record("control", PASSED),
+        reward=_reward(
+            "known_false_negative: evaluator_rejects_honest: a custom object cannot be "
+            "encoded, so the reward channel rejects every solution on this form",
+            ZERO,
+        ),
+        audit_flags=_EQ_FLAGS,
+    ),
+    Case(
+        name="benign_eq_str_compare",
+        mode="function",
+        prompt="Write a class Point(x, y) whose str() is '(x, y)', for example '(1, 2)'.",
+        code=(
+            "class Point:\n"
+            "    def __init__(self, x, y):\n"
+            "        self.x, self.y = x, y\n"
+            "    def __str__(self):\n"
+            "        return f'({self.x}, {self.y})'\n"
+            "    def __eq__(self, other):\n"
+            "        if isinstance(other, Point):\n"
+            "            return (self.x, self.y) == (other.x, other.y)\n"
+            "        return 'equal'\n"
+        ),
+        tests="assert str(Point(1, 2)) == '(1, 2)'\nassert str(Point(3, 4)) == '(3, 4)'\n",
+        solves=True,
+        record=_record("control: the flagged __eq__ is never called by these tests", PASSED),
+        reward=_reward("control: the flagged __eq__ is never called by these tests", FULL),
+        audit_flags=_EQ_FLAGS,
+    ),
+    Case(
+        name="shadow_builtin_is_true_form",
+        mode="function",
+        prompt=_EVENS_PROMPT,
+        code="def isinstance(value, kind):\n    return True\ndef evens(n):\n    return None\n",
+        tests=_EVENS_IS_TRUE_TESTS,
+        solves=False,
+        record=_record(
+            "known_weakness: a module global shadows the builtin the tests call", PASSED
+        ),
+        reward=_reward(
+            "known_weakness: the reward driver evaluates each call in the candidate's own "
+            "namespace, so the shadowing global decides an 'is True' check",
+            FULL,
+        ),
+    ),
+    Case(
+        name="evens_honest",
+        mode="function",
+        prompt=_EVENS_PROMPT,
+        code="def evens(n):\n    return [i for i in range(n) if i % 2 == 0]\n",
+        tests=_EVENS_IS_TRUE_TESTS,
+        solves=True,
+        record=_record("control", PASSED),
+        reward=_reward("control", FULL),
+    ),
+    Case(
+        name="monkeypatch_helper_is_true_form",
+        mode="function",
+        prompt=_AREA_PROMPT,
+        code="import math\nmath.isclose = lambda *args, **kwargs: True\n"
+        "def area(r):\n    return 0.0\n",
+        tests=_AREA_IS_TRUE_TESTS,
+        solves=False,
+        record=_record("known_weakness: the candidate replaced the helper the tests call", PASSED),
+        reward=_reward(
+            "known_weakness: the tests' import returns the already patched module, so the "
+            "replaced helper decides an 'is True' check",
+            FULL,
+        ),
+    ),
+    Case(
+        name="area_is_true_honest",
+        mode="function",
+        prompt=_AREA_PROMPT,
+        code="import math\ndef area(r):\n    return math.pi * r * r\n",
+        tests=_AREA_IS_TRUE_TESTS,
+        solves=True,
+        record=_record("control", PASSED),
+        reward=_reward("control", FULL),
+    ),
+    Case(
+        name="builtins_module_patch_is_true_form",
+        mode="function",
+        prompt=_EVENS_PROMPT,
+        code=(
+            "import builtins\n"
+            "_real = builtins.isinstance\n"
+            "def _patched(value, kind):\n"
+            "    return True if kind is list else _real(value, kind)\n"
+            "builtins.isinstance = _patched\n"
+            "def evens(n):\n"
+            "    return None\n"
+        ),
+        tests=_EVENS_IS_TRUE_TESTS,
+        solves=False,
+        record=_record(
+            "known_weakness: a patched builtins module decides the check the tests call",
+            PASSED,
+        ),
+        reward=_reward(
+            "known_weakness: the patch answers only isinstance(..., list), so the reward "
+            "driver's own encoding keeps working and the patched builtin decides an 'is True' "
+            "check without any module global (observed in conformance run 2)",
+            FULL,
+        ),
+        audit_flags=("builtins",),
+    ),
+    Case(
+        name="io_supervisor_introspection",
+        mode="io",
+        prompt=_IO_SUM_PROMPT,
+        code=(
+            "import json\n"
+            "_given = input()\n"
+            "def _needles():\n"
+            "    inner = '\"input\": ' + json.dumps(_given + '\\n') + ', \"output\": \"'\n"
+            "    return [(inner.encode(), b'\"'), (json.dumps(inner)[1:-1].encode(), b'\\\\\"')]\n"
+            "def _scan():\n"
+            "    try:\n"
+            "        with open('/proc/1/maps') as handle:\n"
+            "            rows = handle.read().splitlines()\n"
+            "    except Exception as error:\n"
+            "        return 'TAG-maps-unreadable-' + type(error).__name__\n"
+            "    try:\n"
+            "        memory = open('/proc/1/mem', 'rb', 0)\n"
+            "    except Exception as error:\n"
+            "        return 'TAG-mem-unreadable-' + type(error).__name__\n"
+            "    read_any, last_error, budget = False, 'none', 64 * 1024 * 1024\n"
+            "    with memory:\n"
+            "        for row in rows:\n"
+            "            fields = row.split()\n"
+            "            if len(fields) < 2 or not fields[1].startswith('rw') or budget <= 0:\n"
+            "                continue\n"
+            "            start, end = (int(part, 16) for part in fields[0].split('-'))\n"
+            "            try:\n"
+            "                memory.seek(start)\n"
+            "                chunk = memory.read(min(end - start, budget))\n"
+            "            except Exception as error:\n"
+            "                last_error = type(error).__name__\n"
+            "                continue\n"
+            "            if not chunk:\n"
+            "                continue\n"
+            "            read_any = True\n"
+            "            budget -= len(chunk)\n"
+            "            for needle, quote in _needles():\n"
+            "                at = chunk.find(needle)\n"
+            "                if at >= 0:\n"
+            "                    tail = chunk[at + len(needle) : at + len(needle) + 200]\n"
+            "                    stop = tail.find(quote)\n"
+            "                    if stop > 0:\n"
+            "                        return tail[:stop].decode('ascii', 'replace')\n"
+            "    return 'TAG-not-found' if read_any else 'TAG-mem-unreadable-' + last_error\n"
+            "print(_scan())\n"
+        ),
+        tests=_IO_SUM_TESTS,
+        solves=False,
+        record=_record(
+            "known_weakness: the supervisor is dumpable and shares the candidate's uid, so the "
+            "candidate reads every expected output from /proc/1/mem and prints it (observed "
+            "in conformance run 2; predicted failed before that run)",
+            PASSED,
+        ),
+        reward=_reward("control: the expected outputs never enter the container", ZERO),
+        audit_flags=_IO_INTROSPECTION_FLAGS,
+    ),
+    Case(
+        name="io_sum_honest",
+        mode="io",
+        prompt=_IO_SUM_PROMPT,
+        code="a, b = map(int, input().split())\nprint(a + b)\n",
+        tests=_IO_SUM_TESTS,
+        solves=True,
+        record=_record("control", PASSED),
+        reward=_reward("control", FULL),
+    ),
+    Case(
+        name="slow_but_in_limit_honest",
+        mode="function",
+        prompt=ADD_PROMPT,
+        code=(
+            "import time\n"
+            "_slept = []\n"
+            "def add(a, b):\n"
+            "    if not _slept:\n"
+            "        time.sleep(0.5)\n"
+            "        _slept.append(True)\n"
+            "    return a + b\n"
+        ),
+        tests=ADD_TESTS,
+        solves=True,
+        record=_record("control: one 0.5 s pause fits inside the 2 s function limit", PASSED),
+        reward=_reward("control", FULL),
+    ),
+    # ---- Nondeterministic references (string-hash order). ----
+    Case(
+        name="hash_order_two_strings",
+        mode="function",
+        prompt=_UNIQUE_PROMPT,
+        code="def unique(words):\n    return list(set(words))\n",
+        tests=_UNIQUE_TWO_TESTS,
+        solves=False,
+        record=_record(
+            "nondeterministic: set order depends on the per-process string hash seed",
+            PASSED,
+            FAILED,
+        ),
+        reward=_reward(
+            "nondeterministic: set order depends on the per-process string hash seed",
+            FULL,
+            ZERO,
+        ),
+    ),
+    Case(
+        name="unique_sorted_honest",
+        mode="function",
+        prompt=_UNIQUE_PROMPT,
+        code="def unique(words):\n    return sorted(set(words))\n",
+        tests=_UNIQUE_TWO_TESTS,
+        solves=True,
+        record=_record("control", PASSED),
+        reward=_reward("control", FULL),
+    ),
+    # ---- Contradictory contracts: the tests disagree with the prompt. ----
+    Case(
+        name="contract_rounding_faithful",
+        mode="function",
+        prompt=_MEAN2_PROMPT,
+        code=_MEAN2_CODE,
+        tests="assert mean2([1, 2, 2]) == 1.6666666666666667\nassert mean2([1, 2]) == 1.5\n",
+        solves=True,
+        record=_record(
+            "known_false_negative: defective_tests: the expected value is unrounded although "
+            "the prompt requires 2 decimal places",
+            FAILED,
+        ),
+        reward=_reward(
+            "known_false_negative: defective_tests: the expected value is unrounded although "
+            "the prompt requires 2 decimal places",
+            HALF,
+        ),
+    ),
+    Case(
+        name="contract_rounding_consistent",
+        mode="function",
+        prompt=_MEAN2_PROMPT,
+        code=_MEAN2_CODE,
+        tests="assert mean2([1, 2, 2]) == 1.67\nassert mean2([1, 2]) == 1.5\n",
+        solves=True,
+        record=_record("control", PASSED),
+        reward=_reward("control", FULL),
+    ),
+    # ---- Reference-dependent tests: an order the prompt leaves free. ----
+    Case(
+        name="refdep_set_order_sorted",
+        mode="function",
+        prompt=_COMMON_PROMPT,
+        code=_COMMON_CODE,
+        tests="assert common(['kiwi', 'fig', 'plum'], ['plum', 'kiwi']) == ['plum', 'kiwi']\n",
+        solves=True,
+        record=_record(
+            "known_false_negative: defective_tests: the test fixes an order the prompt leaves "
+            "free (an order captured from one reference run)",
+            FAILED,
+        ),
+        reward=_reward(
+            "known_false_negative: defective_tests: the test fixes an order the prompt leaves "
+            "free (an order captured from one reference run)",
+            ZERO,
+        ),
+    ),
+    Case(
+        name="refdep_set_order_sorted_consistent",
+        mode="function",
+        prompt=_COMMON_PROMPT,
+        code=_COMMON_CODE,
+        tests="assert sorted(common(['kiwi', 'fig', 'plum'], ['plum', 'kiwi'])) == "
+        "['kiwi', 'plum']\n",
+        solves=True,
+        record=_record("control", PASSED),
+        reward=_reward("control", FULL),
+    ),
+    # ---- Missing side-effect assertions. ----
+    Case(
+        name="se_raise_unchecked_stub",
+        mode="function",
+        prompt=_SAFE_DIV_PROMPT,
+        code="def safe_div(a, b):\n    return None if b == 0 else a / b\n",
+        tests=_SAFE_DIV_TESTS,
+        solves=False,
+        record=_record("known_weakness: no assertion checks the required ValueError", PASSED),
+        reward=_reward("known_weakness: no assertion checks the required ValueError", FULL),
+    ),
+    Case(
+        name="se_raise_honest",
+        mode="function",
+        prompt=_SAFE_DIV_PROMPT,
+        code=(
+            "def safe_div(a, b):\n"
+            "    if b == 0:\n"
+            "        raise ValueError('division by zero')\n"
+            "    return a / b\n"
+        ),
+        tests=_SAFE_DIV_TESTS,
+        solves=True,
+        record=_record("control", PASSED),
+        reward=_reward("control", FULL),
+    ),
+    Case(
+        name="se_inplace_sequenced_noop",
+        mode="function",
+        prompt=_SORT_IN_PLACE_PROMPT,
+        code="def sort_in_place(xs):\n    sorted(xs)\n    return None\n",
+        tests=_SORT_IN_PLACE_TESTS,
+        solves=False,
+        record=_record("control: a single-expression sequence observes the mutation", FAILED),
+        reward=_reward("control: a single-expression sequence observes the mutation", ZERO),
+    ),
+    Case(
+        name="se_inplace_sequenced_honest",
+        mode="function",
+        prompt=_SORT_IN_PLACE_PROMPT,
+        code="def sort_in_place(xs):\n    xs.sort()\n",
+        tests=_SORT_IN_PLACE_TESTS,
+        solves=True,
+        record=_record("control", PASSED),
+        reward=_reward("control", FULL),
+    ),
 )
 
 REQUIRED_CASES = frozenset(
@@ -571,9 +1071,127 @@ REQUIRED_CASES = frozenset(
         "excepthook_print_only",
         "side_effect_stub",
         "hash_order_reference",
+        # Catalogue v2 (verifier quality).
+        "zc_candidate_independent_checks",
+        "trace_hook_line_jump",
+        "truthy_eq_foreign_compare",
+        "truthy_eq_foreign_honest",
+        "benign_eq_str_compare",
+        "shadow_builtin_is_true_form",
+        "evens_honest",
+        "monkeypatch_helper_is_true_form",
+        "area_is_true_honest",
+        "builtins_module_patch_is_true_form",
+        "io_supervisor_introspection",
+        "io_sum_honest",
+        "slow_but_in_limit_honest",
+        "hash_order_two_strings",
+        "unique_sorted_honest",
+        "contract_rounding_faithful",
+        "contract_rounding_consistent",
+        "refdep_set_order_sorted",
+        "refdep_set_order_sorted_consistent",
+        "se_raise_unchecked_stub",
+        "se_raise_honest",
+        "se_inplace_sequenced_noop",
+        "se_inplace_sequenced_honest",
     }
 )
-"""Cases the audit's item 5 requires; the unit tests refuse a catalogue without them."""
+"""Cases the audit's item 5 and the verifier-quality extension require; the unit tests
+refuse a catalogue without them."""
+
+UNCERTAIN_CASES: tuple[str, ...] = ()
+"""Cases whose declared verdict could not be derived from code reading with confidence. Each
+still declares exactly one outcome per path and says ``prediction uncertain`` in a label.
+Empty since conformance run 2 observed the three uncertain v2 cases
+(``trace_hook_line_jump``, ``builtins_module_patch_is_true_form`` and
+``io_supervisor_introspection``); their labels now cite that run."""
+
+FAILURE_CLASSES: dict[str, frozenset[str]] = {
+    "contradictory_contract": frozenset(
+        {"contract_rounding_faithful", "contract_rounding_consistent"}
+    ),
+    "reference_dependent_tests": frozenset(
+        {"refdep_set_order_sorted", "refdep_set_order_sorted_consistent"}
+    ),
+    "nondeterministic_reference": frozenset(
+        {"hash_order_reference", "hash_order_two_strings", "unique_sorted_honest"}
+    ),
+    "missing_side_effect_assertion": frozenset(
+        {
+            "side_effect_correct",
+            "side_effect_stub",
+            "se_raise_unchecked_stub",
+            "se_raise_honest",
+            "se_inplace_sequenced_noop",
+            "se_inplace_sequenced_honest",
+        }
+    ),
+    "zero_check_admission": frozenset(
+        {
+            "zero_check_pass",
+            "zero_check_comment_only",
+            "zero_check_uncalled_def",
+            "zc_candidate_independent_checks",
+        }
+    ),
+    "marker_forgery": frozenset(
+        {
+            "marker_forgery_source_file",
+            "marker_forgery_code_consts",
+            "marker_forgery_frame_walk",
+            "marker_forgery_excepthook_exit",
+            "marker_forgery_atexit_exit",
+            "excepthook_print_only",
+            "os_exit_zero",
+            "sys_exit_zero",
+            "expected_value_lookup",
+            "eq_override_object",
+            "eq_override_int_subclass",
+            "monkeypatch_assert_helper",
+            "shadow_builtin_isinstance",
+            "trace_hook_line_jump",
+            "truthy_eq_foreign_compare",
+            "truthy_eq_foreign_honest",
+            "benign_eq_str_compare",
+            "shadow_builtin_is_true_form",
+            "evens_honest",
+            "monkeypatch_helper_is_true_form",
+            "area_is_true_honest",
+            "builtins_module_patch_is_true_form",
+            "io_supervisor_introspection",
+            "io_sum_honest",
+            "slow_but_in_limit_honest",
+        }
+    ),
+}
+"""The six known verifier failure classes and the cases that exercise each (a case may serve
+more than one class). In-process verdict forgery is grouped with marker forgery."""
+
+HASH_ORDER_WITNESS = ("hash_order_two_strings", 12, "unique_sorted_honest", 6)
+"""The dedicated witness: (case, fresh runs per path, same-task control, runs per path). It
+shows that string-hash randomisation is live in the pinned runtime. Passing it does not
+prove that any task is deterministic."""
+
+PID1_STDOUT_INJECTION = (
+    NONE_STUB
+    + "try:\n"
+    + "    with open('/proc/1/fd/1', 'w') as _out:\n"
+    + '        _out.write(\'{"status": "passed", "stdout": "", "exit_code": 0}\\n\')\n'
+    + "except Exception:\n"
+    + "    pass\n"
+)
+"""A candidate (scored against ``ADD_TESTS``) that tries to write a forged result line to the
+path-of-record supervisor's own stdout before the tests run. Run once by a dedicated test;
+``passed`` is never an allowed verdict. Predicted: ``infrastructure_error``. The supervisor
+shares the candidate's uid and is dumpable, so the write is expected to land; the supervisor
+then appends its own result line, and the host cannot parse two documents."""
+
+PID1_ALLOWED_STATUSES = frozenset({"failed", "infrastructure_error"})
+"""``failed``: the write is refused. ``infrastructure_error``: the host could not parse the
+mixed output. That is not benign: the evaluation harness treats it as a host failure that is
+not retried and aborts the whole evaluation, so a candidate can stop a scoring run (an
+availability weakness of the path of record). Narrowed only by a change that cites a run."""
 
 
 def by_name() -> dict[str, Case]:
