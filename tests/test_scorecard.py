@@ -433,3 +433,57 @@ def test_the_cli_reads_the_names_reuses_and_inputs_from_a_scorecard_inputs_file(
     bad.write_text(json.dumps({"kind": "scorecard-inputs", "schema_version": 1}))
     with pytest.raises(ValueError, match="not a scorecard-inputs file"):
         main(["scorecard", "--inputs", str(bad), "--output", str(tmp_path / "bad-card.json")])
+
+
+def test_an_interface_override_is_carried_into_rows_comparisons_and_markdown(
+    tmp_path: Path,
+) -> None:
+    # SFT weights deliberately generated under the base pool protocol: both sides share the
+    # protocol, so the pair is not cross-protocol, but the override must still show.
+    from scratchcoder.eval.interface import (
+        CHAT_INTERFACE,
+        FROM_WEIGHTS_V1,
+        CheckpointInterface,
+        resolve_protocol,
+    )
+
+    choice = resolve_protocol(
+        CheckpointInterface(CHAT_INTERFACE, FROM_WEIGHTS_V1),
+        "pool",
+        "base-pool-completion-v1",
+        allow_mismatch=True,
+    )
+    assert choice.override is not None
+    override = choice.override.record()
+    tasks = dev_tasks()
+    tasks_path = save_task_file(tmp_path / "dev.jsonl", tasks)
+    results = []
+    for name, sha, crossed in (("base", BASE, None), ("sft", SFT, override)):
+        completions = tmp_path / f"{name}.jsonl"
+        write_fixture_completions(
+            completions,
+            tasks_path,
+            tasks,
+            lambda task, sample: "x = 1  # good" if task.id == "d/1" else "x = 0",
+            protocol="base-pool-completion-v1",
+            checkpoint=sha,
+            interface_override=crossed,
+        )
+        assert read_completions(completions).header.interface_override == crossed
+        path = tmp_path / f"{name}-results.jsonl"
+        execute_completions(
+            completions, tasks_path, path, tokenizer=TOKENIZER, execute=sandbox,
+            sleep=lambda _: None,
+        )  # fmt: skip
+        results.append(path)
+    card = build_scorecard(
+        checkpoints={"base": BASE, "sft": SFT}, results=results, pairs=[("sft", "base")]
+    )
+    assert row(card, "sft", "pool", "greedy")["interface_override"] == override
+    assert "interface_override" not in row(card, "base", "pool", "greedy")
+    (comparison,) = card["comparisons"]
+    assert comparison["cross_protocol"] is False
+    assert comparison["interface_override"] == ["sft"]
+    markdown = render_markdown(card)
+    assert "sft (interface override: chat-v1 checkpoint under a base protocol)" in markdown
+    assert "interface override: sft" in markdown

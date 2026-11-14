@@ -95,6 +95,7 @@ def test_local_checkpoint_code_evaluation_end_to_end(tmp_path: Path) -> None:
         output=tmp_path / "evaluation",
         scorecard=tmp_path / "scores.jsonl",
         config=EvaluationConfig(max_new_tokens=4, bootstrap_samples=10),
+        prompt_mode="base",
     )
     report = json.loads((tmp_path / "evaluation/report.json").read_text())
     assert report["metrics"]["greedy_pass_at_1"] == 0
