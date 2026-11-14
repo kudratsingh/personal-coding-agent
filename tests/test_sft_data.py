@@ -136,7 +136,9 @@ def test_stratified_holdout_takes_each_sources_lowest_salted_hashes() -> None:
     assert stratified_holdout(list(reversed(tasks)), 6) == (chosen, shares)
 
 
-def run_build(tmp_path: Path, **options: Any) -> dict[str, Any]:
+def run_build(
+    tmp_path: Path, quarantine: frozenset[str] = frozenset(), **options: Any
+) -> dict[str, Any]:
     settings: dict[str, Any] = {"sequence_length": 400, "rl_candidates": 5, "language_dev": 3}
     settings.update(options)
     return build(
@@ -146,7 +148,36 @@ def run_build(tmp_path: Path, **options: Any) -> dict[str, Any]:
         encoder=TOKENIZER,
         tokenizer_identity=IDENTITY,
         config=BuildConfig(**settings),
+        quarantine=quarantine,
     )
+
+
+def test_quarantined_tasks_never_become_sft_targets(tmp_path: Path) -> None:
+    plain = run_build(tmp_path / "plain")
+    plain_ids = {row.id for row in read_rows(tmp_path / "plain" / "sft" / "train.jsonl")}
+    target = sorted(plain_ids)[0]
+    record = run_build(tmp_path / "held", quarantine=frozenset({target}))
+    ids = {row.id for row in read_rows(tmp_path / "held" / "sft" / "train.jsonl")}
+    assert ids == plain_ids - {target}
+    assert record["code"]["dropped"].get("quarantined") == 1
+    assert record["code"]["quarantine"]["ids"] == 1
+    # The RL candidate holdout is drawn exactly as without the quarantine.
+    assert record["code"]["rl_candidates"] == plain["code"]["rl_candidates"]
+    assert (tmp_path / "held" / "sft" / "rl_candidates.jsonl").read_bytes() == (
+        tmp_path / "plain" / "sft" / "rl_candidates.jsonl"
+    ).read_bytes()
+
+
+def test_a_quarantine_file_must_list_ids(tmp_path: Path) -> None:
+    from tools.sft_data import load_quarantine
+
+    good = tmp_path / "q.json"
+    good.write_text('{"ids": ["a/1"]}', encoding="utf-8")
+    assert load_quarantine(good) == frozenset({"a/1"}) and load_quarantine(None) == frozenset()
+    bad = tmp_path / "bad.json"
+    bad.write_text('["a/1"]', encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_quarantine(bad)
 
 
 def test_build_holds_out_candidates_excludes_acecode_and_records_hashes(tmp_path: Path) -> None:

@@ -293,11 +293,16 @@ def build(
     config: BuildConfig,
     language: Path | None = None,
     pool_dev: Path | None = None,
+    quarantine: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Write the SFT data set into the new directory ``output``; return its record.
 
     ``language`` is a language stage's ``conversations.jsonl``; its ``record.json``
-    must sit beside it (see ``language_source``).
+    must sit beside it (see ``language_source``). ``quarantine`` holds pool train task IDs
+    whose reference must never become an SFT target (a task whose tests contradict its own
+    prompt, for example). They are dropped from the code rows and counted as
+    ``quarantined``; the RL candidate holdout is drawn as before, so it does not move.
+    Earlier builds are unchanged.
     """
     if output.exists():
         raise FileExistsError(f"{output} already exists")
@@ -316,6 +321,9 @@ def build(
     omitted_train = omitted_dev = 0
     for task in sorted(allowed, key=lambda item: item.id):
         if task.id in held:
+            continue
+        if task.id in quarantine:
+            code_drops["quarantined"] += 1
             continue
         if task.solution is None:
             code_drops["no_reference"] += 1
@@ -432,6 +440,12 @@ def build(
             "sft_rows": len(code_rows),
             "sft_rows_by_source": dict(sorted(Counter(r.source for r in code_rows).items())),
             "dropped": dict(sorted(code_drops.items())),
+            "quarantine": {
+                "ids": len(quarantine),
+                "sha256": hashlib.sha256(
+                    json.dumps(sorted(quarantine)).encode("utf-8")
+                ).hexdigest(),
+            },
             "dev_rows": len(code_dev_rows),
             "dev_dropped": dict(sorted(code_dev_drops.items())),
             "public_tests_omitted": {
@@ -817,6 +831,17 @@ def _encoder(pool_spec: Mapping[str, Any]) -> tuple[TextEncoder, str]:
     return FastEncoder(loaded), loaded.sha256
 
 
+def load_quarantine(path: Path | None) -> frozenset[str]:
+    """The task IDs of a quarantine file (``{"ids": [...]}``), or none without a file."""
+    if path is None:
+        return frozenset()
+    value = json.loads(path.read_text(encoding="utf-8"))
+    ids = value.get("ids") if isinstance(value, dict) else None
+    if not isinstance(ids, list) or not all(isinstance(item, str) and item for item in ids):
+        raise ValueError(f"{path}: a quarantine file holds a non-empty string list 'ids'")
+    return frozenset(ids)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("download", "language", "build"))
@@ -830,6 +855,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, help="new SFT data directory")
     parser.add_argument("--include-acecode", action="store_true", help="use the flagged source")
     parser.add_argument("--rl-candidates", type=int)
+    parser.add_argument(
+        "--quarantine",
+        type=Path,
+        help="JSON file with an 'ids' list of pool train tasks never used as SFT targets",
+    )
     parser.add_argument(
         "--omit-public-tests",
         action="store_true",
@@ -878,6 +908,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rl_candidates=args.rl_candidates,
             omit_public_tests=args.omit_public_tests,
         ),
+        quarantine=load_quarantine(args.quarantine),
     )
     print(json.dumps({key: record[key] for key in ("code", "language", "shares")}, indent=1))
     return 0
