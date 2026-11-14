@@ -12,14 +12,14 @@ Three files, and what each records:
 | --- | --- | --- | --- |
 | New SFT weights | `"format": "weights-v1"`, `"interface": "chat-v1"` | declared | `chat-v1` |
 | Run 1b's SFT weights | `"format": "weights-v1"`, no `interface` key | weights-v1 | `chat-v1` |
-| Run B's `mixed-final` | `"version": 1`, `"optimizer"`, `config.train` with no special-row redraw | trainer-checkpoint | `base` |
+| Run B's `mixed-final` | `"version": 1`, `"optimizer"`, a pretraining `config` (no post-training mark) | trainer-checkpoint | `base` |
 
 Asking for a pool evaluation with no protocol named:
 
-- `eval-generate` on the SFT weights resolves `chat-v1`. The prompt is the chat-v1 token IDs, ending in `<|assistant_start|>` (ID 259); generation stops at `<|python_end|>` or `<|assistant_end|>`; the program is the first closed python block of the generated IDs.
+- `eval-generate` on either SFT file resolves `chat-v1`. The prompt is the chat-v1 token IDs, ending in `<|assistant_start|>` (ID 259); generation stops at `<|python_end|>` or `<|assistant_end|>`; the program is the first closed python block of the generated IDs.
 - `eval-generate` on `mixed-final` resolves `base-pool-completion-v1`. The prompt is the task text and public test in a module docstring, encoded as plain text with no special tokens; the program is the completion before the first stop string of the task's mode.
-- `scratchcoder eval` on the SFT weights stops before loading any weights: `this checkpoint's interface is chat-v1 (found by the weights-v1 rule), and scratchcoder eval has only plain-text prompt modes; evaluate it with scratchcoder eval-generate …`.
-- `scratchcoder eval --prompt-mode instruction` on the SFT weights also stops, naming `--allow-interface-mismatch`. With that flag it runs, and the report records `{"name": "chat-v1", "source": "declared", "prompt_mode_source": "requested", "interface_mismatch_allowed": true}`.
+- `scratchcoder eval` on run 1b's SFT weights stops before loading any weights: `this checkpoint's interface is chat-v1 (found by the weights-v1 rule), and scratchcoder eval has only plain-text prompt modes; evaluate it with scratchcoder eval-generate …`.
+- `scratchcoder eval --prompt-mode instruction` on the new SFT weights also stops, naming `--allow-interface-mismatch`. With that flag it runs, and the report records `{"name": "chat-v1", "source": "declared", "prompt_mode_source": "requested", "interface_mismatch_allowed": true}`.
 
 ## Data flow and shapes
 
@@ -27,7 +27,7 @@ Asking for a pool evaluation with no protocol named:
 - `checkpoint_interface(saved)` returns `CheckpointInterface(name, source)`, where `name` is `chat-v1`, `base` or `None` (undeclared). First match wins:
   1. an `"interface"` key: `declared` (an unknown value is refused);
   2. `"format": "weights-v1"`: `chat-v1`, rule `weights-v1`;
-  3. a trainer checkpoint (`"version"`, `"optimizer"`, a `config.train` mapping, no `"format"`): `base`, or `chat-v1` when `special_rows_init` is not `none`, rule `trainer-checkpoint`;
+  3. a trainer checkpoint (`"version"`, `"optimizer"`, a `config.train` mapping, no `"format"`): `base`, or `chat-v1` when the configuration carries a post-training mark (`special_rows_init` not `none`, `loss_normalization` of `update_targets`, or an `sft` or `rl-references` source in `data_mix`), rule `trainer-checkpoint`;
   4. anything else: undeclared.
 - `resolve_protocol(interface, family, requested, allow_mismatch=False)` returns a protocol name for `eval-generate`. With `requested=None` the interface chooses: `chat-v1`, or for `base` the pool or benchmark base protocol by `family`. An undeclared interface needs a request. A request must fit unless `allow_mismatch`.
 - `resolve_legacy_mode(interface, requested, allow_mismatch=False)` returns `base` or `instruction` for `scratchcoder eval`. With no request a base checkpoint gets `base`; chat-v1 and undeclared checkpoints are refused.
@@ -37,7 +37,7 @@ Asking for a pool evaluation with no protocol named:
 
 - **No new weights format.** Every reader of a weights-v1 file reads only the keys it needs (`config`, `tokenizer_hash`, `model`, `run_id`), so adding one key breaks nothing, while `weights-v2` would have had to be accepted everywhere `weights-v1` is. Files written before the key existed need no sidecar: only post-training has ever written weights-v1, and it all trains on chat-v1, so the format alone is the evidence.
 - **Historical files are never rewritten.** The rules only read. Run 1 and run 1b's SFT weights keep their bytes and SHA-256s, which the seal ledger and the scorecard name.
-- **Why the special-row rule.** Only an SFT run redraws the special-token rows ([special-token rows](special-token-rows.md)). No trainer checkpoint of an SFT run exists today, since the SFT stage saves weights-v1, but a future resumable SFT stage that saves full trainer checkpoints would be read as `chat-v1` rather than `base`. A writer can always add the `"interface"` key, which wins.
+- **Why the post-training marks.** No trainer checkpoint of a post-training run exists today, since the SFT stage and the more-SFT control save weights-v1, but a future resumable SFT stage could save full trainer checkpoints. One mark is not enough on its own: only some SFT runs redraw the special-token rows ([special-token rows](special-token-rows.md)), and run 1's SFT did not. So the rule accepts any of three settings that pretraining never uses: the special-row redraw, loss normalized by assistant targets (`update_targets`), or an `sft` or `rl-references` data source. A post-training writer that sets none of them would still be read as `base`, so such a writer should add the `"interface"` key, which wins.
 - **Undeclared is not base.** A hand-made file or the shared random initialization records nothing, so the code does not guess. It requires the protocol to be named, and accepts any protocol named.
 - **The override is deliberate, not silent.** Crossing interfaces is a legitimate diagnostic, for example base prompting on SFT weights to separate formatting from capability. It takes a named flag. The legacy report records it. A completions file records the protocol and the checkpoint SHA-256, and the interface follows from that checkpoint.
 - **Legacy names say what ran.** On pool tasks the legacy base mode is recorded as `legacy-pool-rstrip-v1`, not the benchmark-only `base-completion-rstrip-v1`. Older legacy reports keep the old name, which on pool tasks means the same procedure.

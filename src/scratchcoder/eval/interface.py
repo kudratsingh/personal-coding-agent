@@ -19,10 +19,12 @@ How a checkpoint's interface is found, first match wins (``checkpoint_interface`
    of it trains on chat-v1, so every such file without the key is ``chat-v1``. This covers
    every historical SFT, RL and control checkpoint without rewriting any of them.
 3. ``trainer-checkpoint``: the trainer's full checkpoint (``"version"``, ``"optimizer"``
-   and a ``"train"`` configuration, no ``"format"``). Only pretraining writes these; it is
-   ``base``, unless its training configuration redrew the special-token rows
-   (``special_rows_init`` other than ``none``), which only an SFT run does: then
-   ``chat-v1``.
+   and a ``"train"`` configuration, no ``"format"``). Only pretraining writes these today;
+   it is ``base`` unless its configuration carries a mark that only post-training sets,
+   then ``chat-v1``: the special-token rows were redrawn (``special_rows_init`` other than
+   ``none``), the loss was normalized by assistant targets (``loss_normalization`` of
+   ``update_targets``), or the data mix names a post-training source (``sft`` or
+   ``rl-references``). Pretraining sets none of these.
 4. Otherwise the interface is undeclared (``None``): a hand-made or fixture file, the
    shared random initialization, or a format this code does not know. An undeclared
    checkpoint is evaluated only under an explicitly chosen protocol.
@@ -96,10 +98,27 @@ def checkpoint_interface(saved: Mapping[str, Any]) -> CheckpointInterface:
         and isinstance(config, Mapping)
         and isinstance(config.get("train"), Mapping)
     ):
-        special_rows = config["train"].get("special_rows_init", "none")
-        name = BASE_INTERFACE if special_rows == "none" else CHAT_INTERFACE
+        name = CHAT_INTERFACE if _post_training_marks(config) else BASE_INTERFACE
         return CheckpointInterface(name, FROM_TRAINER)
     return CheckpointInterface(None, UNDECLARED)
+
+
+POST_TRAINING_SOURCES = frozenset({"sft", "rl-references"})
+"""Data-mix sources only post-training (SFT and the more-SFT control) trains on."""
+
+
+def _post_training_marks(config: Mapping[str, Any]) -> list[str]:
+    """The settings in a trainer configuration that only post-training uses, if any."""
+    train = config["train"]
+    marks = []
+    if train.get("special_rows_init", "none") != "none":
+        marks.append("special_rows_init")
+    if train.get("loss_normalization", "capacity") == "update_targets":
+        marks.append("loss_normalization")
+    data_mix = config.get("data_mix")
+    if isinstance(data_mix, Mapping) and POST_TRAINING_SOURCES & set(data_mix):
+        marks.append("data_mix")
+    return marks
 
 
 def read_checkpoint_interface(path: Path) -> CheckpointInterface:

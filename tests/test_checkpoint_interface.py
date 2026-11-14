@@ -73,27 +73,38 @@ def historical_sft_checkpoint(root: Path) -> Path:
     return path
 
 
-def trainer_checkpoint(root: Path, *, special_rows_init: str = "none") -> Path:
-    """A full checkpoint written by the pretraining trainer itself."""
+def trainer_checkpoint(
+    root: Path,
+    *,
+    special_rows_init: str = "none",
+    loss_normalization: str = "capacity",
+    source: str = "web",
+) -> Path:
+    """A full checkpoint written by the trainer itself (pretraining with the defaults)."""
     config = RunConfig(
         model=MODEL,
         train=TrainConfig(
-            steps=1, sequence_length=8, batch_size=2, special_rows_init=special_rows_init
+            steps=1,
+            sequence_length=8,
+            batch_size=2,
+            special_rows_init=special_rows_init,
+            loss_normalization=loss_normalization,
         ),
-        data_mix={"web": 1.0},
+        data_mix={source: 1.0},
     )
     loader = MixedLoader(
-        {"web": [[256, 1, 2, 3] * 8]}, {"web": 1.0}, sequence_length=8, batch_size=2, seed=0
+        {source: [[256, 1, 2, 3] * 8]}, {source: 1.0}, sequence_length=8, batch_size=2, seed=0
     )
+    name = f"{source}-{special_rows_init}-{loss_normalization}"
     trainer = Trainer(
         config,
         loader,
-        run_id=f"base-{special_rows_init}",
+        run_id=f"trainer-{name}",
         run_root=root / "runs",
         data_hash="fixture-data",
         tokenizer_hash=TOKENIZER.sha256,
     )
-    path = root / f"trainer-{special_rows_init}.pt"
+    path = root / f"trainer-{name}.pt"
     trainer.checkpoint(path)
     return path
 
@@ -123,6 +134,23 @@ def test_each_checkpoint_kind_resolves_by_its_recorded_fields(tmp_path: Path) ->
     special = trainer_checkpoint(tmp_path, special_rows_init="ordinary-mean-noise")
     assert read_checkpoint_interface(special) == CheckpointInterface(CHAT_INTERFACE, FROM_TRAINER)
     assert read_checkpoint_interface(undeclared_checkpoint(tmp_path)) == NONE
+
+
+def test_trainer_checkpoints_of_post_training_runs_resolve_to_chat(tmp_path: Path) -> None:
+    # Run 1's SFT configuration: no special-row redraw, but SFT data and target-normalized
+    # loss. The more-SFT control trains on rl-references the same way. Any one mark is enough.
+    sft_trainer = CheckpointInterface(CHAT_INTERFACE, FROM_TRAINER)
+    run_1_style = trainer_checkpoint(tmp_path, loss_normalization="update_targets", source="sft")
+    assert read_checkpoint_interface(run_1_style) == sft_trainer
+    control = trainer_checkpoint(
+        tmp_path, loss_normalization="update_targets", source="rl-references"
+    )
+    assert read_checkpoint_interface(control) == sft_trainer
+    assert read_checkpoint_interface(trainer_checkpoint(tmp_path, source="sft")) == sft_trainer
+    normalized = trainer_checkpoint(tmp_path, loss_normalization="update_targets")
+    assert read_checkpoint_interface(normalized) == sft_trainer
+    # Pretraining domains with the pretraining defaults stay base.
+    assert read_checkpoint_interface(trainer_checkpoint(tmp_path, source="python")) == BASE
 
 
 def test_declared_key_wins_and_unknown_values_are_refused() -> None:
