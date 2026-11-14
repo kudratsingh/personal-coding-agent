@@ -520,3 +520,45 @@ def test_paraphrases_of_holdouts_leave_training() -> None:
     kept, dropped = task_pool.drop_holdout_paraphrases([held, near, reworded, close, far])
     # Same function name and a loose rewording, or a close rewording: dropped.
     assert [t.id for t in kept] == ["h", "c", "b"] and dropped == {"opencode": 2}
+
+
+def test_a_null_family_grouping_builds_the_same_pool(fixture: Fixture) -> None:
+    spec = fixture.load(fixture.spec())
+    fixture.fetch(spec)
+    historical = task_pool.build(
+        spec, fixture.directory, execute=Sandbox(), runtime={}, progress=quiet
+    )
+    (fixture.directory / "pool").rename(fixture.directory / "pool-historical")
+    value = fixture.spec()
+    value["splits"]["family_grouping"] = None
+    spec_null = fixture.load(value)
+    other = fixture.root / "pool-null"
+    task_pool.fetch(spec_null, other, hub_factory=lambda _: FakeHub(fixture.files), progress=quiet)
+    null = task_pool.build(spec_null, other, execute=Sandbox(), runtime={}, progress=quiet)
+    assert {k: v["task_hash"] for k, v in null["files"].items()} == {
+        k: v["task_hash"] for k, v in historical["files"].items()
+    }
+    assert null["holdouts"] == historical["holdouts"]
+
+
+def test_family_grouping_build_keeps_the_shared_reference_family_together(
+    fixture: Fixture,
+) -> None:
+    # Every fixture TACO row shares one reference, so they form one family with both
+    # TACO test tasks: three holdout slots cannot take it, and the build stops.
+    value = fixture.spec()
+    value["splits"]["family_grouping"] = "task-clusters-v1"
+    spec = fixture.load(value)
+    fixture.fetch(spec)
+    with pytest.raises(ValueError, match="exceed"):
+        task_pool.build(spec, fixture.directory, execute=Sandbox(), runtime={}, progress=quiet)
+    value = fixture.spec(dev=10, test=6)
+    value["splits"]["family_grouping"] = "task-clusters-v1"
+    spec = fixture.load(value)
+    roomy = fixture.root / "roomy"
+    task_pool.fetch(spec, roomy, hub_factory=lambda _: FakeHub(fixture.files), progress=quiet)
+    report = task_pool.build(spec, roomy, execute=Sandbox(), runtime={}, progress=quiet)
+    pool = roomy / "pool"
+    splits = {name: list(load_tasks(pool / f"{name}.jsonl")) for name in ("train", "dev", "test")}
+    assert not any(t.source == task_pool.DATASETS["taco"] for t in splits["train"])
+    assert report["holdouts"]["family_grouping"]["version"] == "task-clusters-v1"

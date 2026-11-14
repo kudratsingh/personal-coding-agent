@@ -54,6 +54,7 @@ from scratchcoder.data.adapters import (
     clean_completion,
 )
 from scratchcoder.data.arc import read_arc_easy
+from scratchcoder.data.clusters import RULES_VERSION, Item, family_map
 from scratchcoder.data.evalplus import read_release, release
 from scratchcoder.data.filters import ContaminationIndex
 from scratchcoder.data.manifest import TRAINING_LICENSES, ManifestEntry, download
@@ -112,6 +113,10 @@ LIMITS_FORMULA_VERSION = 1
 ACECODE_ATTEMPTS = 3
 """Recorded AceCode attempts with an upstream pass rate of 1.0 tried in our sandbox."""
 VERDICT_STATUSES = frozenset({"passed", "failed", "timeout", "output_limit", "resource_limit"})
+FAMILY_GROUPING_VERSIONS = (RULES_VERSION,)
+"""Accepted ``splits.family_grouping`` values. Absent or null (the default, and every
+historical spec) keeps the per-task assignment; a version assigns whole families
+(``assign_families``)."""
 
 
 def load_spec(path: Path) -> dict[str, Any]:
@@ -198,11 +203,18 @@ def load_spec(path: Path) -> dict[str, Any]:
         "protection",
     )
     _positive(protection_spec["min_alpha_tokens"], "protection min_alpha_tokens")
-    splits = _exact_keys(
-        spec["splits"],
-        {"dev", "test", "human_holdout_minimum", "model_holdout_sources", "rl_prompt_tokens"},
-        "splits",
-    )
+    split_keys = {
+        "dev",
+        "test",
+        "human_holdout_minimum",
+        "model_holdout_sources",
+        "rl_prompt_tokens",
+    }
+    if isinstance(spec["splits"], dict) and "family_grouping" in spec["splits"]:
+        split_keys.add("family_grouping")  # Optional: absent in every historical spec.
+    splits = _exact_keys(spec["splits"], split_keys, "splits")
+    if splits.get("family_grouping") not in (None, *FAMILY_GROUPING_VERSIONS):
+        raise ValueError(f"family_grouping must be null or one of {FAMILY_GROUPING_VERSIONS}")
     for key in ("dev", "test", "human_holdout_minimum", "rl_prompt_tokens"):
         _positive(splits[key], f"splits {key}")
     sources = splits["model_holdout_sources"]
@@ -653,11 +665,31 @@ def protection(spec: Mapping[str, Any]) -> tuple[list[Task], list[Any], dict[str
     return benchmarks, choices, identities
 
 
-def assign(kept: Sequence[Task], splits: Mapping[str, Any]) -> tuple[list[Task], dict[str, Any]]:
+def assign(
+    kept: Sequence[Task],
+    splits: Mapping[str, Any],
+    *,
+    families: Mapping[str, str] | None = None,
+) -> tuple[list[Task], dict[str, Any]]:
     """TACO test tasks split evenly, MBPP top-up to the human minimum, then model tasks.
 
-    Model-written holdouts come only from ``splits["model_holdout_sources"]``.
+    Model-written holdouts come only from ``splits["model_holdout_sources"]``. With
+    ``splits["family_grouping"]`` set (off when absent or null, which reproduces every
+    historical build), whole task families go to one split: see ``assign_families``.
+    ``families`` overrides the computed family map (tests).
     """
+    grouping = splits.get("family_grouping")
+    if grouping is not None:
+        if families is None:
+            families = family_map(
+                [
+                    Item(t.id, t.split, t.source, t.prompt, t.solution, t.mode, t.entry_point)
+                    for t in kept
+                ]
+            )
+        return assign_families(kept, splits, families, grouping)
+    if families is not None:
+        raise ValueError("a family map needs splits.family_grouping")
 
     def order(tasks: Sequence[Task]) -> list[Task]:
         return sorted(tasks, key=lambda task: hashlib.sha256(task.id.encode()).digest())
@@ -699,6 +731,127 @@ def assign(kept: Sequence[Task], splits: Mapping[str, Any]) -> tuple[list[Task],
             "from the named sources, by ID hash, fill the rest of dev, then test"
         ),
         "model_holdout_sources": list(splits["model_holdout_sources"]),
+    }
+
+
+def assign_families(
+    kept: Sequence[Task], splits: Mapping[str, Any], families: Mapping[str, str], version: str
+) -> tuple[list[Task], dict[str, Any]]:
+    """The ``assign`` rule with whole families as the unit (``family_grouping``).
+
+    A task's family is its ``scratchcoder.data.clusters`` cluster under the union signals
+    of ``version``; a task missing from ``families`` is its own family. In the same ID-hash
+    orders as ``assign``:
+
+    1. Each TACO test task's family, not yet placed, goes whole to the next of dev/test in
+       alternation. Members from other sources go with it; TACO test tasks stay holdouts.
+    2. MBPP families are added the same way until the holdouts hold
+       ``human_holdout_minimum`` human-written tasks.
+    3. Model-written families from the named sources fill dev, then test. A family goes
+       only if every member is model-written from a named source and it fits the room
+       left; otherwise the whole family stays in training.
+
+    The split sizes stay exact; if they cannot be met, the build stops. No family spans
+    two splits, which the function checks before returning.
+    """
+    if version not in FAMILY_GROUPING_VERSIONS:
+        raise ValueError("unknown family grouping version")
+
+    def order(tasks: Sequence[Task]) -> list[Task]:
+        return sorted(tasks, key=lambda task: hashlib.sha256(task.id.encode()).digest())
+
+    def family(task: Task) -> str:
+        return families.get(task.id, "task:" + task.id)
+
+    members: dict[str, list[Task]] = {}
+    for task in kept:
+        members.setdefault(family(task), []).append(task)
+    assigned: dict[str, str] = {}
+    alternation = 0
+
+    def place_alternating(task: Task) -> None:
+        nonlocal alternation
+        name = "dev" if alternation % 2 == 0 else "test"
+        alternation += 1
+        for member in members[family(task)]:
+            assigned[member.id] = name
+
+    taco_test = order([t for t in kept if t.source == DATASETS["taco"] and t.split != "train"])
+    for task in taco_test:
+        if task.id not in assigned:
+            place_alternating(task)
+    topped = 0
+
+    def human_held() -> int:
+        return sum(t.written_by == "human" for t in kept if t.id in assigned)
+
+    if human_held() < splits["human_holdout_minimum"]:
+        for task in order([t for t in kept if t.source == DATASETS["mbpp"]]):
+            if human_held() >= splits["human_holdout_minimum"]:
+                break
+            if task.id not in assigned:
+                before = len(assigned)
+                place_alternating(task)
+                topped += len(assigned) - before
+    room = {
+        name: splits[name] - sum(value == name for value in assigned.values())
+        for name in ("dev", "test")
+    }
+    if min(room.values()) < 0:
+        raise ValueError("human holdout families exceed the requested split sizes")
+    allowed = {DATASETS[kind] for kind in splits["model_holdout_sources"]}
+    skipped = 0
+    for task in order([t for t in kept if t.written_by == "model" and t.source in allowed]):
+        target = "dev" if room["dev"] > 0 else "test" if room["test"] > 0 else None
+        if target is None:
+            break
+        if task.id in assigned:
+            continue
+        group = members[family(task)]
+        eligible = all(m.written_by == "model" and m.source in allowed for m in group)
+        if not eligible or len(group) > room[target]:
+            skipped += 1
+            continue
+        for member in group:
+            assigned[member.id] = target
+        room[target] -= len(group)
+    if any(room.values()):
+        raise ValueError("not enough verified model-written families for the holdouts")
+    result = [replace(task, split=assigned.get(task.id, "train")) for task in kept]
+    held = {task.id for task in taco_test}
+    if any(task.split == "train" and task.id in held for task in result):
+        raise RuntimeError("an upstream TACO test task reached the training split")
+    spans: dict[str, set[str]] = {}
+    for task in result:
+        spans.setdefault(family(task), set()).add(task.split)
+    if any(len(value) > 1 for value in spans.values()):
+        raise RuntimeError("a task family spans two splits")
+    pulled = Counter(
+        task.source
+        for task in result
+        if task.split != "train"
+        and task.id not in held
+        and task.source != DATASETS["mbpp"]
+        and task.source not in allowed
+    )
+    return result, {
+        "taco_test_holdouts": len(taco_test),
+        "mbpp_holdouts_added": topped,
+        "human_holdout_minimum": splits["human_holdout_minimum"],
+        "rule": (
+            "as the historical rule, with whole task families as the unit: TACO test families "
+            "alternate dev/test by ID hash; MBPP families top up the human minimum; families "
+            "made only of model-written tasks from the named sources fill dev, then test; any "
+            "other family stays in training"
+        ),
+        "model_holdout_sources": list(splits["model_holdout_sources"]),
+        "family_grouping": {
+            "version": version,
+            "families": sum(len(group) > 1 for group in members.values()),
+            "tasks_in_families": sum(len(group) for group in members.values() if len(group) > 1),
+            "model_families_skipped": skipped,
+            "holdout_members_pulled_in_by_source": dict(pulled),
+        },
     }
 
 
