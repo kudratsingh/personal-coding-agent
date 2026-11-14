@@ -36,6 +36,15 @@ BUILDERS = {
     "1b": posttrain_approved.run1b_specification,
 }
 FIRST_LAUNCH_PROBE = {"128": 8_714.860743907404, "256": 9_756.688216709286}
+RUN1B_HOST = {"1": 104.86064191324317, "128": 9_744.70165754305, "256": 11_110.297724650332}
+"""Run 1b's completed host, from its verified report: the probe's generated tokens a second."""
+RUN1B_SFT_SPEED_CHECK = 61_178.93037172776
+"""Run 1b's SFT speed check (``sft.speed_check.measured_slots_per_second``) on that host."""
+SUPERSEDED_RUN2 = (
+    ROOT / "configs" / "rehearsal-a40-s-post-2.json",
+    "19b9f62ff7385324a68977f16694a7b3143e99bc4924705c9061c6bd379e27f4",
+)
+"""Run 2's first template: never launched, kept byte for byte, superseded by the second."""
 
 
 @pytest.mark.parametrize("run", sorted(EXECUTED))
@@ -61,16 +70,23 @@ def _set(raw: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
     target[path[-1]] = value
 
 
-def test_run_one_is_refused_at_the_standing_rules_current_floors() -> None:
-    """The floors the rule derives today are not run 1's: a run-1 specification carrying them
-    is not the one that ran."""
+@pytest.mark.parametrize("run", sorted(EXECUTED))
+def test_an_executed_run_is_refused_at_the_standing_rules_current_floors(run: str) -> None:
+    """The floors and SFT reference the rule derives today are neither run's: a specification
+    carrying them is not the one that ran."""
     floors = dict(posttrain_approved.GENERATION_FLOORS)
-    assert floors != posttrain_approved.RUN1_FLOORS
-    raw = json.loads(EXECUTED["1"][0].read_text())
-    _set(raw, ("probe", "minimum_tokens_per_second"), floors)
-    _set(raw, ("planning", "generation_tokens_per_second"), floors)
-    with pytest.raises(ValueError, match="differs from the approved run 1"):
-        posttrain_approved.check_run1(raw)
+    reference = posttrain_approved.SFT_REFERENCE_SLOTS_PER_SECOND
+    check = {"1": posttrain_approved.check_run1, "1b": posttrain_approved.check_run1b}[run]
+    for path, value in (
+        (("probe", "minimum_tokens_per_second"), floors),
+        (("planning", "generation_tokens_per_second"), floors),
+        (("sft", "reference_slots_per_second"), reference),
+    ):
+        raw = json.loads(EXECUTED[run][0].read_text())
+        assert raw[path[0]][path[1]] != value
+        _set(raw, path, value)
+        with pytest.raises(ValueError, match=f"differs from the approved run {run}"):
+            check(raw)
 
 
 @pytest.mark.parametrize(
@@ -146,3 +162,62 @@ def test_the_standing_rule_derives_10_percent_under_the_hosts_average() -> None:
     assert posttrain_approved.SFT_REFERENCE_SLOTS_PER_SECOND == pytest.approx(
         sum(rate for _, rate in sft) / len(sft)
     )
+
+
+def test_run_1bs_completed_host_is_recorded_and_the_floors_re_derived() -> None:
+    """The standing rule over every measured host, the stopped launches' included: run 1's
+    first launch, run 1, run 1b's first launch and run 1b. The SFT reference is the mean of
+    the two hosts that reached the speed check."""
+    labels = [label for label, _ in posttrain_approved.MEASURED_HOST_PROBES]
+    assert labels == ["run 1 first launch", "run 1", "run 1b first launch", "run 1b"]
+    assert dict(posttrain_approved.MEASURED_HOST_PROBES)["run 1b"] == RUN1B_HOST
+    assert posttrain_approved.GENERATION_FLOORS == {"128": 7_991.0, "256": 9_049.0}
+    assert posttrain_approved.MEASURED_SFT_HOSTS == (
+        ("run 1", 57_103.853248428364),
+        ("run 1b", RUN1B_SFT_SPEED_CHECK),
+    )
+    reference = posttrain_approved.SFT_REFERENCE_SLOTS_PER_SECOND
+    assert reference == pytest.approx(59_141.3918, abs=1e-4)
+    assert 0.9 * reference == pytest.approx(53_227.2526, abs=1e-4)
+
+
+def test_run_two_has_a_new_specification_at_the_re_derived_floors() -> None:
+    """Run 2's current template is a new file at the floors over four hosts; the first
+    template is kept byte for byte, and differs from it in those planning speeds only."""
+    current = posttrain_approved.SPECIFICATION_PATH_2
+    assert current.name == "rehearsal-a40-s-post-2-v2.json"
+    assert json.loads(current.read_text()) == posttrain_approved.run2_specification()
+    assert current.read_bytes() == posttrain_approved.specification_bytes(
+        posttrain_approved.run2_specification()
+    )
+    old_path, old_digest = SUPERSEDED_RUN2
+    assert hashlib.sha256(old_path.read_bytes()).hexdigest() == old_digest
+    assert posttrain_approved.SUPERSEDED_RUN2_TEMPLATES == {old_path: old_digest}
+    old, new = json.loads(old_path.read_text()), json.loads(current.read_text())
+    speeds = ("planning", "generation_tokens_per_second")
+    assert old[speeds[0]][speeds[1]] == {"128": 7_731.0, "256": 8_733.0}
+    assert new[speeds[0]][speeds[1]] == {"128": 7_991.0, "256": 9_049.0}
+    _set(old, speeds, new[speeds[0]][speeds[1]])
+    assert old == new
+
+
+def test_the_gate_refuses_the_superseded_run_two_template(tmp_path: Path) -> None:
+    """A projection of the old template does not give the gate's estimate, and a launch
+    specification filled from the old template is not the approved run 2."""
+    from test_posttrain_run2 import gate_values
+
+    old_path, old_digest = SUPERSEDED_RUN2
+    projection = tmp_path / "feasibility.json"
+    projection.write_text(
+        json.dumps(
+            {"kind": "posttrain-feasibility", "run": "2", "specification_sha256": old_digest}
+        )
+    )
+    with pytest.raises(ValueError, match="another specification than the run-2 template"):
+        posttrain_approved.gate_estimate(projection, run1_report=tmp_path / "unread.json")
+    filled = posttrain_approved.run2_specification(gate_values())
+    posttrain_approved.check_run2(filled)
+    old = json.loads(old_path.read_text())
+    filled["planning"] = old["planning"]
+    with pytest.raises(ValueError, match=r"differs from the approved run 2 in \['planning'\]"):
+        posttrain_approved.check_run2(filled)

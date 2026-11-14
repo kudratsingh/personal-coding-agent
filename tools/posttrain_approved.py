@@ -13,7 +13,7 @@ and every other protocol are run 1's, its floors and SFT speed reference those o
 rule when it was approved (below).
 
 Run 2 (below run 1's values): ``run2_specification()`` is the tracked template
-``configs/rehearsal-a40-s-post-2.json``, every gate value ``null`` (the ceiling, the gate's
+``configs/rehearsal-a40-s-post-2-v2.json``, every gate value ``null`` (the ceiling, the gate's
 estimate and the cost limit it derives, run 1's selected SFT weights and its SFT evaluation
 artifacts, the three ``rl-pod-export`` files and the pool test export);
 ``python -m tools.posttrain_approved run2-gate`` fills them from the gate's own files and writes
@@ -21,7 +21,10 @@ the launch specification, and ``check_run2`` is what the readiness receipt appli
 protocol is the proposal's, frozen at approval (RL, the more-SFT control, ARC-Easy and the
 seven evaluation files of each selected checkpoint), with the owner's later rulings: the
 1,000 RL candidates without AceCode and the reward-wait bounds derived from the channel's
-budgets (``posttrain_ops.bridge_timeouts``) in place of a flat 420 s.
+budgets (``posttrain_ops.bridge_timeouts``) in place of a flat 420 s. Its second version
+plans generation at the floors the standing rule derives with run 1b's host added; the first,
+``configs/rehearsal-a40-s-post-2.json``, never ran and is kept unchanged as superseded
+(``SUPERSEDED_RUN2_TEMPLATES``).
 
 ``run1_specification()`` is ``configs/rehearsal-a40-s-post-1.json`` (a test keeps the two
 equal), and ``check_run1`` is what the readiness receipt applies to the specification it is
@@ -105,11 +108,14 @@ MEASURED_HOST_PROBES: tuple[tuple[str, dict[str, float]], ...] = (
         "run 1b first launch",
         {"1": 64.89268282383944, "128": 8184.357066659413, "256": 9631.724110794974},
     ),
+    ("run 1b", {"1": 104.86064191324317, "128": 9744.70165754305, "256": 11110.297724650332}),
 )
 """Generated tokens/s the chat-v1 probe measured on each A40 host, one entry per host in the
-order measured (batch 1 is recorded but has no floor). Run 1b's first launch was stopped by its
-host's 8,184 tok/s at batch 128, below the floor then in force, which is what this rule
-replaced. After each run, append the new host's rates here."""
+order measured, from each launch's verified report (batch 1 is recorded but has no floor). Every
+measured host stays in the list, stopped launches included. Run 1b's first launch was stopped by
+its host's 8,184 tok/s at batch 128, below the floor then in force, which is what this rule
+replaced. After each run, append the new host's rates here; the floors this gives apply to the
+next specification only."""
 FLOOR_BATCHES = ("128", "256")
 
 
@@ -131,10 +137,14 @@ GENERATION_FLOORS = derive_generation_floors()
 the derivation takes them (run 2's planning speeds); an executed specification keeps its own
 (``RUN1_FLOORS``, ``RUN1B_FLOORS``). Run 1's first launch stopped below its earlier floors at
 batch 256 and at batch 64 (nothing generates at 64 any more)."""
-MEASURED_SFT_HOSTS: tuple[tuple[str, float], ...] = (("run 1", 57103.853248428364),)
-"""Slots/s of the SFT speed check on each host that reached it (only run 1's second launch so
-far); the reference below is their mean and the check's floor is ``minimum_speed_fraction`` of
-it, 10% under. Append the new host's rate after each run."""
+MEASURED_SFT_HOSTS: tuple[tuple[str, float], ...] = (
+    ("run 1", 57103.853248428364),
+    ("run 1b", 61178.93037172776),
+)
+"""Slots/s of the SFT speed check (``sft.speed_check.measured_slots_per_second``) on each host
+that reached it, from the verified reports; the reference below is their mean and the check's
+floor is ``minimum_speed_fraction`` of it, 10% under. Append the new host's rate after each
+run."""
 SFT_REFERENCE_SLOTS_PER_SECOND = sum(r for _, r in MEASURED_SFT_HOSTS) / len(MEASURED_SFT_HOSTS)
 """The SFT speed check's reference the standing rule gives now, for the next SFT specification;
 the executed ones keep theirs (``RUN1_SFT_REFERENCE``, ``RUN1B_SFT_REFERENCE``)."""
@@ -593,7 +603,16 @@ def write_specification_1b(path: Path = SPECIFICATION_PATH_1B) -> None:
 
 # Run 2 --------------------------------------------------------------------------------------
 
-SPECIFICATION_PATH_2 = SPECIFICATION_PATH.with_name("rehearsal-a40-s-post-2.json")
+SPECIFICATION_PATH_2 = SPECIFICATION_PATH.with_name("rehearsal-a40-s-post-2-v2.json")
+"""Run 2's current template, the second version of its specification."""
+SUPERSEDED_RUN2_TEMPLATES = {
+    SPECIFICATION_PATH.with_name("rehearsal-a40-s-post-2.json"): (
+        "19b9f62ff7385324a68977f16694a7b3143e99bc4924705c9061c6bd379e27f4"
+    ),
+}
+"""Earlier run-2 templates, kept byte for byte and never launched: the first planned generation
+at the floors over three hosts (7,731 / 8,733). Nothing reads them; the gate refuses a
+projection of one (``gate_estimate``) and ``check_run2`` a launch specification filled from one."""
 RUN2_LIMITS: dict[str, Any] = {
     **LIMITS,
     "ceiling_usd": None,
@@ -614,8 +633,9 @@ RUN2_PLANNING = {
     "reward_wait_seconds_per_update": 48,
     "dev_wait_seconds_per_check": 300,
 }
-"""Run 1's probe floors at the batches run 2 generates at (128 for the evaluation, 256 for the
-rollouts and the dev checks), run B's measured training rate, and the Mac's time: about 48 s
+"""The standing rule's floors at the batches run 2 generates at (128 for the evaluation, 256 for
+the rollouts and the dev checks; 7,991 and 9,049 over the four measured hosts), run B's
+measured training rate, and the Mac's time: about 48 s
 of rewards per update (256 attempts on 8 workers) and 300 s per 1,800-program dev check. The
 gate's projection re-prices them from run 1's measured rates."""
 RUN2_RL: dict[str, Any] = {
