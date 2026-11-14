@@ -1345,3 +1345,61 @@ def test_cli_test_baseline_retry_exits_zero_once_logged_and_three_otherwise(
     assert main(arguments) == 0
     printed = json.loads(capsys.readouterr().out)
     assert printed["recorded"] is True and Path(printed["test_baseline"]).is_file()
+
+
+UNPROTECTED_PROGRAM = (
+    Path(__file__).parent / "fixtures" / "program_v1_unprotected.py.txt"
+).read_text(encoding="utf-8")
+"""The path-of-record supervisor as it was before the 2026-11-14 hardening (policy version 1):
+dumpable, with no signal handlers and no result nonce."""
+
+
+def test_a_file_started_under_the_unprotected_supervisor_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A results file written by the pre-hardening policy cannot be resumed by the hardened
+    one: its verdicts came from a supervisor a candidate could read and write through."""
+    hardened = execution_policy.execution_policy
+
+    def version_one(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        policy = hardened(*args, **kwargs)
+        policy.pop("supervisor_protections")
+        return {**policy, "version": 1}
+
+    with monkeypatch.context() as old:
+        old.setattr(
+            execution_policy,
+            "module_source",
+            lambda name, original=execution_policy.module_source: (
+                UNPROTECTED_PROGRAM if name == PROGRAM else original(name)
+            ),
+        )
+        old.setattr("scratchcoder.eval.executor.execution_policy", version_one)
+        completions, tasks_path, results = half_done(tmp_path)
+    header = json.loads(results.read_text(encoding="utf-8").splitlines()[0])
+    assert header["execution"]["policy"]["version"] == 1
+    before = results.read_bytes()
+    with pytest.raises(ValueError) as refused:
+        execute_completions(
+            completions,
+            tasks_path,
+            results,
+            tokenizer=TOKENIZER,
+            execute=FakeSandbox(),
+            sleep=no_sleep,
+        )
+    message = str(refused.value)
+    for part in ("version", "supervisor_protections", f"code: {PROGRAM}"):
+        assert part in message, message
+    assert f"code: {RUNNER}" not in message  # Only the supervisor's code differs here.
+    assert results.read_bytes() == before
+
+
+def test_the_policy_records_the_supervisor_protections() -> None:
+    policy = execution_policy.execution_policy(
+        harness.isolated_execution, 3, unexecuted_statuses=(), input_limit=1
+    )
+    assert policy["version"] == execution_policy.EXECUTION_POLICY_VERSION == 2
+    assert policy["supervisor_protections"] == ["signal_handlers", "non_dumpable"]
+    unprotected = execution_policy.unit_sha256(PROGRAM, None, UNPROTECTED_PROGRAM)
+    assert policy["code"]["units"][PROGRAM] != unprotected

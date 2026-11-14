@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import secrets
 import selectors
 import shutil
 import subprocess
@@ -11,13 +12,26 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryFile
+from typing import Any
 from uuid import uuid4
+
+from scratchcoder.sandbox.program import REQUIRED_PROTECTIONS
 
 IMAGE = "python@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe"
 ENDPOINT = "unix:///var/run/docker.sock"
 HOST_WATCHDOG_SECONDS = 10.0
 """How long past the candidate deadline the host waits for the container before giving up.
 The supervisor enforces the candidate deadline itself, so reaching this is a host stall."""
+RESPONSE_STATUSES = frozenset({"passed", "failed", "timeout", "output_limit"})
+"""Supervisor statuses that are a verdict on the candidate."""
+SUPERVISOR_HOST_FAILURES = {
+    "unprotected": "supervisor_unprotected",
+    "spawn_failed": "spawn_failed",
+}
+"""Supervisor statuses that say nothing about the candidate (no candidate code ran), mapped to
+the ``detail`` of the ``infrastructure_error`` result the host reports for them."""
+_RESPONSE_KEYS = frozenset({"status", "stdout", "exit_code", "nonce", "protections"})
+_OPTIONAL_KEYS = frozenset({"error_type"})
 
 
 @dataclass(frozen=True)
@@ -60,10 +74,62 @@ class Result:
     ``timeout`` so the status vocabulary is unchanged, but such a result is not a verdict on
     the candidate: callers must retry it and never score it (as a pass, a failure or a
     timeout)."""
+    detail: str = ""
+    """Why an ``infrastructure_error`` happened: ``malformed_response`` (the container's output
+    was not exactly one valid, nonce-bearing result line), ``supervisor_unprotected`` (a
+    required supervisor protection could not be established, so nothing ran),
+    ``spawn_failed`` (the first candidate process could not start) or ``runner_error`` (the
+    host side failed). Empty for every other status. It is diagnostic only: an
+    ``infrastructure_error`` is never a verdict, whatever its detail."""
 
     @property
     def passed(self) -> bool:
         return self.status == "passed"
+
+
+def parse_response(output: bytes, nonce: str, protections: tuple[str, ...]) -> dict[str, Any]:
+    """Validate the supervisor's output and return its result document.
+
+    The output must be exactly one ASCII line, ending in a newline, holding a JSON object with
+    the expected keys and types, the host's ``nonce`` and every protection in ``protections``
+    reported as established. Anything else (extra lines, a second document, a wrong nonce, a
+    missing protection, a type error, deep nesting) raises :class:`ValueError`; no other
+    exception escapes. The caller turns that into an ``infrastructure_error``: such output
+    is never a verdict, because a candidate that cannot reach the result channel cannot be
+    its cause."""
+    try:
+        if not output.endswith(b"\n") or output.count(b"\n") != 1 or not output.isascii():
+            raise ValueError("not exactly one ASCII line")
+        raw = json.loads(output)
+        if not isinstance(raw, dict):
+            raise ValueError("not an object")
+        keys = set(raw)
+        if not _RESPONSE_KEYS <= keys or not keys <= _RESPONSE_KEYS | _OPTIONAL_KEYS:
+            raise ValueError("unexpected keys")
+        if not isinstance(raw["nonce"], str) or not secrets.compare_digest(raw["nonce"], nonce):
+            raise ValueError("wrong nonce")
+        status = raw["status"]
+        if status not in RESPONSE_STATUSES and status not in SUPERVISOR_HOST_FAILURES:
+            raise ValueError("unknown status")
+        if not isinstance(raw["stdout"], str):
+            raise ValueError("stdout is not text")
+        exit_code = raw["exit_code"]
+        if exit_code is not None and type(exit_code) is not int:
+            raise ValueError("exit code is not an integer")
+        reported = raw["protections"]
+        if not isinstance(reported, dict) or any(
+            type(value) is not bool for value in reported.values()
+        ):
+            raise ValueError("protections are not flags")
+        if status != "unprotected" and not all(reported.get(name) is True for name in protections):
+            raise ValueError("a verdict without every required protection")
+        if "error_type" in raw and not isinstance(raw["error_type"], str):
+            raise ValueError("error type is not text")
+        return raw
+    except ValueError:
+        raise
+    except Exception as error:  # RecursionError, TypeError, MemoryError, ...
+        raise ValueError(f"unparseable response: {type(error).__name__}") from None
 
 
 def command(
@@ -164,8 +230,10 @@ def run(
     if docker is None:
         return Result("unavailable")
     name = "scratchcoder-" + uuid4().hex
+    nonce = secrets.token_hex(16)
     payload = json.dumps(
         {
+            "nonce": nonce,
             "code": code,
             "tests": tests,
             "mode": mode,
@@ -216,9 +284,20 @@ def run(
                 selector.close()
                 process.stdout.close()
             if process.returncode == 0 and status not in {"timeout", "output_limit"}:
-                raw = json.loads(captured)
-                if raw["status"] not in {"passed", "failed", "timeout", "output_limit"}:
-                    raise ValueError("invalid sandbox response")
+                try:
+                    raw = parse_response(bytes(captured), nonce, REQUIRED_PROTECTIONS)
+                except ValueError:
+                    return Result(
+                        "infrastructure_error",
+                        elapsed_seconds=time.monotonic() - started,
+                        detail="malformed_response",
+                    )
+                if raw["status"] in SUPERVISOR_HOST_FAILURES:
+                    return Result(
+                        "infrastructure_error",
+                        elapsed_seconds=time.monotonic() - started,
+                        detail=SUPERVISOR_HOST_FAILURES[raw["status"]],
+                    )
                 return Result(
                     raw["status"],
                     raw["stdout"][: limits.output_bytes],
@@ -235,8 +314,13 @@ def run(
                 elapsed_seconds=time.monotonic() - started,
                 host_stalled=host_stalled,
             )
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return Result("infrastructure_error", elapsed_seconds=time.monotonic() - started)
+    except Exception:
+        # Every host-side failure, whatever its type, is unresolved, never a verdict.
+        return Result(
+            "infrastructure_error",
+            elapsed_seconds=time.monotonic() - started,
+            detail="runner_error",
+        )
     finally:
         if process is not None and process.poll() is None:
             process.kill()

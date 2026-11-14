@@ -8,7 +8,8 @@ records that policy in two ways at once:
 - **By value.** The limits the evaluation runner really applies (a function call, and I/O
   calls with several case counts, through :func:`scratchcoder.eval.harness.execution_limits`),
   the scored statuses, the retry count and backoff, the input limit the caller passes, the
-  image and the host watchdog. A changed constant, or a function replaced in memory, shows here.
+  image, the host watchdog and the protections the supervisor must establish. A changed
+  constant, or a function replaced in memory, shows here.
 - **By code.** A SHA-256 of the syntax tree of every unit in :data:`VERDICT_CODE`, with
   docstrings removed (comments never reach the tree). Editing a docstring or a comment, or
   any file not listed, leaves the identity unchanged; editing the code of a listed unit
@@ -41,10 +42,15 @@ from pathlib import Path
 from typing import Any
 
 from scratchcoder.eval import harness, parallel
-from scratchcoder.sandbox import budget, runner
+from scratchcoder.sandbox import budget, program, runner
 
-EXECUTION_POLICY_VERSION = 1
-"""Bump when :data:`VERDICT_CODE`, the probes or the shape of the policy record change."""
+EXECUTION_POLICY_VERSION = 2
+"""Bump when :data:`VERDICT_CODE`, the probes or the shape of the policy record change.
+
+Version 2 (2026-11-14) adds ``supervisor_protections``: the path-of-record supervisor now
+refuses to run a candidate unless it is non-dumpable and handles the catchable signals, and
+the host accepts only one nonce-bearing result line. A results file started under version 1
+(the unprotected supervisor) is refused on resume."""
 
 CodeUnits = Sequence[tuple[str, tuple[str, ...] | None]]
 
@@ -220,6 +226,7 @@ def execution_policy(
             },
         },
         "host_watchdog_seconds": runner.HOST_WATCHDOG_SECONDS,
+        "supervisor_protections": list(program.REQUIRED_PROTECTIONS),
         "scored_statuses": sorted(harness.SCORED_STATUSES),
         "host_retries": retries,
         "host_backoff_seconds": [harness.host_backoff(n) for n in range(1, retries + 1)],
