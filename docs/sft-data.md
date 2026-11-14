@@ -5,7 +5,7 @@
 ## Status
 
 - **Code rows** can be built now from the 2026-10-25 pool.
-- **The language intake is approved.** On 2026-10-26 the owner accepted the dataset card's Apache-2.0 label plus the dataset paper as the [terms of record](#terms-of-record), for human-written conversation paths only. The `download`, `language` and `build` stages run end to end. No build of record has been made yet.
+- **The language intake is approved.** On 2026-10-26 the owner accepted the dataset card's Apache-2.0 label plus the dataset paper as the [terms of record](#terms-of-record), for human-written conversation paths only. The `download`, `language` and `build` stages run end to end, and both builds of record below use the screened conversations.
 - **The language cap is on loss tokens.** On 2026-10-26 the owner ruled that the 30% language cap applies to the tokens the SFT loss is computed on, with the shares recorded both ways. See [language rows](#build).
 - **AceCode is flagged** and left out of every source list by default. It is used only with `--include-acecode`.
 - **Builds of record.** `runs/sft-data-20261026` (run 1's SFT) and `runs/sft-data-20261027` (run 1b's, with `--omit-public-tests`, from the same pool train and dev splits and language conversations). See [the 2026-10-27 build](#the-2026-10-27-build).
