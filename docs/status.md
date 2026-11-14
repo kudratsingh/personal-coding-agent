@@ -17,7 +17,7 @@ The rehearsal continued from run B's mixed checkpoint (the 135M-parameter S mode
   - greedy generation gave a program for 13 of 16 dev prompts, against a bar of 12.
 - **RL (run 2): blocked, not run.** Screening sampled the run 1b SFT model 8 times on each of 1,000 RL candidates. It kept **161 eligible tasks**, below the **320-task floor**. Of the others, 40 had tests the reward channel could not parse, 216 paid a constant answer at least 0.5, and 583 gave all 8 samples the same reward, so they carry no learning signal. Below the floor no task list is produced, so RL and its more-SFT control have not run. The RL code and the control are CPU-tested only ([rehearsal RL](rl.md)).
 
-Diagnostic evaluation. Pool dev is the rehearsal pool's 2,000-task dev split, scored in the isolated sandbox. HumanEval+ omits task 32, as in all of this project's HumanEval+ scoring. The constant-answer baseline is the best degenerate answer per task (a fixed value, a value copied from the public test, or an echo of the input), a floor for what weak tests let through.
+Diagnostic evaluation. Pool dev is the rehearsal pool's 2,000-task dev split, scored in the isolated sandbox. HumanEval+ omits task 32, as in all of this project's HumanEval+ scoring. The constant-answer baseline is the best degenerate answer per task (a fixed value, a value copied from the public test, or an echo of the input), chosen using that task's tests. It is an oracle diagnostic, not a single policy a model could follow: it shows how much weak tests let through.
 
 | Endpoint | Pool dev greedy | Pool dev, 8 samples: tasks with a pass | HumanEval | HumanEval+ | MBPP+ | ARC-Easy |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -33,6 +33,7 @@ Diagnostic evaluation. Pool dev is the rehearsal pool's 2,000-task dev split, sc
 ### Known limitations of these numbers
 
 - **Train/dev overlap and weak tests.** An independent technical audit (2026-11-13) found pool dev tasks that closely match training tasks, including among tasks the model solved. It did not measure how much of the score the overlap explains. It also found dev tasks whose tests are weak enough that degenerate programs pass them; the constant-answer row above shows the effect. A versioned dev set and evaluator are being prepared to correct both. The numbers above are not rescored. They stay as recorded, as historical diagnostics, and are not comparable with later versions.
+- **Base and SFT use different prompts.** The base model writes plain continuations of the prompt; the SFT model answers in the chat format. On HumanEval, HumanEval+ and MBPP+ the caps differ too: 256 new tokens for base, 512 for SFT. Pool dev used 512 for both. No code-generation column is a matched comparison of the weights alone.
 - **One seed, one run each** at 135M parameters.
 - **The pool test split stays sealed.** Its completion files are sealed and have not been executed.
 
