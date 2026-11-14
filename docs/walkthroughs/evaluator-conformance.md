@@ -134,6 +134,32 @@ control on the same task:
 A second dedicated test writes a forged result line to the path-of-record supervisor's own
 standard output. It is never allowed to pass.
 
+## Demonstrated limitations (observed in the local gated runs)
+
+These are properties of the current evaluators, shown with synthetic cases. They describe
+what a candidate *could* do. They do not mean that any recorded run contained such a
+program, and historical result files are unchanged.
+
+- **Path of record, function mode:** verdicts are decided inside the candidate's process. A
+  candidate can forge the completion marker, skip the tests with a line-trace hook, replace
+  or shadow the helpers the tests call, return objects whose `==` always holds, or read the
+  expected values from its own program text.
+- **Path of record, I/O mode:** the supervisor runs as the candidate's user and is dumpable,
+  so a candidate can read the expected outputs from the supervisor's memory
+  (`/proc/1/mem`) and print them. A candidate can also write to the supervisor's standard
+  output; the host then cannot parse the result, and the evaluation harness aborts the run.
+- **Reward channel:** the host-side comparison resists marker forgery and expected-value
+  reads, but each call is evaluated in the candidate's own namespace after the candidate has
+  run. A candidate that redefines the outer call of an `is True`-type check (a module-level
+  name, a patched attribute of a module the tests import, or a patched `builtins`) earns full
+  credit on that check. It also cannot encode custom objects, so it rejects some honest
+  solutions (`evaluator_rejects_honest`).
+- **Both paths:** checks that never call the candidate, missing side-effect or error checks,
+  tests that contradict the prompt, and tests that fix an order the prompt leaves free are
+  scored as written. String-hash order differs between fresh processes, so a task whose
+  reference depends on set order gives different verdicts from run to run. No evaluator
+  change fixes the task-level problems; they need checks at admission.
+
 ## Design choices and common mistakes
 
 - **Characterize, do not aspire.** An expected verdict says what the current code does. When a
@@ -154,8 +180,10 @@ standard output. It is never allowed to pass.
 - **Predicted, then observed.** The expected verdicts were first derived by reading the
   runner, the supervisors and the reward channel. A local gated run of catalogue version 1
   against the pinned container, inside a passing execution window, then matched every
-  declared verdict on both paths. Version 2 verdicts stay predictions until a gated run
-  observes them. A future mismatch is a finding to investigate: correct
+  declared verdict on both paths. A gated run of version 2 matched 101 of its 102 verdicts.
+  The exception was the I/O supervisor introspection case, predicted to fail on the path of
+  record, which passed. Its expectation was then corrected in a separate change that cites
+  the observation (see "Demonstrated limitations" above). A future mismatch is a finding to investigate: correct
   the catalogue only in a separate, reviewed change that cites the observation.
 - **Out of scope:** NumPy-backed benchmark scoring (the EvalPlus image), benchmark suites
   (none of them is parseable on the reward channel), and the sealed test split.

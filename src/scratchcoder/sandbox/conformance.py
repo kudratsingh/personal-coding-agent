@@ -670,7 +670,7 @@ CASES: tuple[Case, ...] = (
         record=_record(
             "known_weakness: a line-trace hook jumps over the tests to the module's last line, "
             "so the real marker prints with exit 0 without the marker being read "
-            "(prediction uncertain: CPython 3.12 jump rules)",
+            "(observed in conformance run 2)",
             PASSED,
         ),
         reward=_reward(
@@ -825,8 +825,7 @@ CASES: tuple[Case, ...] = (
         reward=_reward(
             "known_weakness: the patch answers only isinstance(..., list), so the reward "
             "driver's own encoding keeps working and the patched builtin decides an 'is True' "
-            "check without any module global (prediction uncertain: the driver shares the "
-            "interpreter with the patch)",
+            "check without any module global (observed in conformance run 2)",
             FULL,
         ),
         audit_flags=("builtins",),
@@ -881,13 +880,10 @@ CASES: tuple[Case, ...] = (
         tests=_IO_SUM_TESTS,
         solves=False,
         record=_record(
-            "control: fails only if /proc/1/mem is refused (for example by Yama "
-            "ptrace_scope >= 1); the supervisor is dumpable, shares the candidate's uid and "
-            "holds every expected output, so a readable /proc/1/mem would let the candidate "
-            "print them and pass, a scorer-integrity finding (prediction uncertain: "
-            "/proc/1/mem access in the pinned container is not established; the observed "
-            "stdout names the branch taken)",
-            FAILED,
+            "known_weakness: the supervisor is dumpable and shares the candidate's uid, so the "
+            "candidate reads every expected output from /proc/1/mem and prints it (observed "
+            "in conformance run 2; predicted failed before that run)",
+            PASSED,
         ),
         reward=_reward("control: the expected outputs never enter the container", ZERO),
         audit_flags=_IO_INTROSPECTION_FLAGS,
@@ -1104,13 +1100,12 @@ REQUIRED_CASES = frozenset(
 """Cases the audit's item 5 and the verifier-quality extension require; the unit tests
 refuse a catalogue without them."""
 
-UNCERTAIN_CASES = (
-    "trace_hook_line_jump",
-    "builtins_module_patch_is_true_form",
-    "io_supervisor_introspection",
-)
+UNCERTAIN_CASES: tuple[str, ...] = ()
 """Cases whose declared verdict could not be derived from code reading with confidence. Each
-still declares exactly one outcome per path and says ``prediction uncertain`` in a label."""
+still declares exactly one outcome per path and says ``prediction uncertain`` in a label.
+Empty since conformance run 2 observed the three uncertain v2 cases
+(``trace_hook_line_jump``, ``builtins_module_patch_is_true_form`` and
+``io_supervisor_introspection``); their labels now cite that run."""
 
 FAILURE_CLASSES: dict[str, frozenset[str]] = {
     "contradictory_contract": frozenset(

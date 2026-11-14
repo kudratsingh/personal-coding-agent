@@ -187,6 +187,7 @@ def test_known_weaknesses_are_pinned() -> None:
         "monkeypatch_helper_is_true_form",
         "builtins_module_patch_is_true_form",
         "se_raise_unchecked_stub",
+        "io_supervisor_introspection",
     }
     assert conformance.known_weaknesses("reward") == {
         "side_effect_stub",
