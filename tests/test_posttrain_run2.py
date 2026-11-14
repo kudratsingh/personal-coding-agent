@@ -290,10 +290,11 @@ def test_the_tracked_template_is_the_approved_run_two_with_its_gate_values_null(
     assert "private/" not in text and "D-3" not in text
 
 
-def test_run_two_generates_as_run_one_and_plans_at_run_ones_floors() -> None:
+def test_run_two_generates_as_run_one_and_plans_at_the_standing_floors() -> None:
     """The base, SFT, RL and more-SFT evaluations share one generation protocol, so run 2
     evaluates at run 1's batch, 128; it plans each batch it generates at (128 for the
-    evaluation, 256 for the rollouts and the dev checks) at run 1's probe floor there."""
+    evaluation, 256 for the rollouts and the dev checks) at the floor the standing rule
+    derives there when its specification is written."""
     run1 = posttrain_approved.run1_specification()
     run2 = posttrain_approved.run2_specification()
     assert run2["generation"] == run1["generation"]
@@ -302,9 +303,14 @@ def test_run_two_generates_as_run_one_and_plans_at_run_ones_floors() -> None:
     batches = {str(run2["generation"]["batch_size"]), str(rl["generation_batch"])}
     assert batches | {str(rl["dev_batch_size"])} == {"128", "256"}
     planning = run2["planning"]["generation_tokens_per_second"]
-    floors = run1["probe"]["minimum_tokens_per_second"]
-    assert set(planning) == set(floors) == batches
-    assert planning == floors == {"128": 7_731.0, "256": 8_733.0}
+    assert set(planning) == set(run1["probe"]["minimum_tokens_per_second"]) == batches
+    assert planning == posttrain_approved.RUN2_FLOORS == {"128": 7_991.0, "256": 9_049.0}
+    # The standing rule over the four hosts measured before run 2's second specification was
+    # written; a host appended later leaves this template's speeds as they are.
+    hosts_before = posttrain_approved.MEASURED_HOST_PROBES[:4]
+    assert posttrain_approved.RUN2_FLOORS == posttrain_approved.derive_generation_floors(
+        hosts_before
+    )
 
 
 def test_the_gate_fills_every_null_and_the_approved_check_refuses_any_other_change() -> None:
@@ -378,7 +384,7 @@ def test_the_cost_limit_is_the_lower_of_the_ceiling_and_120_percent_of_the_estim
         with pytest.raises(ValueError, match="differs from its derivation"):
             Specification.from_dict(changed)
     # The launch rule still refuses a plan that does not fit at the planning rates: at a $2.00
-    # estimate the limit is $2.40, a 14,220 s timer, short of the 17,970 s the plan needs.
+    # estimate the limit is $2.40, a 14,220 s timer, short of the 17,719 s the plan needs.
     low = posttrain_approved.run2_specification(gate_values())
     low["limits"].update(gate_estimate_usd=2.00, cost_limit_usd=2.40)
     low_spec = Specification.from_dict(low)
@@ -392,16 +398,16 @@ def test_the_cost_limit_is_the_lower_of_the_ceiling_and_120_percent_of_the_estim
 
 def test_the_gate_refuses_limits_that_leave_no_room_for_the_planned_setup() -> None:
     """A fast run 1 gives a low estimate, and 120% of it may not hold the planned 900 s setup
-    plus the 17,970 s the launch rule needs at the planning rates: the readiness receipt would
+    plus the 17,719 s the launch rule needs at the planning rates: the readiness receipt would
     then refuse only after the Pod had billed its setup. The gate refuses it first, and says
     what the limits leave for setup."""
     accepted = posttrain_approved.run2_specification({**gate_values(), "gate_estimate_usd": 3.20})
     fit = posttrain_approved.gate_launch_fit(accepted)
     assert fit["fits"] and fit["limit_usd"] == 3.84
     assert fit["lifetime_seconds"] == 22_860 and fit["startup_seconds"] == 900
-    assert fit["planning_seconds_needed"] == pytest.approx(17_970, abs=1)
-    assert fit["setup_allowance_seconds"] == pytest.approx(4_890, abs=1)
-    for estimate, left in ((2.58, "390"), (2.50, "-150"), (2.00, "-3,750")):
+    assert fit["planning_seconds_needed"] == pytest.approx(17_719, abs=1)
+    assert fit["setup_allowance_seconds"] == pytest.approx(5_141, abs=1)
+    for estimate, left in ((2.60, "821"), (2.50, "101"), (2.00, "-3,499")):
         with pytest.raises(ValueError, match=f"leaves {left} s for setup") as caught:
             posttrain_approved.run2_specification({**gate_values(), "gate_estimate_usd": estimate})
         assert "planned 900 s" in str(caught.value)
@@ -597,20 +603,20 @@ def test_run_two_fits_its_ceiling_at_the_planning_rates() -> None:
     stages = plan["stages"]
     assert stages["rl"] == pytest.approx(
         20
-        + 100 * 256 * 256 / 8_733
+        + 100 * 256 * 256 / 9_049
         + 100 * 256 * 1_024 / 56_765
         + 100 * 48
-        + 6 * (1_800 * 512 / 8_733 + 300 + 5)
+        + 6 * (1_800 * 512 / 9_049 + 300 + 5)
     )
     assert stages["more-sft"] == pytest.approx(
-        20 + 100 * 256 * 256 / 8_733 + 100 * 256 * 1_024 / 56_765 + 5 * (1_800 * 512 / 8_733 + 305)
+        20 + 100 * 256 * 256 / 9_049 + 100 * 256 * 1_024 / 56_765 + 5 * (1_800 * 512 / 9_049 + 305)
     )
-    assert stages["eval-rl"] == pytest.approx(7 * 20 + 18_792_960 / 7_731)
+    assert stages["eval-rl"] == pytest.approx(7 * 20 + 18_792_960 / 7_991)
     assert stages["arc-post"] == pytest.approx(2 * (20 + 54))
     lifetime = spec.ceiling.self_destruct_seconds
     fit = launch_fit(spec, remaining_seconds=lifetime - spec.limits["startup_seconds"])
     assert fit["fits_at_planning"] and fit["planning_seconds_needed"] == pytest.approx(
-        17_970, abs=1
+        17_719, abs=1
     )
 
 
