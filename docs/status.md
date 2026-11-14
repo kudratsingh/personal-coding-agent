@@ -1,12 +1,46 @@
 # Public project status
 
-**Updated:** 2026-10-26
+**Updated:** 2026-11-13
 **Real-source sample evidence updated:** 2026-10-24
-**Stage:** Local research pipeline; phase acceptance incomplete
+**Stage:** Local research pipeline; rehearsal post-training paused at the RL stage; phase acceptance incomplete
 
 Local data/tokenization, model/trainer, generation, isolated code evaluation, and multiple-choice components are implemented and reference-tested. No trained coding capability, hosted service, or released weight is claimed.
 
-## Latest result: rehearsal pretraining (2026-10-26)
+## Latest result: rehearsal post-training (2026-10-27 to 2026-10-28)
+
+The rehearsal continued from run B's mixed checkpoint (the 135M-parameter S model, below) on one A40 per run. Supervised fine-tuning (SFT) ran twice. RL has not run. Every number here is a diagnostic of a small rehearsal model, not a capability result. See [limitations](#known-limitations-of-these-numbers).
+
+- **Run 1 (2026-10-27): SFT formatting failure.** Pretraining never trains the chat special tokens, and their tied embedding rows stayed nearly identical through SFT (largest cosine among the three output specials 0.996). After `<|assistant_start|>` the SFT model emitted `<|assistant_end|>` straight away. All 2,000 greedy pool dev answers ended at that first token and held no program. The SFT weights fail the [format gate](walkthroughs/sft-format-gate.md). Their evaluation is recorded as a formatting failure, not a result, and their two sealed test files are withdrawn. Run 1's base-model evaluation stands.
+- **Run 1b (2026-10-28): recovery.** Before SFT, the special-token rows were redrawn apart from each other and trained at 10x the base learning rate ([walkthrough](walkthroughs/special-token-rows.md)). SFT then ran two passes (212 updates). The required format gate passed on the selected weights:
+  - the first assistant token was `<|python_start|>` on all 32 rows, mean probability 0.997;
+  - the largest cosine among the output specials was 0.53, against a bar below 0.9;
+  - greedy generation gave a program for 13 of 16 dev prompts, against a bar of 12.
+- **RL (run 2): blocked, not run.** Screening sampled the run 1b SFT model 8 times on each of 1,000 RL candidates. It kept **161 eligible tasks**, below the **320-task floor**. Of the others, 40 had tests the reward channel could not parse, 216 paid a constant answer at least 0.5, and 583 gave all 8 samples the same reward, so they carry no learning signal. Below the floor no task list is produced, so RL and its more-SFT control have not run. The RL code and the control are CPU-tested only ([rehearsal RL](rl.md)).
+
+Diagnostic evaluation. Pool dev is the rehearsal pool's 2,000-task dev split, scored in the isolated sandbox. HumanEval+ omits task 32, as in all of this project's HumanEval+ scoring. The constant-answer baseline is the best degenerate answer per task (a fixed value, a value copied from the public test, or an echo of the input), a floor for what weak tests let through.
+
+| Endpoint | Pool dev greedy | Pool dev, 8 samples: tasks with a pass | HumanEval | HumanEval+ | MBPP+ | ARC-Easy |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Base, run B (run 1) | 0/2,000 | 3/2,000 | 4/164 | 4/163 | 0/378 | 25.0% |
+| SFT, run 1b | 125/2,000 | 200/2,000 | 3/164 | 2/163 | 8/378 | 24.9% |
+| Constant-answer baseline | 90/1,995 covered | — | 1/164 | 3/163 | 27/378 | — |
+
+- **Tasks are not attempts.** In the 8-sample evaluation, 200 of 2,000 tasks were solved at least once. Of 16,000 attempts, 369 passed (2 of them carry sandbox audit flags; without them the task count is still 200). The base model passed 3 of 16,000 attempts, on 3 tasks.
+- **The human-written dev slice is weak.** Of the 150 human-written dev tasks (MBPP and TACO), the SFT model solved 3 greedy and 6 in 8 samples. Almost all its pool dev passes are on model-written OpenCodeInstruct tasks: 122/1,850 greedy. The constant-answer baseline fully passes 16 of the 150 human-written tasks.
+- **ARC-Easy is at chance.** Uniform guessing gives 25.0% on these 2,376 questions. Base and SFT both pick the first-listed label on about 99% of them, so neither score shows reasoning.
+- **Benchmarks are near zero.** On MBPP+ the SFT model passes fewer tasks than the constant-answer baseline.
+
+### Known limitations of these numbers
+
+- **Train/dev overlap and weak tests.** An independent technical audit (2026-11-13) found pool dev tasks that closely match training tasks, including among tasks the model solved. It did not measure how much of the score the overlap explains. It also found dev tasks whose tests are weak enough that degenerate programs pass them; the constant-answer row above shows the effect. A versioned dev set and evaluator are being prepared to correct both. The numbers above are not rescored. They stay as recorded, as historical diagnostics, and are not comparable with later versions.
+- **One seed, one run each** at 135M parameters.
+- **The pool test split stays sealed.** Its completion files are sealed and have not been executed.
+
+**Next:** the dev-set and evaluator corrections above. RL stays blocked until screening keeps at least 320 tasks; the floor is unchanged.
+
+Run operations, limits and stage records: [post-training runs](posttrain-runs.md).
+
+## Earlier result: rehearsal pretraining (2026-10-26)
 
 Two rehearsal pretraining runs of the 135M-parameter S model completed on 2026-10-26, each on one A40. Both started from one saved initialization and read the same 2B-token multiset.
 - **Run A (two-stage):** 1B English tokens, then 0.9B Python and 0.1B unseen English, with a fresh optimizer and schedule.
@@ -25,13 +59,12 @@ Full-validation bits per byte:
 - **English:** mixed is better by 6.1% of two-stage's value.
 - **Forgetting:** stage 2 cost the two-stage run 0.079 bits per byte of English.
 - **What it compares:** two recipes, not order alone, since the two-stage run also reset its optimizer and schedule, at half the peak learning rate.
-- **Not measured:**
-  - the pre-registered dev pass rate after matched SFT, because post-training continues on run B only;
-  - ARC-Easy accuracy for these checkpoints, which is still to come.
+- **Not measured:** the pre-registered dev pass rate after matched SFT, because post-training continued on run B only.
+- **ARC-Easy, measured later:** 25.0% for each of run A's two checkpoints and run B's final, which is chance ([above](#latest-result-rehearsal-post-training-2026-10-27-to-2026-10-28)).
 
 **Decision:** the main model will pretrain on one mixed stage with one schedule. It keeps its planned token streams, 9B web English plus 9B of Python with 10% English, shuffled together. The two-stage code path stays as an experiment.
 
-**Next:** the rest of the rehearsal continues from run B's checkpoint: SFT on code and language, a short RL run with a "more SFT" control, and full evaluation. One proposal covers all three, priced at the measured A40 speed; nothing is spent before owner approval.
+**Then:** post-training continued from run B's checkpoint ([above](#latest-result-rehearsal-post-training-2026-10-27-to-2026-10-28)).
 
 **Cost and teardown:** run A was billed $6.40 and run B $6.44, each under its $10 cap. Both Pods were deleted after their final checkpoints were verified in R2.
 
@@ -103,7 +136,7 @@ Condition-by-condition evidence reports: [G0](gates/g0-foundation.md), [G1](gate
 | 1. Data/tokenizer | Manifest controls, real-source sample reports, frozen BPE, fast encoder, shards/loader | Full-build estimate owner decision, remaining source/pool coverage and real-scale acceptance |
 | 2. Model/training | CPU-reference model/optimizer/trainer, generation, sanity ladder; one completed A40 pilot (2026-10-24) with measured precision, memory, throughput, checkpoint transfer and verified shutdown | Phase gate review of the pilot evidence; multi-run and distributed fault-recovery acceptance |
 | 3. Evaluation/safety | Development sandbox, task/pool/metric tooling, code/choice CLI; reference G3 closed; disclosed 163-task HumanEval+ scoring complete | Complete real-source suite/holdout coverage, host signoff |
-| 4. Rehearsal | S build, task pool and holdouts; rehearsal pretraining runs A and B completed on two A40s (2026-10-26) and the order comparison recorded | SFT, short RL with its more-SFT control, full evaluation and the local demo, each with its own approval; G4 review |
+| 4. Rehearsal | S build, task pool and holdouts; rehearsal pretraining runs A and B completed on two A40s (2026-10-26) and the order comparison recorded; SFT run 1 (formatting failure) and run 1b (format gate passed) with diagnostic evaluation (2026-10-27 to 2026-10-28) | Corrected dev set and evaluator; short RL with its more-SFT control (blocked: screening kept 161 tasks, below the 320-task floor); full evaluation and the local demo, each with its own approval; G4 review |
 
 These are implementation milestones, not closed phase gates. Synthetic fixtures cannot substitute for real-source or hardware acceptance. No paid compute is authorized without explicit owner permission for the specific run.
 
@@ -125,7 +158,7 @@ retraining without approval.** All specials fit inside IDs **0–65,535**;
 
 The [four gate reports](gates/g0-foundation.md) and [12 Phase 4 work orders](rehearsal-plan.md) remain prepared, not blanket phase acceptance. HumanEval+ scoring still uses **163 tasks with task 32 explicitly excluded**; reference G3 stays closed. No further reference variants or task-32 investigations were run. The [GPU pilot](gpu-pilot-plan.md) has conditional owner approval and a completed readiness audit ([verdict and blockers](../PILOT_LAUNCH_READINESS.md), [runbook](../PILOT_RUNBOOK.md)); the owner selected the agreed specification on 2026-10-24, with `torch.compile` off for training and one separate 20-update compiled probe that measures the speedup. The owner authorized launch on 2026-10-24 and the pilot completed: the A40 preflight passed after a UUID/memory-report fix, the 6e-4 arm won the screen and reached step 500 (**91,750,400 tokens at 35,974 tok/s**, final held-out loss **5.5789**), the compile probe measured **1.57x**, the checkpoint was verified on the Mac and the Pod was deleted (204, then 404). **One Pod for 3,679 seconds, $0.60 spent.** See the [measured results](gpu-pilot-plan.md#measured-a40-pilot-2026-10-24).
 
-The [revised P1-6 estimate](full-build-plan.md) is **approved for the S rehearsal build only, effective after the GPU pilot report** (owner, 2026-10-24); M, L and other full builds are not approved. The [S build ran locally on 2026-10-25](rehearsal-data.md): exactly **1,000,000,000 / 100,000,000 / 900,000,000** stage-1 English, stage-2 English and stage-2 Python shard tokens, Python byte retention **83.22674%** over all 1,090,395 files of five containers, verification passed, $0. After the task-pool holdout exclusion (2,940 documents dropped, quotas still exact) the shards were [admitted for training on 2026-10-25](rehearsal-data.md#holdout-exclusion-and-admission-2026-10-25). The [rehearsal task pool](task-pool.md) holds 8,459 training, 2,000 dev and 2,000 test tasks plus a 4,660-task RL-only AceCode pool. [Rehearsal runs A and B](rehearsal-runs.md) (two-stage and mixed, 2B tokens each on one A40 apiece) ran under a $10 cap per run, which is also each run's binding limit (a 60,000-second Pod wall, $10.00 at the quoted rate), and a 15-minute speed check that stops a run below 90% of the reference speed. Their pre-launch code is written and reviewed: the one-pass loader, quarter-stage validation, the R2 checkpoint uploader, the run binding, the worker, the supervisor and the runbook. The binding, the shards and the shared seed-0 initialization are staged in R2. Both runs completed on 2026-10-26, billed $6.40 and $6.44 ([results](rehearsal-runs.md#measured-results-2026-10-26)). The frozen-tokenizer recount of the current review gives **198,273,119 Python tokens / 828,088,405 bytes**, predicting **12.68948B Python tokens over 64GB**, or **12.62603B after validation reserve**, conditionally—not a measured full-source count. Every model's Python target now fits inside the 59 available containers under that forecast. The 2026-10-20 forecast of 1.68502B covered only header-licensed files. Cached-source timing covers **80 isolated partition calls**, with unmeasured sources/proxies explicit. The small rehearsal remains selected. Builds beyond S are **0**; Phase 4 model runs are **2** (A and B). Post-training and full evaluation for the rehearsal each need their own owner approval.
+The [revised P1-6 estimate](full-build-plan.md) is **approved for the S rehearsal build only, effective after the GPU pilot report** (owner, 2026-10-24); M, L and other full builds are not approved. The [S build ran locally on 2026-10-25](rehearsal-data.md): exactly **1,000,000,000 / 100,000,000 / 900,000,000** stage-1 English, stage-2 English and stage-2 Python shard tokens, Python byte retention **83.22674%** over all 1,090,395 files of five containers, verification passed, $0. After the task-pool holdout exclusion (2,940 documents dropped, quotas still exact) the shards were [admitted for training on 2026-10-25](rehearsal-data.md#holdout-exclusion-and-admission-2026-10-25). The [rehearsal task pool](task-pool.md) holds 8,459 training, 2,000 dev and 2,000 test tasks plus a 4,660-task RL-only AceCode pool. [Rehearsal runs A and B](rehearsal-runs.md) (two-stage and mixed, 2B tokens each on one A40 apiece) ran under a $10 cap per run, which is also each run's binding limit (a 60,000-second Pod wall, $10.00 at the quoted rate), and a 15-minute speed check that stops a run below 90% of the reference speed. Their pre-launch code is written and reviewed: the one-pass loader, quarter-stage validation, the R2 checkpoint uploader, the run binding, the worker, the supervisor and the runbook. The binding, the shards and the shared seed-0 initialization are staged in R2. Both runs completed on 2026-10-26, billed $6.40 and $6.44 ([results](rehearsal-runs.md#measured-results-2026-10-26)). The frozen-tokenizer recount of the current review gives **198,273,119 Python tokens / 828,088,405 bytes**, predicting **12.68948B Python tokens over 64GB**, or **12.62603B after validation reserve**, conditionally—not a measured full-source count. Every model's Python target now fits inside the 59 available containers under that forecast. The 2026-10-20 forecast of 1.68502B covered only header-licensed files. Cached-source timing covers **80 isolated partition calls**, with unmeasured sources/proxies explicit. The small rehearsal remains selected. Builds beyond S are **0**. Phase 4 runs: pretraining runs A and B, then post-training runs 1 and 1b (SFT and diagnostic evaluation); RL has not run ([latest result](#latest-result-rehearsal-post-training-2026-10-27-to-2026-10-28)).
 
 ## Reporting policy
 
