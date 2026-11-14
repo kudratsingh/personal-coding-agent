@@ -21,7 +21,12 @@ One row per checkpoint and completions file (or ARC report) carries:
 
 Named checkpoint pairs on the same tasks get a paired task bootstrap
 (``scratchcoder.eval.metrics.paired_bootstrap``) with a fixed seed; a pair whose protocols
-differ (SFT versus base on the pool) is labelled cross-protocol. The leak flag marks any
+differ (SFT versus base on the pool) is labelled cross-protocol. A completions file
+generated under a deliberate interface override (``eval-generate --allow-interface-mismatch``)
+carries its ``interface_override`` record into its row, the Markdown marks the row, and
+every comparison that uses such a row lists the overridden checkpoints under
+``interface_override``: a protocol shared by both sides does not make the pair comparable
+when one side's checkpoint was not trained for it. The leak flag marks any
 checkpoint above 20% greedy pass@1 on HumanEval, treated as a leak until shown otherwise.
 It has three values: ``True`` (above the threshold, even on a partial row), ``False`` (a
 complete greedy HumanEval row at or below it) and ``None`` (no complete greedy HumanEval
@@ -286,6 +291,8 @@ def _row(name: str, run: Run, baselines: Sequence[dict[str, Any]]) -> dict[str, 
         "sandbox_minutes": run.sandbox_seconds / 60,
         "audit_flagged_passes": run.audit_flagged,
     }
+    if header.interface_override is not None:
+        row["interface_override"] = dict(header.interface_override)
     if run.suite == "pool":
         row["slices"] = _slices(run, baselines)
     if run.suite == LEAK_SUITE and run.decoding == "greedy":
@@ -606,6 +613,13 @@ def build_scorecard(
                         seed=bootstrap_seed,
                     )
                 )
+                overridden = [
+                    name
+                    for name, run in ((first_name, a), (second_name, b))
+                    if run.header.interface_override is not None
+                ]
+                if overridden:
+                    comparisons[-1]["interface_override"] = overridden
         if first in arc_runs and second in arc_runs:
             comparisons.append(
                 _compare(
@@ -761,6 +775,12 @@ def render_markdown(scorecard: Mapping[str, Any]) -> str:
                 leak_mark = " (leak check inconclusive)"
             if row.get("reuses"):
                 leak_mark += f" (reuses {row['reuses']}: not independent)"
+            override = row.get("interface_override")
+            if override:
+                leak_mark += (
+                    f" (interface override: {override['checkpoint_interface']} checkpoint "
+                    f"under a {override['requested_interface']} protocol)"
+                )
             lines.append(
                 f"| {row['checkpoint']}{leak_mark} | {row['decoding']} | {row['protocol']} | "
                 f"{score} | {control} | {unresolved} | "
@@ -785,6 +805,9 @@ def render_markdown(scorecard: Mapping[str, Any]) -> str:
                 interval = f"[{100 * item['lower']:+.2f}, {100 * item['upper']:+.2f}]"
                 direction = item["direction"]
             note = "cross-protocol" if item["cross_protocol"] else ""
+            if item.get("interface_override"):
+                crossed = ", ".join(item["interface_override"])
+                note = f"{note}; interface override: {crossed}".lstrip("; ")
             for name, source in item.get("reused", {}).items():
                 note = f"{note}; {name} is {source}'s results".lstrip("; ")
             lines.append(

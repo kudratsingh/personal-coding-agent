@@ -4,6 +4,13 @@
 ``base-pool-completion-v1`` scores pool tasks with a base model: the task text and
 public test sit in a module docstring, and the model writes the program after it. Its
 stop strings depend on the task's mode, so truncation always names the mode.
+
+Two names belong to the legacy ``scratchcoder eval`` command only:
+``legacy-pool-rstrip-v1`` is its ``--prompt-mode base`` on pool tasks (the benchmark
+prefix-completion procedure applied to a pool task's raw prompt), and
+``legacy-instruction-v1`` is its ``--prompt-mode instruction``. Reports written before
+``legacy-pool-rstrip-v1`` existed recorded that procedure on pool tasks under the name
+``base-completion-rstrip-v1``; those reports are left as they are.
 """
 
 from collections.abc import Mapping, Sequence
@@ -30,6 +37,9 @@ Both amendments were made on 2026-10-26, before the protocol's first scored use,
 table is part of the protocol record, so the record's hash changed with each."""
 POOL_MAX_NEW_TOKENS = 512
 POOL_PROTOCOL = "base-pool-completion-v1"
+BENCHMARK_PROTOCOL = "base-completion-rstrip-v1"
+LEGACY_POOL_PROTOCOL = "legacy-pool-rstrip-v1"
+LEGACY_INSTRUCTION_PROTOCOL = "legacy-instruction-v1"
 
 
 def base_prompt(text: str) -> str:
@@ -84,16 +94,25 @@ def truncate_pool_completion(text: str, *, mode: str) -> str:
 
 
 def prompt_protocol(mode: str = "base", *, stops: Sequence[str] = BASE_STOPS) -> dict[str, Any]:
-    if mode == "base":
-        return {
-            "prompt_stripped": True,
-            "protocol": {
-                "name": "base-completion-rstrip-v1",
-                "prompt_format": "raw-task-prompt.rstrip()",
-                "stop_strings": list(stops),
-                "candidate_assembly": "stripped-prompt+retained-completion",
-            },
+    """The recorded description of a protocol, by mode.
+
+    ``base`` is ``base-completion-rstrip-v1``; ``legacy-pool`` is the same procedure under
+    its own name, ``legacy-pool-rstrip-v1``, for the legacy command on pool tasks;
+    ``base-pool``, ``chat`` and ``chat-benchmark`` are the pipeline's protocols and
+    ``instruction`` is ``legacy-instruction-v1``.
+    """
+    if mode in {"base", "legacy-pool"}:
+        described: dict[str, Any] = {
+            "name": BENCHMARK_PROTOCOL if mode == "base" else LEGACY_POOL_PROTOCOL,
+            "prompt_format": "raw-task-prompt.rstrip()",
+            "stop_strings": list(stops),
+            "candidate_assembly": "stripped-prompt+retained-completion",
         }
+        if mode == "legacy-pool":
+            described["applies_to"] = (
+                "scratchcoder eval --prompt-mode base on pool tasks; not base-pool-completion-v1"
+            )
+        return {"prompt_stripped": True, "protocol": described}
     if mode == "base-pool":
         return {
             "prompt_stripped": True,
@@ -110,10 +129,12 @@ def prompt_protocol(mode: str = "base", *, stops: Sequence[str] = BASE_STOPS) ->
         }
     if mode in {"chat", "chat-benchmark"}:
         return chat.protocol("pool" if mode == "chat" else "benchmark")
+    if mode != "instruction":
+        raise ValueError(f"unknown prompt mode {mode!r}")
     return {
         "prompt_stripped": False,
         "protocol": {
-            "name": "legacy-instruction-v1",
+            "name": LEGACY_INSTRUCTION_PROTOCOL,
             "prompt_format": "public-prompt-with-public-tests",
             "stop_strings": [],
             "candidate_assembly": "legacy-fence-extraction-and-entry-point-heuristic",

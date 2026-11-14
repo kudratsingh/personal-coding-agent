@@ -15,7 +15,13 @@ record, and :func:`validate_against_tasks` checks the header against the task fi
 The header names the suite and split, the protocol and its record's SHA-256, the
 checkpoint SHA-256, the tokenizer identity, the task file SHA-256 and task IDs, the
 sampling settings and seed rule, precision, device, batch size, generation seconds, git
-commit and dirty flag, and the creation time. An attempt records its task ID, sample
+commit and dirty flag, and the creation time. A file generated under a protocol that does
+not fit the checkpoint's interface, which ``eval-generate`` allows only with
+``--allow-interface-mismatch``, also carries ``interface_override``: the requested protocol,
+the interface it is written for, the checkpoint's resolved interface and the rule that found
+it, that the override was used, and the mismatch in words
+(``scratchcoder.eval.interface.InterfaceOverride``). Files without an override have no such
+key, so every earlier file still reads unchanged. An attempt records its task ID, sample
 index, seed, prompt length and prompt hash, the generated token IDs and their count, the
 decoded completion text, the protocol's extracted program (``null`` when there is none)
 and the stop reason (``stop``, ``length`` or ``context_limit``).
@@ -35,6 +41,7 @@ from uuid import uuid4
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.engine.generation import PRECISIONS, SAMPLER_VERSION
 from scratchcoder.eval.harness import attempt_seed
+from scratchcoder.eval.interface import OVERRIDE_KEY, check_override_record
 from scratchcoder.eval.protocols import (
     BENCHMARK_SPLIT,
     POOL,
@@ -135,6 +142,7 @@ class CompletionsHeader:
     generation_seconds: float = 0.0
     git_commit: str | None = None
     dirty: bool | None = None
+    interface_override: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.suite not in SUITES:
@@ -184,11 +192,17 @@ class CompletionsHeader:
                 or not all(isinstance(value, str) and value for value in item.values())
             ):
                 raise ValueError("an excluded task names task_id and reason")
+        if self.interface_override is not None:
+            check_override_record(self.interface_override, self.protocol)
 
     def to_json(self) -> dict[str, Any]:
         value = asdict(self)
         value["protocol_record"] = dict(self.protocol_record)
         value["excluded_tasks"] = [dict(item) for item in self.excluded_tasks]
+        if self.interface_override is None:
+            del value[OVERRIDE_KEY]  # Files without an override keep the original fields.
+        else:
+            value[OVERRIDE_KEY] = dict(self.interface_override)
         return {"kind": "header", "format": FORMAT, "schema_version": SCHEMA_VERSION, **value}
 
     @classmethod
@@ -200,8 +214,10 @@ class CompletionsHeader:
         fields = {key: value for key, value in raw.items() if key not in ("kind", "format")}
         fields.pop("schema_version")
         names = set(cls.__dataclass_fields__)
-        if set(fields) != names:
+        if set(fields) not in (names, names - {OVERRIDE_KEY}):
             raise ValueError("completions header fields differ from the schema")
+        if OVERRIDE_KEY in fields and not isinstance(fields[OVERRIDE_KEY], dict):
+            raise ValueError(f"{OVERRIDE_KEY} must be an object")
         sampling = fields["sampling"]
         if not isinstance(sampling, dict) or set(sampling) != set(Sampling.__dataclass_fields__):
             raise ValueError("invalid sampling settings")

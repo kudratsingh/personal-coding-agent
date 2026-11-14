@@ -10,8 +10,11 @@ import pytest
 from scratchcoder.data import evalplus_corrections as correction
 from scratchcoder.data.evalplus import origin_task, release
 from scratchcoder.eval import suites
+from scratchcoder.eval.interface import UNDECLARED, CheckpointInterface
 from scratchcoder.eval.tasks import Task
 from scratchcoder.sandbox.runner import Limits, Result, Runtime, run
+
+UNDECLARED_INTERFACE = CheckpointInterface(None, UNDECLARED)
 
 
 @pytest.fixture
@@ -116,6 +119,7 @@ def test_suite_default_unchanged_and_corrected_metadata_shared(
     monkeypatch.setattr(
         suites, "load_checkpoint", lambda *_: (None, SimpleNamespace(sha256="fixture"))
     )
+    monkeypatch.setattr(suites, "read_checkpoint_interface", lambda *_: UNDECLARED_INTERFACE)
     monkeypatch.setattr(suites, "checkpoint_generator", lambda *_: lambda task, seed: "fixture")
     executed = []
 

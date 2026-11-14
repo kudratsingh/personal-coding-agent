@@ -49,3 +49,5 @@ Implemented: [the RL reward bridge between the Pod and the Mac](rl-bridge.md).
 Implemented: [the SFT format gate](sft-format-gate.md).
 
 Implemented: [special-token rows: a fresh draw and their own learning rate](special-token-rows.md).
+
+Implemented: [checkpoint interfaces: which protocol a checkpoint gets](checkpoint-interface.md).
