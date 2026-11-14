@@ -53,3 +53,7 @@ Implemented: [special-token rows: a fresh draw and their own learning rate](spec
 Implemented: [checkpoint interfaces: which protocol a checkpoint gets](checkpoint-interface.md).
 
 Implemented: [the run 2 schedule simulator](run2-schedule-simulator.md).
+
+Implemented: [evaluator conformance catalogue](evaluator-conformance.md).
+
+Implemented: [static verifier scan](verifier-scan.md).
