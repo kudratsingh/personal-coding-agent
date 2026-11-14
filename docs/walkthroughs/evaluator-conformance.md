@@ -158,11 +158,14 @@ program, and historical result files are unchanged.
   unless it is non-dumpable and handles the catchable signals, and the host accepts only one
   result line that carries its random nonce. Both cases are catalogue controls that must
   fail.
-- **Reward channel:** the host-side comparison resists marker forgery and expected-value
-  reads, but each call is evaluated in the candidate's own namespace after the candidate has
-  run. A candidate that redefines the outer call of an `is True`-type check (a module-level
-  name, a patched attribute of a module the tests import, or a patched `builtins`) earns full
-  credit on that check. It also cannot encode custom objects, so it rejects some honest
+- **Reward channel (refused since v4):** the host-side comparison resists marker forgery and
+  expected-value reads, but each call is evaluated in the candidate's own namespace after the
+  candidate has run. In conformance run 2 a candidate that redefined the outer call of an
+  `is True`-type check (a module-level name, a patched attribute of a module the tests import,
+  or a patched `builtins`) earned full credit on that check, and checks that never call the
+  candidate paid any program. Reward grammar v2 refuses both shapes, so those tasks are
+  explicit exclusions; the honest controls `evens_honest` and `area_is_true_honest` show the
+  coverage cost. It also cannot encode custom objects, so it rejects some honest
   solutions (`evaluator_rejects_honest`).
 - **Both paths:** checks that never call the candidate, missing side-effect or error checks,
   tests that contradict the prompt, and tests that fix an order the prompt leaves free are

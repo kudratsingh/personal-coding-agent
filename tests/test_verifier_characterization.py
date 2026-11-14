@@ -13,7 +13,7 @@ from scratchcoder.data.pool import build_pool
 from scratchcoder.eval.tasks import Task
 from scratchcoder.rl.rewards import Attempt, AttemptReward
 from scratchcoder.rl.screening import screen
-from scratchcoder.sandbox.reward import degenerate_baseline
+from scratchcoder.sandbox.reward import degenerate_baseline, unsupported_reason
 from scratchcoder.sandbox.runner import Result
 from tools.task_pool import call_key, verify
 
@@ -122,34 +122,35 @@ def test_u3_screening_keeps_a_task_whose_rewards_differ_on_identical_programs() 
     assert result.tasks[0].reason is None
 
 
-def test_u4a_baseline_misses_a_task_with_candidate_independent_checks() -> None:
-    """Characterization of a known gap, not desired behaviour.
+def test_u4a_candidate_independent_checks_are_an_explicit_exclusion() -> None:
+    """Closed by reward-grammar-v2 (was a characterized gap).
 
     Hidden tests that never call the candidate's function (``abs(-1) == 1``) pass for any
-    program. The constant-answer baseline only credits checks whose call is a direct call
-    of a candidate-defined function, so it scores 0.0 and screening cannot see that the
-    task pays every program in full.
+    program. The constant-answer baseline scored such a task 0.0, so screening could not
+    see that it paid every program in full. The grammar now refuses it outright: the task
+    is not parseable, with the reason ``candidate_independent``, and has no baseline.
     """
     task = _task("fixture/independent", "assert abs(-1) == 1\nassert len('ab') == 2\n")
-    best = degenerate_baseline(task)
-    assert best is not None
-    assert best.reward == 0.0
-    assert best.answer == "none"
+    refused = unsupported_reason(task)
+    assert refused is not None and refused.reason == "candidate_independent"
+    assert degenerate_baseline(task) is None
 
 
-def test_u4b_baseline_misses_a_none_returning_method_check() -> None:
-    """Characterization of a known gap, not desired behaviour.
+def test_u4b_a_guessable_method_check_is_an_explicit_exclusion() -> None:
+    """Closed by reward-grammar-v2 (was a characterized gap).
 
     ``Logger().log('a') is None`` is satisfied by a class whose method returns nothing, so
-    a trivial class earns full reward. The baseline applies answers only to direct calls of
-    a candidate function, so this check counts as failed and the baseline is 0.0.
+    a trivial class earned full reward while the baseline, which only answers direct calls
+    of a candidate function, scored 0.0. The value now comes from a method, not a direct
+    candidate call, and the expected answer is guessable, so the task is refused with the
+    reason ``guessable_wrapper``.
     """
     task = _task(
         "fixture/none-method",
         "assert Logger().log('a') is None\nassert Logger().log('b') is None\n",
         prompt="Write a Logger class whose log method records a message.",
     )
-    best = degenerate_baseline(task)
-    assert best is not None
-    assert best.reward == 0.0
-    assert best.answer == "none"
+    refused = unsupported_reason(task)
+    assert refused is not None and refused.reason == "guessable_wrapper"
+    assert refused.form == "is None on method .log()"
+    assert degenerate_baseline(task) is None

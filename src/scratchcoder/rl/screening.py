@@ -34,7 +34,12 @@ from typing import Any
 from scratchcoder.eval.tasks import Task
 from scratchcoder.rl.rewards import Attempt, AttemptReward, RewardSource, check_rewards
 from scratchcoder.rl.withheld import refuse_withheld
-from scratchcoder.sandbox.reward import degenerate_baseline, is_parseable
+from scratchcoder.sandbox.reward import (
+    REWARD_GRAMMAR_VERSION,
+    degenerate_baseline,
+    is_parseable,
+    unsupported_reason,
+)
 
 DEFAULT_THRESHOLD = 0.5
 """Drop a candidate whose best constant answer earns at least this reward (owner ruling)."""
@@ -67,6 +72,11 @@ def baseline_of(task: Task) -> Baseline:
     best = degenerate_baseline(task)
     assert best is not None  # parseable tasks always have a baseline
     return Baseline(True, best.reward, best.answer)
+
+
+def _unsupported(task: Task) -> str | None:
+    refused = unsupported_reason(task)
+    return None if refused is None else refused.reason
 
 
 def require_train_tasks(
@@ -125,6 +135,9 @@ class ScreenedTask:
     statuses: tuple[str, ...]
     audit_flagged: int
     reason: str | None
+    unsupported: str | None = None
+    """For a ``not_parseable`` task, why the reward channel cannot score it
+    (:data:`scratchcoder.sandbox.reward.UNSUPPORTED_REASONS`): an explicit exclusion."""
 
 
 @dataclass(frozen=True)
@@ -151,6 +164,7 @@ class ScreeningResult:
             reasons[label] += 1
             by_source.setdefault(task.source, Counter())[label] += 1
         parseable = sum(task.parseable for task in self.tasks)
+        unsupported = Counter(task.unsupported for task in self.tasks if not task.parseable)
         at_threshold = sum(
             task.baseline is not None and task.baseline >= self.threshold for task in self.tasks
         )
@@ -162,6 +176,9 @@ class ScreeningResult:
             "eligible": len(self.eligible),
             "kept": 0 if self.kept is None else len(self.kept),
             "by_reason": {label: reasons[label] for label in (KEPT, *REASONS)},
+            "not_parseable_by_cause": {
+                str(cause): count for cause, count in sorted(unsupported.items(), key=str)
+            },
             "by_source": {
                 source: {label: counter[label] for label in (KEPT, *REASONS)}
                 for source, counter in sorted(by_source.items())
@@ -179,6 +196,7 @@ class ScreeningResult:
                 "samples": self.samples,
                 "order": f"sha256('{ORDER_SALT}|' + task id)",
                 "reasons": list(REASONS),
+                "reward_grammar": REWARD_GRAMMAR_VERSION,
             },
             "counts": self.counts(),
             "kept": None if self.kept is None else list(self.kept),
@@ -250,6 +268,7 @@ def screen(
                 tuple(item.status for item in ordered),
                 sum(bool(item.audit_flags) for item in ordered),
                 reason,
+                _unsupported(task) if not baseline.parseable else None,
             )
         )
     kept = tuple(item.id for item in screened if item.reason is None)
