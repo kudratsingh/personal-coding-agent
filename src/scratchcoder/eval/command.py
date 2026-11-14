@@ -17,7 +17,12 @@ from scratchcoder.data.shards import file_sha256
 from scratchcoder.engine.generation import SAMPLER_VERSION, generate
 from scratchcoder.eval.checkpoint import load_checkpoint
 from scratchcoder.eval.harness import ContextLimitError, EvaluationConfig, evaluate, save_report
-from scratchcoder.eval.interface import read_checkpoint_interface, resolve_legacy_mode
+from scratchcoder.eval.interface import (
+    OVERRIDE_KEY,
+    check_override_record,
+    read_checkpoint_interface,
+    resolve_legacy_mode,
+)
 from scratchcoder.eval.prompt import base_prompt, prompt_protocol, truncate_completion
 from scratchcoder.eval.tasks import Task, load_tasks
 from scratchcoder.model.gpt import GPT
@@ -40,12 +45,22 @@ def evaluate_checkpoint(
     ``prompt_mode`` is ``base``, ``instruction`` or ``None``; ``None`` takes the mode from
     the checkpoint's interface (``resolve_legacy_mode``), and a requested mode must fit it
     unless ``allow_interface_mismatch``. The resolved mode replaces ``config.prompt_mode``.
-    Both checks run before the weights are loaded.
+    Both checks run before the weights are loaded. A deliberately crossed mode (for
+    example ``base`` on SFT weights, the historical procedure) is recorded in the report
+    and its scorecard row under ``interface_override``.
     """
     interface = read_checkpoint_interface(checkpoint)
-    mode = resolve_legacy_mode(interface, prompt_mode, allow_mismatch=allow_interface_mismatch)
-    config = replace(config, prompt_mode=mode)
     tasks = list(load_tasks(tasks_path))
+    recorded = (
+        None
+        if prompt_mode is None
+        else prompt_protocol(legacy_record_mode(prompt_mode, tasks))["protocol"]["name"]
+    )
+    choice = resolve_legacy_mode(
+        interface, prompt_mode, allow_mismatch=allow_interface_mismatch, protocol=recorded
+    )
+    mode = choice.name
+    config = replace(config, prompt_mode=mode)
     model, tokenizer = load_checkpoint(checkpoint, tokenizer_path)
     report = evaluate(
         tasks,
@@ -61,6 +76,9 @@ def evaluate_checkpoint(
         "prompt_mode_source": "requested" if prompt_mode is not None else "checkpoint interface",
         "interface_mismatch_allowed": allow_interface_mismatch,
     }
+    if choice.override is not None:
+        report[OVERRIDE_KEY] = choice.override.record()
+        check_override_record(report[OVERRIDE_KEY], report["protocol"]["name"])
     save_report(report, output, scorecard=scorecard)
 
 

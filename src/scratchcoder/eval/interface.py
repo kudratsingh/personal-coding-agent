@@ -30,6 +30,18 @@ How a checkpoint's interface is found, first match wins (``checkpoint_interface`
    checkpoint is evaluated only under an explicitly chosen protocol.
 
 Nothing here rewrites a checkpoint: the rules read what the file already records.
+
+**Deliberate overrides.** A protocol that does not fit the checkpoint's interface is
+refused unless the caller passes ``--allow-interface-mismatch`` (``allow_mismatch``). The
+override is never silent: when it is used, the choice carries an ``InterfaceOverride``
+whose ``record()`` is written into the completions header (``eval-generate``) or the
+report and its scorecard row (legacy ``scratchcoder eval``) under ``interface_override``.
+The record names the requested protocol, the interface that protocol is written for, the
+checkpoint's resolved interface and the rule that found it, that the override was used,
+and why it was needed. The flag is refused where it would change nothing (the protocol
+fits, or the checkpoint's interface is undeclared), so a recorded override always marks
+a real mismatch. Historical procedures, such as the legacy command's plain-text base mode
+on SFT weights, stay reproducible this way, and their outputs say so.
 """
 
 from __future__ import annotations
@@ -66,6 +78,23 @@ LEGACY_MODE_INTERFACES: Mapping[str, str] = {"base": BASE_INTERFACE, "instructio
 """``scratchcoder eval --prompt-mode`` values: both encode plain text, no special tokens."""
 
 
+OVERRIDE_FLAG = "--allow-interface-mismatch"
+OVERRIDE_KEY = "interface_override"
+"""The key under which completions headers and legacy reports record a used override."""
+OVERRIDE_FIELDS = frozenset(
+    {
+        "override",
+        "override_used",
+        "requested",
+        "requested_protocol",
+        "requested_interface",
+        "checkpoint_interface",
+        "checkpoint_interface_source",
+        "reason",
+    }
+)
+
+
 class InterfaceMismatchError(ValueError):
     """A protocol was chosen, or would be chosen, that does not fit the checkpoint."""
 
@@ -79,6 +108,71 @@ class CheckpointInterface:
 
     def record(self) -> dict[str, Any]:
         return {"name": self.name, "source": self.source}
+
+
+@dataclass(frozen=True)
+class InterfaceOverride:
+    """A deliberate, used ``--allow-interface-mismatch``: what was crossed, and why.
+
+    ``requested`` is the choice as named on the command line (``--protocol chat-v1``,
+    ``--prompt-mode base``), ``requested_protocol`` the recorded protocol name it ran
+    under, ``requested_interface`` the interface that protocol is written for, and
+    ``reason`` the mismatch, in words.
+    """
+
+    requested: str
+    requested_protocol: str
+    requested_interface: str
+    checkpoint_interface: str
+    checkpoint_interface_source: str
+    reason: str
+
+    def record(self) -> dict[str, Any]:
+        return {
+            "override": OVERRIDE_FLAG,
+            "override_used": True,
+            "requested": self.requested,
+            "requested_protocol": self.requested_protocol,
+            "requested_interface": self.requested_interface,
+            "checkpoint_interface": self.checkpoint_interface,
+            "checkpoint_interface_source": self.checkpoint_interface_source,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class ProtocolChoice:
+    """What a checkpoint is evaluated under, and how that was decided.
+
+    ``name`` is the protocol (``eval-generate``) or legacy prompt mode (``scratchcoder
+    eval``); ``requested`` is what the caller named (``None``: taken from the interface);
+    ``override`` is set only when a mismatch was deliberately crossed.
+    """
+
+    name: str
+    requested: str | None
+    interface: CheckpointInterface
+    override: InterfaceOverride | None = None
+
+
+def check_override_record(record: object, protocol: str) -> None:
+    """Refuse a recorded override that is not a used override of ``protocol``'s mismatch."""
+    if not isinstance(record, Mapping) or set(record) != OVERRIDE_FIELDS:
+        raise ValueError(f"{OVERRIDE_KEY} must name exactly {sorted(OVERRIDE_FIELDS)}")
+    if record["override"] != OVERRIDE_FLAG or record["override_used"] is not True:
+        raise ValueError(f"{OVERRIDE_KEY} records a used {OVERRIDE_FLAG}")
+    if record["requested_protocol"] != protocol:
+        raise ValueError(f"{OVERRIDE_KEY} names another protocol than the one recorded")
+    fits = PROTOCOL_INTERFACES.get(protocol)
+    if record["requested_interface"] != fits:
+        raise ValueError(f"{OVERRIDE_KEY} names the wrong interface for {protocol}")
+    if record["checkpoint_interface"] not in INTERFACES or record["checkpoint_interface"] == fits:
+        raise ValueError(f"{OVERRIDE_KEY} must record a checkpoint interface that differs")
+    if record["checkpoint_interface_source"] not in {DECLARED, FROM_WEIGHTS_V1, FROM_TRAINER}:
+        raise ValueError(f"{OVERRIDE_KEY} names an unknown interface rule")
+    for name in ("requested", "reason"):
+        if not isinstance(record[name], str) or not record[name]:
+            raise ValueError(f"{OVERRIDE_KEY} needs a non-empty {name}")
 
 
 def checkpoint_interface(saved: Mapping[str, Any]) -> CheckpointInterface:
@@ -137,19 +231,47 @@ def _mismatch(interface: CheckpointInterface, chosen: str, fits: str) -> str:
 
 
 def require_fit(
-    interface: CheckpointInterface, chosen: str, fits: str, *, allow_mismatch: bool
-) -> None:
+    interface: CheckpointInterface,
+    chosen: str,
+    fits: str,
+    *,
+    allow_mismatch: bool,
+    protocol: str | None = None,
+) -> InterfaceOverride | None:
     """Refuse ``chosen`` (a protocol or legacy mode written for ``fits``) unless it fits.
 
-    An undeclared interface fits any explicitly chosen protocol. ``allow_mismatch`` is a
-    deliberate, recorded override, for a diagnostic that crosses interfaces on purpose.
+    Returns ``None`` when it fits. An undeclared interface fits any explicitly chosen
+    protocol. ``allow_mismatch`` is a deliberate override, for a diagnostic or historical
+    reproduction that crosses interfaces on purpose: a crossed choice then returns the
+    ``InterfaceOverride`` to record (``protocol`` is the recorded protocol name, default
+    ``chosen``). The override is refused where nothing is crossed, so a recorded override
+    always marks a real mismatch.
     """
-    if interface.name is None or interface.name == fits or allow_mismatch:
-        return
-    raise InterfaceMismatchError(
-        _mismatch(interface, chosen, fits)
-        + "; choose a protocol that fits it, or pass --allow-interface-mismatch to cross "
-        "interfaces deliberately"
+    if interface.name is None or interface.name == fits:
+        if allow_mismatch:
+            why = (
+                "the checkpoint does not record its interface, so any explicitly chosen "
+                "protocol is accepted"
+                if interface.name is None
+                else f"{chosen} fits this checkpoint's {interface.name} interface"
+            )
+            raise InterfaceMismatchError(
+                f"{OVERRIDE_FLAG} was passed but nothing is crossed: {why}; drop the flag"
+            )
+        return None
+    reason = _mismatch(interface, chosen, fits)
+    if not allow_mismatch:
+        raise InterfaceMismatchError(
+            reason + f"; choose a protocol that fits it, or pass {OVERRIDE_FLAG} to cross "
+            "interfaces deliberately (the override is recorded)"
+        )
+    return InterfaceOverride(
+        requested=chosen,
+        requested_protocol=protocol or chosen,
+        requested_interface=fits,
+        checkpoint_interface=interface.name,
+        checkpoint_interface_source=interface.source,
+        reason=reason,
     )
 
 
@@ -173,39 +295,49 @@ def resolve_protocol(
     requested: str | None,
     *,
     allow_mismatch: bool = False,
-) -> str:
+) -> ProtocolChoice:
     """The protocol to generate under: ``requested`` if it fits, else the checkpoint's own.
 
     With no request the checkpoint's interface chooses (``default_protocol``). A request is
-    checked against the interface (``require_fit``).
+    checked against the interface (``require_fit``); a deliberately crossed request comes
+    back with its ``override`` to record.
     """
     if requested is None:
         if allow_mismatch:
-            raise InterfaceMismatchError("--allow-interface-mismatch needs an explicit --protocol")
-        return default_protocol(interface, family)
+            raise InterfaceMismatchError(f"{OVERRIDE_FLAG} needs an explicit --protocol")
+        return ProtocolChoice(default_protocol(interface, family), None, interface)
     if requested not in PROTOCOL_INTERFACES:
         raise ValueError(f"unknown protocol {requested!r}")
-    require_fit(interface, requested, PROTOCOL_INTERFACES[requested], allow_mismatch=allow_mismatch)
-    return requested
+    override = require_fit(
+        interface,
+        f"--protocol {requested}",
+        PROTOCOL_INTERFACES[requested],
+        allow_mismatch=allow_mismatch,
+        protocol=requested,
+    )
+    return ProtocolChoice(requested, requested, interface, override)
 
 
 def resolve_legacy_mode(
-    interface: CheckpointInterface, requested: str | None, *, allow_mismatch: bool = False
-) -> str:
+    interface: CheckpointInterface,
+    requested: str | None,
+    *,
+    allow_mismatch: bool = False,
+    protocol: str | None = None,
+) -> ProtocolChoice:
     """``scratchcoder eval``'s prompt mode: ``base`` or ``instruction``.
 
     Both legacy modes are plain-text protocols. With no request a ``base`` checkpoint gets
     ``base`` (the command's historical default). A chat-v1 checkpoint has no legacy mode
     that fits, and an undeclared one needs the mode named, so both fail with a message
-    that names the way forward. An explicitly requested mode is checked like any protocol.
+    that names the way forward. An explicitly requested mode is checked like any protocol;
+    ``protocol`` is the protocol name the run will record, for a crossed mode's override.
     """
     if requested is None:
         if allow_mismatch:
-            raise InterfaceMismatchError(
-                "--allow-interface-mismatch needs an explicit --prompt-mode"
-            )
+            raise InterfaceMismatchError(f"{OVERRIDE_FLAG} needs an explicit --prompt-mode")
         if interface.name == BASE_INTERFACE:
-            return "base"
+            return ProtocolChoice("base", None, interface)
         if interface.name == CHAT_INTERFACE:
             raise InterfaceMismatchError(
                 f"this checkpoint's interface is chat-v1 (found by the {interface.source} "
@@ -219,10 +351,11 @@ def resolve_legacy_mode(
         )
     if requested not in LEGACY_MODE_INTERFACES:
         raise ValueError("prompt mode must be base or instruction")
-    require_fit(
+    override = require_fit(
         interface,
         f"--prompt-mode {requested}",
         LEGACY_MODE_INTERFACES[requested],
         allow_mismatch=allow_mismatch,
+        protocol=protocol,
     )
-    return requested
+    return ProtocolChoice(requested, requested, interface, override)

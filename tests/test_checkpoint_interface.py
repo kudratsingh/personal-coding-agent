@@ -30,6 +30,7 @@ from scratchcoder.eval.interface import (
     UNDECLARED,
     CheckpointInterface,
     InterfaceMismatchError,
+    check_override_record,
     checkpoint_interface,
     read_checkpoint_interface,
     resolve_legacy_mode,
@@ -195,7 +196,8 @@ def test_save_weights_records_its_interface_and_old_files_still_load(tmp_path: P
 def test_an_omitted_protocol_resolves_from_the_interface(
     interface: CheckpointInterface, family: str, expected: str
 ) -> None:
-    assert resolve_protocol(interface, family, None) == expected
+    choice = resolve_protocol(interface, family, None)
+    assert (choice.name, choice.requested, choice.override) == (expected, None, None)
 
 
 def test_named_protocols_must_fit_unless_deliberately_crossed() -> None:
@@ -203,27 +205,73 @@ def test_named_protocols_must_fit_unless_deliberately_crossed() -> None:
         resolve_protocol(CHAT, "pool", "base-pool-completion-v1")
     with pytest.raises(InterfaceMismatchError, match="interface is base"):
         resolve_protocol(BASE, "benchmark", "chat-v1")
-    assert resolve_protocol(CHAT, "pool", "base-pool-completion-v1", allow_mismatch=True) == (
-        "base-pool-completion-v1"
-    )
-    assert resolve_protocol(NONE, "pool", "chat-v1") == "chat-v1"
+    crossed = resolve_protocol(CHAT, "pool", "base-pool-completion-v1", allow_mismatch=True)
+    assert crossed.name == crossed.requested == "base-pool-completion-v1"
+    assert crossed.override is not None
+    assert crossed.override.record() == {
+        "override": "--allow-interface-mismatch",
+        "override_used": True,
+        "requested": "--protocol base-pool-completion-v1",
+        "requested_protocol": "base-pool-completion-v1",
+        "requested_interface": "base",
+        "checkpoint_interface": "chat-v1",
+        "checkpoint_interface_source": "declared",
+        "reason": "--protocol base-pool-completion-v1 is written for base checkpoints, but "
+        "this checkpoint's interface is chat-v1 (found by the declared rule)",
+    }
+    fitting = resolve_protocol(NONE, "pool", "chat-v1")
+    assert (fitting.name, fitting.override) == ("chat-v1", None)
     with pytest.raises(InterfaceMismatchError, match="choose the protocol explicitly"):
         resolve_protocol(NONE, "pool", None)
     with pytest.raises(InterfaceMismatchError, match="needs an explicit --protocol"):
         resolve_protocol(CHAT, "pool", None, allow_mismatch=True)
 
 
+def test_an_override_that_crosses_nothing_is_refused() -> None:
+    # A recorded override must always mark a real mismatch, so the flag is refused where
+    # the protocol fits, or where the interface is undeclared and any choice is accepted.
+    with pytest.raises(InterfaceMismatchError, match="fits this checkpoint's chat-v1"):
+        resolve_protocol(CHAT, "pool", "chat-v1", allow_mismatch=True)
+    with pytest.raises(InterfaceMismatchError, match="does not record its interface"):
+        resolve_protocol(NONE, "pool", "chat-v1", allow_mismatch=True)
+    with pytest.raises(InterfaceMismatchError, match="nothing is crossed"):
+        resolve_legacy_mode(BASE, "base", allow_mismatch=True)
+
+
 def test_legacy_modes_fit_base_checkpoints_only() -> None:
-    assert resolve_legacy_mode(BASE, None) == "base"
-    assert resolve_legacy_mode(BASE, "instruction") == "instruction"
-    assert resolve_legacy_mode(NONE, "base") == "base"
+    assert resolve_legacy_mode(BASE, None).name == "base"
+    assert resolve_legacy_mode(BASE, "instruction").name == "instruction"
+    assert resolve_legacy_mode(NONE, "base").override is None
     with pytest.raises(InterfaceMismatchError, match="eval-generate"):
         resolve_legacy_mode(CHAT, None)
     with pytest.raises(InterfaceMismatchError, match="--allow-interface-mismatch"):
         resolve_legacy_mode(CHAT, "instruction")
-    assert resolve_legacy_mode(CHAT, "instruction", allow_mismatch=True) == "instruction"
+    crossed = resolve_legacy_mode(
+        CHAT, "instruction", allow_mismatch=True, protocol="legacy-instruction-v1"
+    )
+    assert crossed.name == "instruction"
+    assert crossed.override is not None
+    assert crossed.override.requested == "--prompt-mode instruction"
+    assert crossed.override.requested_protocol == "legacy-instruction-v1"
     with pytest.raises(InterfaceMismatchError, match="--prompt-mode base or instruction"):
         resolve_legacy_mode(NONE, None)
+
+
+def test_recorded_overrides_are_validated_against_the_protocol() -> None:
+    choice = resolve_protocol(CHAT, "pool", "base-pool-completion-v1", allow_mismatch=True)
+    assert choice.override is not None
+    good = choice.override.record()
+    check_override_record(good, "base-pool-completion-v1")
+    with pytest.raises(ValueError, match="another protocol"):
+        check_override_record(good, "base-completion-rstrip-v1")
+    for broken in (
+        {**good, "override_used": False},
+        {**good, "checkpoint_interface": "base"},
+        {**good, "reason": ""},
+        {key: value for key, value in good.items() if key != "reason"},
+    ):
+        with pytest.raises(ValueError, match="interface_override"):
+            check_override_record(broken, "base-pool-completion-v1")
 
 
 # Prompt IDs and extraction through eval-generate ---------------------------------------
@@ -304,6 +352,16 @@ def test_eval_generate_refuses_implicit_and_mismatched_protocols(
             ["--protocol", "base-pool-completion-v1"],
             "interface is chat-v1",
         ),
+        (
+            historical_sft_checkpoint(tmp_path),
+            ["--protocol", "base-pool-completion-v1"],
+            "pass --allow-interface-mismatch",
+        ),
+        (
+            sft_checkpoint(tmp_path),
+            ["--protocol", "chat-v1", "--allow-interface-mismatch"],
+            "nothing is crossed",
+        ),
         (trainer_checkpoint(tmp_path), ["--protocol", "chat-v1"], "interface is base"),
         (undeclared_checkpoint(tmp_path), [], "choose the protocol explicitly"),
     ]
@@ -326,15 +384,113 @@ def test_eval_generate_refuses_implicit_and_mismatched_protocols(
         assert not output.exists()
 
 
+def test_eval_generate_records_a_deliberate_override_in_the_completions_header(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Through the CLI, with the real (tiny, random) model: only the prompt and the header
+    # matter here, not what it generates.
+    task = pool_task("t/1")
+    tasks = save_task_file(tmp_path / "dev.jsonl", [task])
+    output = tmp_path / "crossed.jsonl"
+    code = main(
+        [
+            "eval-generate", "--checkpoint", str(historical_sft_checkpoint(tmp_path)),
+            "--tokenizer", str(_tokenizer_file(tmp_path)), "--suite", "pool", "--split", "dev",
+            "--tasks", str(tasks), "--protocol", "base-pool-completion-v1",
+            "--allow-interface-mismatch", "--output", str(output),
+        ]
+    )  # fmt: skip
+    assert code == 0
+    capsys.readouterr()
+    header = read_completions(output).header
+    assert header.protocol == "base-pool-completion-v1"
+    assert header.interface_override == {
+        "override": "--allow-interface-mismatch",
+        "override_used": True,
+        "requested": "--protocol base-pool-completion-v1",
+        "requested_protocol": "base-pool-completion-v1",
+        "requested_interface": "base",
+        "checkpoint_interface": "chat-v1",
+        "checkpoint_interface_source": "weights-v1",
+        "reason": "--protocol base-pool-completion-v1 is written for base checkpoints, but "
+        "this checkpoint's interface is chat-v1 (found by the weights-v1 rule)",
+    }
+    first = json.loads(output.read_text().splitlines()[0])
+    assert first["interface_override"] == header.interface_override
+    # The crossed prompt is exactly the base checkpoint's prompt: plain text, no special IDs.
+    crossed_ids = TOKENIZER.encode(prompt.pool_prompt(task))
+    assert read_completions(output).row("t/1", 0).prompt_sha256 == prompt_sha256(crossed_ids)
+    # A file generated without an override has no such key, like every earlier file.
+    plain = tmp_path / "plain.jsonl"
+    generate_completions(
+        checkpoint=sft_checkpoint(tmp_path),
+        tokenizer_path=_tokenizer_file(tmp_path),
+        suite="pool",
+        split="dev",
+        tasks_path=tasks,
+        protocol=None,
+        output=plain,
+        generate=_answering({"chat": chat_tokens("x = 1"), "base": ()}),
+    )
+    assert "interface_override" not in json.loads(plain.read_text().splitlines()[0])
+    assert read_completions(plain).header.interface_override is None
+
+
+def test_historical_reproduction_crosses_interfaces_and_gives_the_historical_prompt_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The historical benchmark procedure, base-completion-rstrip-v1, on historical SFT
+    # weights: the raw task prompt with trailing whitespace removed, encoded as plain text.
+    # ByteBPE() has no merges, so the expected IDs are simply the prompt's bytes.
+    from scratchcoder.eval import protocols
+
+    raw = "def add_one(x):\n    # Return x + 1.\n  \t\n"
+    task = pool_task(
+        "HumanEval/0", prompt=raw, split="eval", entry_point="add_one", source="openai/human-eval"
+    )
+    historical_ids = list(b"def add_one(x):\n    # Return x + 1.")
+    monkeypatch.setattr(protocols, "read_humaneval", lambda path: [task])
+    release_file = tmp_path / "humaneval.jsonl.gz"
+    release_file.write_bytes(b"pinned release bytes (fixture)")
+    generator = _answering({"chat": (), "base": tuple(TOKENIZER.encode("\n    return x + 1"))})
+    output = tmp_path / "historical.jsonl"
+    header, _ = generate_completions(
+        checkpoint=historical_sft_checkpoint(tmp_path),
+        tokenizer_path=_tokenizer_file(tmp_path),
+        suite="humaneval",
+        split="eval",
+        tasks_path=release_file,
+        protocol="base-completion-rstrip-v1",
+        output=output,
+        generate=generator,
+        allow_interface_mismatch=True,
+    )
+    assert generator.seen == [historical_ids]
+    assert header.protocol == "base-completion-rstrip-v1"
+    assert header.interface_override is not None
+    assert header.interface_override["requested_protocol"] == "base-completion-rstrip-v1"
+    assert header.interface_override["checkpoint_interface_source"] == "weights-v1"
+    assert read_completions(output).row("HumanEval/0", 0).prompt_sha256 == prompt_sha256(
+        historical_ids
+    )
+
+
 # The legacy eval command --------------------------------------------------------------
 
 
-def _legacy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Stub execution (no code runs) and record the prompts the legacy path generates from."""
+def _legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ids: list[list[int]] | None = None
+) -> list[str]:
+    """Stub execution (no code runs) and record the prompts the legacy path generates from.
+
+    The decoded prompts are returned; with ``ids``, the prompt token IDs are kept there too.
+    """
     seen: list[str] = []
 
     def generated(model: GPT, prompts: torch.Tensor, **options: Any) -> torch.Tensor:
         seen.append(TOKENIZER.decode(prompts[0].tolist()))
+        if ids is not None:
+            ids.append(prompts[0].tolist())
         tokens = TOKENIZER.encode("\n    return x + 1\n\ndef later(): pass")[
             : options["max_new_tokens"]
         ]
@@ -434,7 +590,41 @@ def test_a_deliberate_legacy_mismatch_is_recorded(
         "prompt_mode_source": "requested",
         "interface_mismatch_allowed": True,
     }
+    expected = {
+        "override": "--allow-interface-mismatch",
+        "override_used": True,
+        "requested": "--prompt-mode instruction",
+        "requested_protocol": "legacy-instruction-v1",
+        "requested_interface": "base",
+        "checkpoint_interface": "chat-v1",
+        "checkpoint_interface_source": "declared",
+        "reason": "--prompt-mode instruction is written for base checkpoints, but this "
+        "checkpoint's interface is chat-v1 (found by the declared rule)",
+    }
+    assert report["interface_override"] == expected
+    # The local scorecard row carries the same record.
+    lines = (tmp_path / "scorecard.jsonl").read_text().splitlines()
+    assert [json.loads(line)["interface_override"] for line in lines] == [expected]
     assert seen == [task.public_prompt()]
+
+
+def test_legacy_historical_reproduction_gives_the_historical_prompt_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Before interfaces existed, scratchcoder eval ran SFT weights under its default base
+    # mode: the raw pool prompt with trailing whitespace removed, as plain bytes. That stays
+    # reproducible with an explicit mode and the override, and the outputs say so.
+    seen_ids: list[list[int]] = []
+    _legacy(tmp_path, monkeypatch, seen_ids)
+    task = pool_task("t/1", prompt="Write add_one(x).  \n\t\n")
+    tasks = save_task_file(tmp_path / "dev.jsonl", [task])
+    args = _legacy_args(tmp_path, historical_sft_checkpoint(tmp_path), tasks, "historical")
+    assert main([*args, "--prompt-mode", "base", "--allow-interface-mismatch"]) == 0
+    assert seen_ids == [list(b"Write add_one(x).")]
+    report = json.loads((tmp_path / "historical" / "report.json").read_text())
+    assert report["protocol"]["name"] == "legacy-pool-rstrip-v1"
+    assert report["interface_override"]["requested_protocol"] == "legacy-pool-rstrip-v1"
+    assert report["interface_override"]["checkpoint_interface_source"] == "weights-v1"
 
 
 def test_evalplus_checkpoint_scoring_refuses_chat_weights(tmp_path: Path) -> None:

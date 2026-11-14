@@ -84,6 +84,7 @@ def write_fixture_completions(
     protocol: str = "chat-v1",
     checkpoint: str = CHECKPOINT,
     context: int = 4096,
+    interface_override: dict[str, object] | None = None,
 ) -> str:
     """A pool completions file whose attempts answer with ``program_for``.
 
@@ -141,6 +142,7 @@ def write_fixture_completions(
         created_at="2026-10-26T00:00:00+00:00",
         sampler_version=None if sampling.greedy else SAMPLER_VERSION,
         generation_seconds=1.5,
+        interface_override=interface_override,
     )
     return write_completions(path, header, rows)
 

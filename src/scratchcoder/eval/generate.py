@@ -74,11 +74,13 @@ def generate_completions(
 
     ``protocol`` ``None`` takes the protocol from the checkpoint's interface
     (``scratchcoder.eval.interface.resolve_protocol``); a named protocol must fit that
-    interface unless ``allow_interface_mismatch``. An undeclared interface needs a named
-    protocol. The header names the protocol used; the interface follows from the recorded
-    checkpoint SHA-256. An attempt whose prompt leaves no room to generate is recorded as
-    ``context_limit`` with no tokens and no program; it is never shortened. MPS runs
-    greedy decoding only.
+    interface unless ``allow_interface_mismatch``, a deliberate override that the header
+    records under ``interface_override`` (requested protocol, its interface, the
+    checkpoint's interface and rule, and the mismatch). An undeclared interface needs a
+    named protocol. The header names the protocol used; without an override the
+    interface follows from the recorded checkpoint SHA-256. An attempt whose prompt leaves
+    no room to generate is recorded as ``context_limit`` with no tokens and no program; it
+    is never shortened. MPS runs greedy decoding only.
     """
     sampling = sampling or Sampling()
     if precision not in PRECISIONS:
@@ -96,13 +98,13 @@ def generate_completions(
             "sampled decoding is not supported on MPS: the seeded sampler works in float64, "
             "which MPS lacks; use cpu or cuda for sampling, or greedy decoding on mps"
         )
-    interface = read_checkpoint_interface(checkpoint)
-    definition = protocol_for(
-        resolve_protocol(
-            interface, family(suite), protocol, allow_mismatch=allow_interface_mismatch
-        ),
-        suite,
+    choice = resolve_protocol(
+        read_checkpoint_interface(checkpoint),
+        family(suite),
+        protocol,
+        allow_mismatch=allow_interface_mismatch,
     )
+    definition = protocol_for(choice.name, suite)
     model, tokenizer = load_checkpoint(
         checkpoint, tokenizer_path, device="cpu" if resolved.type == "mps" else device
     )
@@ -196,5 +198,6 @@ def generate_completions(
         generation_seconds=seconds,
         git_commit=commit,
         dirty=dirty,
+        interface_override=None if choice.override is None else choice.override.record(),
     )
     return header, write_completions(output, header, rows)
