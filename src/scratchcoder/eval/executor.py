@@ -22,9 +22,12 @@ runs can never append to the same file at once.
 A resumed run must find the execution policy the file started under
 (:mod:`scratchcoder.eval.execution_policy`): the concrete limits, the scored statuses, the
 retries and backoff, the input limit, the image, the ``execute`` function's name and a hash
-of the verdict-producing code. Any difference is refused before anything is appended, so
-every verdict in one results file comes from one policy. A docstring or comment edit, or a
-change to code outside the enumerated units, does not count as a difference. Results files
+of the verdict-producing code, which includes this module's own verdict decisions
+(:func:`attempt_plan`, :func:`scored_status`, :func:`attempt_passed`,
+:func:`run_verdict_calls`). Any difference is refused before anything is appended, and
+before the task file is read, so every verdict in one results file comes from one policy.
+A docstring or comment edit, or a change to code outside the enumerated units, does not
+count as a difference. Results files
 of schema 1 recorded a narrower identity; they stay readable for scoring, but they cannot be
 resumed. The static audit's identity is recorded beside the policy and in every window,
 not compared: it changes flag counts, never verdicts.
@@ -64,7 +67,7 @@ from scratchcoder.eval.execution_policy import (
 )
 from scratchcoder.eval.export import ExportError, refuse_exported, task_file_identity
 from scratchcoder.eval.harness import HOST_RETRIES, isolated_execution
-from scratchcoder.eval.parallel import Call, Execute, Outcome, run_calls
+from scratchcoder.eval.parallel import INPUT_LIMIT, Call, Execute, Outcome, run_calls
 from scratchcoder.eval.protocols import CHAT, POOL, load_suite_tasks, protocol_for
 from scratchcoder.eval.seal import SealError, SealLedger, UnsealRecord
 from scratchcoder.eval.tasks import Task
@@ -78,6 +81,53 @@ READABLE_SCHEMA_VERSIONS = (1, 2)
 """Schema 1 files stay readable for scoring and reporting; only schema 2 files resume."""
 NO_PROGRAM = "no_program"
 CONTEXT_LIMIT = "context_limit"
+CALL_INPUT_LIMIT = INPUT_LIMIT
+"""The input limit the executor's calls run under (``oversized`` above it)."""
+
+
+# The executor's own verdict decisions. They are listed in the execution policy's
+# VERDICT_CODE, so editing any of them refuses a resume.
+
+
+def attempt_plan(
+    key: tuple[str, int], stop_reason: str, program: str | None, tests: str, mode: str
+) -> Call | str:
+    """What decides one attempt: the status written without running anything, or the call
+    that runs ``program`` with the task's hidden ``tests``."""
+    if program is None:
+        return CONTEXT_LIMIT if stop_reason == CONTEXT_LIMIT else NO_PROGRAM
+    return Call(key, program, tests, mode)
+
+
+def scored_status(outcome: Outcome) -> str | None:
+    """The status to score for an outcome, or ``None`` when it stays unresolved."""
+    return outcome.status if outcome.resolved else None
+
+
+def attempt_passed(status: str) -> bool:
+    return status == "passed"
+
+
+def run_verdict_calls(
+    calls: list[Call],
+    execute: Execute,
+    *,
+    on_outcome: Callable[[Outcome], None],
+    workers: int,
+    retries: int,
+    sleep: Callable[[float], None],
+    max_consecutive_unresolved: int,
+) -> int:
+    return run_calls(
+        calls,
+        execute,
+        on_outcome=on_outcome,
+        workers=workers,
+        retries=retries,
+        sleep=sleep,
+        max_consecutive_unresolved=max_consecutive_unresolved,
+        input_limit=CALL_INPUT_LIMIT,
+    )
 
 
 def program_sha256(program: str) -> str:
@@ -242,7 +292,12 @@ def _derive_programs(
 
 def _execution_record(execute: Execute, retries: int) -> dict[str, Any]:
     """The results header's ``execution``: the verdict policy and, apart, the audit policy."""
-    policy = execution_policy(execute, retries, unexecuted_statuses=(NO_PROGRAM, CONTEXT_LIMIT))
+    policy = execution_policy(
+        execute,
+        retries,
+        unexecuted_statuses=(NO_PROGRAM, CONTEXT_LIMIT),
+        input_limit=CALL_INPUT_LIMIT,
+    )
     audit = audit_policy()
     return {
         "policy": policy,
@@ -255,9 +310,10 @@ def _execution_record(execute: Execute, retries: int) -> dict[str, Any]:
 def _refuse_another_policy(header: Mapping[str, Any], current: Mapping[str, Any]) -> None:
     if header.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(
-            f"the results file has schema {header.get('schema_version')}, which recorded no "
-            "execution-policy identity; it stays readable for scoring, but resuming it could "
-            "mix verdicts from two policies, so start a new results file"
+            f"the results file has schema {header.get('schema_version')}, which recorded only "
+            "a partial execution identity (image, deadline text, runner and supervisor "
+            "hashes); it stays readable for scoring, but resuming it could mix verdicts from "
+            "two policies, so start a new results file"
         )
     recorded = header.get("execution")
     recorded_policy = recorded.get("policy") if isinstance(recorded, Mapping) else None
@@ -268,6 +324,19 @@ def _refuse_another_policy(header: Mapping[str, Any], current: Mapping[str, Any]
             f"({'; '.join(changed)} differ); one results file must not mix verdicts from two "
             "policies, so start a new results file"
         )
+
+
+def _refuse_to_resume(
+    header: Mapping[str, Any],
+    completions: Completions,
+    execution: Mapping[str, Any],
+    unseal: UnsealRecord | None,
+) -> None:
+    if header["completions_sha256"] != completions.sha256:
+        raise ValueError("the results file belongs to other completions")
+    _refuse_another_policy(header, execution)
+    if unseal is not None and header["unseal_sha256"] != unseal.sha256:
+        raise SealError("the results file was opened under another unseal record")
 
 
 def _new_header(
@@ -340,10 +409,14 @@ def execute_completions(
     if ledger is not None and record is not None:
         # Refuse before the sealed task file is opened, hashed or parsed.
         ledger.check_read(completions, record)
-    tasks = {task.id: task for task in validate_against_tasks(completions, tasks_path)}
-    programs = _derive_programs(completions, tasks, tokenizer)
+    # The policy and a resumed file's header need no task: check them before the task file
+    # is read, so a refused resume never parses (sealed) hidden tests.
     execution = _execution_record(execute, retries)
     created = not results_path.exists()
+    if not created:
+        _refuse_to_resume(read_results(results_path).header, completions, execution, record)
+    tasks = {task.id: task for task in validate_against_tasks(completions, tasks_path)}
+    programs = _derive_programs(completions, tasks, tokenizer)
     if created:
         results_header = _new_header(
             completions, tasks, execution=execution, tokenizer=tokenizer, unseal=record
@@ -354,11 +427,7 @@ def execute_completions(
         previous = read_results(results_path)
     else:
         previous = read_results(results_path)
-        if previous.header["completions_sha256"] != completions.sha256:
-            raise ValueError("the results file belongs to other completions")
-        _refuse_another_policy(previous.header, execution)
-        if record is not None and previous.header["unseal_sha256"] != record.sha256:
-            raise SealError("the results file was opened under another unseal record")
+        _refuse_to_resume(previous.header, completions, execution, record)
     results_id = previous.header["results_id"]
     ledger_head = None
     if ledger is not None and record is not None:
@@ -404,7 +473,7 @@ def execute_completions(
             row = completions.row(*key)
             task = tasks[row.task_id]
             program = programs[key]
-            success = status == "passed"
+            success = attempt_passed(status)
             flags = audit_attempt(program) if success and program is not None else None
             out.write(
                 {
@@ -432,21 +501,23 @@ def execute_completions(
 
         calls = []
         for row in pending:
-            program = programs[row.key]
-            if program is None:
-                status = CONTEXT_LIMIT if row.stop_reason == CONTEXT_LIMIT else NO_PROGRAM
-                record_result(row.key, status)
-                continue
             task = tasks[row.task_id]
-            calls.append(Call(row.key, program, task.hidden_tests, task.mode))
+            plan = attempt_plan(
+                row.key, row.stop_reason, programs[row.key], task.hidden_tests, task.mode
+            )
+            if isinstance(plan, Call):
+                calls.append(plan)
+            else:
+                record_result(row.key, plan)
 
         def collect(outcome: Outcome) -> None:
             nonlocal unresolved, sandbox_seconds
             sandbox_seconds += outcome.elapsed_seconds
             key = outcome.key
             assert isinstance(key, tuple)
-            if outcome.resolved:
-                record_result(key, outcome.status, outcome)
+            status = scored_status(outcome)
+            if status is not None:
+                record_result(key, status, outcome)
                 return
             unresolved += 1
             out.write(
@@ -462,7 +533,7 @@ def execute_completions(
 
         limit = max_consecutive_unresolved or max(16, 4 * workers)
         try:
-            run_calls(
+            run_verdict_calls(
                 calls,
                 execute,
                 on_outcome=collect,

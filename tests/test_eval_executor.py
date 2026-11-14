@@ -19,7 +19,7 @@ from eval_fixtures import (
 )
 
 from scratchcoder.cli import main
-from scratchcoder.eval import execution_policy, executor, harness, parallel
+from scratchcoder.eval import execution_policy, executor, harness
 from scratchcoder.eval.completions import Sampling, read_completions
 from scratchcoder.eval.executor import execute_completions, read_results, run_test_baseline
 from scratchcoder.eval.parallel import HostUnavailableError
@@ -796,6 +796,57 @@ def test_a_refused_test_read_never_opens_the_task_file(tmp_path: Path) -> None:
     assert not (tmp_path / "r.jsonl").exists()
 
 
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        (
+            (
+                "scratchcoder.eval.harness",
+                "return result.host_stalled or result.status not in SCORED_STATUSES",
+                "return result.status not in SCORED_STATUSES",
+            ),
+            r"another execution policy \(code: scratchcoder\.eval\.harness differ",
+        ),
+        (
+            ("scratchcoder.eval.harness", "def is_host_failure(", "def is_host_error("),
+            "is_host_failure not found",
+        ),
+    ],
+)
+def test_a_refused_test_resume_never_opens_the_task_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, edit: tuple[str, str, str], message: str
+) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    endpoints, files, tasks_path = four_endpoints(tmp_path, ledger)
+    record = unseal_record(tmp_path / "unseal.json", endpoints)
+    results = tmp_path / "base-results.jsonl"
+    execute_completions(
+        files["base"],
+        tasks_path,
+        results,
+        execute=FakeSandbox(down=lambda code: True),
+        **options(ledger, record),
+    )
+    before, events = results.read_bytes(), SealLedger(ledger).events()
+    missing = tmp_path / "nowhere" / "test.jsonl"  # Opening it would raise FileNotFoundError.
+
+    def never(*_: Any) -> None:
+        raise AssertionError("the task file was read")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(executor, "validate_against_tasks", never)
+        edit_sources(patch, {edit[0]: [(edit[1], edit[2])]})
+        with pytest.raises(ValueError, match=message):
+            execute_completions(
+                files["base"], missing, results, execute=FakeSandbox(), **options(ledger, record)
+            )
+    assert results.read_bytes() == before and SealLedger(ledger).events() == events
+    finished = execute_completions(
+        files["base"], tasks_path, results, execute=FakeSandbox(), **options(ledger, record)
+    )
+    assert finished["scored"] == 2
+
+
 def test_the_test_split_needs_the_tokenizer_before_a_read_is_spent(tmp_path: Path) -> None:
     ledger = tmp_path / "ledger.jsonl"
     endpoints, files, tasks_path = four_endpoints(tmp_path, ledger)
@@ -852,6 +903,7 @@ def edit_sources(monkeypatch: pytest.MonkeyPatch, edits: dict[str, list[tuple[st
 HARNESS, PARALLEL = "scratchcoder.eval.harness", "scratchcoder.eval.parallel"
 RUNNER, PROGRAM = "scratchcoder.sandbox.runner", "scratchcoder.sandbox.program"
 BUDGET, REWARD = "scratchcoder.sandbox.budget", "scratchcoder.sandbox.reward"
+EXECUTOR = "scratchcoder.eval.executor"
 
 Change = Callable[[pytest.MonkeyPatch], dict[str, Any]]
 
@@ -876,21 +928,47 @@ def source_edit(module: str, old: str, new: str) -> Change:
     return apply
 
 
+def together(*changes: Change) -> Change:
+    """Several changes at once, as one real file edit is seen both in memory and in source."""
+
+    def apply(mp: pytest.MonkeyPatch) -> dict[str, Any]:
+        options: dict[str, Any] = {}
+        for change in changes:
+            options |= change(mp)
+        return options
+
+    return apply
+
+
+def per_case_seconds(seconds_per_case: float) -> Callable[[int], float]:
+    return lambda cases: budget.io_seconds(cases, seconds_per_case=seconds_per_case)
+
+
 POLICY_CHANGES: dict[str, tuple[Change, str]] = {
     "function timeout": (
         patched(harness, "execution_limits", lambda tests, mode: Limits(timeout_seconds=60.0)),
         r"\(deadline_rule; limits differ",
     ),
     "I/O budget": (patched(harness, "io_seconds", lambda cases: 30.0), r"\(limits differ"),
-    "I/O deadline constant": (
+    # Only the recorded rule text reads the module constant at call time.
+    "I/O deadline rule text": (
         patched(budget, "IO_SECONDS_PER_CASE", 0.5),
         r"\(deadline_rule differ",
+    ),
+    # Editing the constant in budget.py: a new process sees new source, constant and limits.
+    "I/O per-case constant edited": (
+        together(
+            source_edit(BUDGET, "IO_SECONDS_PER_CASE = 0.25", "IO_SECONDS_PER_CASE = 0.5"),
+            patched(budget, "IO_SECONDS_PER_CASE", 0.5),
+            patched(harness, "io_seconds", per_case_seconds(0.5)),
+        ),
+        r"\(code: scratchcoder\.sandbox\.budget; deadline_rule; limits differ",
     ),
     "scored statuses": (
         patched(harness, "SCORED_STATUSES", frozenset({"passed", "failed"})),
         r"\(scored_statuses differ",
     ),
-    "input limit": (patched(parallel, "INPUT_LIMIT", 10), r"\(input_limit differ"),
+    "input limit": (patched(executor, "CALL_INPUT_LIMIT", 10), r"\(input_limit differ"),
     "image": (patched(runner, "IMAGE", "python@sha256:" + "0" * 64), r"\(image differ"),
     "host retries": (lambda mp: {"retries": 1}, r"host_backoff_seconds; host_retries differ"),
     "execute": (lambda mp: {"execute": constant_hostile}, r"\(execute differ"),
@@ -921,6 +999,31 @@ POLICY_CHANGES: dict[str, tuple[Change, str]] = {
     "runner code": (
         source_edit(RUNNER, "HOST_WATCHDOG_SECONDS = 10.0", "HOST_WATCHDOG_SECONDS = 20.0"),
         r"\(code: scratchcoder\.sandbox\.runner differ",
+    ),
+    "pass rule code": (
+        source_edit(
+            EXECUTOR,
+            'return status == "passed"',
+            'return status in ("passed", "oversized")',
+        ),
+        r"\(code: scratchcoder\.eval\.executor differ",
+    ),
+    "unexecuted status code": (
+        source_edit(
+            EXECUTOR,
+            "return CONTEXT_LIMIT if stop_reason == CONTEXT_LIMIT else NO_PROGRAM",
+            "return NO_PROGRAM",
+        ),
+        r"\(code: scratchcoder\.eval\.executor differ",
+    ),
+    "executor input limit code": (
+        source_edit(
+            EXECUTOR,
+            "max_consecutive_unresolved=max_consecutive_unresolved,\n"
+            "        input_limit=CALL_INPUT_LIMIT,",
+            "max_consecutive_unresolved=max_consecutive_unresolved,",
+        ),
+        r"\(code: scratchcoder\.eval\.executor differ",
     ),
     "budget code": (
         source_edit(
@@ -970,6 +1073,14 @@ def test_documentation_and_unlisted_code_changes_resume(
             ],
             PARALLEL: [("Run sandbox calls in parallel", "Run the sandbox calls in parallel")],
             PROGRAM: [("executed ONLY inside", "run ONLY inside")],
+            # Docstring of a listed executor unit, and code outside the listed units.
+            EXECUTOR: [
+                ("The status to score for an outcome", "The status scored for an outcome"),
+                (
+                    'raise ValueError("the results file belongs to other completions")',
+                    'raise ValueError("the results file is for other completions")',
+                ),
+            ],
             BUDGET: [("The largest deadline the runner", "The longest deadline the runner")],
         },
     )
@@ -1082,7 +1193,7 @@ def test_a_schema_one_file_stays_readable_but_is_never_resumed(tmp_path: Path) -
     run = run_from_results(results)  # The scorecard still reads it.
     assert run.outcomes["t/1"] == [True] and run.unresolved == {"t/2": 1}
     sandbox = FakeSandbox()
-    with pytest.raises(ValueError, match="schema 1, which recorded no execution-policy"):
+    with pytest.raises(ValueError, match="schema 1, which recorded only a partial"):
         execute_completions(completions, tasks_path, results, tokenizer=TOKENIZER, execute=sandbox)
     assert results.read_bytes() == before and sandbox.calls == []
     fresh = tmp_path / "fresh.jsonl"

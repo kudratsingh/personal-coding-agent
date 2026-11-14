@@ -8,6 +8,7 @@ import pytest
 from scratchcoder.eval import execution_policy
 from scratchcoder.eval.execution_policy import (
     VERDICT_CODE,
+    _defined_names,
     callable_name,
     deadline_rule,
     policy_differences,
@@ -22,7 +23,10 @@ HISTORICAL_RULE = "function: 2 s; I/O: 2 s + 0.25 s per case, at most 60 s; 128 
 
 def current() -> dict[str, Any]:
     return execution_policy.execution_policy(
-        isolated_execution, 3, unexecuted_statuses=("no_program", "context_limit")
+        isolated_execution,
+        3,
+        unexecuted_statuses=("no_program", "context_limit"),
+        input_limit=128_000,
     )
 
 
@@ -40,6 +44,7 @@ def test_the_recorded_limits_are_the_deadline_rule() -> None:
     assert policy["host_backoff_seconds"] == [2.0, 4.0, 8.0]
     assert policy["execute"] == "scratchcoder.eval.harness.isolated_execution"
     assert policy["unexecuted_statuses"] == ["context_limit", "no_program"]
+    assert policy["input_limit"] == 128_000
     assert policy_sha256(policy) == policy_sha256(current())  # Deterministic.
 
 
@@ -121,7 +126,7 @@ def test_every_listed_unit_exists_and_imports_only_listed_verdict_code() -> None
         used = {
             child.id
             for node in tree.body
-            if names is None or any(name in names for name in _defined(node))
+            if names is None or any(name in names for name in _defined_names(node))
             for child in ast.walk(node)
             if isinstance(child, ast.Name)
         }
@@ -130,14 +135,6 @@ def test_every_listed_unit_exists_and_imports_only_listed_verdict_code() -> None
             assert source in listed, f"{module} uses {name} from unlisted {source}"
             source_names = listed[source]
             assert source_names is None or name in source_names, f"{source}.{name} unlisted"
-
-
-def _defined(node: ast.stmt) -> set[str]:
-    if isinstance(node, ast.FunctionDef | ast.ClassDef):
-        return {node.name}
-    if isinstance(node, ast.Assign):
-        return {target.id for target in node.targets if isinstance(target, ast.Name)}
-    return set()
 
 
 class Instance:
@@ -166,4 +163,6 @@ def test_differences_are_named() -> None:
 
 def test_negative_retries_are_refused() -> None:
     with pytest.raises(ValueError, match="retries"):
-        execution_policy.execution_policy(isolated_execution, -1, unexecuted_statuses=())
+        execution_policy.execution_policy(
+            isolated_execution, -1, unexecuted_statuses=(), input_limit=128_000
+        )

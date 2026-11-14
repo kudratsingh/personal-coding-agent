@@ -7,8 +7,8 @@ records that policy in two ways at once:
 
 - **By value.** The limits the evaluation runner really applies (a function call, and I/O
   calls with several case counts, through :func:`scratchcoder.eval.harness.execution_limits`),
-  the scored statuses, the retry count and backoff, the input limit, the image and the host
-  watchdog. A changed constant, or a function replaced in memory, shows here.
+  the scored statuses, the retry count and backoff, the input limit the caller passes, the
+  image and the host watchdog. A changed constant, or a function replaced in memory, shows here.
 - **By code.** A SHA-256 of the syntax tree of every unit in :data:`VERDICT_CODE`, with
   docstrings removed (comments never reach the tree). Editing a docstring or a comment, or
   any file not listed, leaves the identity unchanged; editing the code of a listed unit
@@ -17,9 +17,10 @@ records that policy in two ways at once:
 :data:`VERDICT_CODE` is a deliberate enumeration, not an import scan: the sandbox runner,
 its in-container supervisor and the deadline budget as whole modules, plus the named
 definitions and every import of the harness and parallel modules that turn a sandbox result
-into a verdict, a retry or ``oversized``. A renamed or removed listed definition is an
-error, so a refactor has to update the list on purpose. Changing the list or the record's
-shape bumps :data:`EXECUTION_POLICY_VERSION`.
+into a verdict, a retry or ``oversized``, and of the executor that decides which attempts
+run, what an unexecuted attempt scores and which status counts as passed. A renamed or
+removed listed definition is an error, so a refactor has to update the list on purpose.
+Changing the list or the record's shape bumps :data:`EXECUTION_POLICY_VERSION`.
 
 The reward channel's static audit only flags passing attempts; it never changes a verdict.
 Its identity (:func:`audit_policy`) is recorded beside the execution policy, and in every
@@ -80,6 +81,20 @@ VERDICT_CODE: CodeUnits = (
             "_size",
             "resolve_call",
             "run_calls",
+        ),
+    ),
+    # The executor's decisions: unexecuted statuses, the call per attempt, the input limit it
+    # passes, which outcomes are scored and which status is a pass.
+    (
+        "scratchcoder.eval.executor",
+        (
+            "NO_PROGRAM",
+            "CONTEXT_LIMIT",
+            "CALL_INPUT_LIMIT",
+            "attempt_plan",
+            "scored_status",
+            "attempt_passed",
+            "run_verdict_calls",
         ),
     ),
 )
@@ -179,12 +194,17 @@ def _io_tests(cases: int) -> str:
 
 
 def execution_policy(
-    execute: Callable[..., Any], retries: int, *, unexecuted_statuses: Sequence[str]
+    execute: Callable[..., Any],
+    retries: int,
+    *,
+    unexecuted_statuses: Sequence[str],
+    input_limit: int,
 ) -> dict[str, Any]:
     """The verdict identity of an execution with ``execute`` and ``retries`` host retries.
 
     ``unexecuted_statuses`` are the statuses the caller writes without running anything (the
-    executor's ``no_program`` and ``context_limit``)."""
+    executor's ``no_program`` and ``context_limit``); ``input_limit`` is the limit the caller
+    passes to :func:`scratchcoder.eval.parallel.run_calls`."""
     if type(retries) is not int or retries < 0:
         raise ValueError("retries must be a non-negative integer")
     return {
@@ -203,7 +223,7 @@ def execution_policy(
         "scored_statuses": sorted(harness.SCORED_STATUSES),
         "host_retries": retries,
         "host_backoff_seconds": [harness.host_backoff(n) for n in range(1, retries + 1)],
-        "input_limit": parallel.INPUT_LIMIT,
+        "input_limit": input_limit,
         "oversized_status": parallel.OVERSIZED,
         "unexecuted_statuses": sorted(unexecuted_statuses),
         "code": code_identity(VERDICT_CODE),
