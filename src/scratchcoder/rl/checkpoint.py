@@ -4,7 +4,14 @@ RL and the control each start a fresh optimizer and never resume one, so a dev c
 saves only the model weights with their identity. The file is a ``torch.save`` mapping::
 
     {"format": "weights-v1", "config": {"model": {...}}, "tokenizer_hash": ...,
-     "run_id": ..., "step": ..., "metadata": {...}, "model": state_dict}
+     "run_id": ..., "step": ..., "metadata": {...}, "interface": "chat-v1",
+     "model": state_dict}
+
+``interface`` names the prompt interface the weights were trained for
+(``scratchcoder.eval.interface``), so evaluation resolves the matching protocol. It was
+added without a new format version: every reader ignores keys it does not use, and a
+weights-v1 file written before the key existed is chat-v1, because only post-training
+(SFT, RL and the control, all on chat-v1) has ever written this format.
 
 It loads with ``weights_only=True``, and it carries the keys the trainer reads from a
 parent checkpoint (``config.model``, ``tokenizer_hash``, ``run_id``, ``model``) and the
@@ -25,6 +32,7 @@ from typing import Any
 import torch
 
 from scratchcoder.common.config import ModelConfig
+from scratchcoder.eval.interface import CHAT_INTERFACE, INTERFACE_KEY, INTERFACES
 from scratchcoder.model.gpt import GPT
 
 WEIGHTS_FORMAT = "weights-v1"
@@ -43,14 +51,18 @@ def save_weights(
     run_id: str,
     step: int,
     metadata: dict[str, Any] | None = None,
+    interface: str = CHAT_INTERFACE,
 ) -> str:
     """Write the model's weights atomically to ``path``; return the file's SHA-256.
 
     Tensors are copied to the CPU unchanged (same dtype, same values), so loading them back
-    reproduces the weights bit for bit.
+    reproduces the weights bit for bit. ``interface`` is recorded in the file: ``chat-v1``
+    (the default, for post-training weights) or ``base``.
     """
     if not tokenizer_hash or not run_id:
         raise ValueError("a weights checkpoint needs tokenizer and run identities")
+    if interface not in INTERFACES:
+        raise ValueError(f"interface must be one of {', '.join(INTERFACES)}")
     if type(step) is not int or step < 0:
         raise ValueError("step must be a nonnegative integer")
     state = {
@@ -60,6 +72,7 @@ def save_weights(
         "run_id": run_id,
         "step": step,
         "metadata": dict(metadata or {}),
+        INTERFACE_KEY: interface,
         "model": {name: value.detach().cpu().clone() for name, value in model.state_dict().items()},
     }
     path.parent.mkdir(parents=True, exist_ok=True)

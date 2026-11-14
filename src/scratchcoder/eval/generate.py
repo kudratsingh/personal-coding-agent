@@ -26,7 +26,8 @@ from scratchcoder.eval.completions import (
     task_ids_sha256,
     write_completions,
 )
-from scratchcoder.eval.protocols import load_suite_tasks, protocol_for
+from scratchcoder.eval.interface import read_checkpoint_interface, resolve_protocol
+from scratchcoder.eval.protocols import family, load_suite_tasks, protocol_for
 from scratchcoder.tokenizer.bulk import FastEncoder
 from scratchcoder.train.trainer import training_device
 
@@ -60,18 +61,24 @@ def generate_completions(
     suite: str,
     split: str,
     tasks_path: Path,
-    protocol: str,
+    protocol: str | None,
     output: Path,
     sampling: Sampling | None = None,
     device: str = "cpu",
     precision: str = "float32",
     batch_size: int = 64,
     generate: Callable[..., Any] = generate_many,
+    allow_interface_mismatch: bool = False,
 ) -> tuple[CompletionsHeader, str]:
     """Write ``output`` and return its header and SHA-256.
 
-    An attempt whose prompt leaves no room to generate is recorded as ``context_limit``
-    with no tokens and no program; it is never shortened. MPS runs greedy decoding only.
+    ``protocol`` ``None`` takes the protocol from the checkpoint's interface
+    (``scratchcoder.eval.interface.resolve_protocol``); a named protocol must fit that
+    interface unless ``allow_interface_mismatch``. An undeclared interface needs a named
+    protocol. The header names the protocol used; the interface follows from the recorded
+    checkpoint SHA-256. An attempt whose prompt leaves no room to generate is recorded as
+    ``context_limit`` with no tokens and no program; it is never shortened. MPS runs
+    greedy decoding only.
     """
     sampling = sampling or Sampling()
     if precision not in PRECISIONS:
@@ -81,13 +88,21 @@ def generate_completions(
     if output.exists():
         raise FileExistsError(f"{output} already exists; completions files are immutable")
     tasks, exclusions = load_suite_tasks(suite, split, tasks_path)
-    definition = protocol_for(protocol, suite)
+    if protocol is not None:
+        protocol_for(protocol, suite)  # A named protocol must be defined for the suite.
     resolved = generation_device(device)
     if resolved.type == "mps" and not sampling.greedy:
         raise ValueError(
             "sampled decoding is not supported on MPS: the seeded sampler works in float64, "
             "which MPS lacks; use cpu or cuda for sampling, or greedy decoding on mps"
         )
+    interface = read_checkpoint_interface(checkpoint)
+    definition = protocol_for(
+        resolve_protocol(
+            interface, family(suite), protocol, allow_mismatch=allow_interface_mismatch
+        ),
+        suite,
+    )
     model, tokenizer = load_checkpoint(
         checkpoint, tokenizer_path, device="cpu" if resolved.type == "mps" else device
     )

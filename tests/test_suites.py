@@ -8,10 +8,13 @@ import pytest
 
 from scratchcoder.data.evalplus import origin_task, release
 from scratchcoder.eval import suites
+from scratchcoder.eval.interface import UNDECLARED, CheckpointInterface
 from scratchcoder.eval.suites import evaluate_suite
 from scratchcoder.eval.tasks import Task
 from scratchcoder.sandbox.runner import Limits, Result, Runtime
 from tools import evalplus_check
+
+UNDECLARED_INTERFACE = CheckpointInterface(None, UNDECLARED)
 
 
 def test_canonical_suite_preserves_oracles_and_records_profile(tmp_path: Path) -> None:
@@ -162,6 +165,7 @@ def test_task32_excluded_before_both_stages_and_disclosed_in_every_record(
     monkeypatch.setattr(
         suites, "load_checkpoint", lambda *_: (None, SimpleNamespace(sha256="fixture"))
     )
+    monkeypatch.setattr(suites, "read_checkpoint_interface", lambda *_: UNDECLARED_INTERFACE)
     monkeypatch.setattr(suites, "checkpoint_generator", lambda *_: generate)
     output = tmp_path / "excluded"
     reports = evaluate_suite(

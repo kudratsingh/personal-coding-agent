@@ -9,6 +9,7 @@ import torch
 from scratchcoder.common.config import ModelConfig
 from scratchcoder.eval import command
 from scratchcoder.eval.harness import EvaluationConfig, evaluate
+from scratchcoder.eval.interface import FROM_TRAINER, CheckpointInterface
 from scratchcoder.eval.prompt import BASE_STOPS, base_prompt, prompt_protocol, truncate_completion
 from scratchcoder.eval.tasks import Task, save_tasks
 from scratchcoder.model.gpt import GPT
@@ -81,6 +82,9 @@ def test_project_report_and_scorecard_persist_the_prompt_protocol(
 ) -> None:
     model, tokenizer, _ = setup_generator(monkeypatch, "\n    return 3")
     monkeypatch.setattr(command, "load_checkpoint", lambda *_: (model, tokenizer))
+    monkeypatch.setattr(
+        command, "read_checkpoint_interface", lambda *_: CheckpointInterface("base", FROM_TRAINER)
+    )
     monkeypatch.setattr(command, "evaluate", partial(evaluate, execute=lambda *_: Result("passed")))
     checkpoint = tmp_path / "authored.pt"
     checkpoint.write_bytes(b"authored checkpoint identity fixture, not deserialized")
@@ -93,6 +97,7 @@ def test_project_report_and_scorecard_persist_the_prompt_protocol(
         output=tmp_path / "evaluation",
         scorecard=tmp_path / "scorecard.jsonl",
         config=EvaluationConfig(max_new_tokens=64, bootstrap_samples=10),
+        prompt_mode=None,
     )
     for path in (tmp_path / "evaluation/report.json", tmp_path / "scorecard.jsonl"):
         report = json.loads(path.read_text())

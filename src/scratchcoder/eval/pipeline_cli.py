@@ -33,7 +33,16 @@ def add_parsers(subparsers: Any) -> None:
     generate.add_argument("--suite", choices=SUITES, required=True)
     generate.add_argument("--split", help="dev or test for the pool; eval (default) otherwise")
     generate.add_argument("--tasks", type=Path, required=True, help="pool JSONL or release file")
-    generate.add_argument("--protocol", choices=PROTOCOLS, required=True)
+    generate.add_argument(
+        "--protocol",
+        choices=PROTOCOLS,
+        help="omit to take it from the checkpoint's interface (chat-v1 or base)",
+    )
+    generate.add_argument(
+        "--allow-interface-mismatch",
+        action="store_true",
+        help="generate under a --protocol the checkpoint's interface does not fit",
+    )
     generate.add_argument("--output", type=Path, required=True)
     generate.add_argument("--device", default="cpu", help="cpu (default), cuda, cuda:N or mps")
     generate.add_argument("--precision", choices=("float32", "bfloat16"), default="float32")
@@ -121,29 +130,34 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.command == "eval-generate":
         from scratchcoder.eval.completions import Sampling
         from scratchcoder.eval.generate import generate_completions
+        from scratchcoder.eval.interface import InterfaceMismatchError
 
         split = args.split or ("eval" if args.suite != "pool" else None)
         if split is None:
             parser.error("--split dev or --split test is required for the pool")
-        header, digest = generate_completions(
-            checkpoint=args.checkpoint,
-            tokenizer_path=args.tokenizer,
-            suite=args.suite,
-            split=split,
-            tasks_path=args.tasks,
-            protocol=args.protocol,
-            output=args.output,
-            sampling=Sampling(
-                samples=args.samples,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                top_k=args.top_k,
-                seed=args.seed,
-            ),
-            device=args.device,
-            precision=args.precision,
-            batch_size=args.batch_size,
-        )
+        try:
+            header, digest = generate_completions(
+                checkpoint=args.checkpoint,
+                tokenizer_path=args.tokenizer,
+                suite=args.suite,
+                split=split,
+                tasks_path=args.tasks,
+                protocol=args.protocol,
+                output=args.output,
+                sampling=Sampling(
+                    samples=args.samples,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    top_k=args.top_k,
+                    seed=args.seed,
+                ),
+                device=args.device,
+                precision=args.precision,
+                batch_size=args.batch_size,
+                allow_interface_mismatch=args.allow_interface_mismatch,
+            )
+        except InterfaceMismatchError as error:
+            parser.error(str(error))
         _print(
             {
                 "completions": str(args.output),

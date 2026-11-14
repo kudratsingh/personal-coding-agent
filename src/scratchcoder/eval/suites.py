@@ -11,6 +11,7 @@ from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.checkpoint import load_checkpoint
 from scratchcoder.eval.command import checkpoint_generator, sampler_record
 from scratchcoder.eval.harness import EvaluationConfig, evaluate, save_report
+from scratchcoder.eval.interface import BASE_INTERFACE, read_checkpoint_interface, require_fit
 from scratchcoder.eval.prompt import prompt_protocol
 from scratchcoder.eval.tasks import Task
 from scratchcoder.sandbox.diagnostics import failure_category
@@ -105,8 +106,16 @@ def evaluate_suite(
         raise RuntimeError("canonical preflight failed; model evaluation blocked; report preserved")
     reports = {"canonical": canonical}
     if checkpoint is not None and tokenizer_path is not None:
-        model, tokenizer = load_checkpoint(checkpoint, tokenizer_path)
         options = config or EvaluationConfig()
+        # Checkpoint scoring here uses the legacy plain-text prompt modes: refuse a chat-v1
+        # checkpoint before its weights are loaded.
+        require_fit(
+            read_checkpoint_interface(checkpoint),
+            f"prompt mode {options.prompt_mode}",
+            BASE_INTERFACE,
+            allow_mismatch=False,
+        )
+        model, tokenizer = load_checkpoint(checkpoint, tokenizer_path)
         report = evaluate(
             tasks,
             checkpoint_generator(model, tokenizer, options),

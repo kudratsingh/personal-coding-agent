@@ -49,17 +49,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     train.add_argument("--resume", type=Path)
     train.add_argument("--validation", type=Path)
     train.add_argument("--device", default="cpu", help="cpu (default), cuda or cuda:N")
-    evaluation = subparsers.add_parser("eval")
+    evaluation = subparsers.add_parser(
+        "eval",
+        help="legacy plain-text evaluation of a base checkpoint (chat-v1: use eval-generate)",
+    )
     evaluation.add_argument("--checkpoint", type=Path, required=True)
     evaluation.add_argument("--tokenizer", type=Path, required=True)
     evaluation.add_argument("--tasks", type=Path, required=True)
     evaluation.add_argument("--output", type=Path, required=True)
-    evaluation.add_argument("--scorecard", type=Path, default=Path("runs/scorecard.jsonl"))
+    evaluation.add_argument(
+        "--scorecard", type=Path, required=True, help="JSONL file the summary row is appended to"
+    )
     evaluation.add_argument("--samples", type=int, default=1)
     evaluation.add_argument("--seed", type=int, default=0)
     evaluation.add_argument("--max-new-tokens", type=int, default=128)
     evaluation.add_argument("--temperature", type=float, default=0.0)
-    evaluation.add_argument("--prompt-mode", choices=("base", "instruction"), default="base")
+    evaluation.add_argument(
+        "--prompt-mode",
+        choices=("base", "instruction"),
+        help="omit to take it from the checkpoint's interface (base checkpoints: base)",
+    )
+    evaluation.add_argument(
+        "--allow-interface-mismatch",
+        action="store_true",
+        help="run a requested prompt mode the checkpoint's interface does not fit (recorded)",
+    )
     choices = subparsers.add_parser("eval-choice")
     choices.add_argument("--checkpoint", type=Path, required=True)
     choices.add_argument("--tokenizer", type=Path, required=True)
@@ -407,21 +421,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "eval":
         from scratchcoder.eval.command import evaluate_checkpoint
         from scratchcoder.eval.harness import EvaluationConfig
+        from scratchcoder.eval.interface import InterfaceMismatchError
 
-        evaluate_checkpoint(
-            checkpoint=args.checkpoint,
-            tokenizer_path=args.tokenizer,
-            tasks_path=args.tasks,
-            output=args.output,
-            scorecard=args.scorecard,
-            config=EvaluationConfig(
-                samples=args.samples,
-                seed=args.seed,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
+        try:
+            evaluate_checkpoint(
+                checkpoint=args.checkpoint,
+                tokenizer_path=args.tokenizer,
+                tasks_path=args.tasks,
+                output=args.output,
+                scorecard=args.scorecard,
+                config=EvaluationConfig(
+                    samples=args.samples,
+                    seed=args.seed,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                ),
                 prompt_mode=args.prompt_mode,
-            ),
-        )
+                allow_interface_mismatch=args.allow_interface_mismatch,
+            )
+        except InterfaceMismatchError as error:
+            parser.error(str(error))
         return 0
     from scratchcoder.train.command import train_from_files
 
