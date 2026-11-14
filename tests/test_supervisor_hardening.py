@@ -243,10 +243,52 @@ def test_a_failure_before_any_candidate_is_spawn_failed(
     def no_process(*args: Any, **kwargs: Any) -> Any:
         raise BlockingIOError("EAGAIN")
 
-    monkeypatch.setattr(program, "Path", lambda _: tmp_path / "candidate.py")
+    monkeypatch.setattr(program, "CANDIDATE_PATH", str(tmp_path / "candidate.py"))
+    monkeypatch.setattr(program, "_candidate_started", False)
     monkeypatch.setattr("scratchcoder.sandbox.program.subprocess.Popen", no_process)
     result = program.report(dict(PAYLOAD), dict(BOTH))
     assert result["status"] == "spawn_failed" and result["error_type"] == "BlockingIOError"
+
+
+@pytest.mark.parametrize("planted", ["symlink", "file"])
+def test_the_candidate_file_is_created_never_reused(tmp_path: Path, planted: str) -> None:
+    """A path that already exists (a planted symlink, FIFO or file) is refused, so the
+    supervisor never writes through anything a candidate could have prepared."""
+    path = tmp_path / "candidate.py"
+    target = tmp_path / "elsewhere"
+    if planted == "symlink":
+        path.symlink_to(target)
+    else:
+        path.write_text("planted", encoding="utf-8")
+    with pytest.raises(OSError):
+        program._write_candidate(str(path), "print(1)")
+    assert not target.exists()
+    if planted == "file":
+        assert path.read_text(encoding="utf-8") == "planted"
+
+
+def test_the_candidate_file_is_written_once_per_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    writes: list[str] = []
+    monkeypatch.setattr(program, "_write_candidate", lambda path, text: writes.append(path))
+
+    def no_process(*args: Any, **kwargs: Any) -> Any:
+        raise BlockingIOError("EAGAIN")
+
+    monkeypatch.setattr("scratchcoder.sandbox.program.subprocess.Popen", no_process)
+    io_payload = {**PAYLOAD, "mode": "io", "tests": IO_CASE.tests}
+    with pytest.raises(BlockingIOError):
+        program.supervise(io_payload, str(tmp_path / "candidate.py"))
+    assert len(writes) == 1
+
+
+def test_the_sweep_does_nothing_outside_a_container_init(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden(pid: int, sig: int) -> None:
+        raise AssertionError("the sweep signalled a process outside a container")
+
+    monkeypatch.setattr("scratchcoder.sandbox.program.os.kill", forbidden)
+    program._sweep()  # This process is not PID 1, so nothing is signalled.
 
 
 def test_a_failure_after_a_candidate_started_is_a_candidate_failure(
@@ -256,9 +298,9 @@ def test_a_failure_after_a_candidate_started_is_a_candidate_failure(
         program._candidate_started = True
         raise BlockingIOError("EAGAIN")  # e.g. the candidate's leftovers hold the pid limit
 
+    monkeypatch.setattr(program, "_candidate_started", False)  # Restored after the test.
     monkeypatch.setattr(program, "supervise", started_then_failed)
     assert program.report(dict(PAYLOAD), dict(BOTH))["status"] == "failed"
-    monkeypatch.setattr(program, "_candidate_started", False)
 
 
 def test_main_reports_unprotected_with_the_nonce(
@@ -345,6 +387,78 @@ SIGNALS = (
     "    except Exception:\n"
     "        pass\n"
 )
+MEMORY_PROBES = (
+    "import os\n"
+    "def _try(label, action):\n"
+    "    try:\n"
+    "        action()\n"
+    "        return label + '-open'\n"
+    "    except Exception as error:\n"
+    "        return label + '-' + type(error).__name__\n"
+    "def _mem():\n"
+    "    with open('/proc/1/mem', 'rb', 0) as handle:\n"
+    "        handle.read(1)\n"
+    "def _environ():\n"
+    "    with open('/proc/1/environ', 'rb') as handle:\n"
+    "        handle.read(1)\n"
+    "def _task_mem():\n"
+    "    with open('/proc/1/task/1/mem', 'rb', 0) as handle:\n"
+    "        handle.read(1)\n"
+    "def _vm_read():\n"
+    "    import ctypes\n"
+    "    libc = ctypes.CDLL(None, use_errno=True)\n"
+    "    buffer = ctypes.create_string_buffer(8)\n"
+    "    class iovec(ctypes.Structure):\n"
+    "        _fields_ = [('base', ctypes.c_void_p), ('len', ctypes.c_size_t)]\n"
+    "    local = iovec(ctypes.addressof(buffer), 8)\n"
+    "    remote = iovec(0x400000, 8)\n"
+    "    if libc.process_vm_readv(1, ctypes.byref(local), 1, ctypes.byref(remote), 1, 0) < 0:\n"
+    "        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))\n"
+    "print(' '.join(_try(label, action) for label, action in (\n"
+    "    ('mem', _mem), ('environ', _environ), ('task-mem', _task_mem), ('vm', _vm_read))))\n"
+)
+SYMLINK_SWAP = (
+    "import os\n"
+    "a, b = map(int, input().split())\n"
+    "print(a + b)\n"
+    "try:\n"
+    "    os.remove('/tmp/candidate.py')\n"
+    "    os.symlink('/proc/1/fd/1', '/tmp/candidate.py')\n"
+    "except Exception:\n"
+    "    pass\n"
+)
+FIFO_SWAP = (
+    "import os\n"
+    "a, b = map(int, input().split())\n"
+    "print(a + b)\n"
+    "try:\n"
+    "    os.remove('/tmp/candidate.py')\n"
+    "    os.mkfifo('/tmp/candidate.py')\n"
+    "except Exception:\n"
+    "    pass\n"
+)
+STARVE = (
+    "import os, time\n"
+    "try:\n"
+    "    os.setpriority(os.PRIO_PROCESS, 1, 19)\n"
+    "except Exception:\n"
+    "    pass\n"
+    "for _ in range(4):\n"
+    "    if os.fork() == 0:\n"
+    "        while True:\n"
+    "            if os.fork() == 0:\n"
+    "                pass\n"
+    "            else:\n"
+    "                started = time.process_time()\n"
+    "                while time.process_time() - started < 0.5:\n"
+    "                    pass\n"
+    "                os._exit(0)\n"
+    "while True:\n"
+    "    pass\n"
+)
+"""A same-uid candidate lowers PID 1's priority and keeps CPU-bound processes running, each
+replaced before its CPU limit. Predicted ``timeout`` (a scored verdict); a host stall would be
+a finding: an availability residual of the path of record."""
 LEFTOVER = (
     "import os, time\n"
     "if os.fork() == 0:\n"
@@ -369,23 +483,54 @@ def _task(name: str, mode: str, tests: str, prompt: str = ADD_PROMPT) -> Task:
     )
 
 
-# Ordered by ID, so every attack runs before the honest candidates it must not disturb.
-LIVE: list[tuple[Task, str, bool]] = [
-    (_task("a-memory-read", "io", IO_CASE.tests, IO_CASE.prompt), MEMORY_READ, False),
-    (_task("b-stdout-injection", "function", ADD_TESTS), conformance.PID1_STDOUT_INJECTION, False),
-    (_task("c-stdout-probe-io", "io", IO_CASE.tests, IO_CASE.prompt), STDOUT_PROBE, False),
-    (_task("d-signals-then-honest", "function", ADD_TESTS), SIGNALS + ADD_HONEST, True),
+# Ordered by ID, so every attack runs before the honest candidates it must not disturb. Each
+# entry carries its predicted status: the attacks are scored verdicts, never passes and never
+# host failures.
+LIVE: list[tuple[Task, str, str]] = [
+    (_task("a-memory-read", "io", IO_CASE.tests, IO_CASE.prompt), MEMORY_READ, "failed"),
+    (
+        _task("b-stdout-injection", "function", ADD_TESTS),
+        conformance.PID1_STDOUT_INJECTION,
+        "failed",
+    ),
+    (_task("c-stdout-probe-io", "io", IO_CASE.tests, IO_CASE.prompt), STDOUT_PROBE, "failed"),
+    (_task("d-signals-then-honest", "function", ADD_TESTS), SIGNALS + ADD_HONEST, "passed"),
     (
         _task("e-leftover-then-honest", "io", IO_CASE.tests, IO_CASE.prompt),
         LEFTOVER + IO_CASE.code,
-        True,
+        "passed",
     ),
-    (_task("f-honest-io", "io", IO_CASE.tests, IO_CASE.prompt), IO_CASE.code, True),
-    (_task("g-honest-function", "function", ADD_TESTS), ADD_HONEST, True),
+    (_task("e1-symlink-swap", "io", IO_CASE.tests, IO_CASE.prompt), SYMLINK_SWAP, "failed"),
+    (_task("e2-fifo-swap", "io", IO_CASE.tests, IO_CASE.prompt), FIFO_SWAP, "timeout"),
+    (_task("f-honest-io", "io", IO_CASE.tests, IO_CASE.prompt), IO_CASE.code, "passed"),
+    (_task("g-honest-function", "function", ADD_TESTS), ADD_HONEST, "passed"),
 ]
+RECORD_ENV = "SCRATCHCODER_HARDENING_RECORD"
 
 
-def _containers() -> list[str]:
+def _observe(test: str, case: str, predicted: str, result: Result | None, **extra: Any) -> None:
+    """Append one observed outcome beside its prediction, before any assertion, when
+    ``SCRATCHCODER_HARDENING_RECORD`` names a file (keep it outside the repository)."""
+    target = os.environ.get(RECORD_ENV)
+    if not target:
+        return
+    row: dict[str, Any] = {"test": test, "case": case, "predicted": predicted, **extra}
+    if result is not None:
+        row.update(
+            {
+                "status": result.status,
+                "detail": result.detail,
+                "exit_code": result.exit_code,
+                "host_stalled": result.host_stalled,
+                "elapsed_seconds": round(result.elapsed_seconds, 3),
+                "stdout": result.stdout[:200],
+            }
+        )
+    with open(target, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _containers() -> set[str]:
     output = subprocess.run(
         [
             "docker",
@@ -403,11 +548,12 @@ def _containers() -> list[str]:
         check=True,
         timeout=30,
     ).stdout
-    return [name for name in output.split() if name]
+    return {name for name in output.split() if name}
 
 
 @integration
 def test_attacks_neither_pass_nor_stop_the_harness() -> None:
+    before = _containers()
     codes = {task.id: code for task, code, _ in LIVE}
     report = evaluate(
         [task for task, _, _ in LIVE],
@@ -416,42 +562,82 @@ def test_attacks_neither_pass_nor_stop_the_harness() -> None:
         checkpoint_hash="hardening-test",
         tokenizer_hash="hardening-test",
     )
-    assert report["status"] == "completed" and report["task_count"] == len(LIVE)
     observed = {row["id"]: row["attempts"][0]["status"] for row in report["per_task"]}
-    expected = {task.id: ("passed" if honest else "failed") for task, _, honest in LIVE}
-    assert observed == expected
+    for task, _, predicted in LIVE:
+        _observe("harness", task.id, predicted, None, status=observed.get(task.id))
+    assert report["status"] == "completed" and report["task_count"] == len(LIVE)
+    assert observed == {task.id: predicted for task, _, predicted in LIVE}
+    assert _containers() <= before
 
 
 @integration
 def test_attacks_neither_pass_nor_stop_the_executor_scheduler() -> None:
+    before = _containers()
     outcomes: list[parallel.Outcome] = []
     calls = [parallel.Call(task.id, code, task.hidden_tests, task.mode) for task, code, _ in LIVE]
     delivered = parallel.run_calls(
         calls, harness.isolated_execution, on_outcome=outcomes.append, workers=2
     )
+    by_key = {outcome.key: outcome for outcome in outcomes}
+    for task, _, predicted in LIVE:
+        outcome = by_key.get(task.id)
+        _observe(
+            "scheduler",
+            task.id,
+            predicted,
+            None,
+            status=None if outcome is None else outcome.status,
+            resolved=None if outcome is None else outcome.resolved,
+            host_failures=None if outcome is None else outcome.host_failures,
+        )
     assert delivered == len(LIVE) and all(outcome.resolved for outcome in outcomes)
-    observed = {outcome.key: outcome.passed for outcome in outcomes}
-    assert observed == {task.id: honest for task, _, honest in LIVE}
+    assert {key: outcome.status for key, outcome in by_key.items()} == {
+        task.id: predicted for task, _, predicted in LIVE
+    }
     assert all(outcome.host_failures == 0 for outcome in outcomes)
+    assert _containers() <= before
 
 
 @integration
 def test_the_supervisor_memory_and_result_channel_are_unreachable() -> None:
-    read = run(MEMORY_READ, IO_CASE.tests, harness.execution_limits(IO_CASE.tests, "io"), mode="io")
+    limits = harness.execution_limits(IO_CASE.tests, "io")
+    read = run(MEMORY_READ, IO_CASE.tests, limits, mode="io")
+    _observe("unreachable", "maps-scan", "failed: TAG-maps-unreadable-PermissionError", read)
+    probes = run(MEMORY_PROBES, IO_CASE.tests, limits, mode="io")
+    predicted_probes = "mem-PermissionError environ-PermissionError task-mem-PermissionError"
+    _observe(
+        "unreachable", "direct-probes", f"failed: {predicted_probes} vm-PermissionError", probes
+    )
+    probe = run(STDOUT_PROBE, IO_CASE.tests, limits, mode="io")
+    _observe("unreachable", "stdout-probe", "failed: refused-PermissionError", probe)
     assert read.status == "failed"
     assert read.stdout.startswith("TAG-maps-unreadable-PermissionError"), read.stdout
-    limits = harness.execution_limits(IO_CASE.tests, "io")
-    probe = run(STDOUT_PROBE, IO_CASE.tests, limits, mode="io")
+    assert probes.status == "failed"
+    words = probes.stdout.split()
+    assert words[:3] == predicted_probes.split(), probes.stdout
+    assert words[3].startswith("vm-") and words[3] != "vm-open", probes.stdout
     assert probe.status == "failed" and probe.stdout.strip() == "refused-PermissionError"
 
 
 @integration
 def test_no_container_outlives_its_call() -> None:
+    before = _containers()
     result = run(
         LEFTOVER + IO_CASE.code,
         IO_CASE.tests,
         harness.execution_limits(IO_CASE.tests, "io"),
         mode="io",
     )
+    _observe("cleanup", "leftover-sleepers", "passed", result)
     assert result.passed, result
-    assert _containers() == []
+    assert _containers() <= before
+
+
+@integration
+def test_priority_starvation_is_a_verdict_not_a_stall() -> None:
+    """Observed once and recorded. Predicted ``timeout``; a passing verdict fails the test,
+    and a host stall is recorded as an availability finding (not rerun)."""
+    result = run(STARVE, ADD_TESTS, harness.execution_limits(ADD_TESTS, "function"))
+    _observe("starvation", "nice-19-cpu-burners", "timeout", result)
+    assert not result.passed
+    assert result.status == "timeout" and not result.host_stalled, result

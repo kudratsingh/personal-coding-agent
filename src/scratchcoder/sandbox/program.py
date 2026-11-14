@@ -16,6 +16,12 @@ These are the protections the reward supervisor (``reward_program.py``) already 
 either cannot be established the supervisor reports ``unprotected`` and runs nothing; the
 host treats that as a host failure, never as a verdict.
 
+The candidate's source is written to ``/tmp/candidate.py`` once, before any candidate process
+exists, with ``O_EXCL | O_NOFOLLOW``, and never reopened: ``/tmp`` is writable by the candidate,
+so a later write could follow a symlink the candidate planted (to ``/proc/1/fd/1``, which PID 1
+itself may open) or block on a FIFO. After every case the supervisor kills every other process
+in the container, so nothing a case leaves behind runs into the next case.
+
 The result is one JSON line carrying the host's random nonce. The host accepts nothing else:
 see :func:`scratchcoder.sandbox.runner.parse_response`.
 """
@@ -28,7 +34,6 @@ import signal
 import subprocess
 import sys
 import time
-from pathlib import Path
 from tempfile import TemporaryFile
 from typing import Any
 
@@ -42,6 +47,8 @@ HOST_FAILURE_STATUSES = ("unprotected", "spawn_failed")
 ``spawn_failed``: the first candidate process could not be started, so no candidate code ran."""
 _PR_GET_DUMPABLE = 3
 _PR_SET_DUMPABLE = 4
+CANDIDATE_PATH = "/tmp/candidate.py"
+SWEEP_SECONDS = 1.0
 
 _candidate_started = False
 """Set once a candidate process may exist; a failure before that point is the host's."""
@@ -76,21 +83,49 @@ def protect() -> dict[str, bool]:
     return {"signal_handlers": handlers, "non_dumpable": dumpable_off}
 
 
-def supervise(payload: dict[str, Any]) -> dict[str, Any]:
+def _write_candidate(path: str, program: str) -> None:
+    """Create the candidate file; refuse to follow or reuse anything already at ``path``."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o644)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(program)
+
+
+def _sweep() -> None:
+    """Kill every process except PID 1 and reap them. Runs only as PID 1 of a Linux pid
+    namespace (the container's init); anywhere else it does nothing."""
+    if os.getpid() != 1 or not sys.platform.startswith("linux"):
+        return
+    give_up = time.monotonic() + SWEEP_SECONDS
+    try:
+        os.kill(-1, signal.SIGKILL)
+    except OSError:
+        pass
+    while time.monotonic() < give_up:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            time.sleep(0.005)
+
+
+def supervise(payload: dict[str, Any], candidate_path: str | None = None) -> dict[str, Any]:
     global _candidate_started
+    candidate_path = candidate_path or CANDIDATE_PATH
     deadline = time.monotonic() + payload["timeout"]
     cases = (
         [{"input": "", "output": ""}]
         if payload["mode"] == "function"
         else json.loads(payload["tests"])
     )
+    marker = "__scratchcoder_completed_" + secrets.token_hex(24)
+    program = payload["code"]
+    if payload["mode"] == "function":
+        program += "\n" + payload["tests"] + "\nprint(" + repr(marker) + ")\n"
+    _write_candidate(candidate_path, program)  # Once, before any candidate process exists.
     last_output = ""
     for case in cases:
-        marker = "__scratchcoder_completed_" + secrets.token_hex(24)
-        program = payload["code"]
-        if payload["mode"] == "function":
-            program += "\n" + payload["tests"] + "\nprint(" + repr(marker) + ")\n"
-        Path("/tmp/candidate.py").write_text(program, encoding="utf-8")
         with TemporaryFile() as input_stream:
             input_stream.write(case["input"].encode())
             input_stream.seek(0)
@@ -99,7 +134,7 @@ def supervise(payload: dict[str, Any]) -> dict[str, Any]:
                     sys.executable,
                     "-I",
                     *([] if payload["site_packages"] else ["-S"]),
-                    "/tmp/candidate.py",
+                    candidate_path,
                 ],
                 stdin=input_stream,
                 stdout=subprocess.PIPE,
@@ -142,6 +177,7 @@ def supervise(payload: dict[str, Any]) -> dict[str, Any]:
                     process.wait(timeout=1)
                 selector.close()
                 process.stdout.close()
+                _sweep()  # After the case's own process is reaped, so its status is kept.
             last_output = bytes(captured[: payload["output_bytes"]]).decode(
                 "utf-8", errors="replace"
             )
@@ -160,6 +196,8 @@ def supervise(payload: dict[str, Any]) -> dict[str, Any]:
 
 def report(payload: dict[str, Any], protections: dict[str, bool]) -> dict[str, Any]:
     """The result for one call. Nothing runs unless every required protection holds."""
+    global _candidate_started
+    _candidate_started = False
     if not all(protections.get(name) is True for name in REQUIRED_PROTECTIONS):
         return {"status": "unprotected", "stdout": "", "exit_code": None}
     try:

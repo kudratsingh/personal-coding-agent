@@ -78,8 +78,9 @@ class Result:
     """Why an ``infrastructure_error`` happened: ``malformed_response`` (the container's output
     was not exactly one valid, nonce-bearing result line), ``supervisor_unprotected`` (a
     required supervisor protection could not be established, so nothing ran),
-    ``spawn_failed`` (the first candidate process could not start) or ``runner_error`` (the
-    host side failed). Empty for every other status. It is diagnostic only: an
+    ``spawn_failed`` (the first candidate process could not start), ``container_exit`` (the
+    container exited with a status other than 0, 125 or 137, see ``exit_code``) or
+    ``runner_error`` (the host side failed). Empty for every other status. It is diagnostic only: an
     ``infrastructure_error`` is never a verdict, whatever its detail."""
 
     @property
@@ -313,6 +314,7 @@ def run(
                 exit_code=process.returncode,
                 elapsed_seconds=time.monotonic() - started,
                 host_stalled=host_stalled,
+                detail="container_exit" if status == "infrastructure_error" else "",
             )
     except Exception:
         # Every host-side failure, whatever its type, is unresolved, never a verdict.

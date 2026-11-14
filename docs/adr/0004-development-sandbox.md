@@ -245,9 +245,11 @@ random nonce and accepts exactly one ASCII line with that nonce, the expected fi
 types, and both protections reported as held. Any other output is `infrastructure_error`
 with a diagnostic `detail`, and host-side exceptions of any type are too: unresolved, never a
 candidate failure. A failure before the first candidate process starts is `spawn_failed`
-(a host failure); after that it is the candidate's. The execution-policy identity moves to
+(a host failure); after that it is the candidate's. The candidate file is created once, before any candidate runs (`O_EXCL | O_NOFOLLOW`), and never reopened, so a symlink or FIFO a candidate plants in `/tmp` cannot redirect a later supervisor write; every other process is killed after each case. The execution-policy identity moves to
 version 2 and records the protections, so a results file started under the unprotected
 supervisor cannot be resumed.
+
+**Residual (availability).** A same-uid candidate can lower PID 1's scheduling priority. A gated control (nice 19 with CPU-bound processes) records whether that still ends as the candidate's `timeout` or becomes a host stall; see the run record.
 
 **Residual.** Function mode still runs the tests and the completion marker in the
 candidate's process, so a candidate can forge its verdict (marker forgery, a trace hook that
