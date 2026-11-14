@@ -1,7 +1,10 @@
 """Trusted supervisor source, executed ONLY inside the isolated container.
 
 It runs as PID 1 under the same uid as the candidate, so before any candidate process exists
-it establishes two protections and refuses to run anything if either is missing:
+it establishes these protections and refuses to run anything if one is missing:
+
+- **Container init.** It must be PID 1 of the container's pid namespace on Linux (not running
+  under a daemon-configured ``docker-init``): the signal rules and the process sweep rely on it.
 
 - **Signal handlers.** The catchable signals a same-user candidate could send to PID 1 get a
   no-op handler. A pid-namespace init never receives signals it has no handler for, so the
@@ -20,7 +23,10 @@ The candidate's source is written to ``/tmp/candidate.py`` once, before any cand
 exists, with ``O_EXCL | O_NOFOLLOW``, and never reopened: ``/tmp`` is writable by the candidate,
 so a later write could follow a symlink the candidate planted (to ``/proc/1/fd/1``, which PID 1
 itself may open) or block on a FIFO. After every case the supervisor kills every other process
-in the container, so nothing a case leaves behind runs into the next case.
+in the container, so no process a case leaves behind runs into the next case. Files a case
+leaves in ``/tmp`` do persist, including a changed ``/tmp/candidate.py``, which the next case
+then runs: that is the candidate's own code, and gives it nothing it could not already keep
+in another ``/tmp`` file.
 
 The result is one JSON line carrying the host's random nonce. The host accepts nothing else:
 see :func:`scratchcoder.sandbox.runner.parse_response`.
@@ -38,7 +44,7 @@ from tempfile import TemporaryFile
 from typing import Any
 
 HANDLED_SIGNALS = ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGUSR1", "SIGUSR2")
-REQUIRED_PROTECTIONS = ("signal_handlers", "non_dumpable")
+REQUIRED_PROTECTIONS = ("container_init", "signal_handlers", "non_dumpable")
 """Every protection must hold before a candidate process may start."""
 VERDICT_STATUSES = ("passed", "failed", "timeout", "output_limit")
 """Statuses that judge the candidate. The others name a supervisor-side failure."""
@@ -80,7 +86,10 @@ def protect() -> dict[str, bool]:
             )
         except Exception:
             dumpable_off = False
-    return {"signal_handlers": handlers, "non_dumpable": dumpable_off}
+    # Signal immunity and the sweep rely on being the pid namespace's init (not, say, under a
+    # daemon-configured docker-init).
+    init = os.getpid() == 1 and sys.platform.startswith("linux")
+    return {"container_init": init, "signal_handlers": handlers, "non_dumpable": dumpable_off}
 
 
 def _write_candidate(path: str, program: str) -> None:
@@ -107,6 +116,10 @@ def _sweep() -> None:
         except ChildProcessError:
             return
         if pid == 0:
+            try:
+                os.kill(-1, signal.SIGKILL)  # Anything forked since the last signal.
+            except OSError:
+                pass
             time.sleep(0.005)
 
 

@@ -8,6 +8,7 @@ the whole evaluation path inside the pinned container.
 
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +23,7 @@ from scratchcoder.sandbox import conformance, program, runner
 from scratchcoder.sandbox.runner import Limits, Result, parse_response, run
 
 NONCE = "0123456789abcdef0123456789abcdef"
-BOTH = {"signal_handlers": True, "non_dumpable": True}
+BOTH = {"container_init": True, "signal_handlers": True, "non_dumpable": True}
 
 
 def line(**fields: Any) -> bytes:
@@ -76,6 +77,7 @@ MALFORMED: dict[str, bytes] = {
     "protection not a flag": line(protections={"signal_handlers": 1, "non_dumpable": True}),
     "verdict while dumpable": line(protections={"signal_handlers": True, "non_dumpable": False}),
     "verdict without handlers": line(protections={"non_dumpable": True}),
+    "verdict outside a container init": line(protections={**BOTH, "container_init": False}),
     "error type not text": line(status="failed", error_type=3),
     "deep nesting": b"[" * 200_000 + b"]" * 200_000 + b"\n",
     "deep nesting in a field": line(stdout="x").replace(b'"x"', b"[" * 200_000 + b"]" * 200_000),
@@ -98,7 +100,8 @@ payload = json.load(sys.stdin)
 nonce = payload["nonce"]
 def good(**fields):
     document = {"status": "passed", "stdout": "", "exit_code": 0, "nonce": nonce,
-                "protections": {"signal_handlers": True, "non_dumpable": True}}
+                "protections": {"container_init": True, "signal_handlers": True,
+                    "non_dumpable": True}}
     document.update(fields)
     return json.dumps(document) + "\\n"
 behaviour = %r
@@ -283,6 +286,31 @@ def test_the_candidate_file_is_written_once_per_call(
     assert len(writes) == 1
 
 
+def test_the_sweep_kills_everything_else_and_reaps_as_the_init(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``kill`` is replaced before ``getpid`` is, so no mistake here can signal real processes.
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        "scratchcoder.sandbox.program.os.kill", lambda pid, sig: signals.append((pid, sig))
+    )
+    reaped = iter([(41, 0), (0, 0), (42, 0)])
+
+    def waitpid(pid: int, flags: int) -> tuple[int, int]:
+        try:
+            return next(reaped)
+        except StopIteration:
+            raise ChildProcessError from None
+
+    monkeypatch.setattr("scratchcoder.sandbox.program.os.waitpid", waitpid)
+    monkeypatch.setattr("scratchcoder.sandbox.program.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("scratchcoder.sandbox.program.sys.platform", "linux")
+    monkeypatch.setattr("scratchcoder.sandbox.program.os.getpid", lambda: 1)
+    program._sweep()
+    assert signals and all(pid == -1 and sig == signal.SIGKILL for pid, sig in signals)
+    assert len(signals) == 2  # Once at the start, once more while a child was still alive.
+
+
 def test_the_sweep_does_nothing_outside_a_container_init(monkeypatch: pytest.MonkeyPatch) -> None:
     def forbidden(pid: int, sig: int) -> None:
         raise AssertionError("the sweep signalled a process outside a container")
@@ -345,6 +373,7 @@ def test_protect_installs_handlers_and_drops_dumpability_on_linux() -> None:
     state = json.loads(output)
     assert state["signal_handlers"] is True and state["handled"] is True
     assert state["non_dumpable"] is sys.platform.startswith("linux")
+    assert state["container_init"] is False  # This interpreter is not a container's PID 1.
 
 
 def test_the_supervisor_protects_itself_before_reading_the_payload() -> None:

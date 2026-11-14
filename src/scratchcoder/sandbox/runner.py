@@ -79,7 +79,7 @@ class Result:
     was not exactly one valid, nonce-bearing result line), ``supervisor_unprotected`` (a
     required supervisor protection could not be established, so nothing ran),
     ``spawn_failed`` (the first candidate process could not start), ``container_exit`` (the
-    container exited with a status other than 0, 125 or 137, see ``exit_code``) or
+    docker CLI ended with a status other than 0, 125 or 137, or by a signal; see ``exit_code``) or
     ``runner_error`` (the host side failed). Empty for every other status. It is diagnostic only: an
     ``infrastructure_error`` is never a verdict, whatever its detail."""
 

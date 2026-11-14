@@ -1400,6 +1400,6 @@ def test_the_policy_records_the_supervisor_protections() -> None:
         harness.isolated_execution, 3, unexecuted_statuses=(), input_limit=1
     )
     assert policy["version"] == execution_policy.EXECUTION_POLICY_VERSION == 2
-    assert policy["supervisor_protections"] == ["signal_handlers", "non_dumpable"]
+    assert policy["supervisor_protections"] == ["container_init", "signal_handlers", "non_dumpable"]
     unprotected = execution_policy.unit_sha256(PROGRAM, None, UNPROTECTED_PROGRAM)
     assert policy["code"]["units"][PROGRAM] != unprotected
