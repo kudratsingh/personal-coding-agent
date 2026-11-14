@@ -55,12 +55,47 @@ Budgets are `min(512, context − prompt)` for chat-v1 and the base pool protoco
 
 **Results file** (`scratchcoder.eval.executor`): append-only JSON Lines.
 
-- **Header:** names the completions SHA-256, embeds the completions header and lists every task's source and authorship. It also records how execution ran: the runner and supervisor file hashes, the image, the deadline rule, retries and the audit.
+- **Header (schema 2):** names the completions SHA-256, embeds the completions header and lists every task's source and authorship. Its `execution` holds the *execution policy*, its SHA-256, and, apart, the audit policy and its SHA-256 (see [Execution-policy identity](#execution-policy-identity)). Schema 1 headers recorded only the runner and supervisor file hashes, the image, the deadline rule text, retries and the audit name.
 - **Records:**
-  - each `window` and `window_end` (counts and sandbox seconds);
+  - each `window` (with the execution- and audit-policy SHA-256s it ran under) and `window_end` (counts and sandbox seconds);
   - one `attempt` per scored attempt, with its status (`passed`, `failed`, `timeout`, `output_limit`, `resource_limit`, `oversized`, `no_program` or `context_limit`);
   - an `unresolved` record for an attempt whose host failures outlasted the retries.
-- **Resuming:** a later run skips scored attempts and retries unresolved ones. An interruption can leave a torn last line, which the next run drops before appending. A run holds an exclusive lock on the file, so two runs never append to it at once.
+- **Resuming:** a later run skips scored attempts and retries unresolved ones, but only under the same execution policy; any difference is refused before a byte is appended. An interruption can leave a torn last line, which the next run drops before appending. A run holds an exclusive lock on the file, so two runs never append to it at once.
+- **Older files:** `read_results` and the scorecard read schema 1 and schema 2 files alike. A schema 1 file is never resumed: its header cannot show which limits and code produced its verdicts, and the executor does not infer one after the fact. Start a new results file instead.
+
+### Execution-policy identity
+
+`scratchcoder.eval.execution_policy` builds the record a resumed run must match. It has two halves.
+
+*By value*, so a changed constant or a function replaced in memory shows:
+
+| Field | Current value |
+| --- | --- |
+| `limits.function` | 2 s, 128 MiB, 16 processes, 65,536 output bytes, 128,000 input bytes |
+| `limits.io_by_cases` for 0, 1, 40, 99, 100 and 1,000 cases | 2, 2.25, 12, 26.75, 27 and 60 s (other limits as above) |
+| `deadline_rule` | the same rule in words, built from those values |
+| `scored_statuses` | `failed`, `output_limit`, `passed`, `resource_limit`, `timeout` |
+| `host_retries`, `host_backoff_seconds` | 3; 2, 4, 8 s |
+| `input_limit`, `oversized_status` | 128,000 bytes; `oversized` |
+| `unexecuted_statuses` | `context_limit`, `no_program` |
+| `image`, `host_watchdog_seconds` | the pinned digest; 10 s |
+| `execute` | `scratchcoder.eval.harness.isolated_execution` (a callable object is named by its class) |
+
+*By code*: a SHA-256 of the syntax tree, with docstrings dropped, of each enumerated unit:
+
+| Unit | Why it decides verdicts |
+| --- | --- |
+| `sandbox/runner.py` (whole) | limits, the hardened `docker run` command, the host watchdog, the status mapping |
+| `sandbox/program.py` (whole) | the in-container supervisor: deadline, completion marker, I/O comparison |
+| `sandbox/budget.py` (whole) | the I/O deadline rule |
+| `eval/harness.py`: `SCORED_STATUSES`, `HOST_RETRIES`, the backoff constants, `execution_limits`, `isolated_execution`, `is_host_failure`, `host_backoff`, and every import | limits per call, and what is a verdict versus a host failure |
+| `eval/parallel.py`: `Execute`, `OVERSIZED`, `INPUT_LIMIT`, `Call`, `Outcome`, `_size`, `resolve_call`, `run_calls`, and every import | the oversized rule and the retry loop |
+
+Comments never reach the syntax tree, and docstrings are removed from it, so documentation edits leave the identity unchanged. So do edits to anything not listed, such as `harness.evaluate` or `docs/`. A listed definition that is renamed or removed is an error, not a silently narrower identity; a test checks that the listed definitions use scratchcoder code only from other listed units. The Python minor version is recorded with the hashes, because the syntax-tree dump can change between versions. The program extraction is not in the policy: it is already checked by re-deriving every stored program against the completions file, whose hash the header names.
+
+The reward channel's static audit only labels passing attempts, so it never changes a verdict. Its identity (the syntax-tree hash of `sandbox/reward.py`) is recorded in the header and in every window but not compared. `ResultsFile.audit_policies` lists the distinct audit hashes the windows recorded; two or more mean the audit-flag counts mix two audits.
+
+*Example.* A dev run is interrupted after 1,200 of 2,000 attempts. Before it resumes, someone changes `IO_SECONDS_PER_CASE` in `budget.py` to 0.5 s. The resumed run computes `limits.io_by_cases["99"]` as 51.5 s, not 26.75 s, and refuses with `(code: scratchcoder.sandbox.budget; deadline_rule; limits differ)`. Nothing is appended. Reverting the change, or starting a new results file, are the only ways on. Had they only reworded the `io_seconds` docstring, the run would have resumed.
 
 **Seal ledger** (`scratchcoder.eval.seal`): hash-chained JSON Lines events `sealed`, `opened`, `resumed`, `completed`, `baseline` and `withdrawn`. `withdrawn` (`scratchcoder eval-withdraw`) names every sealed file of one endpoint's checkpoint and the reason, and is final: the files are never sealed again, listed in an unseal record or executed, nothing more of that checkpoint is sealed, and it is refused once any read has opened. Run 1's two SFT test files are withdrawn this way as a formatting failure, and run 1b's SFT weights stand for the SFT endpoint. Each event names the SHA-256 of the line before it. A *head record*, `<ledger>.head`, beside the ledger holds the event count and the last line's hash and is rewritten after every append. Each test-read window in a results file also names the ledger's count and head hash when the read opened.
 
@@ -85,7 +120,8 @@ Budgets are `min(512, context − prompt)` for chat-v1 and the base pool protoco
 - **The older `scratchcoder eval` path cannot score the test split.** `evaluate` refuses tasks labelled `test`, because that path writes no ledger entry. The pool test split is scored only by `eval-execute` under an unseal record.
 - **The test split is read once.** `eval-execute` refuses test completions unless they are sealed in the ledger and an unseal record lists them. The record must name all four frozen endpoints (`base`, `sft`, `rl`, `more-sft`), each a different checkpoint, and every completions file it lists must be sealed. The file must also sit under the endpoint whose checkpoint generated it. The read is logged (`opened`) before anything runs, and the ledger and the record are checked before the sealed task file is opened. The tokenizer is required, so the one read is never spent on completions whose prompts and tokens were not checked. An interrupted read resumes on the same results file (`resumed`). Once a read completes, or while another results file holds it, a second execution is refused.
 - **Regenerating buys nothing.** One unseal record governs a ledger. After any read has opened, no file can be sealed and every later read must present the same record. A record may not list two files of one checkpoint, protocol and decoding (greedy or sampled), so a regenerated greedy file cannot be read as a second look at the same endpoint.
-- **A resumed window keeps one runner.** The results header records the runner and supervisor hashes, the image and the deadline rule. Resuming compares them with the current code and refuses a mismatch, so a long run resumed after a rebase never mixes verdicts from two runners.
+- **A results file keeps one execution policy.** Resuming compares the whole recorded policy, not a few hand-picked fields, and refuses any difference, so a long run resumed after a rebase never mixes verdicts from two policies. Before schema 2, only the image, the deadline-rule text and the runner and supervisor file hashes were compared; a changed limit in the harness, the I/O budget, the scored statuses, the input limit, the retries or the execute function went unnoticed, and so would a different host-failure rule.
+- **The verdict code is enumerated, not discovered.** An import scan would pull in modules that never touch a verdict, and a file hash would refuse a resume over a docstring. The enumeration is a deliberate list; changing it bumps `EXECUTION_POLICY_VERSION`, which by itself refuses older schema 2 files.
 - **The test baseline is computed inside the read.** It reads hidden tests, so `pool_constant_baseline` refuses the test split unless the unseal step calls it. It runs after the first complete test read and is written beside the ledger. The ledger records it with its SHA-256, and later reads reuse it. A baseline with an unresolved call is not recorded, so a later read computes it again. If the last read leaves it unlogged, `eval-test-baseline` retries it, but only after every file the unseal record lists has a completed read and only on the task file those files name. A baseline file saved without its ledger event (an interruption between the two) is checked against the task file and recorded, not computed again.
 - **Constant answers cover every pool task or say why not.**
   - *Parseable tasks:* the reward channel scores them on the host and runs no code.
@@ -102,7 +138,8 @@ Budgets are `min(512, context − prompt)` for chat-v1 and the base pool protoco
 - `tests/test_completions.py`: pinned protocol hashes, the stop-table change, prompts, budgets and extraction by hand, round trip and immutability, and every read-time refusal.
 - `tests/test_eval_generate.py`: equality with direct `generate_many`, seeds independent of batch size, context limits, stop tokens, the task-32 exclusion, devices and the CLI.
 - `tests/test_seal_withdrawal.py`: a withdrawal names every sealed file of the checkpoint; withdrawn files and their checkpoint are refused by every later seal, unseal record and read; the replacement checkpoint seals and executes; nothing is withdrawn once a read opened; malformed withdrawals change nothing; the command.
-- `tests/test_eval_executor.py`: scoring, the audit, stall and host-failure retries, resume after an interruption and a torn line, the circuit breaker, refusals, and the whole seal: refusals, one read, resume, malformed unseal records, the ledger chain and its head record, regeneration and second unseal records, the preflight before the task file opens, the tokenizer requirement, the resume environment check and the baseline retry.
+- `tests/test_eval_executor.py`: scoring, the audit, stall and host-failure retries, resume after an interruption and a torn line, the circuit breaker, refusals, and the whole seal: refusals, one read, resume, malformed unseal records, the ledger chain and its head record, regeneration and second unseal records, the preflight before the task file opens, the tokenizer requirement and the baseline retry. For the execution policy: a changed function timeout, I/O budget, deadline constant, scored statuses, input limit, image, retry count or execute function, or edited host-status, oversized, supervisor, runner or budget code, refuses a resume and appends nothing; docstring, comment and unlisted-code edits resume; an audit change resumes and shows as two audit policies; a renamed listed definition is an error; an interrupted and twice-resumed run records the same attempts as an uninterrupted one; a schema 1 file stays readable by the scorecard but is never resumed.
+- `tests/test_execution_policy.py`: the recorded limits against the deadline rule, docstring and comment insensitivity, code sensitivity of listed units only, the closure of the enumeration under its scratchcoder imports, callable names and named differences.
 - `tests/test_parallel_calls.py`, `tests/test_constant_baseline.py`: retry bounds, the oversized rule under the default and a given input limit and task-side errors, the baselines by hand (executed, uncovered, I/O, ARC, benchmark programs, a builtin-named MBPP+ entry) and the test-split refusal.
 - `tests/test_benchmarks.py`, `tests/test_benchmark_dispatch.py`: canonical blocking, unresolved benchmark attempts, the scoring tool (an MBPP+ task whose tests exceed 128,000 bytes is scored under the 2 MiB limit), the workflow's inputs and step order, the AWS presigned-URL reference vector and the dispatch tool with mocked `gh` and R2.
 - `tests/test_scorecard.py`: metrics, slices, baselines, unresolved counts, the fixed-seed pairs, the leak flag, ARC rows and the CLI.
@@ -110,7 +147,7 @@ Budgets are `min(512, context − prompt)` for chat-v1 and the base pool protoco
 
 ```sh
 uv run --locked pytest tests/test_completions.py tests/test_eval_generate.py \
-  tests/test_eval_executor.py tests/test_parallel_calls.py tests/test_constant_baseline.py \
+  tests/test_eval_executor.py tests/test_execution_policy.py tests/test_parallel_calls.py tests/test_constant_baseline.py \
   tests/test_benchmarks.py tests/test_benchmark_dispatch.py tests/test_scorecard.py
 SCRATCHCODER_SANDBOX_TESTS=1 uv run --locked pytest tests/test_eval_pipeline_sandbox.py
 ```
@@ -135,3 +172,5 @@ The reward channel scored 1,893 tasks on the host. Constant programs covered 102
 3. *Why compute the test baseline only inside an unseal read?* It reads the hidden tests: the parse needs them, and the executed constants run against them. Computing it earlier would read sealed tests before the endpoints are frozen.
 4. *What stops a second look at the test split?* The ledger. A completed read, or an open read held by another results file, refuses any new execution of those completions. Editing or deleting a ledger line breaks its hash chain. The chain alone cannot show that the last lines were removed, so the head record, kept beside the ledger, names the count and last hash and a shorter ledger is refused. The two files must travel together; this guards against accidents and casual edits, not against someone who rewrites both. Regenerating the completions does not help: after the first read no new file can be sealed, and every read must use the one unseal record.
 5. *Why is a HumanEval score above 20% flagged?* The reference model scores 14 of 164 under the protocol of record. A 135M rehearsal model far above that more likely saw the benchmark than solved it, so the flag stays until a contamination check clears it.
+6. *I edited a comment in `parallel.py` mid-run. Will the resume be refused?* No. Comments and docstrings never reach the hashed syntax tree. Changing `resolve_call`'s code would be refused, and so would changing a limit in memory, because the limits are also recorded by value.
+7. *Why is a schema 1 file not resumed under its old four-field check?* That check missed the limits and the host-failure rule, and nothing in the old header can show which ones its verdicts came from. Inferring them now would label old verdicts with an identity they were never checked against. A complete schema 1 file needs no resume and stays readable for scoring; an incomplete one is finished by executing into a new results file.
