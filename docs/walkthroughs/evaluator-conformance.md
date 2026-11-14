@@ -109,10 +109,11 @@ The catalogue has 28 cases in eight groups:
   and a shadowed `isinstance`, carry no flag at all.
 - **Refusal is not a pass.** The reward channel refuses a task with no supported assertion
   (`not_parseable`, reward `None`). The tests confirm that it never starts a container for one.
-- **Predicted, not yet observed.** The expected verdicts were derived by reading the runner,
-  the supervisors and the reward channel. They have not yet been run against the pinned
-  container. The first gated run is the observation: any mismatch there is a finding to
-  investigate, and it must not be edited away.
+- **Predicted, then observed.** The expected verdicts were first derived by reading the
+  runner, the supervisors and the reward channel. A local gated run of this catalogue
+  against the pinned container, inside a passing execution window, then matched every
+  declared verdict on both paths. A future mismatch is a finding to investigate: correct
+  the catalogue only in a separate, reviewed change that cites the observation.
 - **Out of scope:** NumPy-backed benchmark scoring (the EvalPlus image), benchmark suites
   (none of them is parseable on the reward channel), and the sealed test split.
 
