@@ -36,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "POSTTRAIN_RUN2_RUNBOOK.md"
 ORIGIN = base.ORIGIN
 BOUNDS = posttrain_ops.bridge_timeouts(attempts_per_request=256, dev_programs=1_800)
-ESTIMATE = 3.145
+ESTIMATE = 3.1032
 """The runbook's example estimate: the run 2 projection's total at the planning speeds."""
 LIMITS = posttrain_ops.ceiling_limits(5.80, 0.60, gate_estimate_usd=ESTIMATE)
 VALUES = {
@@ -44,7 +44,7 @@ VALUES = {
     "RUN": "2",
     "CTRL": "runs/posttrain-controller/2/podpost02",
     "KNOWN_HOSTS": "/Users/owner/.ssh/posttrain_2_known_hosts",
-    "SPEC_TEMPLATE": "configs/rehearsal-a40-s-post-2.json",
+    "SPEC_TEMPLATE": "configs/rehearsal-a40-s-post-2-v2.json",
     "SHARED": "runs/posttrain-shared-2",
     "SPEC": "runs/posttrain-shared-2/rehearsal-a40-s-post-2-gate.json",
     "BINDING": "runs/posttrain-shared-2/binding.json",
@@ -177,7 +177,7 @@ def test_the_runbooks_bounds_are_the_specifications() -> None:
     text = RUNBOOK.read_text()
     planned = posttrain2_report(posttrain_approved.SPECIFICATION_PATH_2, ceiling_usd=5.80)
     assert ESTIMATE == round(planned["scenarios"]["planning speeds"]["total_usd"], 4)
-    assert isinstance(LIMITS, posttrain_ops.EstimateLimits) and LIMITS.limit_usd == 3.77
+    assert isinstance(LIMITS, posttrain_ops.EstimateLimits) and LIMITS.limit_usd == 3.72
     assert (
         posttrain_ops.estimate_limit_usd(5.80, 4.84)
         == 5.80
@@ -185,10 +185,10 @@ def test_the_runbooks_bounds_are_the_specifications() -> None:
     )
     assert posttrain_ops.ceiling_limits(5.80, 0.60).wall_seconds == 34_800
     for phrase in (
-        "**$3.77**",
-        "**$3.76**",
-        "**22,620 s**",
-        "**22,440 s**",
+        "**$3.72**",
+        "**$3.71**",
+        "**22,320 s**",
+        "**22,140 s**",
         "Only an estimate of $4.84 or more lets the $5.80 ceiling bind",
         "**900 s**",
         "**5,600 s**",
@@ -197,17 +197,17 @@ def test_the_runbooks_bounds_are_the_specifications() -> None:
         "**11,746.5 s**",
         "7,914.5 s (reward), 11,806.5 s (dev)",
         "11,746.5 s, $1.96",
-        "7,731 tok/s at batch 128 for the evaluation and 8,733 at batch 256",
-        "17,970 s",
-        "about 4,470 s (1.2 hours) of the 22,440 s",
-        "5.2 hours and $3.15",
-        "cost limit 3.77 USD, wall 22620 s, timer 22440 s, watchdog cost stop 3.76 USD",
+        "7,991 tok/s at batch 128 for the evaluation and 9,049 at batch 256",
+        "17,719 s",
+        "about 4,421 s (1.2 hours) of the 22,140 s",
+        "5.2 hours and $3.10",
+        "cost limit 3.72 USD, wall 22320 s, timer 22140 s, watchdog cost stop 3.71 USD",
     ):
         assert phrase in text, phrase
     lifetime = LIMITS.self_destruct_seconds
     spec = Specification.from_dict(filled)
     needed = launch_fit(spec, remaining_seconds=lifetime)["planning_seconds_needed"]
-    assert (round(needed), lifetime - round(needed)) == (17_970, 4_470)
+    assert (round(needed), lifetime - round(needed)) == (17_719, 4_421)
     assert f"{BOUNDS.lost_bridge_seconds:,.0f} s" in text
     assert "| 1,397.5 s |" in text and "| 857 s |" in text
     assert BOUNDS.mac_check_seconds == 857 and BOUNDS.window_check_seconds == 730
@@ -305,7 +305,7 @@ def test_the_pod_and_mac_commands_name_run_twos_paths_and_limits(
     assert options(run)["--output"] == "/workspace/posttrain-run"
     (watchdog,) = base.by("tools.runpod_watchdog")
     flags = options(watchdog)
-    assert flags["--max-wall-seconds"] == "22620" and flags["--max-cost-usd"] == "3.76"
+    assert flags["--max-wall-seconds"] == "22320" and flags["--max-cost-usd"] == "3.71"
     assert flags["--awaiting-reward-extension-seconds"] == "7914.5"
     assert flags["--awaiting-dev-extension-seconds"] == "11806.5"
     assert flags["--policy"] == f"{VALUES['CTRL']}/policy.json"
@@ -403,7 +403,7 @@ def test_the_bootstrap_call_uses_only_flags_the_script_knows() -> None:
     command = command[: command.index(";")]
     flags = [token for token in shlex.split(base.substitute(command)) if token.startswith("--")]
     assert set(flags) <= known, set(flags) - known
-    assert "--lifetime-seconds 22440" in base.substitute(command) and "--run 2" in base.substitute(
+    assert "--lifetime-seconds 22140" in base.substitute(command) and "--run 2" in base.substitute(
         command
     )
 

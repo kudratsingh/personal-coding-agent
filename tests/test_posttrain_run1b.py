@@ -73,13 +73,17 @@ def test_run_1b_is_the_owners_approval() -> None:
     gate = spec.stage("format-gate").settings
     assert (gate["row_count"], gate["smoke_prompts"], gate["benchmark_prompts"]) == (32, 16, 8)
     assert gate["benchmarks"] == ["humaneval", "mbpp-plus"] and gate["checkpoint"] == "sft"
-    # Run 1's probe, floors, planning rates, generation batch and protocols.
+    # Run 1's probe, planning rates, generation batch and protocols; the floors in force when
+    # run 1b ran (the standing rule over the three hosts measured before it).
     run1 = posttrain_approved.run1_specification()
-    for section in ("model", "probe", "generation", "screening", "r2"):
+    for section in ("model", "generation", "screening", "r2"):
         assert spec.raw[section] == run1[section], section
+    floors = {"128": 7_731.0, "256": 8_733.0}
+    assert spec.raw["probe"] == {**run1["probe"], "minimum_tokens_per_second": floors}
     assert {key: value for key, value in spec.planning.items() if key != "format_gate_seconds"} == (
-        run1["planning"]
+        {**run1["planning"], "generation_tokens_per_second": floors}
     )
+    assert sft["reference_slots_per_second"] == 57_103.853248428364
     eval_sft = next(stage for stage in run1["stages"] if stage["name"] == "eval-sft")
     assert spec.raw["stages"][4] == eval_sft
 
