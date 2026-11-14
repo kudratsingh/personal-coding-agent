@@ -13,7 +13,15 @@ no full corpus has been admitted or model pretrained on these samples.
 
 Real-source sample review is complete, but no full production training corpus has been admitted. Ordinary tests use synthetic strings and byte fixtures authored for this repository. These establish software behavior, not corpus quality or model performance. The reference workflow downloads HumanEval for evaluation only; benchmark material never enters training or tokenizer input.
 
-`data/manifest.json` intentionally contains no full-build-approved sources. The real sample review keeps its raw-container manifests/terms receipts local and ignored, with public source/hash evidence below. External sources require a pinned immutable revision, a verified license and attribution, SHA-256, exact byte count, declared purpose, and owner terms acceptance where applicable. An unverified or incomplete downloader entry fails before a network request.
+`data/manifest.json` intentionally contains no full-build-approved sources: no source is approved yet for a full (M or L) build. An empty list does not mean nothing was downloaded. For the S rehearsal and its evaluation, each source was taken at a pinned revision with its hashes and terms recorded in its own configuration or guide, and the raw files stay local:
+
+- FineWeb-Edu `sample-10BT` and StarCoderData Python: samples for the [real sample review](real-samples.md), then whole files for the [S rehearsal build](rehearsal-data.md);
+- The Stack dedup v1.2: only its repository, path and license columns and its Parquet footers, read by range request for the license join, never a content column;
+- OpenCodeInstruct, AceCode-87K, TACO and MBPP for the [task pool](task-pool.md);
+- OpenAssistant oasst2 for the SFT language rows ([SFT data](sft-data.md));
+- HumanEval, HumanEval+, MBPP+, ARC-Easy and the original MBPP release, for evaluation only (below).
+
+The real sample review keeps its raw-container manifests/terms receipts local and ignored, with public source/hash evidence below. External sources require a pinned immutable revision, a verified license and attribution, SHA-256, exact byte count, declared purpose, and owner terms acceptance where applicable. An unverified or incomplete downloader entry fails before a network request.
 
 The [real sample review](real-samples.md) records FineWeb-Edu `sample-10BT` (Hugging Face; Lozhkov et al., 2024; ODC-By 1.0 plus Common Crawl terms) and StarCoderData Python (BigCode/The Stack plus original repository authors; accepted dataset terms and original file licenses). Original notices and repository/path provenance are retained locally; data is not redistributed here. The original 2026-10-19 fit review kept **498,123,158 web bytes** and **96,638,864 Python bytes**, admitting Python only on explicit allowlisted declarations in each file. The current review admits a Python file on an explicit allowlisted header first or, when the file has no header, on verified upstream repository license metadata in which every listed ID is allowlisted; never on a dataset license tag. The final pool holdout does not exist yet, so its exclusion coverage is explicitly **0**. These samples support the separately authorized tokenizer work, not a full data build. Production BPE counts/freeze are reported separately once measured.
 
