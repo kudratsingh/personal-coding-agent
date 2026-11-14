@@ -172,6 +172,6 @@ The record counts every message by reason, every dropped tree by reason, each sc
 
 - **Terms.** The terms of record are a metadata label and a sentence in the paper's abstract, accepted by the owner. There is no license file or contributor grant.
 - **Fields.** The adapter assumes the README's message fields and mapping-form labels. Missing fields and labels in another shape show up as `missing_metadata` counts, not as silent passes.
-- **PII.** The e-mail screen and the PII label do not find every kind of personal data, and messages that no reviewer labelled for PII are kept (and counted). A manual sample scan is still needed before training.
+- **PII.** The e-mail screen and the PII label do not find every kind of personal data, and messages that no reviewer labelled for PII are kept (and counted). No manual sample scan is recorded for the two builds of record, which the rehearsal SFT runs used; one is still needed before a build is used for further training.
 - **All-token share.** The 30% cap is on loss tokens. Code rows carry long prompts and short programs, so language takes a smaller share of all tokens than of loss tokens. The record reports both.
 - **Code rows.** They inherit the pool's limitations, including its unchecked seed provenance.
