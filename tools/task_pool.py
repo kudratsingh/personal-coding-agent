@@ -744,15 +744,19 @@ def assign_families(
     orders as ``assign``:
 
     1. Each TACO test task's family, not yet placed, goes whole to the next of dev/test in
-       alternation. Members from other sources go with it; TACO test tasks stay holdouts.
+       alternation; TACO test tasks stay holdouts.
     2. MBPP families are added the same way until the holdouts hold
        ``human_holdout_minimum`` human-written tasks.
     3. Model-written families from the named sources fill dev, then test. A family goes
        only if every member is model-written from a named source and it fits the room
        left; otherwise the whole family stays in training.
 
-    The split sizes stay exact; if they cannot be met, the build stops. No family spans
-    two splits, which the function checks before returning.
+    Only TACO, MBPP and the named model sources may be held out. A member of a step 1 or
+    2 family from any other source (AceCode, for one) can go neither to a holdout nor to
+    training beside its held-out family, so it is dropped from the pool and counted in
+    ``members_dropped_by_source``. The split sizes stay exact; if they cannot be met, the
+    build stops. No family spans two splits and no holdout task comes from another
+    source, which the function checks before returning.
     """
     if version not in FAMILY_GROUPING_VERSIONS:
         raise ValueError("unknown family grouping version")
@@ -766,7 +770,10 @@ def assign_families(
     members: dict[str, list[Task]] = {}
     for task in kept:
         members.setdefault(family(task), []).append(task)
+    allowed = {DATASETS[kind] for kind in splits["model_holdout_sources"]}
+    holdout_sources = {DATASETS["taco"], DATASETS["mbpp"], *allowed}
     assigned: dict[str, str] = {}
+    dropped: dict[str, str] = {}
     alternation = 0
 
     def place_alternating(task: Task) -> None:
@@ -774,7 +781,10 @@ def assign_families(
         name = "dev" if alternation % 2 == 0 else "test"
         alternation += 1
         for member in members[family(task)]:
-            assigned[member.id] = name
+            if member.source in holdout_sources:
+                assigned[member.id] = name
+            else:
+                dropped[member.id] = member.source
 
     taco_test = order([t for t in kept if t.source == DATASETS["taco"] and t.split != "train"])
     for task in taco_test:
@@ -799,28 +809,33 @@ def assign_families(
     }
     if min(room.values()) < 0:
         raise ValueError("human holdout families exceed the requested split sizes")
-    allowed = {DATASETS[kind] for kind in splits["model_holdout_sources"]}
-    skipped = 0
+    skipped: set[str] = set()
     for task in order([t for t in kept if t.written_by == "model" and t.source in allowed]):
         target = "dev" if room["dev"] > 0 else "test" if room["test"] > 0 else None
         if target is None:
             break
-        if task.id in assigned:
+        if task.id in assigned or task.id in dropped:
             continue
         group = members[family(task)]
         eligible = all(m.written_by == "model" and m.source in allowed for m in group)
         if not eligible or len(group) > room[target]:
-            skipped += 1
+            skipped.add(family(task))
             continue
         for member in group:
             assigned[member.id] = target
         room[target] -= len(group)
     if any(room.values()):
         raise ValueError("not enough verified model-written families for the holdouts")
-    result = [replace(task, split=assigned.get(task.id, "train")) for task in kept]
+    result = [
+        replace(task, split=assigned.get(task.id, "train"))
+        for task in kept
+        if task.id not in dropped
+    ]
     held = {task.id for task in taco_test}
     if any(task.split == "train" and task.id in held for task in result):
         raise RuntimeError("an upstream TACO test task reached the training split")
+    if any(task.split != "train" and task.source not in holdout_sources for task in result):
+        raise RuntimeError("a task from a source that may not be held out reached a holdout")
     spans: dict[str, set[str]] = {}
     for task in result:
         spans.setdefault(family(task), set()).add(task.split)
@@ -842,15 +857,17 @@ def assign_families(
             "as the historical rule, with whole task families as the unit: TACO test families "
             "alternate dev/test by ID hash; MBPP families top up the human minimum; families "
             "made only of model-written tasks from the named sources fill dev, then test; any "
-            "other family stays in training"
+            "other family stays in training; a held-out family's members from any other "
+            "source are dropped from the pool"
         ),
         "model_holdout_sources": list(splits["model_holdout_sources"]),
         "family_grouping": {
             "version": version,
             "families": sum(len(group) > 1 for group in members.values()),
             "tasks_in_families": sum(len(group) for group in members.values() if len(group) > 1),
-            "model_families_skipped": skipped,
+            "model_families_skipped": len(skipped),
             "holdout_members_pulled_in_by_source": dict(pulled),
+            "members_dropped_by_source": dict(Counter(dropped.values())),
         },
     }
 
@@ -1169,6 +1186,10 @@ def _build(
         ):
             counts[kind][reason] = pool.get(f"source:{dataset}:{reason}", 0)
     assigned, holdout_rule = assign(kept_all, spec["splits"])
+    grouping_record = holdout_rule.get("family_grouping") or {}
+    kind_of = {dataset: kind for kind, dataset in DATASETS.items()}
+    for source, number in grouping_record.get("members_dropped_by_source", {}).items():
+        counts[kind_of[source]]["holdout_family_member_dropped"] = number
     tasks, paraphrased = drop_holdout_paraphrases(assigned)
     for kind, number in paraphrased.items():
         counts[kind]["holdout_paraphrase"] = number

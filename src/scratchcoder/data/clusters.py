@@ -39,6 +39,7 @@ threshold or signal is a new ``RULES_VERSION``.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import math
 import warnings
@@ -63,6 +64,8 @@ SIGNALS = UNION_SIGNALS + FLAG_SIGNALS
 GENERIC_NAMES = frozenset({"main", "solve", "solution"})
 """Defined names too common to tie two prompts together (``tools.task_pool``'s list)."""
 ADJUDICATION_STATUSES = ("pending", "confirmed_equivalent", "not_equivalent", "unclear_quarantined")
+MEMBER_STATUSES = ("confirmed_equivalent", "not_equivalent", "unclear_quarantined")
+"""Per-member decisions inside an ``unclear_quarantined`` (mixed) cluster."""
 BEHAVIOR_OUTCOMES = ("pending", "equivalent", "not_equivalent", "unclear")
 
 
@@ -475,6 +478,9 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
     ``not_equivalent`` needs every one ``not_equivalent``; both need a reviewer, a date and
     a rationale. ``pending`` carries no reviewer. ``unclear_quarantined`` needs at least one
     written uncertainty note. No member may be a sealed-test or holdout task.
+
+    An ``unclear_quarantined`` cluster may also carry ``member_decisions`` (``member_rules``);
+    any member without one stays quarantined with the cluster.
     """
     if manifest.get("format") != MANIFEST_FORMAT:
         raise ValueError("not a task-cluster manifest of a known format")
@@ -514,6 +520,60 @@ def validate_manifest(manifest: Mapping[str, Any]) -> None:
                 raise ValueError(f"{status} needs every behaviour result to be {needed}")
         if status == "unclear_quarantined" and not cluster["uncertainty"]:
             raise ValueError("an unclear cluster must keep its uncertainty notes")
+        member_rules(cluster)
+
+
+def _touching(cluster: Mapping[str, Any], member: str) -> list[str | None]:
+    """The behaviour outcome of each joining edge that touches ``member`` (``None``: untested)."""
+    outcomes = {
+        frozenset((record["a"], record["b"])): record["outcome"] for record in cluster["behavior"]
+    }
+    return [
+        outcomes.get(frozenset((edge["a"], edge["b"])))
+        for edge in cluster["edges"]
+        if edge["union"] and member in (edge["a"], edge["b"])
+    ]
+
+
+def member_rules(cluster: Mapping[str, Any]) -> None:
+    """Check the per-member decisions of one cluster.
+
+    They refine an ``unclear_quarantined`` (mixed) cluster only, and each needs a reviewer,
+    a date and a rationale. A member is released (``not_equivalent``) only when every
+    joining edge that touches it was run and found ``not_equivalent``: an untested edge (a
+    same-split edge has no behaviour record) keeps it quarantined. A member is
+    ``confirmed_equivalent`` only when at least one touching edge was run and every run one
+    is ``equivalent``. ``unclear_quarantined`` keeps it out, like an undecided member.
+    """
+    decisions = cluster.get("member_decisions")
+    if not decisions:
+        return
+    if cluster["adjudication"]["status"] != "unclear_quarantined":
+        raise ValueError("member decisions refine an unclear_quarantined cluster only")
+    known = {member["id"] for member in cluster["members"]}
+    for member, decision in decisions.items():
+        if member not in known:
+            raise ValueError("a member decision names a task outside its cluster")
+        status = decision.get("status")
+        if status not in MEMBER_STATUSES:
+            raise ValueError("unknown member decision status")
+        if not all(decision.get(key) for key in ("reviewer", "decided_at", "rationale")):
+            raise ValueError("a member decision needs a reviewer, a date and a rationale")
+        touching = _touching(cluster, member)
+        run = [outcome for outcome in touching if outcome not in (None, "pending")]
+        if status == "not_equivalent" and (
+            not touching or any(outcome != "not_equivalent" for outcome in touching)
+        ):
+            raise ValueError(
+                "a member is released only when every joining edge touching it was run "
+                "and found not_equivalent"
+            )
+        if status == "confirmed_equivalent" and (
+            not run or any(outcome != "equivalent" for outcome in run)
+        ):
+            raise ValueError(
+                "a confirmed_equivalent member needs every run edge touching it equivalent"
+            )
 
 
 def adjudicate(
@@ -525,11 +585,14 @@ def adjudicate(
     decided_at: str,
     rationale: str,
     uncertainty: str | None = None,
+    member: str | None = None,
 ) -> dict[str, Any]:
-    """Record one reviewer decision; the result must still pass ``validate_manifest``.
+    """Record one reviewer decision if the result still passes ``validate_manifest``.
 
-    An ``unclear_quarantined`` decision appends ``uncertainty`` (required) to the notes;
-    no decision removes an existing note.
+    With ``member``, the decision is about that member of an ``unclear_quarantined``
+    cluster (``member_rules``); otherwise it is the cluster's. An ``unclear_quarantined``
+    decision appends ``uncertainty`` (required) to the notes; no decision removes an
+    existing note.
     """
     if status == "pending":
         raise ValueError("a decision cannot return a cluster to pending")
@@ -542,13 +605,23 @@ def adjudicate(
     )
     if target is None:
         raise KeyError(cluster)
-    target["adjudication"] = {
+    decision = {
         "status": status,
         "reviewer": reviewer,
         "decided_at": decided_at,
         "rationale": rationale,
     }
+    updated = copy.deepcopy(target)
+    if member is None:
+        updated["adjudication"] = decision
+    else:
+        updated.setdefault("member_decisions", {})[member] = decision
     if uncertainty:
-        target["uncertainty"].append(uncertainty)
-    validate_manifest(manifest)
+        updated["uncertainty"].append(uncertainty)
+    # Checked on a copy: a refused decision leaves the manifest as it was.
+    validate_manifest(
+        {**manifest, "clusters": [updated if c is target else c for c in manifest["clusters"]]}
+    )
+    target.clear()
+    target.update(updated)
     return target

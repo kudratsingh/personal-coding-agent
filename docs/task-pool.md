@@ -61,7 +61,7 @@ Every task has one public test; the rest are hidden.
 
 ## Task families (optional, for future builds)
 
-A pool spec may set `splits.family_grouping` to `"task-clusters-v1"`. The holdout assignment then treats each task family, found from reference-solution ASTs and prompt paraphrases, as one unit, so equivalent tasks never sit on both sides of the split. The option is absent from [configs/task-pool-rehearsal.json](../configs/task-pool-rehearsal.json); absent or `null`, the build runs the historical per-task assignment unchanged. The 2026-10-25 pool was built without it and has not been rebuilt. See the [task-cluster walkthrough](walkthroughs/task-clusters.md).
+A pool spec may set `splits.family_grouping` to `"task-clusters-v1"`. The holdout assignment then treats each task family, found from reference-solution ASTs and prompt paraphrases, as one unit, so equivalent tasks never sit on both sides of the split. Only TACO, MBPP and the named model sources are ever held out; a held-out family's members from any other source, such as AceCode, are dropped from the pool and counted. The option is absent from [configs/task-pool-rehearsal.json](../configs/task-pool-rehearsal.json); absent or `null`, the build runs the historical per-task assignment unchanged. The 2026-10-25 pool was built without it and has not been rebuilt. See the [task-cluster walkthrough](walkthroughs/task-clusters.md).
 
 ## Limitations
 

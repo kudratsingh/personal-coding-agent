@@ -8,8 +8,9 @@
     could not compare it. The sealed test, holdout and RL-only files are refused by name.
     The output directory must be new; no existing run artifact is changed.
 ``adjudicate``
-    Records one reviewer decision on one cluster and appends it to the adjudication log.
-    The manifest rules (``validate_manifest``) decide which decisions are allowed:
+    Records one reviewer decision on one cluster, or with ``--member`` on one member of an
+    ``unclear_quarantined`` (mixed) cluster, and appends it to the adjudication log. The
+    manifest rules (``validate_manifest``) decide which decisions are allowed:
     ``confirmed_equivalent`` and ``not_equivalent`` need matching behavioural results
     from ``tools.task_equivalence``.
 ``validate``
@@ -54,7 +55,7 @@ from scratchcoder.eval.tasks import load_tasks
 PRIMARY = ("solution_ast",)
 FORBIDDEN = ("test", "holdout", "rl_only")
 """File-name stems this tool refuses to open: the sealed test, the holdout union and the
-RL-only pool. The guard is by name, before any read."""
+RL-only pool. The guard is by name (given and resolved), before any read."""
 QUARANTINE_RULE = (
     "owner ruling 2026-11-13: the screening candidates whose docstring-stripped reference "
     "solution AST equals a dev task's are provisionally quarantined pending adjudication; "
@@ -63,10 +64,15 @@ QUARANTINE_RULE = (
 
 
 def refuse_sealed(path: Path) -> Path:
-    """Raise before reading a sealed test, holdout or RL-only file."""
-    stem = path.name.split(".")[0].lower()
-    if any(stem == name or stem.startswith(name + "-") for name in FORBIDDEN):
-        raise ValueError(f"{path.name}: sealed test, holdout and RL-only files are never read")
+    """Raise before reading a sealed test, holdout or RL-only file.
+
+    Both the name given and the name the path resolves to are checked, so a link to a
+    refused file is refused too.
+    """
+    for name_given in (path.name, path.resolve().name):
+        stem = name_given.split(".")[0].lower()
+        if any(stem == name or stem.startswith(name + "-") for name in FORBIDDEN):
+            raise ValueError(f"{path.name}: sealed test, holdout and RL-only files are never read")
     return path
 
 
@@ -462,6 +468,7 @@ def record_decision(args: argparse.Namespace) -> int:
         decided_at=decided_at,
         rationale=args.rationale,
         uncertainty=args.uncertainty,
+        member=args.member,
     )
     manifest["kind"] = (
         "adjudicated"
@@ -471,6 +478,7 @@ def record_decision(args: argparse.Namespace) -> int:
     atomic_json(args.manifest, manifest)
     entry = {
         "cluster_id": args.cluster,
+        "member": args.member,
         "status": args.status,
         "reviewer": args.reviewer,
         "decided_at": decided_at,
@@ -514,6 +522,9 @@ def build_parser() -> argparse.ArgumentParser:
     decide.add_argument("--reviewer", required=True)
     decide.add_argument("--rationale", required=True)
     decide.add_argument("--uncertainty")
+    decide.add_argument(
+        "--member", help="decide one member of an unclear_quarantined cluster (a task ID)"
+    )
     check = commands.add_parser("validate", help="check a manifest")
     check.add_argument("--manifest", type=Path, required=True)
     return parser

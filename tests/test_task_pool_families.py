@@ -118,3 +118,31 @@ def test_family_grouping_keeps_every_family_in_one_split() -> None:
             {**splits, "dev": 1},
             families={f"taco-test-{i}": "f" for i in range(3)},
         )
+
+
+@pytest.mark.parametrize("holdout", ["taco-test-0", "mbpp-1"])  # mbpp-1: the MBPP top-up
+def test_an_acecode_member_of_a_held_out_family_is_dropped_not_held_out(holdout: str) -> None:
+    # AceCode is in no dev or test split, and a member beside its held-out family in
+    # training would leak it, so the member leaves the pool and the drop is counted.
+    acecode = task_pool.DATASETS["acecode"]
+    families = {holdout: "x", "ac-1": "x", "ac-2": "x"}
+    splits = {**SPLITS, "dev": 5, "test": 5, "family_grouping": "task-clusters-v1"}
+    result, rule = task_pool.assign(assignment_fixture(), splits, families=families)
+    split_of = {t.id: t.split for t in result}
+    assert split_of[holdout] != "train"
+    assert "ac-1" not in split_of and "ac-2" not in split_of
+    assert not any(t.source == acecode and t.split != "train" for t in result)
+    assert split_of["ac-0"] == "train"
+    grouping = rule["family_grouping"]
+    assert grouping["members_dropped_by_source"] == {acecode: 2}
+    assert grouping["holdout_members_pulled_in_by_source"] == {}
+    assert sum(t.split == "dev" for t in result) == 5
+    assert sum(t.split == "test" for t in result) == 5
+
+
+def test_skipped_model_families_are_counted_once_each() -> None:
+    families = {"oc-1": "f-mixed", "ac-0": "f-mixed", "oc-2": "f-mixed", "oc-3": "f-mixed"}
+    splits = {**SPLITS, "family_grouping": "task-clusters-v1"}
+    _, rule = task_pool.assign(assignment_fixture(), splits, families=families)
+    # Three OpenCode members of one ineligible family: one skipped family.
+    assert rule["family_grouping"]["model_families_skipped"] == 1

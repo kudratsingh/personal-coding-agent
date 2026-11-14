@@ -11,10 +11,15 @@ sandbox container. Calls go through ``scratchcoder.sandbox.runner.run`` and noth
     Refuses to start unless it was launched by ``tools.mac_window_check exec`` with
     ``--receipt``: the receipt must be a passing window check written moments earlier
     for this command with the expected image ID, and no withheld credential name may be
-    set. Then it runs the planned calls and appends one record per pair to
-    ``behavior.jsonl``. A call the sandbox could not decide (infrastructure error,
-    unavailable backend, host stall) is retried and, if it persists, stops the run; it is
-    never scored.
+    set. Then, like run 2's reward bridge, it repeats the full execution-window pass
+    (``scratchcoder.sandbox.window``, through ``scratchcoder.rl.bridge_command.window_pass``)
+    on its own process at its start and again before any sandbox call once the last pass
+    began ``--window-check-interval`` seconds ago (900 s at most), and checks the pinned
+    image's ID before every pair. A failed or errored pass stops the run (exit 4) before
+    anything more runs; every pass is recorded in ``behavior.jsonl``. It appends one record
+    per pair. A call the sandbox could not decide (infrastructure error, unavailable
+    backend, host stall) is retried and, if it persists, stops the run; it is never
+    scored.
 ``merge``
     Copies the manifest to a new file with the recorded outcomes filled in. Adjudication
     statuses are left alone: a reviewer records them (``tools.task_clusters adjudicate``).
@@ -23,11 +28,18 @@ Outcomes, per pair (``classify``):
 
 - ``equivalent``: both directions pass every partner test on every repeat, both own-test
   controls pass, and each partner's hidden tests hold at least ``MIN_CHECKS`` checks;
-- ``not_equivalent``: both directions fail on every repeat while both controls pass;
+- ``not_equivalent``: both directions fail on every repeat while both controls pass, and
+  every failure is a behavioural counterexample (``failure_kind``): a failed assertion in a
+  function task, or wrong output from an I/O task that ran to completion;
 - ``unclear``: anything else, with the reasons kept: one direction passes and the other
   fails, a reference passes public but not hidden tests (or the reverse), repeats
-  disagree (nondeterminism), tests are weak, a control fails, the modes differ, or the
-  partner's called name could not be mapped onto the reference.
+  disagree (nondeterminism), tests are weak, a control fails, the modes differ, the
+  partner's called name could not be mapped onto the reference, or a failure is not a
+  counterexample (a timeout or resource, output or signal limit; a ``NameError``,
+  ``AttributeError``, ``TypeError`` or import error at the call boundary, which says the
+  interfaces differ, not the behaviour; any other exception; or an incomplete run).
+  A wrong ``not_equivalent`` would release a training-exposed dev task, so the harness
+  errs toward ``unclear``, which keeps the task quarantined.
 
 Tasks carry no entry point, so the name a partner's tests call is inferred: the
 module-level names the partner's reference defines and its tests use. When the reference
@@ -41,20 +53,23 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import os
+import sys
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from scratchcoder.common.records import atomic_json, git_state, utc_now
 from scratchcoder.data.clusters import BEHAVIOR_OUTCOMES, validate_manifest
 from scratchcoder.data.shards import file_sha256
 from scratchcoder.eval.tasks import Task, load_tasks
+from scratchcoder.sandbox.diagnostics import failure_category
 from scratchcoder.sandbox.runner import IMAGE, Result, Runtime, run
-from scratchcoder.sandbox.window import IMAGE_ID, dotenv_names, withheld
+from scratchcoder.sandbox.window import IMAGE_ID, dotenv_names, failed_checks, withheld
 from tools.task_clusters import refuse_sealed
 from tools.task_pool import limits_for
 
@@ -68,7 +83,16 @@ VERDICT_STATUSES = frozenset({"passed", "failed", "timeout", "output_limit", "re
 RETRIES = 2
 RETRY_DELAY_SECONDS = 2.0
 MAX_RECEIPT_AGE_SECONDS = 600.0
+WINDOW_CHECK_INTERVAL_SECONDS = 900.0
+"""The longest a full window pass may be old before a sandbox call: the bridge's bound
+(``scratchcoder.rl.bridge_mac.WINDOW_CHECK_INTERVAL_SECONDS``, docs/rl.md)."""
 COMMAND_MODULE = "tools.task_equivalence"
+COUNTEREXAMPLE = "counterexample"
+INTERFACE_ERRORS = frozenset(
+    {"NameError", "AttributeError", "TypeError", "ImportError", "ModuleNotFoundError"}
+)
+"""Exceptions that, raised running one reference against the partner's tests, say the two
+interfaces differ (a name, method or keyword the tests use is missing), not the behaviour."""
 
 
 @dataclass(frozen=True)
@@ -195,10 +219,43 @@ def direction_verdict(statuses: Mapping[str, Sequence[str]]) -> str:
     return "partial"
 
 
+def failure_kind(result: Result, mode: str) -> str | None:
+    """Why a decided call did not pass (``None`` when it passed), from allowlisted names only.
+
+    Only ``COUNTEREXAMPLE`` is evidence that two behaviours differ: a failed assertion in a
+    function task, or an I/O task that exited cleanly with the wrong output. Everything else
+    is a reason for ``unclear``.
+    """
+    if result.status == "passed":
+        return None
+    if result.status != "failed":
+        return f"fail_by_{result.status}"
+    if result.exit_code is not None and result.exit_code < 0:
+        return "fail_by_signal"
+    if mode == "io" and result.exit_code == 0:
+        return COUNTEREXAMPLE
+    category = failure_category(result)
+    if mode == "function" and category == "AssertionError":
+        return COUNTEREXAMPLE
+    if category in INTERFACE_ERRORS:
+        return "interface_mismatch"
+    if result.exit_code == 0:
+        return "fail_by_incomplete_run"
+    return "fail_by_runtime_error"
+
+
 def classify(
-    verdicts: Mapping[str, str], checks: Mapping[str, int], reasons: Sequence[str] = ()
+    verdicts: Mapping[str, str],
+    checks: Mapping[str, int],
+    reasons: Sequence[str] = (),
+    failures: Mapping[str, Collection[str]] | None = None,
 ) -> tuple[str, list[str]]:
-    """Map direction verdicts to ``equivalent``, ``not_equivalent`` or ``unclear``."""
+    """Map direction verdicts to ``equivalent``, ``not_equivalent`` or ``unclear``.
+
+    ``failures`` maps each direction to the ``failure_kind`` of its non-passing calls; a
+    pair is ``not_equivalent`` only when every failure of both directions is a
+    counterexample.
+    """
     why = list(reasons)
     if why or set(verdicts) != {"a_on_b", "b_on_a", "a_on_a", "b_on_b"}:
         return "unclear", why or ["incomplete"]
@@ -217,7 +274,14 @@ def classify(
             return "unclear", [f"weak_tests:{name}" for name in sorted(weak)]
         return "equivalent", []
     if forward == backward == "fail":
-        return "not_equivalent", []
+        if failures is None:
+            return "unclear", ["failure_kinds_unrecorded"]
+        kinds = {kind for name in ("a_on_b", "b_on_a") for kind in failures.get(name, ())}
+        if not kinds:
+            return "unclear", ["failure_kinds_unrecorded"]
+        if kinds == {COUNTEREXAMPLE}:
+            return "not_equivalent", []
+        return "unclear", sorted(kinds - {COUNTEREXAMPLE})
     return "unclear", ["partial_agreement_one_direction"]
 
 
@@ -239,25 +303,33 @@ def execute_pair(
     if repeats < 1:
         raise ValueError("at least one repeat")
     statuses: dict[str, dict[str, list[str]]] = {}
+    failures: dict[str, set[str]] = {}
     aliases: dict[str, str] = {}
     for call in plan.calls:
 
         def once(call: Call = call) -> Result:
             return execute(call)
 
-        values = [decided(once).status for _ in range(repeats)]
-        statuses.setdefault(call.direction, {})[call.part] = values
+        results = [decided(once) for _ in range(repeats)]
+        statuses.setdefault(call.direction, {})[call.part] = [r.status for r in results]
+        kinds = failures.setdefault(call.direction, set())
+        kinds.update(kind for r in results if (kind := failure_kind(r, call.mode)) is not None)
         if call.alias:
             aliases[call.direction] = call.alias.strip()
     verdicts = {name: direction_verdict(parts) for name, parts in statuses.items()}
-    outcome, reasons = classify(verdicts, plan.checks, plan.reasons)
+    outcome, reasons = classify(verdicts, plan.checks, plan.reasons, failures)
     return {
         "a": plan.a,
         "b": plan.b,
         "outcome": outcome,
         "reasons": reasons,
         "directions": [
-            {"direction": name, "verdict": verdicts[name], "statuses": statuses[name]}
+            {
+                "direction": name,
+                "verdict": verdicts[name],
+                "statuses": statuses[name],
+                "failure_kinds": sorted(failures[name]),
+            }
             for name in sorted(statuses)
         ],
         "checks": plan.checks,
@@ -347,6 +419,76 @@ def plan_command(args: argparse.Namespace) -> int:
     return 0
 
 
+class WindowStopped(RuntimeError):
+    """A repeated execution-window pass failed or could not be made; nothing more runs."""
+
+
+def run_pairs(
+    plans: Sequence[PairPlan],
+    execute: Callable[[Call], Result],
+    write: Callable[[dict[str, Any]], None],
+    *,
+    repeats: int,
+    window_check: Callable[[], Mapping[str, Any]],
+    image_check: Callable[[], None],
+    interval: float = WINDOW_CHECK_INTERVAL_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+    done: Collection[tuple[str, str]] = (),
+) -> int:
+    """Run the pending pairs under repeated window passes; return how many were recorded.
+
+    A full pass runs first and again before any sandbox call once the last pass began
+    ``interval`` seconds ago; the pinned image's ID is checked before every pair. A failed
+    or errored pass, or a failed image check, raises ``WindowStopped`` before the next call.
+    """
+    if not 0 < interval <= WINDOW_CHECK_INTERVAL_SECONDS:
+        raise ValueError(f"interval must be positive and at most {WINDOW_CHECK_INTERVAL_SECONDS}")
+    last: float | None = None
+
+    def window(reason: str) -> None:
+        nonlocal last
+        started = clock()
+        try:
+            record = dict(window_check())
+        except Exception as error:
+            write({"kind": "window_pass", "reason": reason, "status": "error"})
+            raise WindowStopped(f"the window pass could not be made: {error}") from error
+        passed = record.get("status") == "passed"
+        write(
+            {
+                "kind": "window_pass",
+                "reason": reason,
+                "status": "passed" if passed else "failed",
+                "checked_at": record.get("checked_at"),
+                "failed_checks": [] if passed else failed_checks(record),
+            }
+        )
+        if not passed:
+            raise WindowStopped("the execution window failed; nothing more runs")
+        last = started
+
+    def guarded(call: Call) -> Result:
+        if last is None or clock() - last >= interval:
+            window("interval")
+        return execute(call)
+
+    window("start")
+    recorded = 0
+    for plan in plans:
+        if (plan.a, plan.b) in done:
+            continue
+        try:
+            image_check()
+        except Exception as error:
+            write({"kind": "image_check", "status": "failed", "pair": [plan.a, plan.b]})
+            raise WindowStopped(f"the pinned image check failed: {error}") from error
+        row = {"kind": "pair", **execute_pair(plan, guarded, repeats=repeats)}
+        row["recorded_at"] = utc_now()
+        write(row)
+        recorded += 1
+    return recorded
+
+
 def run_command(args: argparse.Namespace) -> int:
     receipt = require_window(
         args.window_receipt,
@@ -355,6 +497,16 @@ def run_command(args: argparse.Namespace) -> int:
         dotenv=dotenv_names(args.dotenv),
         now=datetime.now(UTC),
     )
+    # Imported here: the bridge's window pass and image check are only needed to run.
+    from scratchcoder.rl.bridge import BridgeRequest
+    from scratchcoder.rl.bridge_command import image_check, window_pass
+
+    window_check = window_pass(args.image_id, dotenv=args.dotenv, environ=os.environ)
+    inspect = image_check(args.image_id)
+
+    def check_image() -> None:
+        inspect(cast(BridgeRequest, None))  # The check ignores its request argument.
+
     plans = _plans(args)
     output: Path = args.output
     done: set[tuple[str, str]] = set()
@@ -366,34 +518,48 @@ def run_command(args: argparse.Namespace) -> int:
     runtime = Runtime()
     commit, dirty = git_state()
     with output.open("a", encoding="utf-8") as stream:
-        header = {
-            "kind": "header",
-            "format": FORMAT,
-            "started_at": utc_now(),
-            "manifest_sha256": file_sha256(args.manifest),
-            "window_receipt_sha256": file_sha256(args.window_receipt),
-            "window_checked_at": receipt["checked_at"],
-            "image": IMAGE,
-            "image_id": args.image_id,
-            "runtime": asdict(runtime),
-            "verification": VERIFICATION,
-            "repeats": args.repeats,
-            "git_commit": commit,
-            "dirty": dirty,
-        }
-        stream.write(json.dumps(header, sort_keys=True) + "\n")
+
+        def write(row: dict[str, Any]) -> None:
+            stream.write(json.dumps(row, sort_keys=True) + "\n")
+            stream.flush()
+
+        write(
+            {
+                "kind": "header",
+                "format": FORMAT,
+                "started_at": utc_now(),
+                "manifest_sha256": file_sha256(args.manifest),
+                "window_receipt_sha256": file_sha256(args.window_receipt),
+                "window_checked_at": receipt["checked_at"],
+                "window_check_interval_seconds": args.window_check_interval,
+                "image": IMAGE,
+                "image_id": args.image_id,
+                "runtime": asdict(runtime),
+                "verification": VERIFICATION,
+                "repeats": args.repeats,
+                "git_commit": commit,
+                "dirty": dirty,
+            }
+        )
 
         def execute(call: Call) -> Result:
             limits = limits_for(VERIFICATION, call.tests, call.mode)
             return run(call.code, call.tests, limits, mode=call.mode, runtime=runtime)
 
-        for plan in plans:
-            if (plan.a, plan.b) in done:
-                continue
-            row = {"kind": "pair", **execute_pair(plan, execute, repeats=args.repeats)}
-            row["recorded_at"] = utc_now()
-            stream.write(json.dumps(row, sort_keys=True) + "\n")
-            stream.flush()
+        try:
+            run_pairs(
+                plans,
+                execute,
+                write,
+                repeats=args.repeats,
+                window_check=window_check,
+                image_check=check_image,
+                interval=args.window_check_interval,
+                done=done,
+            )
+        except WindowStopped as error:
+            print(json.dumps({"stopped": str(error)}), file=sys.stderr)
+            return 4
     return 0
 
 
@@ -430,6 +596,18 @@ def merge_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _interval(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from error
+    if not math.isfinite(value) or not 0 < value <= WINDOW_CHECK_INTERVAL_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must be positive and at most {WINDOW_CHECK_INTERVAL_SECONDS:.0f} s"
+        )
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -449,6 +627,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--window-receipt", type=Path, required=True)
     run_parser.add_argument("--image-id", required=True)
     run_parser.add_argument("--dotenv", type=Path, help="the Mac's .env (names only)")
+    run_parser.add_argument(
+        "--window-check-interval",
+        type=_interval,
+        default=WINDOW_CHECK_INTERVAL_SECONDS,
+        help="seconds between full window passes (at most 900)",
+    )
     merged = commands.add_parser("merge")
     merged.add_argument("--manifest", type=Path, required=True)
     merged.add_argument("--results", type=Path, required=True)

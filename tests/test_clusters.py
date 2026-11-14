@@ -313,3 +313,82 @@ def test_manifest_validation_refuses_inconsistent_records() -> None:
         clusters.validate_manifest({"format": "other", "clusters": []})
     with pytest.raises(ValueError, match="unique"):
         clusters.find_edges([items[0], items[0]])
+
+
+def mixed_cluster() -> dict[str, Any]:
+    """d1 = t1 (same code), t1 ~ t2 (same prompt, untested train edge), t2 = d2 (same code)."""
+    total = "def s(a):\n    return sum(a)\n"
+    spread = "def m(a):\n    return max(a) - min(a)\n"
+    shared = "Read a list of integers and report one number computed from all of them."
+    items = [
+        item("d1", "dev", "Add up every element.", total),
+        item("t1", "train", shared, total),
+        item("t2", "train", shared, spread),
+        item("d2", "dev", "Largest minus smallest element.", spread),
+    ]
+    record = clusters.cluster_record(items, [0, 1, 2, 3], clusters.find_edges(items))
+    union = {frozenset((e["a"], e["b"])) for e in record["edges"] if e["union"]}
+    assert union == {frozenset(p) for p in (("d1", "t1"), ("t1", "t2"), ("t2", "d2"))}
+    return record
+
+
+def test_member_decisions_refine_a_mixed_cluster_only_where_behaviour_allows() -> None:
+    record = mixed_cluster()
+    for behaviour in record["behavior"]:
+        pair = {behaviour["a"], behaviour["b"]}
+        behaviour["outcome"] = "not_equivalent" if pair == {"d1", "t1"} else "equivalent"
+    manifest = manifest_with(record)
+    cluster = record["cluster_id"]
+    decision = {"reviewer": "owner", "decided_at": "2026-11-14", "rationale": "see runs"}
+    with pytest.raises(ValueError, match="unclear_quarantined cluster only"):
+        clusters.adjudicate(manifest, cluster, status="not_equivalent", member="d1", **decision)
+    clusters.adjudicate(
+        manifest,
+        cluster,
+        status="unclear_quarantined",
+        uncertainty="mixed behaviour across the chain",
+        **decision,
+    )
+    # d1's only joining edge was run and differs: it may be released.
+    clusters.adjudicate(manifest, cluster, status="not_equivalent", member="d1", **decision)
+    # d2's only joining edge was run and agrees: it may be confirmed (and stays excluded).
+    clusters.adjudicate(manifest, cluster, status="confirmed_equivalent", member="d2", **decision)
+    # t1 has an untested train-train edge: it cannot be released.
+    with pytest.raises(ValueError, match="released only"):
+        clusters.adjudicate(manifest, cluster, status="not_equivalent", member="t1", **decision)
+    with pytest.raises(ValueError, match="every run edge"):
+        clusters.adjudicate(
+            manifest, cluster, status="confirmed_equivalent", member="d1", **decision
+        )
+    with pytest.raises(ValueError, match="outside its cluster"):
+        clusters.adjudicate(manifest, cluster, status="not_equivalent", member="zz", **decision)
+    decided = manifest["clusters"][0]["member_decisions"]
+    assert {k: v["status"] for k, v in decided.items()} == {
+        "d1": "not_equivalent",
+        "d2": "confirmed_equivalent",
+    }
+    clusters.validate_manifest(manifest)
+    # A member decision cannot outlive its cluster's unclear status.
+    manifest["clusters"][0]["adjudication"]["status"] = "pending"
+    manifest["clusters"][0]["adjudication"]["reviewer"] = None
+    with pytest.raises(ValueError, match="unclear_quarantined cluster only"):
+        clusters.validate_manifest(manifest)
+
+
+def test_a_member_with_an_unrun_edge_is_never_released() -> None:
+    record = mixed_cluster()
+    record["adjudication"] = {
+        "status": "unclear_quarantined",
+        "reviewer": "owner",
+        "decided_at": "2026-11-14",
+        "rationale": "pending runs",
+    }
+    record["uncertainty"].append("behaviour not yet run")
+    record["member_decisions"] = {
+        "d1": {"status": "not_equivalent", "reviewer": "o", "decided_at": "d", "rationale": "r"}
+    }
+    with pytest.raises(ValueError, match="released only"):
+        clusters.validate_manifest(manifest_with(record))
+    record["member_decisions"]["d1"] = {"status": "not_equivalent", "reviewer": "o"}
+    with pytest.raises(ValueError, match="reviewer, a date and a rationale"):
+        clusters.validate_manifest(manifest_with(record))

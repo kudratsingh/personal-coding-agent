@@ -75,7 +75,12 @@ Named rules compare only items that share a defined name.
 ID, mode, module-level names, roles), every edge with its signals and evidence, a pending
 behaviour record per cross-split joining edge, an adjudication record (status, reviewer,
 date, rationale) and uncertainty notes. Statuses are `pending`, `confirmed_equivalent`,
-`not_equivalent` and `unclear_quarantined`.
+`not_equivalent` and `unclear_quarantined`. A mixed cluster, decided `unclear_quarantined`,
+may also carry per-member decisions (`adjudicate --member`), so a reviewer can release a
+dev task shown to differ without releasing the rest. A member is released
+(`not_equivalent`) only when every joining edge that touches it was run and found
+`not_equivalent`; a same-split edge has no behaviour record, so it keeps the member
+quarantined. A member without a decision stays quarantined with its cluster.
 
 **Behaviour harness.** For a pair (A, B), A's reference runs against B's hidden and public
 tests, B's against A's, and each against its own hidden tests as a control. Every call
@@ -86,7 +91,8 @@ kind, one alias line `b_name = a_name` is appended and recorded. Outcomes:
 | Directions (A on B, B on A) | Controls | Outcome |
 | --- | --- | --- |
 | both pass every repeat, partner tests have ≥ 2 checks | pass | `equivalent` |
-| both fail every repeat | pass | `not_equivalent` |
+| both fail every repeat, every failure a counterexample | pass | `not_equivalent` |
+| both fail, some failure not a counterexample | pass | `unclear` (reason kept) |
 | one passes, one fails | pass | `unclear` (partial agreement) |
 | public passes, hidden fails (or the reverse) | any | `unclear` |
 | repeats disagree | any | `unclear` (nondeterministic) |
@@ -98,11 +104,22 @@ kind, one alias line `b_name = a_name` is appended and recorded. Outcomes:
 switches `tools/task_pool.py` to assign whole families: a TACO test task's family goes to
 its holdout whole, MBPP families top up the human minimum, and a model-written family fills
 dev or test only if every member comes from a named holdout source and it fits; any other
-family stays in training. No family spans two splits. With the option absent, the
+family stays in training. Only TACO, MBPP and the named model sources may be held out: a
+member of a held-out family from any other source (AceCode, for one) can sit neither in
+dev or test nor in training beside its family, so it is dropped from the pool and counted
+(`members_dropped_by_source`). No family spans two splits. With the option absent, the
 assignment is byte-for-byte the historical rule.
 
 ## Design choices and common mistakes
 
+- **Only a counterexample makes a pair `not_equivalent`.** A counterexample is a failed
+  assertion in a function task, or wrong output from an I/O task that ran to completion.
+  A timeout, a resource, output or signal limit, a `NameError`, `AttributeError`,
+  `TypeError` or import error at the call boundary (the interfaces differ, for example
+  different method names), any other exception, or an incomplete run gives `unclear`
+  with the reason (`fail_by_timeout`, `interface_mismatch`, ...). A wrong
+  `not_equivalent` would release a training-exposed dev task; `unclear` keeps it
+  quarantined.
 - **Static matches are evidence, not proof.** Two prompts with identical reference code
   can still specify different contracts or tests. Equivalence is decided by behaviour and
   a reviewer. The validator refuses `confirmed_equivalent` unless every behaviour record
@@ -120,10 +137,16 @@ assignment is byte-for-byte the historical rule.
   keeps the exact-key view separate so the two are never mixed.
 - **The harness runs only inside the isolated sandbox.** `run` refuses unless a fresh,
   passing window receipt written for that command names the expected image, and no
-  credential variable is set. An undecided call (infrastructure error, unavailable
-  backend, host stall) is retried and then stops the run; it is never scored.
+  credential variable is set. Like run 2's reward bridge, it then repeats the full
+  window pass on its own process at its start and before any sandbox call once the last
+  pass began `--window-check-interval` seconds ago (900 s at most), and checks the pinned
+  image's ID before every pair. A failed or errored pass stops the run with exit 4 before
+  anything more runs; each pass is recorded in `behavior.jsonl`. An undecided call
+  (infrastructure error, unavailable backend, host stall) is retried and then stops the
+  run; it is never scored.
 - **Sealed files are refused by name.** The tools never open the sealed test, the holdout
-  union or the RL-only file.
+  union or the RL-only file, checking both the name given and the name a path resolves
+  to, so a link to one is refused too.
 
 ## Verification
 

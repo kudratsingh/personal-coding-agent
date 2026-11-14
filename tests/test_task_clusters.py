@@ -112,6 +112,20 @@ def test_sealed_and_holdout_files_are_refused_by_name(name: str, tmp_path: Path)
     assert task_clusters.refuse_sealed(tmp_path / "testing-notes.jsonl")
 
 
+def test_a_link_to_a_sealed_file_is_refused_by_its_resolved_name(tmp_path: Path) -> None:
+    sealed = tmp_path / "test.jsonl"
+    sealed.write_text("")  # Empty: the guard must refuse before any read.
+    link = tmp_path / "dev.jsonl"
+    link.symlink_to(sealed)
+    with pytest.raises(ValueError, match="never read"):
+        task_clusters.refuse_sealed(link)
+    real = tmp_path / "pool-dev.jsonl"
+    real.write_text("")
+    alias = tmp_path / "dev-link.jsonl"
+    alias.symlink_to(real)
+    assert task_clusters.refuse_sealed(alias) == alias
+
+
 def test_candidate_manifest_is_pending_traceable_and_changes_no_input(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
