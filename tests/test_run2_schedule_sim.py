@@ -71,11 +71,74 @@ def task(index: int) -> Task:
 TASKS = [task(index) for index in range(6)]
 
 
-# The documented truncation (docs/posttrain-runs.md, "An arm's stop") ----------------------
+# The margin-stop table (docs/posttrain-runs.md, "An arm's stop") --------------------------
 
-# (Mac time, GPU time) -> (estimate, stop, 900 s setup for 320 and 1,000 kept tasks, the same
-# with a 1,500 s setup), each stop in the simulator's words.
-DOCUMENTED = {
+# (Mac time, GPU time) -> (estimate, stop, first stop after a 900 s setup for 320 and 1,000
+# kept tasks, the same after a 1,500 s setup), each stop in the simulator's words, at the
+# current specification (post-2-v2: planning generation at 7,991 and 9,049 tok/s).
+CURRENT = {
+    (1.0, 1.0): (
+        "3.10",
+        "3.72",
+        ("the control, before update 11", "the control, before update 33"),
+        (
+            "RL, at its dev check after update 100, unscored",
+            "RL, at its dev check after update 100, unscored",
+        ),
+    ),
+    (1.1, 1.0): (
+        "3.24",
+        "3.88",
+        ("the control, before update 11", "the control, before update 33"),
+        ("the control, before update 1", "the control, before update 1"),
+    ),
+    (1.5, 1.0): (
+        "3.78",
+        "4.53",
+        ("the control, before update 41", "the control, before update 126"),
+        ("the control, before update 21", "the control, before update 64"),
+    ),
+    (2.0, 1.0): (
+        "4.45",
+        "5.34",
+        ("the control, before update 727", "the control, before update 727"),
+        ("the control, before update 81", "the control, before update 251"),
+    ),
+    (0.9, 1.0): (
+        "2.97",
+        "3.56",
+        ("the control, before update 1", "the control, before update 1"),
+        ("RL, before update 95", "RL, before update 95"),
+    ),
+    (0.75, 1.0): (
+        "2.77",
+        "3.31",
+        ("RL, before update 95", "RL, before update 95"),
+        ("RL, before update 82", "RL, before update 82"),
+    ),
+    (0.7, 1.0): (
+        "2.70",
+        "3.23",
+        ("RL, before update 91", "RL, before update 91"),
+        None,  # the run stops before RL: test_a_late_low_estimate_run_stops_before_rl
+    ),
+    (1.0, 0.9): (
+        "2.96",
+        "3.55",
+        ("RL, before update 96", "RL, before update 96"),
+        ("RL, before update 86", "RL, before update 86"),
+    ),
+    (1.0, 0.8): (
+        "2.83",
+        "3.39",
+        ("RL, before update 83", "RL, before update 83"),
+        ("RL, before update 76", "RL, before update 76"),
+    ),
+}
+
+# The same at the superseded first template (planning generation at 7,731 and 8,733 tok/s):
+# the table docs/posttrain-runs.md keeps as the historical scenario.
+HISTORICAL = {
     (1.0, 1.0): (
         "3.15",
         "3.77",
@@ -141,10 +204,17 @@ DOCUMENTED = {
     ),
 }
 
-
-# (Mac time, GPU time, setup) -> the table's share of the control's budget spent, in whole
-# percent, for 320 and 1,000 kept tasks; None for "under 2%".
-DOCUMENTED_SHARE: dict[tuple[float, float, float], tuple[int, int] | None] = {
+# (Mac time, GPU time, setup) -> the share of the control's budget spent, in whole percent,
+# for 320 and 1,000 kept tasks; None for "under 2%".
+CURRENT_SHARE: dict[tuple[float, float, float], tuple[int, int] | None] = {
+    (1.0, 1.0, 900.0): None,
+    (1.1, 1.0, 900.0): None,
+    (1.5, 1.0, 900.0): (2, 6),
+    (2.0, 1.0, 900.0): (35, 35),
+    (1.5, 1.0, 1500.0): (1, 3),
+    (2.0, 1.0, 1500.0): (4, 12),
+}
+HISTORICAL_SHARE: dict[tuple[float, float, float], tuple[int, int] | None] = {
     (1.0, 1.0, 900.0): None,
     (1.1, 1.0, 900.0): (1, 3),
     (1.5, 1.0, 900.0): (4, 12),
@@ -152,52 +222,180 @@ DOCUMENTED_SHARE: dict[tuple[float, float, float], tuple[int, int] | None] = {
     (1.5, 1.0, 1500.0): (2, 6),
     (2.0, 1.0, 1500.0): (5, 12),
 }
+Documented = dict[tuple[float, float], tuple[str, str, Any, Any]]
+Shares = dict[tuple[float, float, float], tuple[int, int] | None]
+TABLES: dict[str, tuple[Documented, Shares]] = {
+    run2_schedule_sim.CURRENT_TEMPLATE: (CURRENT, CURRENT_SHARE),
+    run2_schedule_sim.HISTORICAL_TEMPLATE: (HISTORICAL, HISTORICAL_SHARE),
+}
 
 
-@pytest.mark.parametrize(("mac", "gpu"), sorted(DOCUMENTED))
-def test_the_documented_truncation_is_reproduced(mac: float, gpu: float) -> None:
-    """Every row of the table in docs/posttrain-runs.md: the estimate projected at the rates,
-    the 120% stop, the first margin stop for 320 and 1,000 kept tasks after a 900 s and a
-    1,500 s setup, and the share of the control's budget spent where the table gives one."""
-    estimate, stop, short, long = DOCUMENTED[(mac, gpu)]
+def check_truncation(template: str, mac: float, gpu: float) -> None:
+    documented, documented_share = TABLES[template]
+    estimate, stop, short, long = documented[(mac, gpu)]
     for setup, expected in ((900.0, short), (1500.0, long)):
+        if expected is None:
+            continue
         shares: list[float] = []
         for tasks, where in zip((320, 1000), expected, strict=True):
-            row = simulate(Scenario(mac=mac, gpu=gpu, setup_seconds=setup, tasks=tasks))
+            row = simulate(
+                Scenario(mac=mac, gpu=gpu, setup_seconds=setup, tasks=tasks, template=template)
+            )
+            assert row["specification"]["name"] == template
             assert f"{row['estimate_usd']:.2f}" == estimate
             assert f"{row['cost_limit_usd']:.2f}" == stop
             assert row["first_stop"] == f"{where} ({WAIT_MARGIN_STOP})"
             assert row["outcome"] == "stopped" and row["stop_reason"] == WAIT_MARGIN_STOP
+            assert row["margin_stop"]["wait_seconds"] == 11_746.5
             if row["control"] is not None:
                 shares.append(100 * row["control"]["busy_fraction"])
-        if (mac, gpu, setup) in DOCUMENTED_SHARE:
-            documented = DOCUMENTED_SHARE[(mac, gpu, setup)]
-            if documented is None:
-                assert len(shares) == 2 and all(share < 2 for share in shares)
+        if (mac, gpu, setup) in documented_share:
+            share = documented_share[(mac, gpu, setup)]
+            if share is None:
+                assert len(shares) == 2 and all(value < 2 for value in shares)
             else:
-                assert tuple(round(share) for share in shares) == documented
+                assert tuple(round(value) for value in shares) == share
 
 
+@pytest.mark.parametrize(("mac", "gpu"), sorted(CURRENT))
+def test_the_current_truncation_is_reproduced(mac: float, gpu: float) -> None:
+    """Every row of the docs' table at the current specification (the default template): the
+    estimate projected at the rates, the 120% stop, the first margin stop for 320 and 1,000
+    kept tasks after a 900 s and a 1,500 s setup, and the share of the control's budget spent
+    where the table gives one."""
+    check_truncation(run2_schedule_sim.CURRENT_TEMPLATE, mac, gpu)
+
+
+@pytest.mark.parametrize(("mac", "gpu"), sorted(HISTORICAL))
+def test_the_historical_truncation_is_reproduced(mac: float, gpu: float) -> None:
+    """The historical scenario: the same rows at the superseded first template, the figures
+    the earlier analysis gave ($3.15 and $3.77 at the planning rates)."""
+    check_truncation(run2_schedule_sim.HISTORICAL_TEMPLATE, mac, gpu)
+
+
+@pytest.mark.parametrize(
+    ("template", "low", "high"),
+    [
+        (run2_schedule_sim.CURRENT_TEMPLATE, 2.56, 2.56),
+        (run2_schedule_sim.HISTORICAL_TEMPLATE, 2.59, 2.61),
+    ],
+)
 @pytest.mark.parametrize(("mac", "gpu"), [(0.6, 1.0), (0.8, 0.8)])
-def test_the_documented_gate_refusals_are_reproduced(mac: float, gpu: float) -> None:
-    """The table's last row: an estimate of $2.59 to $2.61, refused at the gate for 320 and
-    1,000 kept tasks after either setup."""
+def test_the_documented_gate_refusals_are_reproduced(
+    template: str, low: float, high: float, mac: float, gpu: float
+) -> None:
+    """The table's last row: refused at the gate for 320 and 1,000 kept tasks after either
+    setup, at an estimate of $2.56 (current) or $2.59 to $2.61 (historical)."""
     for setup in (900.0, 1500.0):
         for tasks in (320, 1000):
-            row = simulate(Scenario(mac=mac, gpu=gpu, setup_seconds=setup, tasks=tasks))
-            assert 2.59 <= round(row["estimate_usd"], 2) <= 2.61
+            row = simulate(
+                Scenario(mac=mac, gpu=gpu, setup_seconds=setup, tasks=tasks, template=template)
+            )
+            assert low <= round(row["estimate_usd"], 2) <= high
             assert row["outcome"] == "refused at the gate" and "rl" not in row
 
 
+def test_a_late_low_estimate_run_stops_before_rl() -> None:
+    """At the current specification, a Mac at 0.7 of the planning time gives so low an
+    estimate that a 1,500 s setup leaves less than the projected-finish rule needs: the run
+    stops at the RL stage's start, nothing trained, and finalizes."""
+    for tasks in (320, 1000):
+        row = simulate(Scenario(mac=0.7, setup_seconds=1500.0, tasks=tasks))
+        assert row["outcome"] == "stopped"
+        assert row["stop_reason"] == "projected_finish_after_deadline"
+        assert row["rl"] is None and row["control"] is None and row["arm_stop"] is None
+        assert row["stages"]["rl"] == "stopped"
+        assert row["pod_elapsed_seconds"] == 1500.0
+
+
+DOCS = Path(__file__).resolve().parents[1] / "docs" / "posttrain-runs.md"
+
+
+def test_the_docs_tables_are_the_tool_output() -> None:
+    """docs/posttrain-runs.md's margin-stop table is ``margin_table`` at the current
+    specification, byte for byte, and the historical table it keeps is the same rendering at
+    the superseded template, labelled as the historical scenario after the current one."""
+    text = DOCS.read_text(encoding="utf-8")
+    current = run2_schedule_sim.margin_table(
+        run2_schedule_sim.margin_rows(run2_schedule_sim.CURRENT_TEMPLATE)
+    )
+    historical = run2_schedule_sim.margin_table(
+        run2_schedule_sim.margin_rows(run2_schedule_sim.HISTORICAL_TEMPLATE)
+    )
+    assert "| 1.0, 1.0 | $3.10, $3.72 |" in current
+    assert "| 1.0, 1.0 | $3.15, $3.77 |" in historical
+    assert text.count(current) == 1 and text.count(historical) == 1
+    at, before = text.index(current), text.index(historical)
+    assert at < before
+    label = text.rfind("**Historical scenario", 0, before)
+    assert at < label < before
+    assert "superseded" in text[label:before] and "never launched" in text[label:before]
+
+
+def test_the_template_defaults_to_the_current_specification() -> None:
+    """The simulator, its projection and its CLI default to post-2-v2; the superseded template
+    is reachable only by its historical name."""
+    chosen = run2_schedule_sim.template_named(run2_schedule_sim.CURRENT_TEMPLATE)
+    assert chosen.path == posttrain_approved.SPECIFICATION_PATH_2
+    assert chosen.path.name == "rehearsal-a40-s-post-2-v2.json" and not chosen.historical
+    assert Scenario().template == run2_schedule_sim.CURRENT_TEMPLATE
+    old = run2_schedule_sim.template_named(run2_schedule_sim.HISTORICAL_TEMPLATE)
+    assert old.historical and old.path in posttrain_approved.SUPERSEDED_RUN2_TEMPLATES
+    assert old.record()["sha256"] == posttrain_approved.SUPERSEDED_RUN2_TEMPLATES[old.path]
+    assert "HISTORICAL" in old.record()["description"]
+    row = simulate(Scenario(tasks=320))
+    assert row["specification"]["path"] == "configs/rehearsal-a40-s-post-2-v2.json"
+    assert not row["historical"]
+    assert simulate(Scenario(tasks=320, template=old.name))["historical"]
+    with pytest.raises(ValueError, match="no run-2 template"):
+        run2_schedule_sim.template_named("post-2")
+
+
+def test_a_template_with_other_bytes_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The current template must equal ``run2_specification()`` and the historical one its
+    pinned SHA-256; a projection report of other bytes is refused too."""
+    from dataclasses import replace
+
+    templates = dict(run2_schedule_sim.TEMPLATES)
+    current = templates[run2_schedule_sim.CURRENT_TEMPLATE]
+    changed = tmp_path / current.path.name
+    changed.write_text(current.path.read_text().replace("7991.0", "7992.0"))
+    monkeypatch.setitem(run2_schedule_sim.TEMPLATES, current.name, replace(current, path=changed))
+    with pytest.raises(ValueError, match="differs from"):
+        simulate(Scenario(tasks=320))
+    old = templates[run2_schedule_sim.HISTORICAL_TEMPLATE]
+    monkeypatch.setitem(run2_schedule_sim.TEMPLATES, old.name, replace(old, path=changed))
+    with pytest.raises(ValueError, match="not the pinned superseded"):
+        simulate(Scenario(tasks=320, template=old.name))
+    monkeypatch.setitem(run2_schedule_sim.TEMPLATES, current.name, current)
+    report = tmp_path / "projection.json"
+    report.write_text(
+        json.dumps(
+            {
+                "kind": "posttrain-feasibility",
+                "run": "2",
+                "specification_sha256": "0" * 64,
+                "scenarios": {},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="priced another specification"):
+        run2_schedule_sim.projection_scenarios(
+            report, setups=(900.0,), tasks=(320,), ceiling_usd=10.0
+        )
+
+
 def test_the_planning_rates_cut_the_control_to_under_two_percent_of_its_budget() -> None:
-    """The documented case in numbers: RL runs its 100 updates; the control, about 2,100
-    updates of budget, stops after its pass-1 check, unmatched; it reuses no SFT result
-    because it trained; RL's endpoint is evaluated and the run ends stopped, finalized in
-    full within the reserve."""
+    """The documented case in numbers, at the current specification: RL runs its 100
+    updates; the control, about 2,055 updates of budget, stops after its pass-1 check,
+    unmatched; it reuses no SFT result because it trained; RL's endpoint is evaluated and the
+    run ends stopped, finalized in full within the reserve."""
     row = simulate(Scenario(tasks=320))
     assert row["rl"]["reached_budget"] and row["rl"]["updates"] == 100
     control = row["control"]
-    assert control["budget_updates"] == 2100 and control["updates"] == 10
+    assert control["budget_updates"] == 2055 and control["updates"] == 10
     assert control["busy_fraction"] < 0.02 and not control["within_tolerance"]
     assert control["stop_reason"] == "external" and control["checks"] == [0, 10]
     margin = row["margin_stop"]
@@ -217,9 +415,23 @@ def test_the_planning_rates_cut_the_control_to_under_two_percent_of_its_budget()
     assert row["endpoints"]["more-sft"]["selected"] == "more-sft-check-00010"
     assert row["finalization"]["seconds_left_before_wall"] >= 900.0
     assert row["forecast"].startswith("forecast at the given rates")
-    # After a 1,500 s setup the control trains nothing: it selects its start, RL's update-0
-    # check, which holds the SFT weights, so the SFT results stand for it.
+    # After a 1,500 s setup RL's last dev check is refused its Mac wait: RL selects its
+    # update-75 check, the control is skipped and only RL's endpoint is evaluated.
     late = simulate(Scenario(tasks=320, setup_seconds=1500.0))
+    assert late["rl"]["updates"] == 100 and late["control"] is None
+    assert late["arm_stop"]["arm"] == "rl" and late["margin_stop"]["kind"] == "dev"
+    assert late["stages"]["more-sft"] == "skipped"
+    assert late["endpoints"]["rl"]["selected"] == "rl-check-0075"
+
+
+def test_the_historical_planning_rates_left_the_control_its_start() -> None:
+    """The historical scenario's documented case: at the superseded template the control's
+    budget was about 2,100 updates, and after a 1,500 s setup the control trained nothing and
+    selected its start, RL's update-0 check, so the SFT results stood for it."""
+    old = run2_schedule_sim.HISTORICAL_TEMPLATE
+    row = simulate(Scenario(tasks=320, template=old))
+    assert row["control"]["budget_updates"] == 2100 and row["control"]["updates"] == 10
+    late = simulate(Scenario(tasks=320, setup_seconds=1500.0, template=old))
     assert late["control"]["updates"] == 0
     assert late["endpoints"]["more-sft"] == {
         "selected": "rl-check-0000",
@@ -237,13 +449,13 @@ def test_a_low_estimate_is_refused_at_the_gate() -> None:
 def test_a_pool_below_the_floor_is_flagged_and_the_passes_can_run_out() -> None:
     """161 kept tasks are below the 320 floor (the worker refuses them; the simulation is a
     hypothetical). At a rate where the control is not cut short, its 400-pass loader plans
-    2,013 updates, fewer than the 2,100 its budget buys: it stops at passes_exhausted."""
+    2,013 updates, fewer than the 2,055 its budget buys: it stops at passes_exhausted."""
     row = simulate(Scenario(mac=2.0, gpu=1.2, tasks=161))
     assert row["floor"] == 320 and not row["admitted_by_floor"]
     control = row["control"]
     assert control["stop_reason"] == "passes_exhausted" and control["updates"] == 2013
-    assert control["planned_updates"] == 2013 and control["budget_updates"] == 2100
-    assert 0.95 < control["busy_fraction"] < 0.96 and control["within_tolerance"]
+    assert control["planned_updates"] == 2013 and control["budget_updates"] == 2055
+    assert 0.97 < control["busy_fraction"] < 0.98 and control["within_tolerance"]
 
 
 def test_a_higher_stop_fraction_lets_the_control_spend_its_budget() -> None:
@@ -433,7 +645,51 @@ def test_the_command_writes_the_forecast(
     assert [row["first_stop"] for row in saved["scenarios"]] == [
         "the control, before update 11 (wait_margin)"
     ]
-    assert "forecast at the given rates" in capsys.readouterr().out
+    assert saved["specification"]["name"] == "post-2-v2" and not saved["historical"]
+    out = capsys.readouterr().out
+    assert "forecast at the given rates" in out and "HISTORICAL" not in out
+    assert "configs/rehearsal-a40-s-post-2-v2.json" in out
+
+
+def test_the_command_labels_the_historical_scenario(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The superseded template runs only when named, and every output of it says it is the
+    historical scenario."""
+    output = tmp_path / "sim.json"
+    code = run2_schedule_sim.main(
+        [
+            "--template",
+            "post-2-superseded",
+            "--mac",
+            "1",
+            "--gpu",
+            "1",
+            "--setup",
+            "900",
+            "--tasks",
+            "320",
+            "--output",
+            str(output),
+        ]
+    )
+    assert code == 0
+    saved = json.loads(output.read_text())
+    assert saved["historical"] and saved["specification"]["name"] == "post-2-superseded"
+    assert all(row["historical"] for row in saved["scenarios"])
+    assert saved["scenarios"][0]["estimate_usd"] == pytest.approx(3.145, abs=0.0005)
+    out = capsys.readouterr().out
+    assert out.startswith("HISTORICAL scenario: run 2's superseded first template")
+
+
+def test_the_command_prints_the_margin_table(capsys: pytest.CaptureFixture[str]) -> None:
+    assert run2_schedule_sim.main(["--margin-table"]) == 0
+    out = capsys.readouterr().out
+    assert out.endswith(
+        run2_schedule_sim.margin_table(
+            run2_schedule_sim.margin_rows(run2_schedule_sim.CURRENT_TEMPLATE)
+        )
+    )
 
 
 # Conformance: the simulator's loops make the real loops' calls -----------------------------

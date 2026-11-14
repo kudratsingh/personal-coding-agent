@@ -9,10 +9,18 @@ It runs the **real** worker's decision code: ``Run2Worker.execute`` and ``run_st
 real ``run_rl`` and ``run_more_sft`` stage bodies, ``should_stop``, ``margin_reason``,
 ``before_wait``/``after_wait``, ``observe_wait``, ``RunLimits.stop_reason``, ``stopped``,
 ``tick``, the projected-finish rule with ``drop_control_for_rl``, ``measure_rl``,
-``stop_kind``, ``stop_arm``, ``choose_endpoint``, ``skip_reason`` and ``after_stages``, on the
-approved run-2 template filled with the gate's values by ``posttrain_approved.fill_gate``.
-The gate's estimate comes from the real projection (``pilot_feasibility.posttrain2_report``)
-and the gate's launch rule from ``posttrain_approved.gate_launch_fit``.
+``stop_kind``, ``stop_arm``, ``choose_endpoint``, ``skip_reason`` and ``after_stages``, on a
+run-2 template filled with the gate's values by ``posttrain_approved.fill_gate``. The gate's
+estimate comes from the real projection (``pilot_feasibility.posttrain2_report``) of that
+template and the gate's launch rule from ``posttrain_approved.gate_launch_fit``.
+
+**The template.** By default the current run-2 specification, ``post-2-v2``
+(``configs/rehearsal-a40-s-post-2-v2.json``, ``posttrain_approved.SPECIFICATION_PATH_2``). The
+superseded first template (``configs/rehearsal-a40-s-post-2.json``, never launched) can be
+chosen only by name, ``--template post-2-superseded``, as an explicitly **historical
+scenario**: every record and printed table of it says so. Each template is read from its
+tracked bytes and checked first: the current one must equal ``run2_specification()``, the
+superseded one its pinned SHA-256 (``SUPERSEDED_RUN2_TEMPLATES``).
 
 What is fake (``SimulatedRun2Worker``, ``patched_worker``):
 
@@ -41,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import itertools
 import json
 import math
@@ -105,6 +114,84 @@ TICK_SLICES = 8
 """A generation advances the clock in this many slices, each followed by a tick."""
 SIM_SHA256 = "0" * 64
 START_UNIX = 1_800_000_000.0
+
+
+# The template -------------------------------------------------------------------------------
+
+CURRENT_TEMPLATE = "post-2-v2"
+"""Run 2's current specification, the simulator's default."""
+HISTORICAL_TEMPLATE = "post-2-superseded"
+"""Run 2's first template, superseded and never launched: a historical scenario only."""
+HISTORICAL_LABEL = (
+    "HISTORICAL scenario: run 2's superseded first template "
+    "(configs/rehearsal-a40-s-post-2.json, never launched; planning generation at 7,731 and "
+    "8,733 tok/s), kept to reproduce the earlier analysis; not run 2's current specification"
+)
+
+
+@dataclass(frozen=True)
+class Template:
+    """A run-2 template the simulator can run, read from its tracked bytes."""
+
+    name: str
+    path: Path
+    historical: bool
+    description: str
+
+    def data(self) -> bytes:
+        """The tracked bytes, checked: the current template must equal
+        ``run2_specification()``, a superseded one its pinned SHA-256."""
+        data = self.path.read_bytes()
+        if self.historical:
+            pinned = posttrain_approved.SUPERSEDED_RUN2_TEMPLATES.get(self.path)
+            if pinned is None or hashlib.sha256(data).hexdigest() != pinned:
+                raise ValueError(f"{self.path.name} is not the pinned superseded run-2 template")
+        elif data != posttrain_approved.specification_bytes(
+            posttrain_approved.run2_specification()
+        ):
+            raise ValueError(
+                f"{self.path.name} differs from posttrain_approved.run2_specification(): "
+                "the tracked template must be rewritten before it is simulated"
+            )
+        return data
+
+    def raw(self) -> dict[str, Any]:
+        loaded: dict[str, Any] = json.loads(self.data())
+        return loaded
+
+    def spec(self) -> Specification:
+        return Specification.from_dict(self.raw(), allow_gate_nulls=True)
+
+    def record(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "path": f"configs/{self.path.name}",
+            "sha256": hashlib.sha256(self.data()).hexdigest(),
+            "historical": self.historical,
+            "description": self.description,
+        }
+
+
+TEMPLATES = {
+    CURRENT_TEMPLATE: Template(
+        CURRENT_TEMPLATE,
+        posttrain_approved.SPECIFICATION_PATH_2,
+        historical=False,
+        description="run 2's current specification, the second version (the default)",
+    ),
+    HISTORICAL_TEMPLATE: Template(
+        HISTORICAL_TEMPLATE,
+        posttrain_approved.SPECIFICATION_PATH.with_name("rehearsal-a40-s-post-2.json"),
+        historical=True,
+        description=HISTORICAL_LABEL,
+    ),
+}
+
+
+def template_named(name: str) -> Template:
+    if name not in TEMPLATES:
+        raise ValueError(f"no run-2 template {name!r}: choose one of {sorted(TEMPLATES)}")
+    return TEMPLATES[name]
 
 
 # The fake clock and hardware --------------------------------------------------------------
@@ -225,20 +312,22 @@ def measured_input(spec: Specification, rates: Rates) -> dict[str, Any]:
     }
 
 
-def projected_estimate(rates: Rates, *, ceiling_usd: float) -> float:
+def projected_estimate(
+    rates: Rates, *, ceiling_usd: float, template: str = CURRENT_TEMPLATE
+) -> float:
     """The gate's estimate at ``rates``: the real run-2 projection's total
     (``pilot_feasibility.posttrain2_report``, its "run 1's measured rates" scenario) on the
-    approved template."""
+    named template, by default the current specification."""
     from tools.pilot_feasibility import posttrain2_report
 
-    template = Specification.from_dict(
-        posttrain_approved.run2_specification(), allow_gate_nulls=True
-    )
+    chosen = template_named(template)
     report = posttrain2_report(
-        posttrain_approved.SPECIFICATION_PATH_2,
+        chosen.path,
         ceiling_usd=ceiling_usd,
-        measured=measured_input(template, rates),
+        measured=measured_input(chosen.spec(), rates),
     )
+    if report["specification_sha256"] != hashlib.sha256(chosen.data()).hexdigest():
+        raise ValueError(f"the projection priced other bytes than {chosen.path.name}")
     return float(report["gate_estimate_usd"])
 
 
@@ -942,6 +1031,9 @@ class Scenario:
     """A hypothetical cost-stop fraction of the estimate in place of the code's 120%: the
     gate is given ``estimate x fraction / 1.2``, so its 120% rule yields that stop. ``None``
     keeps the code's rule. For the owner's decision only; the worker is unchanged."""
+    template: str = CURRENT_TEMPLATE
+    """The run-2 template (``TEMPLATES``): the current specification unless the superseded
+    one is named, as a historical scenario."""
 
 
 def _arm_phrase(arm: str, updates: int, margin: Mapping[str, Any] | None) -> str:
@@ -958,12 +1050,12 @@ def _arm_phrase(arm: str, updates: int, margin: Mapping[str, Any] | None) -> str
 
 def simulate(scenario: Scenario) -> dict[str, Any]:
     """Run one scenario through the gate and the worker; return its forecast record."""
-    template = Specification.from_dict(
-        posttrain_approved.run2_specification(), allow_gate_nulls=True
-    )
+    chosen = template_named(scenario.template)
+    template_raw = chosen.raw()
+    template = Specification.from_dict(template_raw, allow_gate_nulls=True)
     rates = scenario.rates or scaled_rates(template, mac=scenario.mac, gpu=scenario.gpu)
     estimate = (
-        projected_estimate(rates, ceiling_usd=scenario.ceiling_usd)
+        projected_estimate(rates, ceiling_usd=scenario.ceiling_usd, template=scenario.template)
         if scenario.estimate_usd is None
         else scenario.estimate_usd
     )
@@ -986,13 +1078,15 @@ def simulate(scenario: Scenario) -> dict[str, Any]:
         if scenario.stop_fraction is None
         else scenario.stop_fraction,
         "hypothetical_stop": scenario.stop_fraction is not None,
+        "specification": chosen.record(),
+        "historical": chosen.historical,
         "forecast": FORECAST_LABEL,
     }
     try:
         # The gate's own refusals: fill_gate refuses limits that leave less than the planned
         # setup once the launch rule's need at the planning rates is held.
-        raw = posttrain_approved.run2_specification(
-            gate_values(ceiling_usd=scenario.ceiling_usd, estimate_usd=written)
+        raw = posttrain_approved.fill_gate(
+            template_raw, gate_values(ceiling_usd=scenario.ceiling_usd, estimate_usd=written)
         )
         gate = posttrain_approved.gate_launch_fit(raw)
     except ValueError as error:
@@ -1148,15 +1242,14 @@ def grid(
     setups: Sequence[float] = SETUP_GRID,
     tasks: Sequence[int] = TASKS_GRID,
     ceiling_usd: float = DEFAULT_CEILING_USD,
+    template: str = CURRENT_TEMPLATE,
 ) -> list[dict[str, Any]]:
     """Every combination; the estimate of each (mac, gpu) is projected once."""
-    template = Specification.from_dict(
-        posttrain_approved.run2_specification(), allow_gate_nulls=True
-    )
+    spec = template_named(template).spec()
     rows = []
     for mac, gpu in itertools.product(macs, gpus):
-        rates = scaled_rates(template, mac=mac, gpu=gpu)
-        estimate = projected_estimate(rates, ceiling_usd=ceiling_usd)
+        rates = scaled_rates(spec, mac=mac, gpu=gpu)
+        estimate = projected_estimate(rates, ceiling_usd=ceiling_usd, template=template)
         for setup, count in itertools.product(setups, tasks):
             rows.append(
                 simulate(
@@ -1169,6 +1262,7 @@ def grid(
                         estimate_usd=estimate,
                         rates=rates,
                         label=f"mac {mac:g}x, gpu {gpu:g}x",
+                        template=template,
                     )
                 )
                 | {"mac_time_multiple": mac, "gpu_time_multiple": gpu}
@@ -1177,19 +1271,26 @@ def grid(
 
 
 def projection_scenarios(
-    path: Path, *, setups: Sequence[float], tasks: Sequence[int], ceiling_usd: float
+    path: Path,
+    *,
+    setups: Sequence[float],
+    tasks: Sequence[int],
+    ceiling_usd: float,
+    template: str = CURRENT_TEMPLATE,
 ) -> list[dict[str, Any]]:
     """Each scenario of a run-2 projection report (``pilot_feasibility posttrain --output``)
-    at its recorded rates, with that scenario's own projected total as the gate estimate."""
+    at its recorded rates, with that scenario's own projected total as the gate estimate. The
+    report must have priced the simulated template's bytes."""
     report = json.loads(path.read_text(encoding="utf-8"))
     if report.get("kind") != "posttrain-feasibility" or report.get("run") != "2":
         raise ValueError(f"{path} is not a run-2 projection report")
-    template = Specification.from_dict(
-        posttrain_approved.run2_specification(), allow_gate_nulls=True
-    )
+    chosen = template_named(template)
+    if report.get("specification_sha256") != hashlib.sha256(chosen.data()).hexdigest():
+        raise ValueError(f"{path} priced another specification than {chosen.path.name}")
+    spec = chosen.spec()
     rows = []
     for name, scenario in report["scenarios"].items():
-        rates = rates_from_projection(template, scenario["rates"])
+        rates = rates_from_projection(spec, scenario["rates"])
         estimate = float(scenario["total_usd"])
         for setup, count in itertools.product(setups, tasks):
             rows.append(
@@ -1201,15 +1302,19 @@ def projection_scenarios(
                         estimate_usd=estimate,
                         rates=rates,
                         label=f"{path.name}: {name}",
+                        template=template,
                     )
                 )
             )
     return rows
 
 
-def document(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def document(rows: list[dict[str, Any]], template: str = CURRENT_TEMPLATE) -> dict[str, Any]:
+    chosen = template_named(template)
     return {
         "format": FORMAT,
+        "specification": chosen.record(),
+        "historical": chosen.historical,
         "forecast": FORECAST_LABEL,
         "assumptions": list(ASSUMPTIONS),
         "scenarios": rows,
@@ -1242,6 +1347,161 @@ def table(rows: Sequence[Mapping[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+# The margin-stop table of docs/posttrain-runs.md ("Can a margin stop happen?") -----------
+
+MARGIN_CASES: tuple[tuple[float, float], ...] = (
+    (1.0, 1.0),
+    (1.1, 1.0),
+    (1.5, 1.0),
+    (2.0, 1.0),
+    (0.9, 1.0),
+    (0.75, 1.0),
+    (0.7, 1.0),
+    (1.0, 0.9),
+    (1.0, 0.8),
+    (0.6, 1.0),
+    (0.8, 0.8),
+)
+"""The (Mac time, GPU time) multiples of the planning rates the docs' table gives."""
+MARGIN_SETUPS = (900.0, 1500.0)
+MARGIN_TASKS = (320, 1000)
+"""Run 2's minimum of kept tasks and the candidates' count: a range in the table is these."""
+
+
+def _multiple(value: float) -> str:
+    return f"{value:.1f}" if round(value, 1) == value else f"{value:g}"
+
+
+def _stop_parts(row: Mapping[str, Any]) -> tuple[str, int | None, str]:
+    """Where a row first stopped, as ``head + number + tail`` so two rows that differ only
+    in the update number merge into a range."""
+    if row["outcome"] == "refused at the gate":
+        return ("refused at the gate", None, "")
+    arm = row.get("arm_stop")
+    margin: Mapping[str, Any] = row.get("margin_stop") or {}
+    if arm is not None and arm["kind"] == "margin":
+        control = arm["arm"] == CONTROL_REFERENCE
+        name = "the control" if control else "RL"
+        updates = int((row["control"] if control else row["rl"])["updates"])
+        kind, raw_index = margin.get("kind"), margin.get("index")
+        index = 0 if raw_index is None else int(raw_index)
+        if kind == "next update":
+            if updates == 0:
+                return (f"{name}, before its first update", None, "")
+            return (f"{name}, before update ", updates + 1, "")
+        if kind == "dev" and control:
+            config = template_named(row["specification"]["name"]).raw()["control"]
+            per_update = int(config["batch_size"]) * int(config["accumulation_steps"])
+            boundaries = pass_boundaries(int(row["tasks"]), per_update, config["pass_checks"])
+            passes = boundaries.get(index, [])
+            which = f"pass-{passes[-1]}" if passes else "end"
+            return (f"the control, at its {which} check (update ", index, "), unscored")
+        if kind == "dev":
+            last = index == int(row["rl"]["declared_updates"])
+            head = "RL at its last check (update " if last else "RL at its check (update "
+            return (head, index, "), unscored")
+        return (f"{name}, at the reward wait of update ", index, "")
+    if row["outcome"] == "completed":
+        return (str(row["first_stop"]), None, "")
+    if row.get("rl") is None:
+        return (f"the run, before RL starts ({row['stop_reason']})", None, "")
+    return (str(row["first_stop"]), None, "")
+
+
+def _share(rows: Sequence[Mapping[str, Any]]) -> str:
+    """The share of the control's budget spent, where it stopped before a later update."""
+    shares = []
+    for row in rows:
+        head, number, _ = _stop_parts(row)
+        if not head.startswith("the control, before update") or number is None:
+            return ""
+        shares.append(100 * row["control"]["busy_fraction"])
+    if all(share < 2 for share in shares):
+        return " (under 2% of its budget)"
+    low, high = (round(share) for share in (min(shares), max(shares)))
+    return f" ({low}%)" if low == high else f" ({low} to {high}%)"
+
+
+def _cell(rows: Sequence[Mapping[str, Any]]) -> str:
+    parts = [_stop_parts(row) for row in rows]
+    heads = {(head, tail) for head, _, tail in parts}
+    numbers = [number for _, number, _ in parts]
+    if len(heads) == 1:
+        ((head, tail),) = heads
+        if len(set(numbers)) == 1:
+            text = head + ("" if numbers[0] is None else str(numbers[0])) + tail
+        else:
+            text = f"{head}{min(numbers)} to {max(numbers)}{tail}"  # type: ignore[type-var]
+    else:
+        text = "; ".join(
+            f"{head}{'' if number is None else number}{tail} ({tasks:,} kept tasks)"
+            for (head, number, tail), tasks in zip(parts, MARGIN_TASKS, strict=True)
+        )
+    return text + _share(rows)
+
+
+def margin_rows(template: str = CURRENT_TEMPLATE) -> list[dict[str, Any]]:
+    """Every case of the docs' table: each (Mac, GPU) multiple, both setups, both task counts."""
+    rows = []
+    for mac, gpu in MARGIN_CASES:
+        for setup, tasks in itertools.product(MARGIN_SETUPS, MARGIN_TASKS):
+            rows.append(
+                simulate(
+                    Scenario(mac=mac, gpu=gpu, setup_seconds=setup, tasks=tasks, template=template)
+                )
+            )
+    return rows
+
+
+def margin_table(rows: Sequence[Mapping[str, Any]]) -> str:
+    """The docs' Markdown table from ``margin_rows``: per case, the estimate and the stop it
+    gives, then the first stop after a 900 s and a 1,500 s setup for 320 and 1,000 kept tasks
+    (a range where they differ), with the share of the control's budget spent where it stopped
+    before a later update. The cases refused at the gate after both setups share the last row."""
+    by_case: dict[tuple[float, float], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        key = (float(row["mac_time_multiple"]), float(row["gpu_time_multiple"]))
+        by_case.setdefault(key, []).append(row)
+    lines: list[str] = []
+    refused: list[tuple[str, list[float]]] = []
+    margin_only = True
+    for (mac, gpu), case in by_case.items():
+        label = f"{_multiple(mac)}, {_multiple(gpu)}"
+        if all(row["outcome"] == "refused at the gate" for row in case):
+            refused.append((label, [float(row["estimate_usd"]) for row in case]))
+            continue
+        cells = []
+        for setup in MARGIN_SETUPS:
+            chosen = [row for row in case if row["setup_seconds"] == setup]
+            chosen.sort(key=lambda row: int(row["tasks"]))
+            margin_only &= all(
+                row["outcome"] == "refused at the gate"
+                or (row.get("arm_stop") or {}).get("kind") == "margin"
+                for row in chosen
+            )
+            cells.append(_cell(chosen))
+        first = case[0]
+        lines.append(
+            f"| {label} | ${first['estimate_usd']:.2f}, ${first['cost_limit_usd']:.2f} "
+            f"| {cells[0]} | {cells[1]} |"
+        )
+    if refused:
+        estimates = [f"{value:.2f}" for _, values in refused for value in values]
+        low, high = min(estimates, key=float), max(estimates, key=float)
+        span = f"${low}" if low == high else f"${low} to ${high}"
+        lines.append(
+            f"| {' or '.join(label for label, _ in refused)} | {span} "
+            "| refused at the gate (below) | refused at the gate |"
+        )
+    stop = "margin stop" if margin_only else "stop"
+    header = [
+        f"| Mac time, GPU time (x planning) | Estimate, stop | First {stop}, 900 s setup "
+        "| 1,500 s setup |",
+        "| --- | --- | --- | --- |",
+    ]
+    return "\n".join(header + lines) + "\n"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--mac", type=float, nargs="*", default=list(MAC_GRID))
@@ -1256,26 +1516,53 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=[],
         help="also simulate each scenario of this run-2 projection report at its rates",
     )
+    parser.add_argument(
+        "--template",
+        choices=sorted(TEMPLATES),
+        default=CURRENT_TEMPLATE,
+        help=f"the run-2 template (default {CURRENT_TEMPLATE}, the current specification; "
+        f"{HISTORICAL_TEMPLATE} is a historical scenario only)",
+    )
+    parser.add_argument(
+        "--margin-table",
+        action="store_true",
+        help="simulate the cases of the docs' margin-stop table and print it (the grid "
+        "options are ignored)",
+    )
     parser.add_argument("--output", type=Path, help="write the JSON record here")
     args = parser.parse_args(argv)
-    rows = grid(
-        macs=args.mac,
-        gpus=args.gpu,
-        setups=args.setup,
-        tasks=args.tasks,
-        ceiling_usd=args.ceiling_usd,
-    )
-    for path in args.projection:
-        rows += projection_scenarios(
-            path, setups=args.setup, tasks=args.tasks, ceiling_usd=args.ceiling_usd
+    chosen = template_named(args.template)
+    if args.margin_table:
+        rows = margin_rows(args.template)
+    else:
+        rows = grid(
+            macs=args.mac,
+            gpus=args.gpu,
+            setups=args.setup,
+            tasks=args.tasks,
+            ceiling_usd=args.ceiling_usd,
+            template=args.template,
         )
+        for path in args.projection:
+            rows += projection_scenarios(
+                path,
+                setups=args.setup,
+                tasks=args.tasks,
+                ceiling_usd=args.ceiling_usd,
+                template=args.template,
+            )
     if args.output is not None:
         args.output.write_text(
-            json.dumps(document(rows), indent=2, sort_keys=True, allow_nan=False) + "\n",
+            json.dumps(document(rows, args.template), indent=2, sort_keys=True, allow_nan=False)
+            + "\n",
             encoding="utf-8",
         )
+    if chosen.historical:
+        print(f"{HISTORICAL_LABEL}.\n")
+    record = chosen.record()
+    print(f"Template: {record['path']} (SHA-256 {record['sha256']}).")
     print(f"Run 2 schedule: {FORECAST_LABEL}.\n")
-    print(table(rows), end="")
+    print(margin_table(rows) if args.margin_table else table(rows), end="")
     return 0
 
 
