@@ -9,8 +9,10 @@ from typing import Any
 import pytest
 
 from tools.rl_reward_signal import (
+    ALL_SCOPE,
     EXTRAPOLATION_LABEL,
     FORECAST_LABEL,
+    SOURCE_SCOPE,
     analyze,
     beta_binomial_fit,
     extrapolate,
@@ -90,6 +92,10 @@ def test_the_statistics_by_hand() -> None:
     assert report["sources"]["A"]["eligible"] == 2 and report["sources"]["B"]["eligible"] == 1
     assert report["notes"]["executed_code"] is False
     assert report["notes"]["forecast"] == FORECAST_LABEL
+    # A source's extrapolation is the whole shortfall as if every candidate came from it.
+    assert every["extrapolation"]["scope"] == ALL_SCOPE
+    assert report["sources"]["A"]["extrapolation"]["scope"] == SOURCE_SCOPE
+    assert "as if every new candidate came from it" in SOURCE_SCOPE
     assert "AceCode exclusion stays in force" in report["notes"]["sources"]
     groups = every["informative_fresh_groups"]
     assert 0 < groups["beta_binomial_mean"] < 1 and groups["forecast"] == FORECAST_LABEL
@@ -213,4 +219,5 @@ def test_the_command_never_writes_beside_the_record(
     assert len(saved["inputs"]["screening_sha256"]) == 64
     printed = capsys.readouterr().out
     assert "extrapolation from the observed eligibility rate" in printed
+    assert SOURCE_SCOPE in printed and ALL_SCOPE in printed
     assert "AceCode exclusion stays in force" in printed

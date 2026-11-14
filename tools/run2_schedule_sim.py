@@ -810,6 +810,11 @@ class SimulatedRun2Worker(Run2Worker):
             client.wait = None
 
     # Stages that need a model: their timing, with the real tick and rate updates ---------
+    #
+    # These two stage bodies are simulated, not inherited: ``Run2Worker.run_arc`` and
+    # ``PosttrainWorker.run_eval`` load a model and score it. ``run_arc`` repeats
+    # ``Run2Worker.run_arc``'s bookkeeping (the checkpoints left out and why); a drift test
+    # runs the real one next to it on the same worker state.
 
     def run_arc(self, stage: StagePlan) -> list[dict[str, Any]]:
         evaluated = self.evaluated_stage(stage)
@@ -1175,7 +1180,7 @@ def projection_scenarios(
     path: Path, *, setups: Sequence[float], tasks: Sequence[int], ceiling_usd: float
 ) -> list[dict[str, Any]]:
     """Each scenario of a run-2 projection report (``pilot_feasibility posttrain --output``)
-    at its recorded rates, with the report's own gate estimate where it has one."""
+    at its recorded rates, with that scenario's own projected total as the gate estimate."""
     report = json.loads(path.read_text(encoding="utf-8"))
     if report.get("kind") != "posttrain-feasibility" or report.get("run") != "2":
         raise ValueError(f"{path} is not a run-2 projection report")

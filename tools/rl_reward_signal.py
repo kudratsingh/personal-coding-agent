@@ -56,6 +56,11 @@ EXTRAPOLATION_LABEL = (
     "extrapolation from the observed eligibility rate of one screen; not a requirement and "
     "not a guarantee: new candidates may be eligible at another rate"
 )
+ALL_SCOPE = "every source together: new candidates eligible at the pooled rate"
+SOURCE_SCOPE = (
+    "this source alone: as if every new candidate came from it, at its own rate; the whole "
+    "shortfall of the floor, not this source's share of it"
+)
 SOURCE_NOTE = (
     "screening more tasks from a source already accepted for screening is a different "
     "decision from admitting a new source or lifting a source's exclusion; the AceCode "
@@ -402,9 +407,11 @@ def analyze(
         "floor": floor,
     }
     sources: dict[str, Any] = {ALL: source_report(tasks, eligible, **options)}
+    sources[ALL]["extrapolation"]["scope"] = ALL_SCOPE
     for name in sorted({str(row["source"]) for row in tasks}):
         rows = [row for row in tasks if row["source"] == name]
         sources[name] = source_report(rows, eligible, **options)
+        sources[name]["extrapolation"]["scope"] = SOURCE_SCOPE
     report: dict[str, Any] = {
         "format": FORMAT,
         "rule": dict(rule),
@@ -473,18 +480,22 @@ def markdown(report: Mapping[str, Any]) -> str:
     lines += [
         "",
         "| Source | Short of floor | More candidates if eligible at the observed rate "
-        "(Wilson 95%) |",
-        "| --- | ---: | --- |",
+        "(Wilson 95%) | Scope |",
+        "| --- | ---: | --- | --- |",
     ]
     for name, row in report["sources"].items():
         extra = row["extrapolation"]
         if extra.get("more_candidates_at_observed_rate") is None:
-            lines.append(f"| {name} | {extra['short_of_floor']} | no eligible task observed |")
+            lines.append(
+                f"| {name} | {extra['short_of_floor']} | no eligible task observed | "
+                f"{extra['scope']} |"
+            )
             continue
         low, high = extra["more_candidates_at_wilson_95"]
         lines.append(
             f"| {name} | {extra['short_of_floor']} | "
-            f"{extra['more_candidates_at_observed_rate']:,} ({low:,}-{high:,}) |"
+            f"{extra['more_candidates_at_observed_rate']:,} ({low:,}-{high:,}) | "
+            f"{extra['scope']} |"
         )
     notes = report["notes"]
     lines += [

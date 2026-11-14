@@ -30,8 +30,14 @@ from scratchcoder.rl.rewards import Attempt
 from scratchcoder.rl.rollout import Rollout
 from scratchcoder.tokenizer.bpe import ByteBPE
 from scratchcoder.train import trainer as trainer_module
-from tools import posttrain_run2, run2_schedule_sim
-from tools.posttrain_run import WAIT_MARGIN_STOP, Rates, Specification
+from tools import posttrain_approved, posttrain_run2, run2_schedule_sim
+from tools.posttrain_run import (
+    CONTROL_REFERENCE,
+    WAIT_MARGIN_STOP,
+    PosttrainWorker,
+    Rates,
+    Specification,
+)
 from tools.posttrain_run2 import Run2Worker
 from tools.run2_schedule_sim import (
     Scenario,
@@ -136,19 +142,51 @@ DOCUMENTED = {
 }
 
 
+# (Mac time, GPU time, setup) -> the table's share of the control's budget spent, in whole
+# percent, for 320 and 1,000 kept tasks; None for "under 2%".
+DOCUMENTED_SHARE: dict[tuple[float, float, float], tuple[int, int] | None] = {
+    (1.0, 1.0, 900.0): None,
+    (1.1, 1.0, 900.0): (1, 3),
+    (1.5, 1.0, 900.0): (4, 12),
+    (2.0, 1.0, 900.0): (54, 54),
+    (1.5, 1.0, 1500.0): (2, 6),
+    (2.0, 1.0, 1500.0): (5, 12),
+}
+
+
 @pytest.mark.parametrize(("mac", "gpu"), sorted(DOCUMENTED))
 def test_the_documented_truncation_is_reproduced(mac: float, gpu: float) -> None:
     """Every row of the table in docs/posttrain-runs.md: the estimate projected at the rates,
-    the 120% stop, and the first margin stop for 320 and 1,000 kept tasks after a 900 s and a
-    1,500 s setup."""
+    the 120% stop, the first margin stop for 320 and 1,000 kept tasks after a 900 s and a
+    1,500 s setup, and the share of the control's budget spent where the table gives one."""
     estimate, stop, short, long = DOCUMENTED[(mac, gpu)]
     for setup, expected in ((900.0, short), (1500.0, long)):
+        shares: list[float] = []
         for tasks, where in zip((320, 1000), expected, strict=True):
             row = simulate(Scenario(mac=mac, gpu=gpu, setup_seconds=setup, tasks=tasks))
             assert f"{row['estimate_usd']:.2f}" == estimate
             assert f"{row['cost_limit_usd']:.2f}" == stop
             assert row["first_stop"] == f"{where} ({WAIT_MARGIN_STOP})"
             assert row["outcome"] == "stopped" and row["stop_reason"] == WAIT_MARGIN_STOP
+            if row["control"] is not None:
+                shares.append(100 * row["control"]["busy_fraction"])
+        if (mac, gpu, setup) in DOCUMENTED_SHARE:
+            documented = DOCUMENTED_SHARE[(mac, gpu, setup)]
+            if documented is None:
+                assert len(shares) == 2 and all(share < 2 for share in shares)
+            else:
+                assert tuple(round(share) for share in shares) == documented
+
+
+@pytest.mark.parametrize(("mac", "gpu"), [(0.6, 1.0), (0.8, 0.8)])
+def test_the_documented_gate_refusals_are_reproduced(mac: float, gpu: float) -> None:
+    """The table's last row: an estimate of $2.59 to $2.61, refused at the gate for 320 and
+    1,000 kept tasks after either setup."""
+    for setup in (900.0, 1500.0):
+        for tasks in (320, 1000):
+            row = simulate(Scenario(mac=mac, gpu=gpu, setup_seconds=setup, tasks=tasks))
+            assert 2.59 <= round(row["estimate_usd"], 2) <= 2.61
+            assert row["outcome"] == "refused at the gate" and "rl" not in row
 
 
 def test_the_planning_rates_cut_the_control_to_under_two_percent_of_its_budget() -> None:
@@ -253,13 +291,68 @@ def test_the_simulated_worker_inherits_every_decision_method() -> None:
         assert getattr(SimulatedRun2Worker, name) is getattr(Run2Worker, name)
 
 
+def sim_worker() -> SimulatedRun2Worker:
+    clock = SimClock()
+    spec = Specification.from_dict(
+        posttrain_approved.run2_specification(
+            run2_schedule_sim.gate_values(ceiling_usd=10.0, estimate_usd=3.15)
+        )
+    )
+    return SimulatedRun2Worker(
+        spec, clock=clock, rates=Rates.planning(spec), tasks=320, pod_created=clock()
+    )
+
+
+SWAPPED = (
+    "run_rl_loop",
+    "run_more_sft",
+    "load_weights",
+    "BridgeRewardSource",
+    "compare_to_loaded",
+    "file_sha256",
+)
+
+
 def test_the_patch_is_undone_after_the_run() -> None:
-    saved = {
-        name: getattr(posttrain_run2, name)
-        for name in ("run_rl_loop", "run_more_sft", "load_weights", "BridgeRewardSource")
-    }
+    """Every name ``patched_worker`` swaps is swapped during the run and restored after it."""
+    saved = {name: getattr(posttrain_run2, name) for name in SWAPPED}
+    with patched_worker(sim_worker()):
+        assert all(getattr(posttrain_run2, name) is not saved[name] for name in SWAPPED)
+    assert {name: getattr(posttrain_run2, name) for name in SWAPPED} == saved
     simulate(Scenario(tasks=320))
-    assert {name: getattr(posttrain_run2, name) for name in saved} == saved
+    assert {name: getattr(posttrain_run2, name) for name in SWAPPED} == saved
+
+
+@pytest.mark.parametrize("left_out", [{}, {CONTROL_REFERENCE: "not evaluated: a reason"}])
+def test_the_simulated_arc_keeps_the_real_bookkeeping(
+    left_out: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A drift guard for the one stage body the simulator repeats: the real
+    ``Run2Worker.run_arc``, with the model-bound ARC body beneath it replaced by a recorder,
+    and the simulated one evaluate the same checkpoints and record the same left out."""
+    simulated, real = sim_worker(), sim_worker()
+    stage = next(stage for stage in simulated.plan.stages if stage.kind == "arc")
+    assert CONTROL_REFERENCE in stage.settings["checkpoints"]
+    evaluated: list[list[str]] = []
+
+    def recorder(self: Any, arc: Any) -> list[dict[str, Any]]:
+        evaluated.append(list(arc.settings["checkpoints"]))
+        return []
+
+    monkeypatch.setattr(PosttrainWorker, "run_arc", recorder)
+    for worker in (simulated, real):
+        worker.not_on_pod.update(left_out)
+        worker.produced.update({ref: Path(f"{ref}.pt") for ref in ("rl", CONTROL_REFERENCE)})
+    simulated.run_arc(stage)
+    Run2Worker.run_arc(real, stage)
+    simulated_labels = [label.removeprefix(f"{stage.name}-") for label in simulated.labels]
+    assert evaluated == [simulated_labels]
+    record, expected = (
+        simulated.stage_by_name[stage.name],
+        real.stage_by_name[stage.name],
+    )
+    assert record.get("checkpoints_not_evaluated") == expected.get("checkpoints_not_evaluated")
+    assert ("checkpoints_not_evaluated" in expected) == bool(left_out)
 
 
 def test_a_limit_reached_during_a_wait_is_the_real_wait_limit_stop(
