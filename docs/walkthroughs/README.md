@@ -57,3 +57,5 @@ Implemented: [the run 2 schedule simulator](run2-schedule-simulator.md).
 Implemented: [evaluator conformance catalogue](evaluator-conformance.md).
 
 Implemented: [static verifier scan](verifier-scan.md).
+
+Implemented: [task-family clusters and adjudication](task-clusters.md).

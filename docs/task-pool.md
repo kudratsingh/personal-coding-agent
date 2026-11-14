@@ -59,10 +59,14 @@ Every task has one public test; the rest are hidden.
 - **TACO easy:** 6,928 were not standalone stdin/stdout problems, and 178 references failed.
 - **MBPP:** 47 were near-duplicates or benchmark matches, and 31 were holdout paraphrases.
 
+## Task families (optional, for future builds)
+
+A pool spec may set `splits.family_grouping` to `"task-clusters-v1"`. The holdout assignment then treats each task family, found from reference-solution ASTs and prompt paraphrases, as one unit, so equivalent tasks never sit on both sides of the split. Only TACO, MBPP and the named model sources are ever held out; a held-out family's members from any other source, such as AceCode, are dropped from the pool and counted. The option is absent from [configs/task-pool-rehearsal.json](../configs/task-pool-rehearsal.json); absent or `null`, the build runs the historical per-task assignment unchanged. The 2026-10-25 pool was built without it and has not been rebuilt. See the [task-cluster walkthrough](walkthroughs/task-clusters.md).
+
 ## Limitations
 
 - Licenses are as declared on each dataset card. The seed provenance of the model-written sources is not independently cleared.
 - A reference that times out under the sandbox limits counts as invalid.
-- Rewordings looser than the paraphrase rule remain.
+- Rewordings looser than the paraphrase rule remain. Tasks with the same reference solution can sit in both training and dev; candidate families are listed by `tools/task_clusters.py` for behavioural adjudication.
 - RL-only tasks have model-synthesized tests that no reference has passed here.
 - The pool is sized for the S rehearsal's 1,024-token context; a larger model needs its own build.
