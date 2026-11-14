@@ -142,9 +142,10 @@ The gated tests do not need the NumPy (EvalPlus) image.
    this being a weakness?* That marker only checks the process's end-of-output behaviour.
    Credit comes from reported values compared on the host, and forging the marker supplies
    none.
-3. *What would turn `zero_check_pass` into a `control` on the path of record?* A pass would
-   have to require at least one executed check, counted somewhere the candidate cannot forge.
-   A count that the candidate's own process reports is not enough.
+3. *What would stop `zero_check_pass` from passing on the path of record?* The task itself
+   would be refused before any candidate runs: the host counts the declared checks in the
+   test text statically and rejects tests with too few. No count reported from inside the
+   candidate's process is needed or trusted, because that process can forge one.
 4. *Why is `hash_order_reference` allowed two outcomes?* Under `python -I` the string hash
    seed changes in every process, so `list(set(words))` returns a different order from run to
    run.
