@@ -290,10 +290,11 @@ def test_the_tracked_template_is_the_approved_run_two_with_its_gate_values_null(
     assert "private/" not in text and "D-3" not in text
 
 
-def test_run_two_generates_as_run_one_and_plans_at_run_ones_floors() -> None:
+def test_run_two_generates_as_run_one_and_plans_at_the_standing_floors() -> None:
     """The base, SFT, RL and more-SFT evaluations share one generation protocol, so run 2
     evaluates at run 1's batch, 128; it plans each batch it generates at (128 for the
-    evaluation, 256 for the rollouts and the dev checks) at run 1's probe floor there."""
+    evaluation, 256 for the rollouts and the dev checks) at the floor the standing rule
+    derives there when its specification is written."""
     run1 = posttrain_approved.run1_specification()
     run2 = posttrain_approved.run2_specification()
     assert run2["generation"] == run1["generation"]
@@ -302,9 +303,8 @@ def test_run_two_generates_as_run_one_and_plans_at_run_ones_floors() -> None:
     batches = {str(run2["generation"]["batch_size"]), str(rl["generation_batch"])}
     assert batches | {str(rl["dev_batch_size"])} == {"128", "256"}
     planning = run2["planning"]["generation_tokens_per_second"]
-    floors = run1["probe"]["minimum_tokens_per_second"]
-    assert set(planning) == set(floors) == batches
-    assert planning == floors == {"128": 7_731.0, "256": 8_733.0}
+    assert set(planning) == set(run1["probe"]["minimum_tokens_per_second"]) == batches
+    assert planning == posttrain_approved.GENERATION_FLOORS == {"128": 7_731.0, "256": 8_733.0}
 
 
 def test_the_gate_fills_every_null_and_the_approved_check_refuses_any_other_change() -> None:
