@@ -468,19 +468,36 @@ def fake_score(task: Task, code: str) -> RewardResult:
     return RewardResult(COMPLETED, 1.0 if code == "good" else 0.0, 1, 1)
 
 
-def gate_file(root: Path, checkpoint: Path, *, passed: bool = True) -> Path:
-    path = root / "gate" / f"gate-{passed}.json"
+def gate_file(
+    root: Path,
+    checkpoint: Path,
+    *,
+    passed: bool = True,
+    name: str | None = None,
+    **changes: Any,
+) -> Path:
+    """A CPU format-gate record of ``checkpoint`` (and the tokenizer beside its folder),
+    written now, in the current gate format; ``changes`` override its fields."""
+    from scratchcoder.eval import format_gate
+
+    tokenizer = checkpoint.parent.parent / "tokenizer.json"
+    path = root / "gate" / (name or f"gate-{passed}.json")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "passed": passed,
-                "failed_checks": [] if passed else ["close"],
-                "inputs": {"checkpoint_sha256": sha(checkpoint)},
-            }
-        ),
-        encoding="utf-8",
-    )
+    record: dict[str, Any] = {
+        "format": format_gate.FORMAT,
+        "version": format_gate.VERSION,
+        "passed": passed,
+        "failed_checks": [] if passed else ["close"],
+        "inputs": {
+            "checkpoint_sha256": sha(checkpoint),
+            "tokenizer_sha256": sha(tokenizer) if tokenizer.exists() else "0" * 64,
+        },
+        "device": "cpu",
+        "torch_threads": 4,
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    record.update(changes)
+    path.write_text(json.dumps(record), encoding="utf-8")
     return path
 
 
@@ -840,9 +857,9 @@ def test_a_missing_supervisor_protection_stops_at_once(tmp_path: Path) -> None:
     unprotected = Result("infrastructure_error", detail="supervisor_unprotected")
     executor = Counting(lambda code, tests, mode: unprotected)
     assert execute_stage(run, "verify", execute=executor) == tool.EXIT_STOP
-    assert stop_reason(run) == "sandbox_failure"
-    # Never retried; only calls already picked up by a worker thread still start.
-    assert len(set(executor.calls)) == len(executor.calls) < 16
+    assert stop_reason(run) == "containment_failure"
+    # Never retried, and no queued call starts: only those already running (one per worker).
+    assert len(executor.calls) <= 4
 
 
 def test_too_many_unresolved_admission_runs_stop(tmp_path: Path) -> None:
@@ -1231,3 +1248,319 @@ def test_rule_four_flags_fewer_than_three_hundred_screened_as_low_confidence() -
 def test_a_yield_of_exactly_fifteen_percent_is_sized_not_diagnosed() -> None:
     assert tool.recommend(**{**BASE, "eligible": 150})["rule"] == 4
     assert tool.recommend(**{**BASE, "eligible": 149})["rule"] == 3
+
+
+# --------------------------------------------------------------------------------------
+# Review follow-ups: the gate's identity, durable generation time, the run's wall time,
+# reruns on the same inputs, containment, draining and zero candidates.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "changes,message",
+    [
+        ({"device": "cuda:0"}, "not on the CPU"),
+        ({"version": 1}, "format and version"),
+        ({"format": "other"}, "format and version"),
+        ({"created_at": "2020-01-01T00:00:00+00:00"}, "before this run"),
+        ({"inputs": {"checkpoint_sha256": None, "tokenizer_sha256": "0" * 64}}, "checkpoint"),
+    ],
+)
+def test_only_a_current_cpu_gate_of_this_checkpoint_and_tokenizer_is_accepted(
+    tmp_path: Path, changes: dict[str, Any], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run, paths = new_run(tmp_path)
+    through_select(run)
+    if "inputs" in changes:
+        changes["inputs"]["checkpoint_sha256"] = sha(paths["checkpoint"])
+        message = "another tokenizer"
+    gate = gate_file(tmp_path, paths["checkpoint"], **changes)
+    argv = ["generate", "--run", str(run), "--format-gate", str(gate)]
+    assert tool.main(argv, options={"generator": FakeGenerator}) == tool.EXIT_REFUSED
+    assert message in capsys.readouterr().err
+    assert not (run / "stop.json").exists() and not (run / "generate" / tool.GATE_PIN).exists()
+
+
+def test_a_passing_cuda_gate_of_the_same_checkpoint_is_refused(tmp_path: Path) -> None:
+    run, paths = new_run(tmp_path)
+    through_select(run)
+    cuda = gate_file(tmp_path, paths["checkpoint"], device="cuda:0", torch_threads=None)
+    argv = ["generate", "--run", str(run), "--format-gate", str(cuda)]
+    assert tool.main(argv, options={"generator": FakeGenerator}) == tool.EXIT_REFUSED
+    assert not (run / "generate" / "result.json").exists()
+
+
+def test_the_gate_is_pinned_on_first_use_and_recorded_with_its_device_and_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run, paths = new_run(tmp_path)
+    through_select(run)
+    first = gate_file(tmp_path, paths["checkpoint"], name="first.json")
+
+    class Dies(FakeGenerator):
+        def __call__(self, tasks: Any) -> list[Attempt]:
+            raise Interrupted
+
+    argv = ["generate", "--run", str(run), "--format-gate", str(first)]
+    with pytest.raises(Interrupted):
+        tool.main(argv, options={"generator": Dies})
+    second = gate_file(tmp_path, paths["checkpoint"], name="second.json")
+    other = ["generate", "--run", str(run), "--format-gate", str(second)]
+    assert tool.main(other, options={"generator": FakeGenerator}) == tool.EXIT_REFUSED
+    assert tool.main(argv, options={"generator": FakeGenerator}) == 0
+    result = json.loads((run / "generate" / "result.json").read_text())
+    assert result["gate"]["device"] == "cpu" and result["gate"]["torch_threads"] == 4
+    assert result["gate"]["sha256"] == sha(first)
+
+
+def run_generate(run: Path, paths: dict[str, Path], **options: Any) -> int:
+    gate = run.parent / "gate" / "pinned.json"
+    if not gate.exists():
+        gate_file(run.parent, paths["checkpoint"], name="pinned.json")
+    argv = ["generate", "--run", str(run), "--format-gate", str(gate)]
+    return tool.main(argv, options=options)
+
+
+def test_interrupted_generation_time_counts_towards_the_four_hours(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run, paths = new_run(tmp_path)
+    through_select(run)
+    monkeypatch.setattr(tool, "CHUNK_TASKS", 1)
+    clock = Clock(1000.0)
+
+    class DiesSecond(SlowGenerator):
+        def __call__(self, tasks: Any) -> list[Attempt]:
+            if self.chunks:
+                raise Interrupted
+            return super().__call__(tasks)
+
+    with pytest.raises(Interrupted):
+        run_generate(run, paths, generator=type("D", (DiesSecond,), {"clock": clock}), clock=clock)
+    # One recorded chunk, plus the longest chunk for the one it was in when interrupted.
+    assert tool.generation_seconds_used(tool.RunDir(run)) == 2000.0
+    assert run_generate(run, paths, generator=slow(clock), clock=clock) == 0
+    result = json.loads((run / "generate" / "result.json").read_text())
+    assert result["prior_generation_seconds"] == 2000.0
+    assert result["projected_generation_seconds"] == 2000.0 + 4 * 1000.0
+    assert tool.generation_seconds_used(tool.RunDir(run)) == 2000.0 + 4 * 1000.0
+
+
+def test_generation_already_at_four_hours_stops_on_entry(tmp_path: Path) -> None:
+    run, paths = new_run(tmp_path)
+    through_select(run)
+    log = run / "generate" / tool.GENERATION_LOG
+    log.parent.mkdir()
+    log.write_text(
+        '{"event": "start"}\n{"event": "chunk", "index": 0, "seconds": 7200.0}\n'
+        '{"event": "chunk", "index": 1, "seconds": 7200.0}\n{"event": "end"}\n',
+        encoding="utf-8",
+    )
+    built: list[int] = []
+
+    def factory(files: Any) -> FakeGenerator:
+        built.append(1)
+        return FakeGenerator()
+
+    assert run_generate(run, paths, generator=factory) == tool.EXIT_STOP
+    assert stop_reason(run) == "generation_time_cap" and built == []
+
+
+def test_a_chunk_that_could_overrun_the_remaining_time_is_not_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run, paths = new_run(tmp_path)
+    through_select(run)
+    monkeypatch.setattr(tool, "CHUNK_TASKS", 1)
+    clock = Clock(0.0)
+
+    class Slowing(SlowGenerator):
+        def __call__(self, tasks: Any) -> list[Attempt]:
+            # 3,000 s projects 3.3 h; then 6,000 s: 9,000 s used, and another 6,000 s chunk
+            # would pass 4 h, so the third is never started.
+            self.clock.chunk_seconds = 3000.0 if not self.chunks else 6000.0
+            return super().__call__(tasks)
+
+    made: list[Slowing] = []
+
+    def factory(files: Any) -> Slowing:
+        generator = Slowing()
+        generator.clock = clock
+        made.append(generator)
+        return generator
+
+    assert run_generate(run, paths, generator=factory, clock=clock) == tool.EXIT_STOP
+    assert stop_reason(run) == "generation_time_cap"
+    assert made[0].chunks == [1, 1] and clock.now == 9000.0
+
+
+def _age(run: Path, seconds: float) -> None:
+    """Move the run's init time ``seconds`` into the past."""
+    from datetime import timedelta
+
+    inputs = json.loads((run / "inputs.json").read_text())
+    created = datetime.fromisoformat(inputs["created_at"]) - timedelta(seconds=seconds)
+    inputs["created_at"] = created.isoformat()
+    (run / "inputs.json").write_text(json.dumps(inputs), encoding="utf-8")
+
+
+def test_a_stage_after_twelve_hours_of_run_wall_time_stops(tmp_path: Path) -> None:
+    run, _ = new_run(tmp_path)
+    _age(run, 12 * 3600 + 1)
+    executor = Counting()
+    assert execute_stage(run, "verify", execute=executor) == tool.EXIT_STOP
+    stop = json.loads((run / "stop.json").read_text())
+    assert stop["reason"] == "cap_reached" and "run wall time" in stop["detail"]
+    assert executor.calls == []
+    assert tool.main(["report", "--run", str(run)]) == 0
+    report = json.loads((run / "report" / "report.json").read_text())
+    wall = [i for i in report["stopping_criteria"] if "12 h end-to-end" in i["criterion"]]
+    assert wall[0]["status"] == "fired"
+
+
+def test_calls_and_chunks_stop_at_the_run_wall_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import timedelta
+
+    deadline = datetime(2026, 1, 1, tzinfo=UTC)
+    moments = [deadline - timedelta(seconds=1), deadline]
+    budget = tool.Budget(
+        tmp_path / "budget.jsonl", "verify", cap=10, deadline=deadline, now=lambda: moments[0]
+    )
+    budget.charge()
+    moments[0] = moments[1]
+    with pytest.raises(tool.CapReached, match="run wall time"):
+        budget.charge()
+    # A chunk is not started when the longest measured chunk would reach the deadline.
+    run, paths = new_run(tmp_path / "chunks")
+    through_select(run)
+    monkeypatch.setattr(tool, "CHUNK_TASKS", 1)
+    end = tool.run_deadline(tool.RunDir(run))
+    clock = Clock(100.0)
+    late = lambda: end - timedelta(seconds=50)  # noqa: E731
+    assert run_generate(run, paths, generator=slow(clock), clock=clock, now=late) == tool.EXIT_STOP
+    stop = json.loads((run / "stop.json").read_text())
+    assert stop["reason"] == "cap_reached" and "run wall time" in stop["detail"]
+    assert clock.now == 100.0  # Only the first chunk ran.
+
+
+def failed_run(root: Path) -> Path:
+    run, _ = new_run(root)
+    executor = Counting(lambda code, tests, mode: Result("infrastructure_error"))
+    assert execute_stage(run, "verify", execute=executor) == tool.EXIT_STOP
+    assert stop_reason(run) == "sandbox_failure"
+    return run
+
+
+def test_a_second_run_on_the_same_inputs_needs_to_supersede_a_host_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = failed_run(tmp_path)
+    paths = pilot_inputs(tmp_path / "same")
+    # The same pilot bytes are the same inputs, wherever the files are.
+    paths["pilot"] = tmp_path / "after-scan" / "pilot-clear.jsonl"
+    paths["remainder"] = tmp_path / "after-scan" / "remainder-clear.jsonl"
+    second = tmp_path / "run2"
+    assert tool.main(init_argv(paths, second)) == tool.EXIT_REFUSED
+    wrong = [*init_argv(paths, second), "--supersedes", str(tmp_path / "elsewhere")]
+    assert tool.main(wrong) == tool.EXIT_REFUSED
+    assert tool.main([*init_argv(paths, second), "--supersedes", str(first)]) == 0
+    # Caps hold across the rerun: the new ledger starts with the old run's calls.
+    before = tool.ledger_counts(first / "budget.jsonl")
+    assert tool.ledger_counts(second / "budget.jsonl") == before
+    carried = json.loads((second / "inputs.json").read_text())["carried"]
+    assert carried["from"] == str(first.resolve()) and carried["stop_reason"] == "sandbox_failure"
+    monkeypatch.setitem(tool.CALL_CAPS, "verify", before["verify"] + 15)
+    executor = Counting()
+    assert execute_stage(second, "verify", execute=executor) == tool.EXIT_STOP
+    assert stop_reason(second) == "cap_reached" and executor.calls == []
+    # Only the latest run can be superseded, and only after a host failure.
+    third = [*init_argv(paths, tmp_path / "run3"), "--supersedes", str(first)]
+    assert tool.main(third) == tool.EXIT_REFUSED
+    third[-1] = str(second)
+    assert tool.main(third) == tool.EXIT_REFUSED  # second stopped on a cap.
+    assert not (tmp_path / "run3").exists()
+
+
+def test_a_run_that_did_not_stop_on_a_host_failure_cannot_be_superseded(tmp_path: Path) -> None:
+    run, paths = new_run(tmp_path)
+    again = [*init_argv(paths, tmp_path / "run2"), "--supersedes", str(run)]
+    assert tool.main(again) == tool.EXIT_REFUSED  # Not stopped: resume it instead.
+    assert execute_stage(run, "verify", execute=Counting()) == 0
+    assert tool.main(again) == tool.EXIT_REFUSED
+
+
+def test_carried_generation_and_wall_time_count_in_the_new_run(tmp_path: Path) -> None:
+    run, paths = new_run(tmp_path)
+    inputs = json.loads((run / "inputs.json").read_text())
+    inputs["carried"] = {"generation_seconds": 5000.0, "wall_seconds": 3600.0}
+    (run / "inputs.json").write_text(json.dumps(inputs), encoding="utf-8")
+    directory = tool.RunDir(run)
+    assert tool.generation_seconds_used(directory) == 5000.0
+    created = datetime.fromisoformat(inputs["created_at"])
+    assert (tool.run_deadline(directory) - created).total_seconds() == 11 * 3600
+
+
+def test_after_a_containment_failure_no_queued_admission_call_starts(tmp_path: Path) -> None:
+    tasks = [pilot_task(f"p/{i}") for i in range(12)]
+    run, _ = new_run(tmp_path, tasks=tasks)
+    assert execute_stage(run, "verify", execute=Counting()) == 0
+    unprotected = Result("infrastructure_error", detail="supervisor_unprotected")
+    executor = Counting(lambda code, tests, mode: unprotected)
+    assert execute_stage(run, "admit", execute=executor) == tool.EXIT_STOP
+    assert stop_reason(run) == "containment_failure"
+    assert len(executor.calls) <= tool.ADMIT_WORKERS
+    budget = tool.Budget(tmp_path / "b.jsonl", "admit", cap=5)
+    budget.trip()
+    with pytest.raises(tool.ContainmentFailure):
+        budget.charge()
+
+
+def test_a_scoring_stop_waits_for_calls_in_flight_before_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    import time
+
+    from scratchcoder.rl.rewards import LocalRewardSource
+    from scratchcoder.sandbox.reward import UNAVAILABLE
+
+    monkeypatch.setattr(LocalRewardSource, "backoff", lambda self, retry: 0.0)
+    run, paths = new_run(tmp_path)
+    through_select(run)
+    assert generate(run, paths) == 0
+    lock = threading.Lock()
+    state = {"started": 0, "finished": 0}
+
+    def score(task: Task, code: str) -> RewardResult:
+        if code == "good":
+            return RewardResult(UNAVAILABLE, None)  # A host that stays down.
+        with lock:
+            state["started"] += 1
+        time.sleep(0.3)
+        with lock:
+            state["finished"] += 1
+        return fake_score(task, code)
+
+    assert execute_stage(run, "score", score=score) == tool.EXIT_STOP
+    assert stop_reason(run) == "sandbox_failure"
+    # Every call that started finished before the stop was recorded and the lock released.
+    assert state["started"] == state["finished"]
+    stop = json.loads((run / "stop.json").read_text())
+    assert stop["budget"]["calls_in_flight"] == 0
+    assert stop["budget"]["run_calls"] == sum(tool.ledger_counts(run / "budget.jsonl").values())
+
+
+def test_zero_cleared_candidates_complete_every_stage_and_report_rule_two(tmp_path: Path) -> None:
+    run, paths = new_run(tmp_path, tasks=[])
+    through_select(run)
+    assert generate(run, paths) == 0
+    assert execute_stage(run, "score", score=fake_score) == 0
+    assert tool.main(["report", "--run", str(run)]) == 0
+    verify = json.loads((run / "verify" / "result.json").read_text())
+    assert verify["status"] == "completed" and verify["verified_share"] is None
+    report = json.loads((run / "report" / "report.json").read_text())
+    assert report["decision"]["rule"] == 2
+    assert report["decision"]["step"] == "integrity_scan"
+    assert not (run / "stop.json").exists()

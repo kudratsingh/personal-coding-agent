@@ -108,6 +108,9 @@ A pool spec may set `splits.family_grouping` to `"task-clusters-v1"`. The holdou
   - the SFT checkpoint, with its record, and the tokenizer.
 
   The checkpoint must hash to its record's selected SHA-256. An input listed in a `SHA256SUMS` beside it must match that line. Every later stage checks the inputs it reads against these hashes again.
+- **Reruns.** Every run is entered in `stages-registry.jsonl` beside it, keyed by the pilot input's SHA-256.
+  - A second run on the same inputs needs `--supersedes PRIOR`, naming the latest run on them. That run must have stopped on a sandbox host failure.
+  - The new run starts with the old run's sandbox calls, generation time and wall time, so a rerun resets no cap.
 - **Stages, in order.** Each needs the previous one completed and refuses to run twice.
 
   | Stage | What it does | Runs code |
@@ -115,23 +118,23 @@ A pool spec may set `splits.family_grouping` to `"task-clusters-v1"`. The holdou
   | `verify` | Each reference against its public and hidden tests, once per distinct call, through `tools.task_pool.verify` (its resumable cache and retry rules). The evaluation path's deadline must equal the pool's rule under the spec's policy for every call. | yes, at most 20,000 sandbox calls |
   | `admit` | [Admission](walkthroughs/admission.md) through `tools.admission_check`'s planning and recording: the static gate, three breadth-first reference runs and the negative controls. An admitted task must also be parseable under the reward grammar, and its best constant answer must earn less than the keep rule's threshold. | yes, at most 25,000 |
   | `select` | The first 1,000 admitted candidates in `rl-candidate-v1` hash order, with their positions. The rest is a reserve. | no |
-  | `generate` | Needs a passing `scratchcoder sft-format-gate` record of the same checkpoint. The existing seeded sampler draws the screening protocol's 8 samples per candidate on the CPU, in `float32`, at batch 64, in chunks of 64 candidates, at torch's default thread count. | no |
+  | `generate` | Needs a passing `scratchcoder sft-format-gate` record in the current gate format, measured on the CPU after `init`, of the same checkpoint and tokenizer; its path and SHA-256 are pinned on first use. The existing seeded sampler draws the screening protocol's 8 samples per candidate on the CPU, in `float32`, at batch 64, in chunks of 64 candidates, at torch's default thread count. Each chunk's time is logged durably, so the 4 h cap counts interrupted invocations, and no chunk starts unless the longest one measured still fits. | no |
   | `score` | Rewards through the local reward channel and the unchanged keep rule (`scratchcoder.rl.command.screen_attempts`, header required), under reward grammar v2 only. | yes, at most 9,000 reward calls |
   | `report` | The measured outcome and one recommendation by the pilot's fixed decision rule. It also runs after a stop, and then draws no decision. | no |
 
 - **Execution window.** `verify`, `admit` and `score` refuse to start without a passing receipt from `tools.mac_window_check exec` for that exact command line, under 30 minutes old (`tools.admission_check`'s rule). The receipt's image ID is bound to the run on first use, and a later stage under another image or evaluator identity is refused.
 - **Budget.** A ledger in the run directory counts every sandbox try, retries included. Each try is charged before it is made, against its stage's cap and 60,000 for the whole run, and a try that would pass either cap is not made.
 - **Hard stops.** Each is recorded with its reason, after which only `report` runs:
-  - a containment failure: a supervisor that could not establish a required protection, on its first occurrence;
+  - a containment failure: a supervisor that could not establish a required protection, on its first occurrence. No queued call starts after it;
   - a sandbox host failure that outlasted its retries;
-  - any cap reached: calls, the run budget, or 4 h of generation;
+  - any cap reached: calls, the run budget, 4 h of generation, or 12 h of wall time from `init` (checked at every stage, call and chunk);
   - under 20% of candidates verified;
   - more than 5% of admission runs unresolved after retries;
   - a failing format gate;
   - a reward grammar or facts identity other than v2;
   - a first chunk of generation that projects past 4 h.
 
-  An interrupted stage with no stop recorded resumes from its cache.
+  A stopping stage refuses further calls and waits for those in flight before it records the stop. An interrupted stage with no stop recorded resumes from its cache. A run with no cleared candidates completes every stage and reports that no candidates remained.
 - **The attempts header.** Besides the usual fields, the header carries an optional `environment` record:
   - the torch thread count actually in use;
   - the torch, Python and NumPy versions;

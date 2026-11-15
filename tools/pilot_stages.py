@@ -14,6 +14,10 @@ Subcommands (every path is explicit; nothing is globbed or walked):
     intake ``record.json``, the pool spec (its ``verification`` policy), the SFT checkpoint
     with its ``record.json`` (the checkpoint must hash to the record's selected SHA-256) and
     the tokenizer. An input beside a ``SHA256SUMS`` must match its line there. Runs nothing.
+    Every run is entered in ``stages-registry.jsonl`` beside it, keyed by the pilot input's
+    SHA-256. A second run on the same inputs needs ``--supersedes PRIOR`` naming the latest
+    one, which must have stopped on a sandbox host failure; it then starts with PRIOR's
+    sandbox calls, generation time and wall time, so no cap is reset by a rerun.
 ``verify --run RUN --receipt R`` (executes)
     Reference verification: each reference against its public and its hidden tests, once
     per distinct call, through ``tools.task_pool.verify`` (its resumable cache, its retry
@@ -32,12 +36,16 @@ Subcommands (every path is explicit; nothing is globbed or walked):
     The first 1,000 admitted candidates in ``rl-candidate-v1`` hash order
     (``scratchcoder.rl.screening.hash_order``), with their positions. Runs nothing.
 ``generate --run RUN --format-gate GATE``
-    CPU screening generation: needs a passing ``scratchcoder sft-format-gate`` record of the
-    same checkpoint. The existing seeded sampler (``scratchcoder.rl.rollout``) draws the
+    CPU screening generation: needs a passing ``scratchcoder sft-format-gate`` record in the
+    current gate format, measured on the CPU after ``init``, of the same checkpoint and
+    tokenizer; the record's path and SHA-256 are pinned on first use. The existing seeded
+    sampler (``scratchcoder.rl.rollout``) draws the
     screening protocol's 8 samples per candidate (temperature 1.0, top-p 1.0, at most 256 new
     tokens, seed base 2^40, chat-v1 prompt with the public test) on ``cpu`` in ``float32`` at
-    batch 64, in chunks of 64 candidates, at torch's default thread count. The first chunk is
-    timed: if it projects past 4 h, generation stops. The attempts header records the
+    batch 64, in chunks of 64 candidates, at torch's default thread count. Every chunk's time
+    is logged durably, so the 4 h cap counts interrupted invocations too. The first chunk is
+    timed: if it projects past 4 h, generation stops; no chunk starts unless the longest one
+    measured still fits. The attempts header records the
     device, precision, batch size, the thread count actually in use, the torch, Python and
     NumPy versions, the candidate order's SHA-256 and the seeds' SHA-256. Executes nothing.
 ``score --run RUN --receipt R`` (executes)
@@ -57,11 +65,14 @@ against the stage's cap and 60,000 for the whole run; a call that would pass eit
 not made.
 
 Stopping criteria are hard stops with a recorded reason (``stop.json``, exit 4); after one,
-only ``report`` runs: a sandbox host failure that outlasted its retries; any cap reached
-(calls, the run budget, or 4 h of generation); under 20% of candidates verified; more than
+only ``report`` runs: a containment failure (a supervisor that could not establish a required
+protection: no queued call starts after it); a sandbox host failure that outlasted its
+retries; any cap reached (calls, the run budget, 4 h of generation, or 12 h of wall time from
+``init``, checked at every stage, call and chunk); under 20% of candidates verified; more than
 5% of admission runs unresolved after retries; a failing format gate; a reward grammar or
-facts identity other than v2; a generation projection over 4 h. An interrupted stage (no
-stop recorded) resumes from its cache. Every stage writes its outputs as new files and a
+facts identity other than v2; a generation projection over 4 h. A stopping stage refuses
+further calls and waits for those in flight before it records the stop. An interrupted
+stage (no stop recorded) resumes from its cache. Every stage writes its outputs as new files and a
 ``SHA256SUMS``; the report adds one for the whole run.
 
 Exit codes: 0 done; 2 a sealed input refused (nothing opened); 3 the output exists already;
@@ -84,7 +95,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Protocol
@@ -129,6 +140,19 @@ RUN_CALL_CAP = 60_000
 """Sandbox tries for the whole run."""
 CANDIDATE_CAP = MAX_KEPT
 GENERATION_CAP_SECONDS = 4 * 3600.0
+RUN_WALL_CAP_SECONDS = 12 * 3600.0
+"""End-to-end wall time from ``init`` (less any carried from a superseded run)."""
+DRAIN_SECONDS = 900.0
+"""How long a stopping stage waits for calls already in flight before recording the stop."""
+GENERATION_LOG = "generation.jsonl"
+"""Under ``generate/``: one row per invocation start and end and per completed chunk, so the
+4 h generation cap counts every invocation, interrupted ones too."""
+GATE_PIN = "format-gate-pin.json"
+REGISTRY_NAME = "stages-registry.jsonl"
+"""Beside the run directories: every run, keyed by the pilot input's SHA-256."""
+SUPERSEDABLE = frozenset({"sandbox_failure"})
+"""Stops after which a new run on the same inputs may replace the stopped one: only a host
+failure that outlasted its retries (the pilot plan reruns only for host failures)."""
 MIN_VERIFIED_SHARE = 0.20
 MAX_UNRESOLVED_SHARE = 0.05
 
@@ -183,9 +207,9 @@ HEURISTICS = (
     "heuristics: they guide diagnosis and never permit ignoring failures below them."
 )
 STOP_CRITERIA = {
-    "sandbox_failure": "a containment failure, or a sandbox host failure that outlasted its "
-    "retries",
-    "cap_reached": "a sandbox call cap or the run budget was reached",
+    "containment_failure": "the sandbox supervisor could not establish a required protection",
+    "sandbox_failure": "a sandbox host failure outlasted its retries",
+    "cap_reached": "a sandbox call cap, the run budget or the run's 12 h wall time was reached",
     "generation_time_cap": "screening generation reached its 4 h wall-time cap",
     "under_verified": "under 20% of the candidates verified",
     "admission_unresolved": "more than 5% of admission runs unresolved after retries",
@@ -222,14 +246,18 @@ class ContainmentFailure(Exception):
 UNPROTECTED = "supervisor_unprotected"
 
 
-def tripwire(execute: Callable[[str, str, str], Result]) -> Callable[[str, str, str], Result]:
+def tripwire(
+    execute: Callable[[str, str, str], Result], budget: Budget
+) -> Callable[[str, str, str], Result]:
     """``execute``, stopping the run at the first call whose supervisor could not establish
     a required protection. The path of record would retry it as a host failure (no
-    candidate code ran); the pilot treats it as a containment failure and stops."""
+    candidate code ran); the pilot treats it as a containment failure and stops. The budget
+    is tripped first, so no queued call starts afterwards."""
 
     def checked(code: str, tests: str, mode: str) -> Result:
         result = execute(code, tests, mode)
         if result.status == "infrastructure_error" and result.detail == UNPROTECTED:
+            budget.trip()
             raise ContainmentFailure("the sandbox supervisor reported a missing protection")
         return result
 
@@ -343,15 +371,20 @@ class RunDir:
 
 
 def ledger_counts(path: Path) -> Counter[str]:
-    """Sandbox tries recorded per stage. A torn last line still counts (towards
-    ``unknown``), so an interrupted write never frees budget."""
+    """Sandbox tries recorded per stage. A line is one try, or ``calls`` tries carried
+    from a superseded run. A torn last line still counts (towards ``unknown``), so an
+    interrupted write never frees budget."""
     counts: Counter[str] = Counter()
     if not path.exists():
         return counts
     raw = path.read_bytes()
     cut = raw.rfind(b"\n") + 1
     for line in raw[:cut].splitlines():
-        counts[str(json.loads(line)["stage"])] += 1
+        row = json.loads(line)
+        calls = row.get("calls", 1)
+        if type(calls) is not int or calls < 0:
+            raise ValueError(f"{path}: malformed ledger row")
+        counts[str(row["stage"])] += calls
     if cut != len(raw):
         counts["unknown"] += 1
     return counts
@@ -359,19 +392,36 @@ def ledger_counts(path: Path) -> Counter[str]:
 
 class Budget:
     """The run-wide sandbox ledger. ``wrap`` returns a function that appends one line per
-    call before making it, and raises :class:`CapReached` instead of making a call that
-    would pass the stage's cap or the run's."""
+    call before making it, and raises instead of making a call that would pass the stage's
+    cap, the run's cap or the run's wall-time deadline (:class:`CapReached`), or any call
+    after a containment failure (:class:`ContainmentFailure`) or once the stage is stopping.
+    It counts the calls in flight so a stopping stage can wait for them."""
 
-    def __init__(self, path: Path, stage: str, *, cap: int, run_cap: int = RUN_CALL_CAP):
+    def __init__(
+        self,
+        path: Path,
+        stage: str,
+        *,
+        cap: int,
+        run_cap: int = RUN_CALL_CAP,
+        deadline: datetime | None = None,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ):
         self.path = path
         self.stage = stage
         self.cap = cap
         self.run_cap = run_cap
+        self.deadline = deadline
+        self.now = now
         counts = ledger_counts(path)
         self.stage_used = counts[stage]
         self.total = sum(counts.values())
         self.made = 0
+        self.active = 0
+        self.tripped = False
+        self.closed = False
         self._lock = threading.Lock()
+        self._idle = threading.Condition(self._lock)
 
     def require(self, planned: int) -> None:
         """Refuse a plan that cannot fit: ``planned`` is the fewest tries it needs."""
@@ -383,6 +433,12 @@ class Budget:
 
     def charge(self) -> None:
         with self._lock:
+            if self.tripped:
+                raise ContainmentFailure("a containment failure was reported; no further calls")
+            if self.closed:
+                raise CapReached(f"{self.stage} is stopping; no further calls")
+            if self.deadline is not None and self.now() >= self.deadline:
+                raise CapReached(f"run wall time: the 12 h deadline {self.deadline} has passed")
             if self.stage_used + 1 > self.cap or self.total + 1 > self.run_cap:
                 raise CapReached(
                     f"{self.stage} reached its cap ({self.stage_used} of {self.cap} calls; "
@@ -396,16 +452,41 @@ class Budget:
             self.stage_used += 1
             self.total += 1
             self.made += 1
+            self.active += 1
+
+    def release(self) -> None:
+        with self._lock:
+            self.active -= 1
+            self._idle.notify_all()
+
+    def trip(self) -> None:
+        with self._lock:
+            self.tripped = True
+
+    def close_and_drain(self, timeout: float = DRAIN_SECONDS) -> int:
+        """Refuse every further call, then wait up to ``timeout`` seconds for the calls in
+        flight to end; return how many are still running."""
+        end = time.monotonic() + timeout
+        with self._lock:
+            self.closed = True
+            while self.active > 0 and (left := end - time.monotonic()) > 0:
+                self._idle.wait(left)
+            return self.active
 
     def wrap(self, function: Callable[..., Any]) -> Callable[..., Any]:
         def counted(*args: Any) -> Any:
             self.charge()
-            return function(*args)
+            try:
+                return function(*args)
+            finally:
+                self.release()
 
         return counted
 
-    def record(self) -> dict[str, int]:
+    def record(self) -> dict[str, Any]:
         return {
+            "calls_in_flight": self.active,
+            "tripped": self.tripped,
             "calls_this_invocation": self.made,
             "stage_calls": self.stage_used,
             "stage_cap": self.cap,
@@ -445,22 +526,113 @@ def init(args: argparse.Namespace) -> int:
         print(f"refused: {out} already exists", file=sys.stderr)
         return EXIT_EXISTS
     paths = {name: Path(getattr(args, name)) for name in INPUTS}
+    registry = out.parent / REGISTRY_NAME
+    supersedes: Path | None = args.supersedes
     try:
-        guard([*paths.values(), out])
+        guard([*paths.values(), out, registry, *([supersedes] if supersedes else [])])
     except SealedPathError as error:
         print(f"refused: {error}", file=sys.stderr)
         return EXIT_SEALED
-    try:
-        record = _pin_inputs(paths)
-    except Refused as error:
-        print(f"refused: {error}", file=sys.stderr)
-        return EXIT_REFUSED
-    out.mkdir(parents=True)
-    run = RunDir(out)
-    _write_new(run.inputs, _json_bytes(record))
-    _write_new(run.budget, b"")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with (out.parent / (REGISTRY_NAME + ".lock")).open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            record = _pin_inputs(paths)
+            carried = _carried(registry, record["files"]["pilot"]["sha256"], supersedes)
+        except Refused as error:
+            print(f"refused: {error}", file=sys.stderr)
+            return EXIT_REFUSED
+        if carried is not None:
+            record["carried"] = carried
+        out.mkdir()
+        run = RunDir(out)
+        _write_new(run.inputs, _json_bytes(record))
+        seed = [] if carried is None else carried["ledger_rows"]
+        _write_new(run.budget, _jsonl_bytes(seed))
+        entry = {
+            "pilot_sha256": record["files"]["pilot"]["sha256"],
+            "run": str(out.resolve()),
+            "created_at": record["created_at"],
+            "supersedes": None if carried is None else carried["from"],
+        }
+        with registry.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry, sort_keys=True) + "\n")
     _log(f"initialized {out}")
     return 0
+
+
+def _registry(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def generation_seconds_used(run: RunDir) -> float:
+    """Screening generation time this run has used, with any carried from the run it
+    superseded. An invocation that ended without a terminal record is charged its longest
+    measured chunk as well, for the chunk it was in when it was interrupted."""
+    carried = float(_json(run.inputs).get("carried", {}).get("generation_seconds", 0.0))
+    path = run.stage("generate") / GENERATION_LOG
+    if not path.exists():
+        return carried
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    chunks = [float(row["seconds"]) for row in rows if row["event"] == "chunk"]
+    longest = max(chunks, default=0.0)
+    open_invocations = 0
+    for row in rows:
+        if row["event"] == "start":
+            open_invocations += 1
+        elif row["event"] in {"end", "stopped"}:
+            open_invocations = max(0, open_invocations - 1)
+    return carried + sum(chunks) + longest * open_invocations
+
+
+def _created(run: RunDir) -> datetime:
+    return datetime.fromisoformat(_json(run.inputs)["created_at"])
+
+
+def run_deadline(run: RunDir) -> datetime:
+    """The run's end-to-end wall-time deadline: 12 h from init, less carried wall time."""
+    carried = float(_json(run.inputs).get("carried", {}).get("wall_seconds", 0.0))
+    return _created(run) + timedelta(seconds=RUN_WALL_CAP_SECONDS - carried)
+
+
+def _carried(registry: Path, pilot_sha256: str, supersedes: Path | None) -> dict[str, Any] | None:
+    """What a new run on these inputs carries from the run it supersedes, or ``None`` for a
+    first run. A second run needs ``--supersedes`` naming the latest run on the same inputs,
+    and that run must have stopped on a host failure."""
+    prior = [entry for entry in _registry(registry) if entry["pilot_sha256"] == pilot_sha256]
+    if not prior:
+        if supersedes is not None:
+            raise Refused("--supersedes names no earlier run on these inputs")
+        return None
+    latest = prior[-1]["run"]
+    if supersedes is None:
+        raise Refused(
+            f"a run on these inputs exists ({latest}); a new one needs --supersedes naming it "
+            "after a host failure"
+        )
+    if str(supersedes.resolve()) != latest:
+        raise Refused(f"--supersedes must name the latest run on these inputs ({latest})")
+    run = RunDir(Path(latest))
+    if not run.stop.is_file() or _json(run.stop)["reason"] not in SUPERSEDABLE:
+        raise Refused("only a run stopped by a sandbox host failure can be superseded")
+    stop = _json(run.stop)
+    counts = ledger_counts(run.budget)
+    inputs = _json(run.inputs)
+    wall = float(inputs.get("carried", {}).get("wall_seconds", 0.0))
+    wall += (datetime.fromisoformat(stop["stopped_at"]) - _created(run)).total_seconds()
+    return {
+        "from": latest,
+        "stop_reason": stop["reason"],
+        "calls": dict(sorted(counts.items())),
+        "generation_seconds": generation_seconds_used(run),
+        "wall_seconds": wall,
+        "ledger_rows": [
+            {"stage": stage, "calls": calls, "carried_from": latest}
+            for stage, calls in sorted(counts.items())
+        ],
+    }
 
 
 def _pin_inputs(paths: Mapping[str, Path]) -> dict[str, Any]:
@@ -653,8 +825,14 @@ def _run_locked(
         if result is None or result.get("status") != "completed":
             print(f"refused: stage {before} has not completed", file=sys.stderr)
             return EXIT_REFUSED
+    clock_now: Callable[[], datetime] = options.get("now") or now
     context = Context(run, stage, options=dict(options))
+    context.options["now"] = clock_now
     try:
+        if stage != "report" and clock_now() >= run_deadline(run):
+            raise Stop(
+                "cap_reached", f"run wall time: the 12 h deadline {run_deadline(run)} has passed"
+            )
         if stage in EXECUTING:
             if receipt is None:
                 raise Refused(f"{stage} executes code and needs --receipt")
@@ -663,14 +841,30 @@ def _run_locked(
             except (ValueError, KeyError, OSError) as error:
                 raise Refused(f"window receipt: {error}") from error
             _bind_runtime(run, context.image_id, stage)
-            context.budget = Budget(run.budget, stage, cap=CALL_CAPS[stage], run_cap=RUN_CALL_CAP)
+            context.budget = Budget(
+                run.budget,
+                stage,
+                cap=CALL_CAPS[stage],
+                run_cap=RUN_CALL_CAP,
+                deadline=run_deadline(run),
+                now=clock_now,
+            )
         run.stage(stage).mkdir(parents=True, exist_ok=True)
         try:
-            result = body(context)
+            try:
+                result = body(context)
+            except BaseException:
+                # Nothing more starts, and calls still in flight (reward containers too)
+                # end before the stop is recorded and the run's lock is released.
+                if context.budget is not None:
+                    left = context.budget.close_and_drain()
+                    if left:
+                        _log(f"{left} calls were still running after {DRAIN_SECONDS:.0f} s")
+                raise
         except CapReached as error:
             raise Stop("cap_reached", str(error), _partial(context)) from error
         except ContainmentFailure as error:
-            raise Stop("sandbox_failure", str(error), _partial(context)) from error
+            raise Stop("containment_failure", str(error), _partial(context)) from error
     except Refused as error:
         print(f"refused: {error}", file=sys.stderr)
         return EXIT_REFUSED
@@ -772,7 +966,7 @@ def verify_stage(context: Context) -> dict[str, Any]:
         results, counters = task_pool.verify(
             calls,
             cache,
-            execute=budget.wrap(tripwire(execute)),
+            execute=budget.wrap(tripwire(execute, budget)),
             deadline=deadline,
             workers=int(verification["workers"]),
             progress=_log,
@@ -795,7 +989,7 @@ def verify_stage(context: Context) -> dict[str, Any]:
         if task.id not in reasons:
             verified.append(task)
     digest = _write_new(directory / "verified.jsonl", task_lines(verified))
-    share = len(verified) / len(tasks) if tasks else 0.0
+    share = len(verified) / len(tasks) if tasks else None
     result = {
         "tasks": len(tasks),
         "verified": len(verified),
@@ -811,7 +1005,7 @@ def verify_stage(context: Context) -> dict[str, Any]:
         },
         "outputs": {"verified.jsonl": digest},
     }
-    if share < MIN_VERIFIED_SHARE:
+    if share is not None and share < MIN_VERIFIED_SHARE:
         raise Stop(
             "under_verified",
             f"{len(verified)} of {len(tasks)} candidates verified",
@@ -848,7 +1042,7 @@ def admit_stage(context: Context) -> dict[str, Any]:
             ids,
             run_id=f"pilot-stages:{run.root.name}",
             workers=ADMIT_WORKERS,
-            call=budget.wrap(tripwire(execute)),
+            call=budget.wrap(tripwire(execute, budget)),
         )
     except HostUnavailableError as error:
         raise Stop("sandbox_failure", str(error), _partial(context)) from error
@@ -1043,28 +1237,76 @@ def seeds_sha256(ids: Sequence[str]) -> str:
     return hashlib.sha256("\n".join(seeds).encode()).hexdigest()
 
 
-def _check_gate(gate_path: Path, checkpoint_sha256: str) -> dict[str, Any]:
+def _check_gate(
+    run: RunDir, gate_path: Path, checkpoint_sha256: str, tokenizer_sha256: str
+) -> dict[str, Any]:
+    """The CPU format gate of this checkpoint, measured after this run was initialized, in
+    the current gate format. Its path and SHA-256 are pinned on first use; a later
+    invocation must present the same file."""
+    from scratchcoder.eval import format_gate
+
+    digest = _sha256(gate_path)
+    pin_path = run.stage("generate") / GATE_PIN
+    pin = {"path": str(gate_path.resolve()), "sha256": digest}
+    if pin_path.exists() and _json(pin_path) != pin:
+        raise Refused("this run is pinned to another format-gate record")
     gate = _json(gate_path)
     if not isinstance(gate, dict) or "passed" not in gate:
         raise Refused("the format-gate file is not a gate record")
-    if gate.get("inputs", {}).get("checkpoint_sha256") != checkpoint_sha256:
+    if gate.get("format") != format_gate.FORMAT or gate.get("version") != format_gate.VERSION:
+        raise Refused("the format-gate record is not in the current gate format and version")
+    if gate.get("device") != DEVICE:
+        raise Refused(f"the format gate ran on {gate.get('device')!r}, not on the CPU")
+    inputs = gate.get("inputs", {})
+    if inputs.get("checkpoint_sha256") != checkpoint_sha256:
         raise Refused("the format gate measured another checkpoint")
+    if inputs.get("tokenizer_sha256") != tokenizer_sha256:
+        raise Refused("the format gate used another tokenizer")
+    try:
+        created = datetime.fromisoformat(str(gate.get("created_at")))
+    except ValueError as error:
+        raise Refused("the format-gate record has no valid created_at") from error
+    if created <= _created(run):
+        raise Refused("the format gate was measured before this run was initialized")
+    if not pin_path.exists():
+        atomic_json(pin_path, pin)
     return {
-        "path": str(gate_path.resolve()),
-        "sha256": _sha256(gate_path),
+        **pin,
         "passed": gate["passed"] is True,
         "failed_checks": gate.get("failed_checks"),
         "checkpoint_sha256": checkpoint_sha256,
+        "device": gate.get("device"),
+        "torch_threads": gate.get("torch_threads"),
+        "created_at": gate.get("created_at"),
+        "format": gate.get("format"),
+        "version": gate.get("version"),
     }
+
+
+def _append_log(path: Path, row: Mapping[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({**row, "at": utc_now()}, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _longest_chunk(path: Path) -> float:
+    if not path.exists():
+        return 0.0
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    return max((float(row["seconds"]) for row in rows if row["event"] == "chunk"), default=0.0)
 
 
 def generate_stage(context: Context) -> dict[str, Any]:
     run = context.run
     files = load_inputs(run, ("checkpoint", "checkpoint_record", "tokenizer"))
-    checkpoint_sha256 = _json(run.inputs)["files"]["checkpoint"]["sha256"]
+    pinned = _json(run.inputs)["files"]
+    checkpoint_sha256 = pinned["checkpoint"]["sha256"]
     if _json(files["checkpoint_record"])["sft"]["selected"]["sha256"] != checkpoint_sha256:
         raise Refused("the checkpoint does not hash to its record's selected SHA-256")
-    gate = _check_gate(Path(context.options["format_gate"]), checkpoint_sha256)
+    gate = _check_gate(
+        run, Path(context.options["format_gate"]), checkpoint_sha256, pinned["tokenizer"]["sha256"]
+    )
     if not gate["passed"]:
         raise Stop("format_gate_failed", f"failed checks: {gate['failed_checks']}", {"gate": gate})
     tasks_path = run.output("select", "tasks.jsonl")
@@ -1077,6 +1319,16 @@ def generate_stage(context: Context) -> dict[str, Any]:
         raise Refused("the selected tasks are not in the recorded order")
     if not tasks:
         return {"tasks": 0, "skipped": "no candidates were selected", "gate": gate, "outputs": {}}
+    log = run.stage("generate") / GENERATION_LOG
+    prior = generation_seconds_used(run)
+    now: Callable[[], datetime] = context.options["now"]
+    deadline = run_deadline(run)
+    if prior >= GENERATION_CAP_SECONDS:
+        raise Stop(
+            "generation_time_cap",
+            f"{prior / 3600:.2f} h of generation already used",
+            {"prior_generation_seconds": prior, "gate": gate},
+        )
     factory = context.options.get("generator")
     generator: Generator = (
         factory(files) if factory else CheckpointGenerator(files["checkpoint"], files["tokenizer"])
@@ -1086,9 +1338,35 @@ def generate_stage(context: Context) -> dict[str, Any]:
     attempts: list[Attempt] = []
     chunk_seconds: list[float] = []
     first: dict[str, Any] = {}
+    longest = _longest_chunk(log)
+    _append_log(log, {"event": "start", "prior_generation_seconds": prior})
     started = clock()
+
+    def stop(reason: str, detail: str, **extra: Any) -> Stop:
+        _append_log(log, {"event": "stopped", "reason": reason})
+        result = {
+            "tasks": len(tasks),
+            "chunks_done": len(chunk_seconds),
+            "chunk_seconds": chunk_seconds,
+            "elapsed_seconds": clock() - started,
+            "prior_generation_seconds": prior,
+            "gate": gate,
+            **first,
+            **extra,
+        }
+        return Stop(reason, detail, result)
+
     for start in range(0, len(tasks), CHUNK_TASKS):
         chunk = tasks[start : start + CHUNK_TASKS]
+        elapsed = clock() - started
+        # Before every chunk: the remaining budget must hold the longest chunk measured.
+        if prior + elapsed + longest > GENERATION_CAP_SECONDS:
+            raise stop(
+                "generation_time_cap",
+                f"{(prior + elapsed) / 3600:.2f} h used; the next chunk could take {longest:.0f} s",
+            )
+        if now() + timedelta(seconds=longest) >= deadline:
+            raise stop("cap_reached", f"run wall time: the next chunk would pass {deadline}")
         chunk_started = clock()
         drawn = generator(chunk)
         seconds = clock() - chunk_started
@@ -1097,35 +1375,28 @@ def generate_stage(context: Context) -> dict[str, Any]:
             raise RuntimeError("the generator did not return each candidate's samples in order")
         attempts += drawn
         chunk_seconds.append(seconds)
+        longest = max(longest, seconds)
+        _append_log(log, {"event": "chunk", "index": len(chunk_seconds) - 1, "seconds": seconds})
         elapsed = clock() - started
-        partial = {
-            "tasks": len(tasks),
-            "chunks_done": len(chunk_seconds),
-            "chunk_seconds": chunk_seconds,
-            "elapsed_seconds": elapsed,
-            "gate": gate,
-            **first,
-        }
         if start == 0:
             first = {
                 "first_chunk_tasks": len(chunk),
                 "first_chunk_seconds": seconds,
-                "projected_generation_seconds": seconds * len(tasks) / len(chunk),
+                "projected_generation_seconds": prior + seconds * len(tasks) / len(chunk),
             }
-            partial.update(first)
             _log(
                 f"first chunk: {seconds:.1f} s for {len(chunk)} candidates; projected "
                 f"{first['projected_generation_seconds'] / 3600:.2f} h"
             )
             if first["projected_generation_seconds"] > GENERATION_CAP_SECONDS:
-                raise Stop(
+                raise stop(
                     "time_projection",
                     f"{first['projected_generation_seconds'] / 3600:.2f} h projected",
-                    partial,
                 )
-        if elapsed > GENERATION_CAP_SECONDS:
-            raise Stop("generation_time_cap", f"{elapsed / 3600:.2f} h elapsed", partial)
+        if prior + elapsed > GENERATION_CAP_SECONDS:  # The backstop.
+            raise stop("generation_time_cap", f"{(prior + elapsed) / 3600:.2f} h used")
     elapsed = clock() - started
+    _append_log(log, {"event": "end", "seconds": elapsed})
     commit, dirty = git_state()
     environment = {
         **generator.environment(),
@@ -1139,6 +1410,7 @@ def generate_stage(context: Context) -> dict[str, Any]:
         "seed_rule": "attempt_seed(seed_base, task id, sample)",
         "seeds_sha256": seeds_sha256(ids),
         "generation_cap_seconds": GENERATION_CAP_SECONDS,
+        "prior_generation_seconds": prior,
         "loadavg_before": loadavg_before,
         "loadavg_after": list(os.getloadavg()),
         "numerics": NUMERICS,
@@ -1173,6 +1445,7 @@ def generate_stage(context: Context) -> dict[str, Any]:
         "with_program": sum(attempt.code is not None for attempt in attempts),
         "generated_tokens": sum(tokens),
         "generation_seconds": elapsed,
+        "prior_generation_seconds": prior,
         "chunk_seconds": chunk_seconds,
         **first,
         "header": header.to_json(),
@@ -1520,8 +1793,19 @@ def _criteria(
     caps = fired in {"cap_reached", "generation_time_cap"}
     return [
         {
+            "criterion": STOP_CRITERIA["containment_failure"],
+            "status": status("containment_failure", verify is not None),
+        },
+        {
             "criterion": STOP_CRITERIA["sandbox_failure"],
             "status": status("sandbox_failure", verify is not None),
+        },
+        {
+            "criterion": "the run's 12 h end-to-end wall time",
+            "status": "fired"
+            if stop is not None and "run wall time" in str(stop.get("detail"))
+            else "checked",
+            "deadline": str(run_deadline(run)),
         },
         {
             "criterion": "sealed access outside the approved scan",
@@ -1530,7 +1814,7 @@ def _criteria(
             "opens nothing",
         },
         {
-            "criterion": "any cap reached (calls, run budget, 4 h of generation)",
+            "criterion": "any cap reached (calls, run budget, 4 h of generation, 12 h of run)",
             "status": "fired" if caps else "checked",
             "detail": None if stop is None or not caps else stop["detail"],
         },
@@ -1806,6 +2090,9 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     start = commands.add_parser("init")
     start.add_argument("--out", type=Path, required=True, help="the new run directory")
+    start.add_argument(
+        "--supersedes", type=Path, help="the latest run on these inputs, stopped by a host failure"
+    )
     for name in INPUTS:
         start.add_argument(f"--{name.replace('_', '-')}", dest=name, type=Path, required=True)
     for stage in STAGES:
