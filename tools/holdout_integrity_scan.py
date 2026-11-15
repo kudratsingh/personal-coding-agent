@@ -46,7 +46,8 @@ Exit codes:
 - 0: done.
 - 2: refused before the sealed file was opened; nothing was logged.
 - 3: an output exists.
-- 4: the sealed file differs from what was checked or pinned (logged as failed).
+- 4: the sealed file differs from what was checked or pinned: another file, SHA-256 or task
+  count (logged as failed).
 - 5: any other failure after the ledger event (logged as failed when the ledger allows).
 """
 
@@ -56,19 +57,23 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import stat
 import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import scratchcoder.common.records as records_module
 import scratchcoder.data.adapters as adapters_module
 import scratchcoder.data.clusters as clusters_module
+import scratchcoder.data.filters as filters_module
 import scratchcoder.data.integrity_scan as scan_module
 import scratchcoder.data.pool as pool_module
+import scratchcoder.eval.completions as completions_module
 import scratchcoder.eval.seal as seal_module
 import scratchcoder.eval.tasks as tasks_module
 import tools.verifier_scan as verifier_scan_module
@@ -83,7 +88,7 @@ from scratchcoder.data.integrity_scan import (
 )
 from scratchcoder.eval.seal import SealError, SealLedger
 from scratchcoder.eval.tasks import Task, load_tasks
-from tools.verifier_scan import SealedPathError, guard
+from tools.verifier_scan import SEALED_NAMES, SealedPathError, guard
 
 REQUEST_KIND = "holdout-integrity-scan-request"
 SCHEMA_VERSION = 1
@@ -97,6 +102,9 @@ MAX_SMALL_INPUT_BYTES = 1 << 20
 """An approval document or pool report larger than this is refused unread (both are a few
 kilobytes; the sealed split is megabytes), so neither can stand in for the sealed file."""
 PERFORMS = {"generation": False, "execution": False, "scoring": False}
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+PINNED_SEALED_FILES = ("test", "holdout", "rl_only")
+"""Pool-report entries whose files are sealed: no input may have one of their hashes."""
 
 
 class Refused(Exception):
@@ -121,6 +129,8 @@ def code_identity() -> dict[str, str]:
         "scratchcoder/common/records.py": Path(str(records_module.__file__)),
         "scratchcoder/data/integrity_scan.py": Path(str(scan_module.__file__)),
         "scratchcoder/data/clusters.py": Path(str(clusters_module.__file__)),
+        "scratchcoder/data/filters.py": Path(str(filters_module.__file__)),
+        "scratchcoder/eval/completions.py": Path(str(completions_module.__file__)),
         "scratchcoder/data/pool.py": Path(str(pool_module.__file__)),
         "scratchcoder/data/adapters.py": Path(str(adapters_module.__file__)),
         "scratchcoder/eval/tasks.py": Path(str(tasks_module.__file__)),
@@ -142,18 +152,58 @@ def _sealed_stat(path: Path) -> os.stat_result:
     return info
 
 
-def _not_sealed(path: Path, sealed: os.stat_result, what: str) -> None:
-    """Refuse ``path`` before reading it if it is sealed by name or is the sealed file."""
+@dataclass(frozen=True)
+class SealedSet:
+    """The sealed test file's checked metadata, the inodes of every sealed-named file beside
+    it (test, holdout union, RL-only) and the pinned SHA-256 values of the sealed files."""
+
+    info: os.stat_result
+    inodes: frozenset[tuple[int, int]]
+    hashes: frozenset[str]
+
+
+def _sealed_set(path: Path, hashes: frozenset[str] = frozenset()) -> SealedSet:
+    info = _sealed_stat(path)
+    inodes = {(info.st_dev, info.st_ino)}
+    for name in sorted(SEALED_NAMES):
+        try:
+            sibling = os.stat(path.parent / name)
+        except OSError:
+            continue
+        inodes.add((sibling.st_dev, sibling.st_ino))
+    return SealedSet(info, frozenset(inodes), hashes)
+
+
+def _pinned(report: bytes) -> tuple[str, int, frozenset[str]]:
+    """The test file's pinned SHA-256 and task count, and every sealed file's pinned hash."""
+    try:
+        files = json.loads(report)["files"]
+        test = files["test"]
+        digest, tasks = test["file_sha256"], test["tasks"]
+        hashes = {files[name]["file_sha256"] for name in PINNED_SEALED_FILES if name in files}
+    except (ValueError, KeyError, TypeError):
+        raise Refused("the pool report does not pin the test file") from None
+    if not isinstance(digest, str) or not SHA256_HEX.fullmatch(digest):
+        raise Refused("the pool report's test SHA-256 is malformed")
+    if type(tasks) is not int or tasks < 1:
+        raise Refused("the pool report's test task count must be a positive integer")
+    if any(not isinstance(value, str) or not SHA256_HEX.fullmatch(value) for value in hashes):
+        raise Refused("the pool report's sealed-file hashes are malformed")
+    return digest, tasks, frozenset(hashes)
+
+
+def _not_sealed(path: Path, sealed: SealedSet, what: str) -> None:
+    """Refuse ``path`` before reading it if it is sealed by name or is any sealed file."""
     guard([path])
     try:
         info = os.stat(path)
     except OSError as error:
         raise Refused(f"{what} is not there: {type(error).__name__}") from None
-    if (info.st_dev, info.st_ino) == (sealed.st_dev, sealed.st_ino):
-        raise Refused(f"{what} is the sealed file")
+    if (info.st_dev, info.st_ino) in sealed.inodes:
+        raise Refused(f"{what} is a sealed file")
 
 
-def _read_small(path: Path, sealed: os.stat_result, what: str) -> bytes:
+def _read_small(path: Path, sealed: SealedSet, what: str) -> bytes:
     _not_sealed(path, sealed, what)
     if os.stat(path).st_size > MAX_SMALL_INPUT_BYTES:
         raise Refused(f"{what} is larger than {MAX_SMALL_INPUT_BYTES} bytes")
@@ -161,15 +211,15 @@ def _read_small(path: Path, sealed: os.stat_result, what: str) -> bytes:
 
 
 def _task_file(
-    label: str, path: Path, sealed: os.stat_result, pinned_sha256: str, splits: Sequence[str]
+    label: str, path: Path, sealed: SealedSet, splits: Sequence[str]
 ) -> tuple[dict[str, Any], list[Task]]:
     """A subject or bridge file's identity and tasks; refused if it is or copies the sealed
     file."""
     _not_sealed(path, sealed, f"set {label}")
     data = path.read_bytes()
     digest = _sha_bytes(data)
-    if digest == pinned_sha256:
-        raise Refused(f"set {label} is a copy of the sealed file")
+    if digest in sealed.hashes:
+        raise Refused(f"set {label} is a copy of a sealed file")
     try:
         tasks = list(load_tasks(path))
     except ValueError:
@@ -194,10 +244,40 @@ def _labelled(values: Sequence[str]) -> list[tuple[str, Path]]:
     return pairs
 
 
-def _unique_ids(sets: Sequence[list[Task]]) -> None:
-    ids = [task.id for tasks in sets for task in tasks]
-    if len(set(ids)) != len(ids):
-        raise Refused("subject and bridge IDs must be unique across all sets")
+def _task_hash(task: Task) -> str:
+    return canonical_sha256(asdict(task))
+
+
+def _merge(
+    subjects: dict[str, list[Task]], bridges: dict[str, list[Task]]
+) -> tuple[dict[str, list[Task]], int]:
+    """Bridges without the tasks that are also subjects, and how many were dropped.
+
+    Subject IDs must be unique across subject sets, and bridge IDs across bridge sets. A
+    task that is both a subject and a bridge (an RL candidate is a pool train task) is
+    judged as the subject; the same ID with different content is refused."""
+    judged: dict[str, str] = {}
+    for tasks in subjects.values():
+        for task in tasks:
+            if task.id in judged:
+                raise Refused("subject IDs must be unique across all subject sets")
+            judged[task.id] = _task_hash(task)
+    seen: set[str] = set()
+    kept: dict[str, list[Task]] = {}
+    dropped = 0
+    for label, tasks in bridges.items():
+        kept[label] = []
+        for task in tasks:
+            if task.id in seen:
+                raise Refused("bridge IDs must be unique across all bridge sets")
+            seen.add(task.id)
+            if task.id in judged:
+                if judged[task.id] != _task_hash(task):
+                    raise Refused("a subject and a bridge share an ID but differ in content")
+                dropped += 1
+            else:
+                kept[label].append(task)
+    return kept, dropped
 
 
 def build_request(
@@ -209,23 +289,23 @@ def build_request(
     ledger: Path,
     out: Path,
 ) -> dict[str, Any]:
-    sealed_info = _sealed_stat(sealed)
-    report_bytes = _read_small(pool_report, sealed_info, "the pool report")
-    try:
-        pinned = json.loads(report_bytes)["files"]["test"]
-        pinned_sha256, pinned_tasks = pinned["file_sha256"], pinned["tasks"]
-    except (ValueError, KeyError, TypeError):
-        raise Refused("the pool report does not pin the test file") from None
+    report_bytes = _read_small(pool_report, _sealed_set(sealed), "the pool report")
+    pinned_sha256, pinned_tasks, hashes = _pinned(report_bytes)
+    sealed_info = _sealed_set(sealed, hashes)
     labels = [label for label, _ in [*subjects, *bridges]]
     if not subjects:
         raise Refused("at least one subject set is required")
     if len(set(labels)) != len(labels):
         raise Refused("set labels must be unique")
-    made = [_task_file(lb, p, sealed_info, pinned_sha256, SUBJECT_SPLITS) for lb, p in subjects]
-    linked = [_task_file(lb, p, sealed_info, pinned_sha256, BRIDGE_SPLITS) for lb, p in bridges]
-    _unique_ids([tasks for _, tasks in [*made, *linked]])
-    _not_sealed(ledger, sealed_info, "the seal ledger")
+    made = [_task_file(lb, p, sealed_info, SUBJECT_SPLITS) for lb, p in subjects]
+    linked = [_task_file(lb, p, sealed_info, BRIDGE_SPLITS) for lb, p in bridges]
+    _merge(
+        {entry["label"]: tasks for entry, tasks in made},
+        {entry["label"]: tasks for entry, tasks in linked},
+    )
     seal = SealLedger(ledger)
+    _not_sealed(ledger, sealed_info, "the seal ledger")
+    _not_sealed(seal.head_path, sealed_info, "the seal ledger's head record")
     if not ledger.exists() or not seal.head_path.exists():
         raise Refused("the seal ledger and its head record must exist")
     commit, dirty = git_state()
@@ -281,8 +361,9 @@ def request(args: argparse.Namespace) -> int:
 
 def _checked(
     document: Any,
-) -> tuple[dict[str, Any], str, dict[str, str], dict[str, list[Task]], dict[str, list[Task]]]:
-    """The approved request, its hash, the approval and the sets, re-verified."""
+) -> tuple[dict[str, Any], str, dict[str, str], dict[str, list[Task]], dict[str, list[Task]], int]:
+    """The approved request, its hash, the approval, the subject and (merged) bridge sets
+    and the number of bridge tasks judged as subjects, all re-verified."""
     if not isinstance(document, dict) or set(document) != {
         "request",
         "request_sha256",
@@ -318,39 +399,46 @@ def _checked(
         sealed = Path(body["sealed"]["path"])
         if str(sealed.resolve()) != body["sealed"]["path"]:
             raise Refused("the sealed path no longer resolves to the approved path")
-        sealed_info = _sealed_stat(sealed)
         pinned_by = body["sealed"]["pinned_by"]
-        report = _read_small(Path(pinned_by["path"]), sealed_info, "the pool report")
+        report = _read_small(Path(pinned_by["path"]), _sealed_set(sealed), "the pool report")
         if _sha_bytes(report) != pinned_by["sha256"]:
             raise Refused("the pool report that pins the sealed file changed")
-        pinned_sha256 = body["sealed"]["sha256"]
+        pinned_sha256, pinned_tasks, hashes = _pinned(report)
+        if (pinned_sha256, pinned_tasks) != (body["sealed"]["sha256"], body["sealed"]["tasks"]):
+            raise Refused("the request's pinned values differ from the pool report")
+        sealed_info = _sealed_set(sealed, hashes)
         sets: list[dict[str, list[Task]]] = [{}, {}]
         for which, key, splits in ((0, "subjects", SUBJECT_SPLITS), (1, "bridges", BRIDGE_SPLITS)):
             for entry in body[key]:
                 current, tasks = _task_file(
-                    entry["label"], Path(entry["path"]), sealed_info, pinned_sha256, splits
+                    entry["label"], Path(entry["path"]), sealed_info, splits
                 )
                 if current != entry:
                     raise Refused(f"set {entry['label']} differs from the approved file")
                 sets[which][entry["label"]] = tasks
         if not sets[0]:
             raise Refused("at least one subject set is required")
-        _unique_ids([*sets[0].values(), *sets[1].values()])
+        sets[1], dropped = _merge(sets[0], sets[1])
         ledger = Path(body["ledger"]["path"])
         _not_sealed(ledger, sealed_info, "the seal ledger")
+        _not_sealed(SealLedger(ledger).head_path, sealed_info, "the seal ledger's head record")
         head = body["ledger"]["head"]
         if not SealLedger(ledger).extends(head["events"], head["head_sha256"]):
             raise Refused("the seal ledger is not the approved ledger (or lost events)")
-        if any(
-            event.get("request_sha256") == request_sha256 for event in SealLedger(ledger).events()
-        ):
-            raise Refused("this request was already scanned; a new scan needs a new request")
+        wording = {key: approval[key] for key in APPROVAL_FIELDS if key != "request_sha256"}
+        for event in SealLedger(ledger).events():
+            if event.get("request_sha256") == request_sha256:
+                raise Refused("this request was already scanned; a new scan needs a new request")
+            earlier = event.get("approval")
+            if event["event"] == "integrity_scan_opened" and isinstance(earlier, dict):
+                if {key: earlier.get(key) for key in wording} == wording:
+                    raise Refused("this approval wording was already used for another scan")
     except (KeyError, TypeError) as error:
         raise Refused(f"the request is malformed ({type(error).__name__})") from None
     out = Path(body["out"])
     if any((out / name).exists() for name in OUTPUTS):
         raise FileExistsError("an output already exists")
-    return body, request_sha256, approval, sets[0], sets[1]
+    return body, request_sha256, approval, sets[0], sets[1], dropped
 
 
 def _write_partial(path: Path, value: dict[str, Any]) -> str:
@@ -366,10 +454,17 @@ def _partial(out: Path, name: str) -> Path:
     return out / f".{name}.partial"
 
 
+class SealedFileChanged(SealedContentError):
+    """The file opened is not the sealed file whose metadata was checked."""
+
+
 def _read_sealed(path: Path, checked: os.stat_result) -> bytes:
     """The sealed file's bytes, opened without following links; refused unless the opened
     file is the regular file whose metadata was checked."""
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise SealedFileChanged("the sealed file could not be opened as checked") from None
     with os.fdopen(descriptor, "rb") as stream:
         info = os.fstat(stream.fileno())
         same = (info.st_dev, info.st_ino, info.st_size) == (
@@ -378,7 +473,7 @@ def _read_sealed(path: Path, checked: os.stat_result) -> bytes:
             checked.st_size,
         )
         if not stat.S_ISREG(info.st_mode) or not same:
-            raise SealedContentError("the opened sealed file is not the file that was checked")
+            raise SealedFileChanged("the opened sealed file is not the file that was checked")
         return stream.read()
 
 
@@ -422,7 +517,7 @@ def run(args: argparse.Namespace) -> int:
     except ValueError:
         raise Refused("the approval document is not JSON") from None
     try:
-        body, request_sha256, approval, subjects, bridges = _checked(document)
+        body, request_sha256, approval, subjects, bridges, dropped = _checked(document)
     except FileExistsError:
         print("refused: an output already exists", file=sys.stderr)
         return 3
@@ -433,6 +528,7 @@ def run(args: argparse.Namespace) -> int:
     out.mkdir(parents=True, exist_ok=True)
     for name in OUTPUTS:
         _partial(out, name).unlink(missing_ok=True)
+    state = {"completed": False}
     with _terminate_as_exit():
         ledger.open_integrity_scan(
             request_sha256,
@@ -451,10 +547,24 @@ def run(args: argparse.Namespace) -> int:
             ],
         )
         try:
-            return _scan_and_close(body, request_sha256, approval, subjects, bridges, checked)
+            return _scan_and_close(
+                body, request_sha256, approval, subjects, bridges, dropped, checked, state
+            )
         except BaseException as error:  # noqa: BLE001 - every failure is logged, never quoted
+            if state["completed"]:
+                # The ledger already records a completed scan with these outputs' hashes:
+                # keep whatever is on disk (final or .partial names), never delete it.
+                print(
+                    f"failed after the completed close ({type(error).__name__}): rename the "
+                    ".partial outputs whose hashes the ledger's close event records",
+                    file=sys.stderr,
+                )
+                return 5
             for name in OUTPUTS:
-                _partial(out, name).unlink(missing_ok=True)
+                try:
+                    _partial(out, name).unlink(missing_ok=True)
+                except BaseException:  # noqa: BLE001, S110 - the failure close must still run
+                    pass
             _close_failed(ledger, request_sha256, type(error).__name__)
             print(f"failed: {type(error).__name__}", file=sys.stderr)
             return 5
@@ -466,11 +576,18 @@ def _scan_and_close(
     approval: dict[str, str],
     subjects: dict[str, list[Task]],
     bridges: dict[str, list[Task]],
+    dropped: int,
     checked: os.stat_result,
+    state: dict[str, bool],
 ) -> int:
     ledger = SealLedger(Path(body["ledger"]["path"]))
     out = Path(body["out"])
-    data = _read_sealed(Path(body["sealed"]["path"]), checked)
+    try:
+        data = _read_sealed(Path(body["sealed"]["path"]), checked)
+    except SealedFileChanged:
+        _close_failed(ledger, request_sha256, "sealed_file_changed")
+        print("failed: the sealed file differs from the file that was checked")
+        return 4
     digest = _sha_bytes(data)
     if digest != body["sealed"]["sha256"]:
         del data
@@ -489,6 +606,7 @@ def _scan_and_close(
         bridges={label: [item_of(task) for task in tasks] for label, tasks in bridges.items()},
     )
     del test
+    counts["bridge_tasks_judged_as_subjects"] = dropped
     exclusions = {
         "format": SCAN_FORMAT,
         "request_sha256": request_sha256,
@@ -528,7 +646,11 @@ def _scan_and_close(
             "performed": dict(PERFORMS),
         },
     )
+    # From the completed close on, nothing may delete the outputs: ignore SIGTERM (the
+    # handler is restored on leaving _terminate_as_exit).
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     ledger.close_integrity_scan(request_sha256, "completed", outputs=hashes, counts=counts)
+    state["completed"] = True
     for name in OUTPUTS:
         os.replace(_partial(out, name), out / name)
     print(json.dumps(counts, indent=2, sort_keys=True))

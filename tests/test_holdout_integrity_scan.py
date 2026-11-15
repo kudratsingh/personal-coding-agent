@@ -152,7 +152,7 @@ def test_bridges_join_families_but_are_not_judged() -> None:
     assert [(r.id, r.status, r.signals) for r in results] == [
         ("s-behind-bridge", "excluded", ("family_chain",))
     ]
-    assert counts["bridges"] == {"pool_train": {"in_test_family": 1, "total": 1}}
+    assert counts["bridge_tasks"] == {"in_test_family": 1, "total": 1}
     assert counts["test_tasks_in_a_subject_family"] == 1
 
 
@@ -602,3 +602,139 @@ def test_the_scan_imports_no_generation_execution_or_scoring_code() -> None:
             )
             for name in names:
                 assert not name.startswith(forbidden), f"{path.name} imports {name}"
+
+
+def test_signal_counts_are_totals_and_suppressed_for_few_subjects() -> None:
+    few, counts = scan(
+        [item_of(item) for item in sealed_tasks()],
+        {label: [item_of(item)] for label, item in SUBJECTS.items()},
+    )
+    assert len(few) == 8 and str(counts["subject_signals_total"]).startswith("suppressed")
+    many = [
+        task(f"s-many-{n}", f"kappa{n} " * 3 + " ".join(OTHER), f"def many{n}():\n    return {n}\n")
+        for n in range(20)
+    ]
+    _, counts = scan(
+        [item_of(item) for item in sealed_tasks()],
+        {"a": [item_of(item) for item in many[:10]], "b": [item_of(item) for item in many[10:]]},
+    )
+    assert isinstance(counts["subject_signals_total"], dict)
+    assert "subjects_by_signal" not in counts
+
+
+def test_subjects_inside_the_train_bridge_are_judged_as_subjects(
+    tmp_path: Path, sealed_reads: Reads
+) -> None:
+    """The real layout: RL candidates are pool train tasks, and pool train is a bridge."""
+    paths = setup(tmp_path)
+    sealed_reads.arm(paths["sealed"])
+    linker = task("b-linker", prompt(16, tail="lnk"), "def linkfn(z):\n    return z + 13\n")
+    behind = task("s-behind", prompt(0, tail="bhd"), "def linkfn(z):\n    return z + 13\n")
+    train = write_tasks(tmp_path / "pool" / "train.jsonl", [*SUBJECTS.values(), linker, behind])
+    remainder = write_tasks(tmp_path / "subjects" / "remainder.jsonl", [behind])
+    argv = request_argv(paths, tmp_path / "scan", "--bridge", f"pool_train={train}")
+    argv += ["--subject", f"remainder={remainder}"]
+    # pilot (all of SUBJECTS) and remainder are both inside the train bridge.
+    assert tool.main(argv) == 0
+    approval = approve(tmp_path / "scan" / tool.REQUEST_NAME)
+    assert tool.main(["run", "--approval", str(approval)]) == 0
+    exclusions = json.loads((tmp_path / "scan" / "exclusions.json").read_text())
+    assert exclusions["excluded"]["remainder"] == ["s-behind"]
+    summary = json.loads((tmp_path / "scan" / "summary.json").read_text())
+    assert summary["counts"]["bridge_tasks_judged_as_subjects"] == 9
+    assert summary["counts"]["bridge_tasks"] == {"in_test_family": 1, "total": 1}
+    assert sealed_reads.reads == [str(paths["sealed"].resolve())]
+
+
+def test_a_bridge_with_a_subject_id_but_other_content_is_refused(tmp_path: Path) -> None:
+    paths = setup(tmp_path)
+    altered = task("s-clear", "a different prompt entirely here", "def other():\n    return 1\n")
+    train = write_tasks(tmp_path / "pool" / "train.jsonl", [altered])
+    argv = request_argv(paths, tmp_path / "scan", "--bridge", f"pool_train={train}")
+    assert tool.main(argv) == 2
+
+
+def test_other_sealed_files_and_the_ledger_head_are_refused_unread(
+    tmp_path: Path, sealed_reads: Reads
+) -> None:
+    paths = setup(tmp_path)
+    holdout = write_tasks(tmp_path / "pool" / "holdout.jsonl", sealed_tasks())
+    report = json.loads(paths["report"].read_text())
+    report["files"]["holdout"] = {"file_sha256": tool._sha_bytes(holdout.read_bytes())}
+    paths["report"].write_text(json.dumps(report))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    os.link(holdout, elsewhere / "dev.jsonl")
+    copy = tmp_path / "copy" / "dev.jsonl"
+    copy.parent.mkdir()
+    copy.write_bytes(holdout.read_bytes())
+    sealed_reads.arm(holdout)
+    for bridge in (elsewhere / "dev.jsonl", copy):
+        argv = request_argv(paths, tmp_path / "scan", "--bridge", f"dev={bridge}")
+        assert tool.main(argv) == 2
+    assert sealed_reads.reads == []
+    sealed_reads.arm(paths["sealed"])
+    head = SealLedger(paths["ledger"]).head_path
+    head.unlink()
+    os.link(paths["sealed"], head)
+    assert tool.main(request_argv(paths, tmp_path / "scan2")) == 2
+    assert sealed_reads.reads == []
+
+
+def test_reused_approval_wording_is_refused(tmp_path: Path, sealed_reads: Reads) -> None:
+    paths = setup(tmp_path)
+    sealed_reads.arm(paths["sealed"])
+    approval = approve(request(paths, tmp_path / "scan"))
+    assert tool.main(["run", "--approval", str(approval)]) == 0
+    # A new output directory, re-quoted, under the same approval wording.
+    edited(approval, lambda d: d["request"].update(out=str((tmp_path / "second").resolve())))
+    assert tool.main(["run", "--approval", str(approval)]) == 2
+    assert len(sealed_reads.reads) == 1
+
+
+def test_a_test_split_pinned_at_zero_tasks_is_refused(tmp_path: Path) -> None:
+    paths = setup(tmp_path)
+    report = json.loads(paths["report"].read_text())
+    report["files"]["test"]["tasks"] = 0
+    paths["report"].write_text(json.dumps(report))
+    assert tool.main(request_argv(paths, tmp_path / "scan")) == 2
+
+
+def test_a_sealed_file_swapped_after_the_check_exits_4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = setup(tmp_path)
+    approval = approve(request(paths, tmp_path / "scan"))
+    real_open = SealLedger.open_integrity_scan
+
+    def open_then_swap(self: SealLedger, digest: str, **fields: Any) -> Any:
+        event = real_open(self, digest, **fields)
+        data = paths["sealed"].read_bytes()
+        paths["sealed"].unlink()
+        paths["sealed"].write_bytes(data)  # same bytes, a new inode
+        return event
+
+    monkeypatch.setattr(SealLedger, "open_integrity_scan", open_then_swap)
+    assert tool.main(["run", "--approval", str(approval)]) == 4
+    assert SealLedger(paths["ledger"]).events()[-1]["error"] == "sealed_file_changed"
+
+
+def test_a_failure_after_the_completed_close_keeps_the_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = setup(tmp_path)
+    approval = approve(request(paths, tmp_path / "scan"))
+    real_replace = os.replace
+
+    def failing_replace(source: Any, target: Any) -> None:
+        if str(target).endswith("summary.json"):
+            raise OSError("disk full")
+        real_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    assert tool.main(["run", "--approval", str(approval)]) == 5
+    events = SealLedger(paths["ledger"]).events()
+    assert events[-1]["event"] == "integrity_scan_closed" and events[-1]["outcome"] == "completed"
+    recorded = events[-1]["outputs"]
+    on_disk = (tmp_path / "scan" / ".summary.json.partial").read_bytes()
+    assert tool._sha_bytes(on_disk) == recorded["summary.json"]

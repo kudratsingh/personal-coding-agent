@@ -24,7 +24,9 @@ a test task through a bridge is excluded too.
 
 The result names subjects only, each with its status. It never carries a test task's ID,
 prompt, reference, tests, signal key or any per-test value, and it does not say which signal
-excluded a subject: signal names appear only in aggregate counts.
+excluded a subject: signal names appear only in counts summed over every subject (and not at
+all below 20 subjects). One disclosure is unavoidable: a subject whose ID equals a test
+task's ID is listed as excluded under that ID.
 """
 
 from __future__ import annotations
@@ -183,21 +185,26 @@ def scan(
     counts["test_tasks_in_a_subject_family"] = sum(
         joined.find(index) in subject_roots for index in range(first_other)
     )
-    counts["bridges"] = {
-        label: {"in_test_family": tally["in_test_family"], "total": sum(tally.values())}
-        for label, tally in sorted(bridge_counts.items())
+    counts["bridge_tasks"] = {
+        "in_test_family": sum(tally["in_test_family"] for tally in bridge_counts.values()),
+        "total": sum(sum(tally.values()) for tally in bridge_counts.values()),
     }
     return results, counts
+
+
+MIN_SUBJECTS_FOR_SIGNAL_COUNTS = 20
+"""Signal counts are summed over every subject, and suppressed below this many subjects, so
+no count can be traced to one subject (and through it to one unnamed test task)."""
 
 
 def aggregates(
     results: Sequence[SubjectResult], *, labels: Sequence[str], test_tasks: int
 ) -> dict[str, Any]:
     by_label: dict[str, Counter[str]] = {label: Counter() for label in labels}
-    signals: dict[str, Counter[str]] = {label: Counter() for label in labels}
+    signals: Counter[str] = Counter()
     for result in results:
         by_label[result.label][result.status] += 1
-        signals[result.label].update(result.signals)
+        signals.update(result.signals)
     return {
         "test_tasks_scanned": test_tasks,
         "subjects": {
@@ -205,7 +212,9 @@ def aggregates(
             | {"total": sum(counts.values())}
             for label, counts in sorted(by_label.items())
         },
-        "subjects_by_signal": {
-            label: dict(sorted(counts.items())) for label, counts in sorted(signals.items())
-        },
+        "subject_signals_total": (
+            dict(sorted(signals.items()))
+            if len(results) >= MIN_SUBJECTS_FOR_SIGNAL_COUNTS
+            else f"suppressed: fewer than {MIN_SUBJECTS_FOR_SIGNAL_COUNTS} subjects"
+        ),
     }
