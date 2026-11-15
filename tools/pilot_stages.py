@@ -151,7 +151,26 @@ GENERATION_LOG = "generation.jsonl"
 """Under ``generate/``: one row per invocation start and end and per completed chunk, so the
 4 h generation cap counts every invocation, interrupted ones too."""
 GATE_PIN = "format-gate-pin.json"
-REGISTRY = Path(__file__).resolve().parents[1] / "runs" / "pilot-stages-registry.jsonl"
+
+
+def _main_checkout(start: Path) -> Path:
+    """The main checkout that owns ``start``'s repository, so every worktree shares one
+    registry. A linked worktree's ``.git`` file names ``<main>/.git/worktrees/<name>``, whose
+    ``commondir`` points back to ``<main>/.git``. Falls back to ``start`` outside git."""
+    marker = start / ".git"
+    if marker.is_file():
+        text = marker.read_text(encoding="utf-8").strip()
+        if text.startswith("gitdir:"):
+            gitdir = (start / text.removeprefix("gitdir:").strip()).resolve()
+            common = gitdir / "commondir"
+            if common.is_file():
+                return (gitdir / common.read_text(encoding="utf-8").strip()).resolve().parent
+    return start
+
+
+REGISTRY = (
+    _main_checkout(Path(__file__).resolve().parents[1]) / "runs" / "pilot-stages-registry.jsonl"
+)
 """One registry for every run, wherever its directory: each run keyed by its pilot tasks'
 content (``content_key``). It sits in the ignored ``runs/`` tree; tests point it elsewhere."""
 SUPERSEDABLE = frozenset({"sandbox_failure"})
@@ -1374,6 +1393,16 @@ def _check_gate(
 
 
 def _append_log(path: Path, row: Mapping[str, Any]) -> None:
+    """Append one durable row. A torn last line (a kill mid-append) is cut off first, so it
+    cannot merge with the new row; the invocation it belonged to stays open and charged."""
+    if path.exists():
+        with path.open("r+b") as raw:
+            data = raw.read()
+            cut = data.rfind(b"\n") + 1
+            if cut != len(data):
+                raw.truncate(cut)
+                raw.flush()
+                os.fsync(raw.fileno())
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps({**row, "at": utc_now()}, sort_keys=True) + "\n")
         stream.flush()

@@ -1753,3 +1753,27 @@ def test_a_torn_registry_line_is_refused_cleanly(tmp_path: Path) -> None:
     tool.REGISTRY.write_text('{"key": "abc", "ru', encoding="utf-8")
     assert tool.main(init_argv(paths, tmp_path / "run")) == tool.EXIT_REFUSED
     assert not (tmp_path / "run").exists()
+
+
+def test_a_torn_generation_log_line_does_not_wedge_later_appends(tmp_path: Path) -> None:
+    log = tmp_path / "generation.jsonl"
+    tool._append_log(log, {"event": "start", "prior_generation_seconds": 0.0})
+    tool._append_log(log, {"event": "chunk_start", "index": 0})
+    with log.open("a", encoding="utf-8") as stream:
+        stream.write('{"event": "chu')  # killed mid-append
+    tool._append_log(log, {"event": "start", "prior_generation_seconds": 0.0})
+    rows, torn = tool._jsonl_rows(log)
+    assert not torn
+    assert [row["event"] for row in rows] == ["start", "chunk_start", "start"]
+
+
+def test_the_registry_is_anchored_to_the_main_checkout(tmp_path: Path) -> None:
+    main = tmp_path / "main"
+    (main / ".git" / "worktrees" / "wt").mkdir(parents=True)
+    (main / ".git" / "worktrees" / "wt" / "commondir").write_text("../..\n")
+    worktree = tmp_path / "elsewhere" / "wt"
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'wt'}\n")
+    assert tool._main_checkout(worktree) == main.resolve()
+    assert tool._main_checkout(main) == main
+    assert tool._main_checkout(tmp_path / "nogit") == tmp_path / "nogit"
