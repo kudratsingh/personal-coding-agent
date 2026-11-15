@@ -70,3 +70,29 @@ A pool spec may set `splits.family_grouping` to `"task-clusters-v1"`. The holdou
 - Rewordings looser than the paraphrase rule remain. Tasks with the same reference solution can sit in both training and dev; candidate families are listed by `tools/task_clusters.py` for behavioural adjudication.
 - RL-only tasks have model-synthesized tests that no reference has passed here.
 - The pool is sized for the S rehearsal's 1,024-token context; a larger model needs its own build.
+
+## Pilot intake from a row range
+
+`python -m tools.pilot_intake` prepares further training candidates from a row range of a pool source file the pool build already pinned, without rebuilding the pool.
+- **Reading.** It reads rows `[--start-row, --start-row + --rows)` of the receipted OpenCodeInstruct file, in file order. The file's size and SHA-256 must match the pool's completed download receipt. Rows the pool build itself read are refused, because they include the pool's holdouts.
+- **Rules.** Each row goes through the reviewed adapter and then these rules, in this order; the first rule that fails is the drop reason.
+  1. The build's intake screens: the context fit and the sandbox input limit.
+  2. The RL prompt limit, which is the build's RL-only rule.
+  3. ARC-Easy and benchmark protection.
+  4. Pool and range ID checks.
+  5. n-gram contamination against dev, checked over all four task fields. This is the build's RL-only rule, made stricter.
+  6. Near-duplicates of pool train, dev or earlier rows, keeping the first in file order.
+  7. The build's holdout-paraphrase rule against dev.
+  8. The frozen family rules against dev. Families are computed over dev, pool train and every adapted row of the range, so a row dropped for any other reason still links its family-mates. This is stricter than the build, which put only verified tasks in its family graph: it can drop a candidate the build would keep, never the reverse.
+- **What it does not do.** It runs no code and opens no sealed split.
+- **Outputs.** It writes the kept candidates, every row's outcome, the scan bridges, and a record with:
+  - the inputs and rules;
+  - counts, including the scan bridges';
+  - software, lockfile and tokenizer identities.
+- **Scan bridges.** `scan-bridges.jsonl` holds every adapted row the intake dropped, for any reason including the family rule, as train-split tasks in row order. These rows are rejected and never train. They exist so that the sealed-test scan uses the same family graph as the dev check: pass them to the scan as a bridge set, so a candidate linked to a test task only through a dropped row is still excluded.
+  - A dropped row whose family fields (source, prompt, reference, mode, entry point) equal a task already held under its ID adds no link, and is left out.
+  - Any other repeated ID is kept and counted. The scan's request refuses repeated bridge IDs, so a repeat can never drop out of the family graph unnoticed; such a range needs a reviewed change before it is scanned.
+  - Rows the adapter refused have no task and cannot link anything.
+  - When the record's `scan_bridges.tasks` is 0, the file is empty: leave it out of the scan request, which refuses an empty set. An empty set links nothing.
+- **What comes next.** Protection against the sealed test split is a separate, approved step: the [holdout integrity scan](walkthroughs/holdout-integrity-scan.md) runs on this output, with pool train, pool dev and the scan bridges as bridge sets. Reference verification follows.
+- **Row offset.** `tools.task_pool._parquet_rows` takes the 0-based offset `start`. The pool build itself still reads from row 0.

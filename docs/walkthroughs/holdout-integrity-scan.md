@@ -69,7 +69,7 @@ Any failure before the close, SIGTERM included, removes the temporary files and 
   - The signals and thresholds are `task-clusters-v1`'s. Equal reference AST, equal reference AST after renaming, equal upstream ID, and prompt paraphrase at Jaccard 0.5 form families.
   - A shared defined name at Jaccard 0.25 is the pool build's named-paraphrase drop rule, so it excludes a subject. At Jaccard 0.10 it is the rules' flag level.
   - Prompt shingles and function names alone would miss a renamed copy of a reference.
-- **Bridges matter.** Families chain through any task. Without the pool's train and dev splits passed as bridges, a subject linked to a test task only through a pool task would come out clear.
+- **Bridges matter.** Families chain through any task. Without the pool's train and dev splits passed as bridges, a subject linked to a test task only through a pool task would come out clear. The same holds for rows an intake dropped: pass the pilot intake's `scan-bridges.jsonl` too, or a candidate linked to a test task only through a dropped row would come out clear.
 - **Flags are not decided here.** Deciding a flag would mean showing someone the test task. The scan lists flagged subjects separately and the owner decides what they mean.
 - **Nothing about a test task leaves the process.** Edges carry signal keys (AST hash prefixes) and per-pair Jaccard values, and per-subject signal names say what an unnamed test task looks like. So every output channel carries only three things:
   - the subjects' statuses;

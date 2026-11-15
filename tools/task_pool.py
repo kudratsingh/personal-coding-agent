@@ -369,11 +369,22 @@ def _provenance(source: Mapping[str, Any], receipt: Mapping[str, Any]) -> Manife
     )
 
 
-def _parquet_rows(path: Path, columns: Sequence[str]) -> Iterator[dict[str, Any]]:
+def _parquet_rows(
+    path: Path, columns: Sequence[str], *, start: int = 0
+) -> Iterator[dict[str, Any]]:
+    """The file's rows in file order, from row ``start`` (0-based) on."""
+    if type(start) is not int or start < 0:
+        raise ValueError("start must be a nonnegative integer")
     parquet = importlib.import_module("pyarrow.parquet")
+    skipped = 0
     with parquet.ParquetFile(path, arrow_extensions_enabled=False) as handle:
         for batch in handle.iter_batches(batch_size=512, columns=list(columns)):
-            yield from batch.to_pylist()
+            if skipped + batch.num_rows <= start:
+                skipped += batch.num_rows
+                continue
+            rows = batch.to_pylist()
+            yield from rows[start - skipped :] if skipped < start else rows
+            skipped = max(skipped, start)
 
 
 def candidates(
