@@ -176,6 +176,55 @@ class IoCases:
         return len(self.inputs)
 
 
+REWARD_GRAMMAR_VERSION = "reward-grammar-v2"
+"""The supported-check grammar of :func:`explain_function_checks` (see its docstring).
+
+v1 accepted every ``CALL == LITERAL``, ``LITERAL == CALL``, ``CALL is None/True/False`` and
+``not CALL`` whose ``CALL`` compares nothing. v2 (2026-11-14) adds two rules, because
+conformance run 2 showed a candidate earning full credit by redefining the outer call of an
+``is True`` check (a module-level ``isinstance``, a patched ``math.isclose``, a patched
+``builtins``), and checks that never call the candidate passing for any program."""
+
+UNSUPPORTED_REASONS = (
+    "syntax",
+    "statement",
+    "form",
+    "star_import",
+    "candidate_independent",
+    "guessable_wrapper",
+    "row_size",
+    "input_size",
+    "no_checks",
+    "io_malformed",
+    "io_case_count",
+    "io_input_size",
+    "io_output_size",
+)
+"""Why a task is not parseable for the reward channel; the first rule a task breaks."""
+
+GRAMMAR_V2_REASONS = frozenset({"star_import", "candidate_independent", "guessable_wrapper"})
+"""The reasons v2 added. Every other reason already made a task unparseable under v1."""
+
+ENTRY_EXCLUDED_NAMES = frozenset(dir(builtins))
+"""Names that are never the candidate's: the host interpreter's builtins. Names of the form
+``__name__`` (the module namespace's own entries, such as ``__builtins__`` or ``__file__``)
+are never the candidate's either."""
+
+GUESSABLE_STRINGS = frozenset({"True", "False", "None"})
+
+
+@dataclass(frozen=True)
+class Unsupported:
+    """Why a task cannot be scored by the reward channel: an explicit exclusion, never a
+    zero or a silent omission. ``index`` is the 0-based top-level statement that broke the
+    rule (``None`` for a whole-task rule); ``form`` names the check's shape for the
+    compatibility report, for example ``"is True on builtin isinstance()"``."""
+
+    reason: str
+    index: int | None = None
+    form: str | None = None
+
+
 # --------------------------------------------------------------------------------------
 # Host-side parsing of hidden tests (pure).
 # --------------------------------------------------------------------------------------
@@ -249,6 +298,164 @@ def _parse_predicate(test: ast.expr) -> Check | None:
     return None
 
 
+def _import_bindings(node: ast.Import | ast.ImportFrom) -> set[str]:
+    """The names an import statement binds (``import a.b`` binds ``a``)."""
+    names: set[str] = set()
+    for alias in node.names:
+        if alias.asname is not None:
+            names.add(alias.asname)
+        elif isinstance(node, ast.Import):
+            names.add(alias.name.split(".")[0])
+        else:
+            names.add(alias.name)
+    return names
+
+
+def _all_import_bindings(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names |= _import_bindings(node)
+    return names
+
+
+def _locally_bound(node: ast.expr) -> set[str]:
+    """Names bound inside an expression: comprehension targets, lambda arguments and
+    assignment-expression targets."""
+    bound: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.comprehension):
+            bound |= {name.id for name in ast.walk(sub.target) if isinstance(name, ast.Name)}
+        elif isinstance(sub, ast.Lambda):
+            arguments = sub.args
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                *(item for item in (arguments.vararg, arguments.kwarg) if item is not None),
+            ):
+                bound.add(argument.arg)
+        elif isinstance(sub, ast.NamedExpr):
+            bound.add(sub.target.id)
+    return bound
+
+
+def _entry_names(target: ast.expr, imported: set[str]) -> set[str]:
+    """The candidate's names a check's ``CALL`` uses: every name it reads that is not a
+    builtin, not bound by the tests' imports and not bound inside the expression. The hidden
+    tests hold only imports and assertions, so such a name can only be the candidate's."""
+    bound = _locally_bound(target)
+    return {
+        node.id
+        for node in ast.walk(target)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id not in ENTRY_EXCLUDED_NAMES
+        and not (node.id.startswith("__") and node.id.endswith("__"))
+        and node.id not in imported
+        and node.id not in bound
+    }
+
+
+def _root(target: ast.expr) -> ast.expr:
+    """The operation that produces a check's value, through any subscripts of it."""
+    node = target
+    while isinstance(node, ast.Subscript):
+        node = node.value
+    return node
+
+
+def _is_entry_call(node: ast.expr, entries: set[str]) -> bool:
+    return (
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in entries
+    )
+
+
+def _guessable_value(value: object, depth: int = 0) -> bool:
+    """Whether ``value`` is what a trusted boolean predicate's result would be compared
+    with: a value equal to ``None``, ``True`` or ``False`` (so ``1``, ``0``, ``1.0`` and
+    ``0.0`` too, as ``True == 1``), their names as text, or a non-empty container of only
+    such values."""
+    if depth > 32:
+        return True
+    if value is None or (isinstance(value, (bool, int, float)) and value in (0, 1)):
+        return True
+    if isinstance(value, str):
+        return value.strip() in GUESSABLE_STRINGS
+    if isinstance(value, dict):
+        items = [*value.keys(), *value.values()]
+        return bool(items) and all(_guessable_value(item, depth + 1) for item in items)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return bool(value) and all(_guessable_value(item, depth + 1) for item in value)
+    return False
+
+
+def _guessable(check: Check) -> bool:
+    """Whether the expected answer of ``check`` is one a program can produce without solving
+    anything: ``is None/True/False``, falsiness, or ``==`` against a value equal to
+    ``None``, ``True`` or ``False`` (``1``, ``0.0``, ``[True, True]``, ``'True'``, ...)."""
+    if check.predicate in {"is", "falsy"}:
+        return True
+    return _guessable_value(check.expected)
+
+
+def _attribute_base(node: ast.expr) -> ast.expr:
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node
+
+
+def _describe_root(root: ast.expr, imported: set[str]) -> str:
+    """A short name for what produces a check's value, for the compatibility report."""
+    if isinstance(root, ast.Call):
+        func = root.func
+        if isinstance(func, ast.Name):
+            if func.id in ENTRY_EXCLUDED_NAMES:
+                return f"builtin {func.id}()"
+            if func.id in imported:
+                return f"imported {func.id}()"
+            return "candidate call"
+        if isinstance(func, ast.Attribute):
+            base = _attribute_base(func)
+            if isinstance(base, ast.Name) and base.id in imported:
+                return f"imported {ast.unparse(func)}()"
+            return f"method .{func.attr}()"
+        return "call of an expression"
+    if isinstance(root, ast.Attribute):
+        return f"attribute .{root.attr}"
+    return type(root).__name__
+
+
+def _describe_predicate(check: Check) -> str:
+    if check.predicate == "is":
+        return f"is {check.expected!r}"
+    if check.predicate == "falsy":
+        return "not"
+    return f"== {check.expected!r}" if _guessable(check) else "== literal"
+
+
+def _grammar_v2(check: Check, test: ast.expr, imported: set[str]) -> Unsupported | None:
+    """The v2 rules for one parsed check (``test`` is the assertion's test expression).
+
+    - ``candidate_independent``: the ``CALL`` reads no candidate name, so the check's value
+      does not depend on the program at all.
+    - ``guessable_wrapper``: the expected answer is guessable (``None``, ``True``, ``False``
+      or falsiness) and the value is not produced by a direct call of a candidate name
+      (``f(...)``, or a subscript of it). The outer operation is then code the test author
+      trusted (a builtin, an imported function, a method or an operator), which the
+      candidate can replace in its own process and answer for.
+    """
+    target = ast.parse(check.call, mode="eval").body
+    entries = _entry_names(target, imported)
+    root = _root(target)
+    form = f"{_describe_predicate(check)} on {_describe_root(root, imported)}"
+    if not entries:
+        return Unsupported("candidate_independent", form=form)
+    if _guessable(check) and not _is_entry_call(root, entries):
+        return Unsupported("guessable_wrapper", form=form)
+    return None
+
+
 def _size(text: str) -> int:
     return len(text.encode("utf-8", errors="surrogatepass"))
 
@@ -262,85 +469,196 @@ def _is_utf8_text(text: str) -> bool:
     return True
 
 
-def parse_function_checks(
-    hidden_tests: str, *, limits: Limits | None = None
-) -> FunctionChecks | None:
-    """Parse a function task's hidden assertions; ``None`` means the task is not parseable
-    for the reward channel. Any top-level statement other than an import or a supported
-    ``assert`` makes the whole task unparseable, so a partial parse never over-rewards. So
-    does an expected value too large to be reported within one result row, or call sources
-    larger than the sandbox input limit."""
+GRAMMAR_V1 = "reward-grammar-v1"
+"""The previous grammar, accepted only by :func:`explain_function_checks` for the static
+compatibility comparison and its tests. Scoring and screening always use the current one."""
+
+
+def check_forms(hidden_tests: str) -> list[tuple[int, str, str | None]]:
+    """Every assertion's shape under the current grammar, for the compatibility report:
+    ``(statement index, outcome, form)`` with outcome ``"supported"``, a v2 reason, or
+    ``"form"`` for an assertion outside both grammars. Unlike
+    :func:`explain_function_checks` it does not stop at the first refusal."""
+    try:
+        tree = ast.parse(hidden_tests)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return []
+    imported = _all_import_bindings(tree)
+    rows: list[tuple[int, str, str | None]] = []
+    for index, node in enumerate(tree.body):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+                rows.append((index, "star_import", None))
+            continue
+        if not isinstance(node, ast.Assert):
+            continue
+        check = _parse_predicate(node.test)
+        if check is None:
+            rows.append((index, "form", None))
+            continue
+        target = ast.parse(check.call, mode="eval").body
+        form = f"{_describe_predicate(check)} on {_describe_root(_root(target), imported)}"
+        refused = _grammar_v2(check, node.test, imported)
+        rows.append((index, "supported" if refused is None else refused.reason, form))
+    return rows
+
+
+def explain_function_checks(
+    hidden_tests: str, *, limits: Limits | None = None, grammar: str = REWARD_GRAMMAR_VERSION
+) -> FunctionChecks | Unsupported:
+    """Parse a function task's hidden assertions under :data:`REWARD_GRAMMAR_VERSION`.
+
+    The supported grammar, statement by statement (any other statement, or any assertion
+    outside it, makes the whole task unsupported, so a partial parse never over-rewards):
+
+    - ``import ...`` and ``from ... import name [as alias]`` lines, kept as setup. A star
+      import is unsupported (``star_import``): it hides which names are the candidate's.
+    - ``assert CALL == LITERAL``, ``assert LITERAL == CALL``, ``assert CALL is None``,
+      ``assert CALL is True``, ``assert CALL is False`` and ``assert not CALL``, where
+      ``LITERAL`` is an :func:`ast.literal_eval` value of a reportable type and ``CALL`` has no
+      comparison, boolean operator, ``not`` or bare constant at its top (otherwise ``form``).
+    - ``CALL`` must read at least one candidate name, a name that is not a builtin, not a
+      ``__dunder__`` name, not bound by an import anywhere in the tests and not bound inside
+      ``CALL`` (otherwise ``candidate_independent``). Naming the candidate is enough: a check
+      such as ``f.__name__ == 'f'`` passes for any program that defines ``f``.
+    - When the expected answer is guessable (``is None/True/False``, ``not``, or ``==``
+      against ``None``, ``True`` or ``False``), ``CALL`` must be a direct call of a
+      candidate name, ``f(...)``, or a subscript of one, ``f(...)[0]`` (otherwise
+      ``guessable_wrapper``). Guessable includes every value equal to ``None``, ``True`` or
+      ``False`` (``1``, ``0.0``), their names as text and containers of only such values. A
+      wrapper the test author trusted, such as ``isinstance(f(x), list) is True`` or
+      ``math.isclose(f(x), 3.14) == 1``, runs in the candidate's process, where the candidate
+      can replace it and answer ``True``. Values produced by a method or an operator are
+      treated the same way, even on the candidate's own class (``Book(1900).is_classic() is
+      True``): the grammar cannot tell a method the candidate is asked to write from one of a
+      built-in type it returned. Against any other literal a wrapper stays supported
+      (``len(f(x)) == 3``, ``sorted(f(x)) == [1, 2]``, ``round(f(x), 2) == 3.14``). That does
+      not make such a check unforgeable: the candidate controls the value (by replacing the
+      wrapper, or through operators on its own return value), and only the expected literal
+      is hidden from it. A constant that happens to equal it still passes, which
+      :func:`degenerate_baseline` measures on every accepted check.
+    - Every expected value must fit one result row (``row_size``), the call sources and the
+      import lines must fit the sandbox input limit (``input_size``), and there must be at
+      least one check (``no_checks``).
+    """
+    if grammar not in {REWARD_GRAMMAR_VERSION, GRAMMAR_V1}:
+        raise ValueError(f"unknown reward grammar {grammar!r}")
+    current = grammar == REWARD_GRAMMAR_VERSION
     limits = limits or Limits()
     row_bytes = limits.output_bytes
     try:
         tree = ast.parse(hidden_tests)
     except (SyntaxError, ValueError, MemoryError, RecursionError):
-        return None
+        return Unsupported("syntax")
     setup_lines: list[str] = []
+    # Every import line runs as setup before any call in the container, so a name an import
+    # binds is never the candidate's, wherever that import stands.
+    imported = _all_import_bindings(tree)
     checks: list[Check] = []
-    for node in tree.body:
+    for index, node in enumerate(tree.body):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
+            star = isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names)
+            if star and current:
+                return Unsupported("star_import", index)
             setup_lines.append(ast.unparse(node))
             continue
         if not isinstance(node, ast.Assert):
-            return None
+            return Unsupported("statement", index, type(node).__name__)
         check = _parse_predicate(node.test)
         if check is None:
-            return None
+            return Unsupported("form", index)
+        refused = _grammar_v2(check, node.test, imported) if current else None
+        if refused is not None:
+            return Unsupported(refused.reason, index, refused.form)
         if check.predicate == "eq" and _honest_row_bytes(len(checks), check.expected) > row_bytes:
-            return None
+            return Unsupported("row_size", index)
         checks.append(check)
     if not checks:
-        return None
+        return Unsupported("no_checks")
     setup = "\n".join(setup_lines)
     if _size(setup) + sum(_size(check.call) for check in checks) > limits.input_bytes:
-        return None
+        return Unsupported("input_size")
     return FunctionChecks(setup, tuple(checks))
 
 
-def parse_io_cases(hidden_tests: str, *, limits: Limits | None = None) -> IoCases | None:
-    """Parse an I/O task's cases; ``None`` when the cases are malformed, more than the
-    evaluation runner allows, the inputs together are larger than the sandbox input limit,
-    or an expected output is larger than the per-case output cap (no stdout could ever match
-    it). Expected outputs never enter the container, so their total size is not limited."""
+def parse_function_checks(
+    hidden_tests: str, *, limits: Limits | None = None
+) -> FunctionChecks | None:
+    """The parsed checks, or ``None`` when the task is not parseable for the reward channel
+    (:func:`explain_function_checks` says why)."""
+    parsed = explain_function_checks(hidden_tests, limits=limits)
+    return None if isinstance(parsed, Unsupported) else parsed
+
+
+def explain_io_cases(hidden_tests: str, *, limits: Limits | None = None) -> IoCases | Unsupported:
+    """Parse an I/O task's cases. Unsupported when the cases are malformed
+    (``io_malformed``), more than the evaluation runner allows (``io_case_count``), the
+    inputs together are larger than the sandbox input limit (``io_input_size``), or an
+    expected output is larger than the per-case output cap, so no stdout could ever match it
+    (``io_output_size``). Expected outputs never enter the container, so their total size is
+    not limited."""
     limits = limits or Limits()
     try:
         cases = loads(hidden_tests)
     except ValueError:
-        return None
-    if not isinstance(cases, list) or not 1 <= len(cases) <= MAX_IO_CASES:
-        return None
+        return Unsupported("io_malformed")
+    if not isinstance(cases, list):
+        return Unsupported("io_malformed")
+    if not 1 <= len(cases) <= MAX_IO_CASES:
+        return Unsupported("io_case_count")
     inputs: list[str] = []
     expected: list[str] = []
-    for case in cases:
+    for index, case in enumerate(cases):
         if (
             not isinstance(case, dict)
             or not isinstance(case.get("input"), str)
             or not isinstance(case.get("output"), str)
         ):
-            return None
+            return Unsupported("io_malformed", index)
         if _size(case["output"].strip()) > limits.output_bytes:
-            return None
+            return Unsupported("io_output_size", index)
         inputs.append(case["input"])
         expected.append(case["output"])
     if sum(_size(text) for text in inputs) > limits.input_bytes:
-        return None
+        return Unsupported("io_input_size")
     return IoCases(tuple(inputs), tuple(expected))
+
+
+def parse_io_cases(hidden_tests: str, *, limits: Limits | None = None) -> IoCases | None:
+    """The parsed cases, or ``None`` when the task is not parseable
+    (:func:`explain_io_cases` says why)."""
+    parsed = explain_io_cases(hidden_tests, limits=limits)
+    return None if isinstance(parsed, Unsupported) else parsed
+
+
+def explain_task(
+    task: Task, *, limits: Limits | None = None
+) -> FunctionChecks | IoCases | Unsupported:
+    """The parsed hidden tests of a task, or why the reward channel cannot score it."""
+    if task.mode == "io":
+        return explain_io_cases(task.hidden_tests, limits=limits)
+    return explain_function_checks(task.hidden_tests, limits=limits)
+
+
+def unsupported_reason(task: Task, *, limits: Limits | None = None) -> Unsupported | None:
+    """Why ``task`` is excluded from the reward channel, or ``None`` when it is supported."""
+    parsed = explain_task(task, limits=limits)
+    return parsed if isinstance(parsed, Unsupported) else None
 
 
 def parse_task(task: Task, *, limits: Limits | None = None) -> FunctionChecks | IoCases | None:
     """The parsed hidden tests of a task, or ``None`` if unparseable for this mode."""
-    if task.mode == "io":
-        return parse_io_cases(task.hidden_tests, limits=limits)
-    return parse_function_checks(task.hidden_tests, limits=limits)
+    parsed = explain_task(task, limits=limits)
+    return None if isinstance(parsed, Unsupported) else parsed
 
 
 def is_parseable(task: Task, *, limits: Limits | None = None) -> bool:
-    """Whether the reward channel can score ``task``. RL screening keeps only parseable
-    tasks: a function task is parseable iff every hidden assertion is a supported form, each
-    expected value fits one result row, and the call sources with the import lines fit the
-    sandbox input limit; an I/O task iff its cases are well formed (at most 100), their inputs
-    together fit the sandbox input limit, and every expected output fits the output cap."""
+    """Whether the reward channel can score ``task`` under :data:`REWARD_GRAMMAR_VERSION`.
+    RL screening keeps only parseable tasks and records every other task's
+    :func:`unsupported_reason`. A function task is parseable iff every statement is in the
+    grammar of :func:`explain_function_checks`; an I/O task iff its cases are well formed
+    (at most 100), their inputs together fit the sandbox input limit, and every expected
+    output fits the output cap."""
     return parse_task(task, limits=limits) is not None
 
 
@@ -622,6 +940,10 @@ def _public_outputs(task: Task) -> list[str]:
     ]
 
 
+_PLACEHOLDER_CALL = ast.Call(func=ast.Name(id="_", ctx=ast.Load()), args=[], keywords=[])
+_ECHO_LABELS = frozenset(label for label, _ in _ARGUMENT_ECHOES)
+
+
 def _function_baseline(task: Task, parsed: FunctionChecks) -> DegenerateBaseline:
     foreign = set(dir(builtins)) | _imported_names(parsed.setup)
     calls = [_direct_call(check.call, foreign) for check in parsed.checks]
@@ -633,8 +955,13 @@ def _function_baseline(task: Task, parsed: FunctionChecks) -> DegenerateBaseline
         passed = 0
         for check, call in zip(parsed.checks, calls, strict=True):
             if call is None:
-                continue  # not a direct call of a candidate function: counted as failed
-            known, value = answer_for(call)
+                if label in _ECHO_LABELS:
+                    continue  # an argument echo needs a direct call to take the argument of
+                # A constant or public-example answer applies to any accepted check's value:
+                # the candidate controls a wrapper's, a method's or a subscript's result too.
+                known, value = answer_for(_PLACEHOLDER_CALL)
+            else:
+                known, value = answer_for(call)
             if not known:
                 continue
             try:
@@ -673,9 +1000,10 @@ def degenerate_baseline(task: Task, *, limits: Limits | None = None) -> Degenera
     task is not parseable.
 
     It is computed on the host from the parsed hidden tests with the channel's own
-    comparison, and runs no code. For a function task an answer is applied only to checks
-    whose call is a direct call of a function the candidate defines (``f(1, 2)``, not
-    ``len(f(1))`` or ``Stack().pop()``); other checks count as failed, so the value is a
+    comparison, and runs no code. For a function task a constant or public-example answer is
+    applied to the value of every accepted check (``f(1, 2)``, ``len(f(1))``, ``f(1)[0]``),
+    since the candidate controls each of those values; an echo answer applies only to direct
+    calls of a candidate function, which have arguments to echo. The value is a
     lower bound, and a policy that reads the task can do better than any answer here. A
     check whose call uses a name the tests' reference defines (module data such as
     ``f(products)``, or ``os`` without an import in the tests) is counted as the answer

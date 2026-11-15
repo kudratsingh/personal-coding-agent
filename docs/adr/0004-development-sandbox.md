@@ -258,3 +258,15 @@ scorer-integrity limitation of every function-mode score in use: development sco
 checkpoint and model selection, and run reports. Weak tests, such as a check that a result
 `is None`, are a separate exposure: they admit wrong but ordinary solutions, which is not a
 demonstrated forged pass.
+
+## Amendment (2026-11-14): reward-channel check grammar v2
+
+Conformance run 2 showed full reward for `... is True` checks whose outer call (`isinstance`,
+`math.isclose`, `builtins.isinstance`) the candidate had replaced in its own process, and for
+checks that never call the candidate. **Decision:** the reward channel refuses, as an explicit
+exclusion with a named reason, any check whose `CALL` reads no candidate name
+(`candidate_independent`) and any check with a guessable expected answer whose value is not a
+direct call of a candidate name (`guessable_wrapper`); star imports are refused too. Wrappers
+against an informative literal stay supported. A static comparison over the dev split, the RL
+candidates and the RL remainder reports every newly excluded task and check shape before
+adoption; benchmark and evaluation scoring are unchanged.

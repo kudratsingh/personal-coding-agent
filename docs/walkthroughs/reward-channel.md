@@ -67,7 +67,28 @@ host: classify the invocation from the frames → validate and decode each row i
   at present (an open choice; see the design choices below). Any other top-level statement, or
   any assertion outside these forms, makes the whole task **not parseable**
   (`parse_function_checks` returns `None`, `is_parseable` is `False`), so a partial parse can
-  never under-count the denominator and over-reward. A task whose expected value could not fit
+  never under-count the denominator and over-reward. Grammar v2 (`REWARD_GRAMMAR_VERSION`,
+  2026-11-14) adds two rules, documented in `explain_function_checks`: `CALL` must read a
+  candidate name (one that is not a builtin, not bound by the tests' imports and not bound
+  inside `CALL`), or the check is `candidate_independent`; and when the expected answer is
+  guessable (`is None/True/False`, `not`, or `==` against `None`, `True` or `False`), `CALL`
+  must be a direct call of a candidate name, `f(...)`, or a subscript of one, or the check is
+  a `guessable_wrapper`. Conformance run 2 showed why: a candidate that redefined
+  `isinstance`, patched `math.isclose` or patched `builtins` earned full credit on
+  `... is True` checks, because each call is evaluated in the candidate's own process, and
+  `abs(-1) == 1` paid any program. The same rule refuses `Logger().log('a') is None`, which a
+  trivial class satisfies while the constant baseline scored it 0.0. Guessable answers include
+  every value equal to `None`, `True` or `False` (`1`, `0.0`, `[True, True]`) and the text
+  `'True'`, `'False'` or `'None'`. A wrapper against any other literal stays supported
+  (`len(f(x)) == 3`, `str(f(x)) == '3'`). That is not unforgeable: the candidate controls the
+  value, and only the literal is hidden from it, so a constant that equals it passes; the
+  baseline measures that. Imports count wherever they stand in the tests, because every
+  import runs before any call. A star import is unsupported because it hides which names
+  are the candidate's. Every refusal is explicit: `unsupported_reason(task)` names the rule
+  (`UNSUPPORTED_REASONS`), RL screening records it per task (`unsupported`) and counts it
+  (`not_parseable_by_cause`), and the screening record names the grammar version. The static
+  comparison `tools/reward_grammar_compat.py` reports, for the dev split, the RL candidates
+  and the RL remainder, every task v2 newly excludes and every refused check shape. A task whose expected value could not fit
   in one result row (64 KiB by default) is not parseable either, and neither is one whose
   call sources and import lines together exceed the sandbox input limit (128,000 bytes),
   because they enter the container with the candidate. In the container the child
@@ -198,6 +219,11 @@ host: classify the invocation from the frames → validate and decode each row i
   (falsy, or one singleton), and a bare `assert CALL` would too (any truthy value). What
   protects them is not the channel but that the candidate never sees which form a check uses;
   a constant answer still passes every check of its form, which `degenerate_baseline` counts.
+  Since grammar v2 these forms are accepted only on a direct call of a candidate name (or a
+  subscript of one); on a builtin, an imported function, a method or an operator the
+  candidate could answer for trusted code, so the task is refused. The baseline's constant
+  and public-example answers now apply to every accepted check's value, wrappers included,
+  because the candidate controls each of those values.
   Supporting bare asserts would add the same kind of exposure; whether to do so is open.
 - **Why a degenerate-answer baseline.** The RL advantage is a reward minus its group's mean,
   so on a task where returning `None` or printing `YES` earns 0.3, that answer beats a typical

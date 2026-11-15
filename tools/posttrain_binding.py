@@ -159,8 +159,9 @@ def require_withheld(name: str, kind: str, path: Path) -> int:
 
 
 def require_facts(name: str, path: Path) -> None:
-    """Run 2's facts file is a canonical ``rl-task-facts-v1`` record (its own SHA-256 is
-    checked against the specification by the binding and by ``load_facts`` on the Pod)."""
+    """Run 2's facts file is a canonical ``rl-task-facts-v2`` record, which names the reward
+    grammar (its own SHA-256 is checked against the specification by the binding and by
+    ``load_facts`` on the Pod)."""
     from scratchcoder.rl.facts import load_facts
 
     raw = path.read_bytes()

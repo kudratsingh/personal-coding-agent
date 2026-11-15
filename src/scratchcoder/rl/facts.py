@@ -26,8 +26,12 @@ from scratchcoder.rl.bridge import canonical_json, require_sha256
 from scratchcoder.rl.dev import ConstantBaseline
 from scratchcoder.rl.screening import Baseline, baseline_of
 from scratchcoder.rl.withheld import is_withheld
+from scratchcoder.sandbox.reward import REWARD_GRAMMAR_VERSION
 
-FACTS_FORMAT = "rl-task-facts-v1"
+FACTS_FORMAT = "rl-task-facts-v2"
+"""v2 (2026-11-14) names the reward grammar the facts were computed under: ``parseable``
+depends on it, and facts from another grammar are refused rather than trusted (an
+unparseable task would score 0 for every program without anyone noticing)."""
 MAX_FACTS_BYTES = 8 * 1024 * 1024
 FACT_KEYS = frozenset({"parseable", "reward"})
 
@@ -51,7 +55,9 @@ def facts_bytes(facts: Mapping[str, Baseline]) -> bytes:
     for identifier, fact in sorted(facts.items()):
         _check_fact(identifier, fact)
         rows[identifier] = {"parseable": fact.parseable, "reward": fact.reward}
-    return canonical_json({"format": FACTS_FORMAT, "tasks": rows})
+    return canonical_json(
+        {"format": FACTS_FORMAT, "reward_grammar": REWARD_GRAMMAR_VERSION, "tasks": rows}
+    )
 
 
 def facts_sha256(facts: Mapping[str, Baseline]) -> str:
@@ -92,12 +98,15 @@ def load_facts(raw: bytes, *, sha256: str) -> dict[str, Baseline]:
         raise ValueError("the facts file is not JSON") from error
     if (
         not isinstance(value, dict)
-        or set(value) != {"format", "tasks"}
+        or set(value) != {"format", "reward_grammar", "tasks"}
         or value["format"] != FACTS_FORMAT
+        or value["reward_grammar"] != REWARD_GRAMMAR_VERSION
         or not isinstance(value["tasks"], dict)
         or not value["tasks"]
     ):
-        raise ValueError(f"the facts file is not a nonempty {FACTS_FORMAT} record")
+        raise ValueError(
+            f"the facts file is not a nonempty {FACTS_FORMAT} record under {REWARD_GRAMMAR_VERSION}"
+        )
     facts: dict[str, Baseline] = {}
     for identifier, row in value["tasks"].items():
         if not isinstance(row, dict) or set(row) != FACT_KEYS:
