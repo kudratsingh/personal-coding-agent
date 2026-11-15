@@ -65,6 +65,16 @@ ALL_FAIL = {
     ("reference", 2): "timeout",
 }
 
+ALL_TIMEOUT = {
+    **SOUND,
+    ("reference", 0): "timeout",
+    ("reference", 1): "timeout",
+    ("reference", 2): "resource_limit",
+}
+
+TIMING = "timing_unstable_reference"
+NONE_STUB = "defective_tests:accepts_none_stub"
+
 
 def test_a_sound_task_is_admitted() -> None:
     item = task("assert f(1) == 2\nassert f(2) == 3\nassert f(5) == 6")
@@ -107,9 +117,11 @@ def test_controls_define_every_called_candidate_name() -> None:
     "statuses,status,defects,warnings",
     [
         (ALL_FAIL, "excluded", ("reference_failed",), ()),
+        (ALL_TIMEOUT, "held", (), ()),
+        ({**SOUND, ("reference", 1): "resource_limit"}, "admitted", (), (TIMING,)),
         ({**SOUND, ("reference", 1): "failed"}, "excluded", ("nondeterministic_reference",), ()),
-        ({**SOUND, ("reference", 2): "timeout"}, "admitted", (), ("timing_unstable_reference",)),
-        ({**SOUND, ("none_stub", 0): "passed"}, "excluded", ("none_stub_passed",), ()),
+        ({**SOUND, ("reference", 2): "timeout"}, "admitted", (), (TIMING,)),
+        ({**SOUND, ("none_stub", 0): "passed"}, "excluded", (NONE_STUB,), ()),
         ({**SOUND, ("echo_stub", 0): "passed"}, "admitted", (), ("echo_passed",)),
     ],
 )  # fmt: skip
@@ -213,3 +225,113 @@ def test_union_counts_count_tasks_not_reasons() -> None:
     counts = admission.union_counts(decisions)
     assert counts["excluded"] == 2
     assert counts["excluded_by_reason_overlapping"] == {"none_only_checks": 2, "reviewed:x": 1}
+
+
+def test_load_sensitive_references_are_held_not_excluded() -> None:
+    item = task("assert f(1) == 2\nassert f(2) == 3\nassert f(5) == 6")
+    decision = decide(item, scan(item), outcomes(item, ALL_TIMEOUT))
+    assert decision.status == "held" and decision.held == ("reference_unverified",)
+    assert decision.defects == ()
+
+
+def test_controls_define_referenced_names_too() -> None:
+    item = task(
+        "assert list(map(is_even, [1, 2])) == [False, True]\nassert sorted([2, 1], key=k) == [1, 2]"
+    )
+    stub = admission.control_program(item, "none_stub")
+    assert "def is_even(" in stub and "def k(" in stub and "def map(" not in stub
+
+
+@pytest.mark.parametrize(
+    "hidden,mode",
+    [
+        ("assert f(1) ==", "function"),
+        ("x" * 200_000, "function"),
+    ],
+)
+def test_unrunnable_tests_are_a_defect_without_any_run(hidden: str, mode: str) -> None:
+    item = task(hidden, mode=mode)
+    assert plan(item) == []
+    assert decide(item, scan(item), {}).defects == ("defective_tests:not_runnable",)
+
+
+def test_conflicting_rows_and_changed_programs_are_never_reused(tmp_path: Path) -> None:
+    item = task("assert f(1) == 2")
+    digest = admission.task_sha256(item)
+    run = plan(item)[0]
+
+    def row(status: str, code: str | None = None) -> dict[str, Any]:
+        planned = run if code is None else replace(run, code=code)
+        return admission.cache_row(
+            planned, digest, IDS, status=status, resolved=True, host_failures=0,
+            elapsed_seconds=1,
+        )  # fmt: skip
+
+    rows = [row("passed"), {**row("failed"), "run_id": "second"}]
+    found = usable(rows, {item.id: item}, IDS)
+    assert found[run.key]["status"] == admission.CONFLICT
+    assert usable([row("passed", code="other")], {item.id: item}, IDS) == {}
+    assert usable([{**row("passed"), "run_id": "x"}], {item.id: item}, IDS)[run.key]["status"] == (
+        "passed"
+    )
+
+
+def test_runs_are_scheduled_breadth_first(tmp_path: Path) -> None:
+    from tools import admission_check
+
+    tasks = {"dev": {name: task("assert f(1) == 2", task_id=name) for name in ("t/a", "t/b")}}
+    runs = admission_check.pending_runs(tasks, tmp_path / "none.jsonl", IDS)
+    keys = [(run.kind, run.index, run.task_id) for run, _ in runs]
+    assert keys[:6] == [
+        ("reference", 0, "t/a"),
+        ("reference", 0, "t/b"),
+        ("reference", 1, "t/a"),
+        ("reference", 1, "t/b"),
+        ("reference", 2, "t/a"),
+        ("reference", 2, "t/b"),
+    ]
+
+
+def test_a_torn_tail_is_cut_before_appending(tmp_path: Path) -> None:
+    from tools import admission_check
+
+    cache = tmp_path / "cache.jsonl"
+    cache.write_text('{"task_id": "a", "resolved": true}\n{"torn', encoding="utf-8")
+    admission_check._repair_tail(cache)
+    with cache.open("a", encoding="utf-8") as stream:
+        stream.write('{"task_id": "b", "resolved": true}\n')
+    assert [row["task_id"] for row in admission.read_cache(cache)] == ["a", "b"]
+
+
+def test_the_receipt_must_be_this_commands_passing_exec_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    from datetime import UTC, datetime
+
+    from scratchcoder.sandbox import runner
+    from tools import admission_check
+
+    now = datetime.now(UTC)
+    receipt = {
+        "kind": "mac-execution-window-check",
+        "status": "passed",
+        "checked_at": now.isoformat(),
+        "command": ["uv", "run", "python", "-m", "tools.admission_check", "execute", "--x"],
+        "checks": {
+            "image": {
+                "passed": True,
+                "image": runner.IMAGE,
+                "expected_id": "sha256:" + "2" * 64,
+                "found_id": "sha256:" + "2" * 64,
+            }
+        },
+    }
+    path = tmp_path / "receipt.json"
+    path.write_text(json.dumps(receipt), encoding="utf-8")
+    assert admission_check._receipt_image(path, now, ["execute", "--x"]) == "sha256:" + "2" * 64
+    with pytest.raises(ValueError, match="another command"):
+        admission_check._receipt_image(path, now, ["execute", "--y"])
+    path.write_text(json.dumps({**receipt, "kind": "check"}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        admission_check._receipt_image(path, now, ["execute", "--x"])

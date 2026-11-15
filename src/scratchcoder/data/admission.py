@@ -9,18 +9,29 @@ in it. The module separates three kinds of evidence:
   module-level value only the reference assigns and the prompt never names
   (``reference_only_global``). Executed ones come from the checks below: the reference fails
   every one of its three fresh-process runs (``reference_failed``), or gives a different
-  verdict between runs without a timeout being involved (``nondeterministic_reference``); a
-  program that returns ``None`` for every call passes (``none_stub_passed``); a program that
-  prints nothing passes an I/O task (``empty_output_passed``). Reviewed exclusions (overlap
-  adjudication, read-confirmed quarantines, owner rulings) are supplied by the caller with
-  their reasons.
+  verdict between runs other than by timing out or a resource limit
+  (``nondeterministic_reference``); a program that returns ``None`` for every call passes
+  (``defective_tests:accepts_none_stub``); a program that prints nothing passes an I/O task
+  (``defective_tests:accepts_empty_output``); the tests cannot be run as written
+  (``defective_tests:not_runnable``). The two stub findings are test-adequacy defects: the
+  tests cannot tell a trivial program from a solution, whatever the prompt asks. Reviewed
+  exclusions (overlap adjudication, read-confirmed quarantines, owner rulings) are supplied
+  by the caller with their reasons.
 - **Warnings** keep a task admitted but labelled: heuristic scan flags (a raise named in the
   prompt, a set-order or order-free pattern, a prompt-named global, a rounding clause, two or
   fewer checks), an echo program passing (the task may legitimately be an identity), and a
   verdict that varied only with timeouts (load-sensitive timing, not an established defect).
   Prompt-required globals and two-check tasks are therefore kept.
+- **Held**: every check ran, but the reference never passed and only timed out or hit a
+  resource limit (``reference_unverified``), or two cache rows of one run disagree
+  (``conflicting_outcomes``). The task is not admitted, and no defect is claimed; the owner
+  decides.
 - **Pending**: a check is missing or unresolved (a host failure that outlasted its retries).
   Such a task is neither admitted nor excluded until a later run resolves it.
+
+The three reference runs of a task are scheduled far apart (all first runs, then all second
+runs, then all third runs, then the controls), so one burst of host load cannot touch all
+three.
 
 Every execution goes through the evaluation path of record
 (:func:`scratchcoder.eval.harness.isolated_execution`, one fresh container and interpreter
@@ -67,10 +78,16 @@ defect. R2 on some (not all) checks is a warning too: ``partly_candidate_indepen
 EXECUTED_DEFECTS = (
     "reference_failed",
     "nondeterministic_reference",
-    "none_stub_passed",
-    "empty_output_passed",
+    "defective_tests:accepts_none_stub",
+    "defective_tests:accepts_empty_output",
+    "defective_tests:not_runnable",
 )
 EXECUTED_WARNINGS = ("echo_passed", "timing_unstable_reference")
+HELD_REASONS = ("reference_unverified", "conflicting_outcomes")
+LOAD_SENSITIVE = frozenset({"timeout", "resource_limit"})
+"""Outcomes that can come from host load rather than the task: they never establish a
+defect by themselves."""
+RUN_ORDER = ("reference", *("none_stub", "echo_stub", "empty_output", "echo_input"))
 
 FUNCTION_CONTROLS = ("none_stub", "echo_stub")
 IO_CONTROLS = ("empty_output", "echo_input")
@@ -93,22 +110,52 @@ def task_sha256(task: Task) -> str:
 
 
 def _entry_names(hidden_tests: str) -> list[str]:
-    """The names the hidden tests call that are neither builtins nor imported: the
-    candidate's functions and classes, which a control program must define."""
-    import builtins
+    """Every candidate name the hidden tests read (called or not: ``map(is_even, xs)``),
+    with the reward channel's rule: not a builtin, not a ``__dunder__`` name, not bound by an
+    import and not bound inside the expression. A control program defines them all."""
+    from scratchcoder.sandbox.reward import _all_import_bindings
+    from scratchcoder.sandbox.reward import _entry_names as candidate_names
 
     tree = ast.parse(hidden_tests)
-    imported: set[str] = set()
+    imported = _all_import_bindings(tree)
+    names: set[str] = set()
     for node in tree.body:
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                imported.add(alias.asname or alias.name.split(".")[0])
-    names = {
-        node.func.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    return sorted(names - set(dir(builtins)) - imported)
+        if isinstance(node, ast.Assert):
+            names |= candidate_names(node.test, imported)
+    return sorted(names)
+
+
+def runnable(task: Task) -> bool:
+    """Whether the evaluation runner accepts the task's tests at all (it raises otherwise):
+    a known mode, non-empty tests within the input limit and, for I/O, 1 to 100 cases of
+    string ``input``/``output`` pairs; function tests must also parse."""
+    from scratchcoder.sandbox.runner import Limits
+
+    tests = task.hidden_tests
+    if task.mode not in {"function", "io"} or not tests.strip():
+        return False
+    if len(tests.encode("utf-8", errors="surrogatepass")) > Limits().input_bytes:
+        return False
+    if task.mode == "io":
+        try:
+            cases = json.loads(tests)
+        except ValueError:
+            return False
+        return (
+            isinstance(cases, list)
+            and 1 <= len(cases) <= 100
+            and all(
+                isinstance(case, dict)
+                and set(case) == {"input", "output"}
+                and all(isinstance(value, str) for value in case.values())
+                for case in cases
+            )
+        )
+    try:
+        ast.parse(tests)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return False
+    return True
 
 
 def control_program(task: Task, kind: str) -> str:
@@ -149,7 +196,7 @@ class Run:
 
 def plan(task: Task) -> list[Run]:
     """The reference runs and the negative controls of one task."""
-    if task.solution is None:
+    if task.solution is None or not runnable(task):
         return []
     runs = [
         Run(task.id, "reference", index, task.solution, task.hidden_tests, task.mode)
@@ -216,16 +263,26 @@ def read_cache(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+CONFLICT = "conflict"
+"""The status :func:`usable` gives a run whose matching resolved rows disagree."""
+
+
 def usable(
     rows: Iterable[Mapping[str, Any]],
     tasks: Mapping[str, Task],
     identities: Identities,
 ) -> dict[tuple[str, str, int], Mapping[str, Any]]:
-    """The latest resolved outcome per run whose task, evaluator and runtime identities
-    match the current ones. Unresolved rows and rows of other identities are kept in the
-    file (every outcome is recorded) but never satisfy a run."""
+    """The resolved outcome of each planned run whose task, program, evaluator and runtime
+    identities match the current ones. Unresolved rows and rows of other identities stay in
+    the file (every outcome is recorded) but never satisfy a run. Two matching resolved rows
+    with different statuses make the run a ``conflict``, never a silent choice."""
     current = asdict(identities)
     hashes = {task_id: task_sha256(task) for task_id, task in tasks.items()}
+    codes = {
+        run.key: hashlib.sha256(run.code.encode("utf-8")).hexdigest()
+        for task in tasks.values()
+        for run in plan(task)
+    }
     found: dict[tuple[str, str, int], Mapping[str, Any]] = {}
     for row in rows:
         task_id = row.get("task_id")
@@ -235,7 +292,14 @@ def usable(
             continue
         if not row.get("resolved") or row.get("status") not in VERDICTS:
             continue
-        found[(task_id, row["kind"], int(row["index"]))] = row
+        key = (task_id, row["kind"], int(row["index"]))
+        if codes.get(key) != row.get("code_sha256"):
+            continue
+        earlier = found.get(key)
+        if earlier is not None and earlier["status"] != row["status"]:
+            found[key] = {**earlier, "status": CONFLICT}
+        elif earlier is None:
+            found[key] = row
     return found
 
 
@@ -246,13 +310,14 @@ def usable(
 
 @dataclass(frozen=True)
 class Decision:
-    """A task's admission outcome: ``admitted``, ``excluded`` or ``pending``."""
+    """A task's admission outcome: ``admitted``, ``excluded``, ``held`` or ``pending``."""
 
     id: str
     status: str
     defects: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     pending: tuple[str, ...] = ()
+    held: tuple[str, ...] = ()
     reference_statuses: tuple[str, ...] = ()
     control_statuses: dict[str, str] = field(default_factory=dict)
 
@@ -293,6 +358,8 @@ def executed_findings(
     missing: list[str] = []
     if task.solution is None:
         return ["no_reference"], [], [], (), {}
+    if not runnable(task):
+        return ["defective_tests:not_runnable"], [], [], (), {}
     statuses: list[str] = []
     for index in range(REFERENCE_RUNS):
         row = outcomes.get((task.id, "reference", index))
@@ -307,20 +374,25 @@ def executed_findings(
             missing.append(kind)
         else:
             controls[kind] = str(row["status"])
-    if len(statuses) == REFERENCE_RUNS:
+    if CONFLICT in statuses or CONFLICT in controls.values():
+        warnings.append("conflicting_outcomes")
+    elif len(statuses) == REFERENCE_RUNS:
         passes = statuses.count("passed")
+        others = {status for status in statuses if status != "passed"}
         if passes == 0:
-            defects.append("reference_failed")
+            if others <= LOAD_SENSITIVE:
+                warnings.append("reference_unverified")
+            else:
+                defects.append("reference_failed")
         elif passes < REFERENCE_RUNS:
-            others = {status for status in statuses if status != "passed"}
-            if others <= {"timeout"}:
+            if others <= LOAD_SENSITIVE:
                 warnings.append("timing_unstable_reference")
             else:
                 defects.append("nondeterministic_reference")
     if controls.get("none_stub") == "passed":
-        defects.append("none_stub_passed")
+        defects.append("defective_tests:accepts_none_stub")
     if controls.get("empty_output") == "passed":
-        defects.append("empty_output_passed")
+        defects.append("defective_tests:accepts_empty_output")
     if controls.get("echo_stub") == "passed" or controls.get("echo_input") == "passed":
         warnings.append("echo_passed")
     return defects, warnings, missing, tuple(statuses), controls
@@ -337,11 +409,16 @@ def decide(
     static_defects, static_warnings = static_gate(scan)
     run_defects, run_warnings, missing, references, controls = executed_findings(task, outcomes)
     defects = sorted({*static_defects, *run_defects, *reviewed})
-    warnings = sorted({*static_warnings, *run_warnings, *reviewed_warnings} - set(defects))
+    held = sorted(set(run_warnings) & set(HELD_REASONS))
+    warnings = sorted(
+        {*static_warnings, *run_warnings, *reviewed_warnings} - set(defects) - set(held)
+    )
     if defects:
         status = "excluded"
     elif missing:
         status = "pending"
+    elif held:
+        status = "held"
     else:
         status = "admitted"
     return Decision(
@@ -350,6 +427,7 @@ def decide(
         tuple(defects),
         tuple(warnings),
         tuple(missing),
+        tuple(held),
         references,
         controls,
     )
@@ -370,6 +448,15 @@ def union_counts(decisions: Sequence[Decision]) -> dict[str, Any]:
         "tasks": len(decisions),
         "admitted": sum(d.status == "admitted" for d in decisions),
         "excluded": sum(d.status == "excluded" for d in decisions),
+        "held": sum(d.status == "held" for d in decisions),
+        "held_by_reason": dict(
+            sorted(
+                {
+                    reason: sum(reason in d.held for d in decisions if d.status == "held")
+                    for reason in HELD_REASONS
+                }.items()
+            )
+        ),
         "pending": sum(d.status == "pending" for d in decisions),
         "excluded_by_reason_overlapping": dict(sorted(by_reason.items())),
         "admitted_with_warning_by_warning_overlapping": dict(sorted(by_warning.items())),
