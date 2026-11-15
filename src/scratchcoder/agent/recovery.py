@@ -10,8 +10,10 @@ to the next special token (or the end of the generation). Two rules can fire; ea
 - ``eos_whole_parse``: the block ended at ``<|assistant_end|>`` and the generation stopped
   there (finish ``stop``, not ``length``), and the whole block text parses. The model closed its
   turn; only the block marker is missing.
-- ``followed_by_top_level``: the longest prefix that (a) ends just before a later column-0 line
-  that is not blank and not a comment and (b) parses as a module. Because the prefix parses
+- ``followed_by_top_level``: the longest prefix that (a) ends just before a later logical line
+  at indentation 0 and (b) parses as a module, provided the dropped tail is inert
+  (:func:`tail_is_inert`: it parses completely into expression statements that bind
+  nothing). Because the prefix parses
   completely and the next line starts at column 0, every top-level statement in the prefix,
   including any function, ended before the generation ran out.
 
@@ -19,19 +21,19 @@ The prefix then goes through the same reply rules and editor as a normal reply
 (:func:`scratchcoder.agent.workspace.parse_reply`): exactly one shown function, nothing it
 depends on dropped, the function's own lines taken verbatim. Recovery never looks at test
 outcomes, and a text with a carriage return is not recovered (normalizing it would change
-characters).
+characters), and neither is one with a form feed or vertical tab.
 """
 
 from __future__ import annotations
 
 import ast
 import io
-import re
 import tokenize
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from scratchcoder.agent import workspace
 from scratchcoder.data.chat import ASSISTANT_END, PYTHON_END, PYTHON_START, TextDecoder, is_special
 
 MODES = ("off", "intact-function")
@@ -104,66 +106,36 @@ def logical_line_starts(text: str) -> list[int]:
     return starts
 
 
-_DEFINES = re.compile(r"(async\s+def|def|class|import|from)\b|@")
-
-
-def _depth_zero_assignment(line: str) -> bool:
-    """Whether ``line`` has an ``=`` (or ``:=``/augmented form) outside brackets that is not a
-    comparison; strings are skipped roughly (any quote toggles)."""
-    depth, quote = 0, ""
-    for index, char in enumerate(line):
-        if quote:
-            if char == quote:
-                quote = ""
-            continue
-        if char in "'\"":
-            quote = char
-        elif char in "([{":
-            depth += 1
-        elif char in ")]}":
-            depth -= 1
-        elif char == "=" and depth <= 0:
-            before = line[index - 1] if index else ""
-            after = line[index + 1] if index + 1 < len(line) else ""
-            if before not in "=!<>" and after != "=":
-                return True
-        elif char == ":" and depth <= 0:
-            return True  # an annotation, or a compound statement header
-    return False
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.NamedExpr)
 
 
 def tail_is_inert(tail: Sequence[str]) -> bool:
-    """Whether the dropped tail can only hold expression statements and comments at column 0:
-    no definition, decorator, import, assignment (plain, annotated, augmented, walrus) or
-    compound statement. Anything else could change what the kept function means, so the
-    normal rules would have to see it, and recovery refuses instead."""
-    for line in tail:
-        if not line or line[0].isspace() or line.startswith("#"):
-            continue
-        if _DEFINES.match(line):
+    """Whether the dropped tail is provably unable to change the kept function: after its
+    trailing blank and comment-only lines are removed, it is empty, or it parses completely
+    into expression statements that bind no name (by the same rule ``parse_reply`` uses) and
+    contain no comprehension or assignment expression. A tail that does not parse (a truncated
+    statement) is refused: its meaning is unknown."""
+    lines = list(tail)
+    while lines and (not lines[-1].strip() or lines[-1].lstrip().startswith("#")):
+        lines.pop()
+    if not lines:
+        return True
+    try:
+        tree = ast.parse("\n".join(lines))
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return False
+    for statement in tree.body:
+        if not isinstance(statement, ast.Expr) or workspace._bound(statement):
             return False
-        try:
-            tree = ast.parse(line)
-        except (SyntaxError, ValueError, MemoryError, RecursionError):
-            tree = None
-        if tree is not None:
-            if not all(isinstance(node, ast.Expr) for node in tree.body):
-                return False
-            if any(isinstance(node, ast.NamedExpr) for node in ast.walk(tree)):
-                return False
-            continue
-        # A truncated line: only the start of a call, with no assignment outside brackets.
-        if not re.match(r"[A-Za-z_][\w.]*\(", line) or _depth_zero_assignment(line):
-            return False
-        if ":=" in line:
+        if any(isinstance(node, _COMPREHENSIONS) for node in ast.walk(statement)):
             return False
     return True
 
 
 def recover_text(text: str, *, ended_by_eos: bool) -> Recovery | None:
     """Apply the two rules to an unclosed block's text."""
-    if "\r" in text:
-        return None
+    if any(char in text for char in "\r\x0b\x0c"):
+        return None  # Line-ending and form-feed characters the host and Python may split apart.
     lines = text.split("\n")
     if (
         ended_by_eos

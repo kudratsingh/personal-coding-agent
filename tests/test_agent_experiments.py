@@ -105,7 +105,7 @@ def test_the_oracle_solves_under_the_training_layout(case: Case) -> None:
     [
         # A complete function, then an example call cut off by the length limit.
         (
-            "def f(x):\n    return x\n\nprint(f(2), f(",
+            "def f(x):\n    return x\n\nprint(f(2), f(3))",
             False,
             "followed_by_top_level",
             "def f(x):\n    return x\n",
@@ -119,21 +119,21 @@ def test_the_oracle_solves_under_the_training_layout(case: Case) -> None:
         ),
         # Complete example calls and comments may follow; the longest parseable prefix stays.
         (
-            "def f(x):\n    return x\n# usage\nf(1)\nprint(f(",
+            "def f(x):\n    return x\n# usage\nf(1)\nprint(f(1))\n# done\n",
             False,
             "followed_by_top_level",
             "def f(x):\n    return x\n# usage\nf(1)",
         ),
         # Nested defs belong to the outer function.
         (
-            "def f(x):\n    def g():\n        return 1\n    return g()\nprint(f",
+            "def f(x):\n    def g():\n        return 1\n    return g()\nprint(f)",
             False,
             "followed_by_top_level",
             "def f(x):\n    def g():\n        return 1\n    return g()",
         ),
         # A decorated function keeps its decorator.
         (
-            "@cache\ndef f(x):\n    return x\n\nf(",
+            "@cache\ndef f(x):\n    return x\n\n(lambda: 0)()",
             False,
             "followed_by_top_level",
             "@cache\ndef f(x):\n    return x\n",
@@ -172,6 +172,24 @@ def test_recovery_keeps_only_a_verbatim_prefix_of_complete_statements(
         ("def f(x):\n    return x\nLIMIT: int = (", False),
         ("def f(x):\n    return x\ncount += f(", False),
         ("def f(x):\n    return x\nif f(1):\n    y = (", False),
+        # Tails the normal rules would refuse once closed, or whose meaning is unknown.
+        ("def f(x):\n    return x\nprint([x for x in range(3)])", False),
+        ("def f(x):\n    return x\nprint(1,\n    (x := 2))", False),
+        ("def f(x):\n    return x\nprint(1) + \\\n    (x := 2)", False),
+        ("def f(x):\n    return x\nfor(x) in (\n    [1]): pass", False),
+        ("def f(x):\n    return x\nfor(x) in range(3)", False),
+        ("def f(x):\n    return x\nwith(open('p')) as x: pass", False),
+        ("def f(x):\n    return x\nwith(open('p')) as x", False),
+        ("def f(x):\n    return x\ndel(x", False),
+        ("def f(x):\n    return x\ndel(x)", False),
+        ("def f(x):\n    return x\nif(x", False),
+        ('def f(x):\n    return x\nprint("\\""); x = ', False),
+        ('def f(x):\n    return x\nprint("\\""); x = 1', False),
+        ("def f(x):\n    return x\nf(1); import os as", False),
+        ("def f(x):\n    return x\nf(1); import os", False),
+        ("def f(x):\n    return x\nprint(1)\n\x0cx = 1", False),
+        ("def f(x):\x0b\n    return x\nprint(1)", False),
+        ("def f(x):\n    return x\nprint(f(", False),  # a truncated call: meaning unknown
     ],
 )
 def test_recovery_refuses_anything_not_provably_complete(text: str, eos: bool) -> None:
@@ -180,7 +198,7 @@ def test_recovery_refuses_anything_not_provably_complete(text: str, eos: bool) -
 
 def test_recovery_applies_only_to_an_open_block_without_an_end_marker() -> None:
     decoder = Bytes()
-    body = list(b"def f(x):\n    return x\nprint(1")
+    body = list(b"def f(x):\n    return x\nprint(1)")
     assert recovery.recover([PYTHON_START, *body], decoder, "length") is not None
     assert recovery.recover(body, decoder, "length") is None  # no block at all
     assert recovery.recover([ASSISTANT_END, PYTHON_START, *body], decoder, "length") is None
@@ -203,7 +221,7 @@ def model_policy(replies: list[list[int]], mode: str, finish: str = "length") ->
 
 
 def test_a_recovered_function_goes_through_the_same_reply_rules(case: Case) -> None:
-    unclosed = [PYTHON_START, *(FIXED_DOUBLE + "\n\nprint(double(2))\nprint(double(").encode()]
+    unclosed = [PYTHON_START, *(FIXED_DOUBLE + "\n\nprint(double(2))").encode()]
     off, _ = instance(case, model_policy([list(unclosed)] * 3, "off"), condition=loop.SINGLE)
     assert not off.solved and off.turns[0].edit == "no_python_block"
     on, trace = instance(
@@ -211,13 +229,17 @@ def test_a_recovered_function_goes_through_the_same_reply_rules(case: Case) -> N
     )
     turn = on.turns[0]
     assert on.solved and turn.recovered and not turn.closed_block
-    assert turn.recovery == {"rule": "followed_by_top_level", "end_line": 5, "block_lines": 6}
+    assert turn.recovery == {"rule": "followed_by_top_level", "end_line": 4, "block_lines": 5}
     generation = next(event for event in trace.events if event["event"] == "generation")
-    assert generation["recovered"] and generation["text"].endswith("print(double(")  # full original
+    assert generation["recovered"] and generation["text"].endswith(
+        "print(double(2))"
+    )  # full original
     # A recovered prefix with two shown functions is refused like a normal reply.
     two = [
         PYTHON_START,
-        *(FIXED_DOUBLE + "\n\ndef scaled(x, a, b):\n    return 0\n\nprint(scaled(").encode(),
+        *(
+            FIXED_DOUBLE + "\n\ndef scaled(x, a, b):\n    return 0\n\nprint(scaled(1, 0, 2))"
+        ).encode(),
     ]
     refused, _ = instance(case, model_policy([two], "intact-function"), condition=loop.SINGLE)
     assert refused.turns[0].recovered and refused.turns[0].edit == "multiple_functions"
@@ -426,7 +448,9 @@ def test_the_agent_package_never_imports_or_alters_the_rl_screening_protocol() -
 def test_boundaries_are_logical_lines_not_backslash_continuations() -> None:
     assert recovery.logical_line_starts("a = 1 + \\\n2\nb = (3,\n4)\nc = 5\n") == [0, 2, 4]
     # The column-0 "1" continues the return statement, so it is kept with the function.
-    found = recovery.recover_text("def f(x):\n    return x + \\\n1\nprint(f(", ended_by_eos=False)
+    found = recovery.recover_text(
+        "def f(x):\n    return x + \\\n1\nprint(f(1))", ended_by_eos=False
+    )
     assert found is not None and found.code == "def f(x):\n    return x + \\\n1"
     # A truncated tail stops the tokenizer without losing the starts before it.
     assert recovery.logical_line_starts('x = 1\ny = """\nz = 2') == [0, 1]
@@ -459,6 +483,8 @@ def test_funnel_stages_nest_and_non_target_edits_stay_beside_them(case: Case) ->
 
 def card(**identity: object) -> dict[str, object]:
     base: dict[str, object] = {
+        "git_commit": "abc",
+        "dirty": False,
         "valid_cases": ["X01"],
         "cases_registry_sha256": "r",
         "checkpoint_sha256": "c",
@@ -536,6 +562,8 @@ def test_compare_labels_factors_and_flags_runs_that_differ_outside_the_config() 
         {"decodings": [{"label": "greedy", "index": 0, "temperature": 0.0, "top_p": 1.0}]},
         {"seed_base": 2},
         {"runtime_image_id": "j"},
+        {"git_commit": "def"},
+        {"dirty": True},
     ):
         mixed = scorecard.comparison([("A", card()), ("X", card(**change))])
         assert not mixed["comparable"] and mixed["rows"][1]["noncomparable_fields"]
@@ -562,3 +590,21 @@ def test_the_compare_command_refuses_noncomparable_runs_unless_allowed(tmp_path:
     assert agent_dev_run.main(command) == 2 and not md.exists() and not js.exists()
     assert agent_dev_run.main([*command, "--allow-noncomparable"]) == 0
     assert "NO: threads" in md.read_text("utf-8")
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        ["print(f(1))"],
+        ["f(1) if True else g"],
+        ["(lambda: 0)()"],
+        ["# only a comment", "   # another", ""],
+        [],
+        ["print(f(1))", "", "# trailing"],
+    ],
+)
+def test_inert_tails_are_complete_expressions_that_bind_nothing(tail: list[str]) -> None:
+    assert recovery.tail_is_inert(tail)
+    found = recovery.recover_text("def f(x):\n    return x\n" + "\n".join(tail), ended_by_eos=False)
+    if any(line.strip() and not line.lstrip().startswith("#") for line in tail):
+        assert found is not None and found.code == "def f(x):\n    return x"

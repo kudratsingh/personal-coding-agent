@@ -119,9 +119,10 @@ changes one factor at a time.
   longest prefix that parses and is followed by a new logical line at indentation 0 (found with
   the tokenizer, so a bracket or backslash continuation is not a boundary): every function in
   it ended before the generation ran out (`followed_by_top_level`). The dropped tail must be
-  inert: at column 0 only expression statements (example calls) and comments. A definition,
-  decorator, import, class or any assignment there could change what the kept function means,
-  so recovery refuses instead. Nothing is added, edited or
+  inert: after trailing blank and comment lines, it must parse completely into expression
+  statements that bind no name and contain no comprehension or assignment expression. A
+  truncated tail, or anything else, could change what the kept function means, so recovery
+  refuses instead; so does any completion with a form feed, vertical tab or carriage return. Nothing is added, edited or
   re-indented, and test outcomes are never consulted. The prefix then meets the same reply rules
   and editor as any reply. The turn records `recovered`, the rule and the kept span; the trace
   keeps the full original completion.
@@ -137,7 +138,7 @@ failures (`invented_name`, `public_test_name`, `unshown_repo_function`) and a ha
 refused as unparsable, a single shown function refused as several, an import the target
 already has) is flagged as a harness defect. `agent_dev_run compare --runs DIR... --out-md
 --out-json` writes one table across runs. The first run is the baseline; every run must share
-its cases, case registry, checkpoint, tokenizer, seeds, decoding rows, conditions, budgets,
+its code commit (clean tree), cases, case registry, checkpoint, tokenizer, seeds, decoding rows, conditions, budgets,
 threads, batch size, supervisor and runtime image, or the comparison is refused (unless
 `--allow-noncomparable`, which marks those rows). Each row names the configuration fields that
 differ and is labelled baseline, single factor (prompt, sampled decoding as one factor, or

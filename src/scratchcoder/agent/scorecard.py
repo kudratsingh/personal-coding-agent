@@ -260,6 +260,8 @@ def _inferred_config(identity: dict[str, Any]) -> dict[str, Any]:
 
 
 INVARIANT_FIELDS = (
+    "git_commit",
+    "dirty",
     "valid_cases",
     "cases_registry_sha256",
     "checkpoint_sha256",
@@ -391,7 +393,8 @@ def comparison_markdown(table: dict[str, Any]) -> str:
     lines = [
         "# Agent development comparison",
         "",
-        f"Baseline: {table['baseline']}. Every run must share the baseline's cases, case "
+        f"Baseline: {table['baseline']}. Every run must share the baseline's code commit "
+        "(and clean tree), cases, case "
         "registry, checkpoint, tokenizer, seeds, decoding rows, conditions, budgets, threads, "
         "batch size, supervisor and runtime image; only the configuration may differ. Funnel "
         "columns are nested generation stages, then side counts. Solved counts instances: "
