@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 
 from scratchcoder.agent import workspace
 from scratchcoder.agent.cases import Case
 from scratchcoder.agent.loop import Decoding, Proposal
 from scratchcoder.agent.prompt import Prompt
+from scratchcoder.agent.recovery import MODES as RECOVERY_MODES
+from scratchcoder.agent.recovery import recover
 from scratchcoder.data.chat import CODE_STOP_IDS, TextDecoder, extract_program
 from scratchcoder.eval.harness import attempt_seed
 
@@ -64,7 +67,11 @@ class ModelPolicy:
         *,
         name: str = "model",
         clock: Callable[[], float] = time.perf_counter,
+        recovery: str = "off",
     ) -> None:
+        if recovery not in RECOVERY_MODES:
+            raise ValueError(f"unknown recovery mode {recovery!r}")
+        self.recovery = recovery
         self.name = name
         self.generate = generate
         self.decoder = decoder
@@ -84,26 +91,25 @@ class ModelPolicy:
         key = (prompt.ids, max_new_tokens, decoding.temperature, decoding.top_p, seed)
         if key in self.cache:
             hit = self.cache[key]
-            return Proposal(
-                hit.code,
-                hit.text,
-                hit.generated_tokens,
-                hit.finish_reason,
-                0.0,
-                cached=True,
-                cached_seconds=hit.seconds,
-            )
+            return replace(hit, seconds=0.0, cached=True, cached_seconds=hit.seconds)
         started = self.clock()
         tokens, finish = self.generate(
             prompt.ids, max_new_tokens, decoding.temperature, decoding.top_p, seed
         )
         seconds = self.clock() - started
+        code = extract_program(tokens, self.decoder)
+        recovered = None
+        if code is None and self.recovery == "intact-function":
+            recovered = recover(tokens, self.decoder, finish)
         proposal = Proposal(
-            extract_program(tokens, self.decoder),
+            code if recovered is None else recovered.code,
             self.decoder.decode(tokens),
             len(tokens),
             finish,
             seconds,
+            tokens=tuple(tokens),
+            closed_block=code is not None,
+            recovery=None if recovered is None else recovered.record(),
         )
         self.cache[key] = proposal
         return proposal

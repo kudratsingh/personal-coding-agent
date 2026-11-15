@@ -33,8 +33,9 @@ from pathlib import Path
 from typing import Any, Protocol, TextIO
 
 from scratchcoder.agent import execution, workspace
+from scratchcoder.agent.audit import audit_refusal, name_failure, reply_facts
 from scratchcoder.agent.cases import Case
-from scratchcoder.agent.prompt import Blocks, ContextLimit, Prompt, Snippet, build
+from scratchcoder.agent.prompt import LAYOUTS, Blocks, ContextLimit, Prompt, Snippet, build_layout
 from scratchcoder.data.chat import TextEncoder
 from scratchcoder.sandbox.reward import audit_attempt
 
@@ -46,7 +47,8 @@ FAILURE_CLASSES = (
     "action_selection",
     "model_capability",
 )
-MAX_TRACE_TEXT = 4000
+MAX_TRACE_TEXT = 65536
+"""Generations are at most 324 tokens, so this keeps every completion whole in the trace."""
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,12 @@ class Proposal:
     cached: bool = False
     cached_seconds: float = 0.0
     """For a cache hit, the time the reused generation took when it was made."""
+    tokens: tuple[int, ...] = ()
+    """The generated token IDs (for the refusal audit); empty for non-model policies."""
+    closed_block: bool | None = None
+    """Whether the reply had a closed python block; None means ``code is not None``."""
+    recovery: dict[str, Any] | None = None
+    """When ``code`` was recovered from an unclosed block: the rule and span kept."""
 
 
 class Policy(Protocol):
@@ -131,6 +139,20 @@ class Turn:
     """The generation was reused from an identical earlier request (same prompt and seed)."""
     cached_seconds: float = 0.0
     """For a reused generation, the time it took when it was first made."""
+    closed_block: bool = False
+    recovered: bool = False
+    recovery: dict[str, Any] | None = None
+    parseable: bool = False
+    defined: list[str] = field(default_factory=list)
+    """Top-level function names the reply's code defines."""
+    shown_defined: list[str] = field(default_factory=list)
+    """Those of them that were shown in the prompt."""
+    target_defined: bool = False
+    """The reply defines exactly one shown function, and it is a target of the case."""
+    name_failure: str = ""
+    """For an ``unknown_name`` refusal, one of :data:`scratchcoder.agent.audit.NAME_FAILURES`."""
+    audit: list[str] = field(default_factory=list)
+    """Harness-defect flags: contradictions between the refusal and the reply rules."""
     edit: str = ""
     """``applied`` or the refusal reason."""
     function: str = ""
@@ -153,6 +175,7 @@ class InstanceResult:
     target_located: bool = False
     targets_touched: bool = False
     audit_flags: list[str] = field(default_factory=list)
+    harness_defects: list[str] = field(default_factory=list)
     touched: list[str] = field(default_factory=list)
     diff: str = ""
     feedback_before: str = ""
@@ -213,12 +236,27 @@ def _previous(original: Mapping[str, str], files: Mapping[str, str]) -> list[str
     return lines
 
 
+def public_test_sources(case: Case, files: Mapping[str, str], failing: list[str]) -> list[str]:
+    """The source of each failing public test function (all of them when none is known), in
+    file order; public material only."""
+    sources: list[str] = []
+    for path in case.public_tests:
+        found = workspace.functions(files[path], path)
+        names = [name for name in found if name.startswith("test_")]
+        chosen = [name for name in names if name in failing] or ([] if failing else names)
+        sources.extend(workspace.function_source(files[path], found[name]) for name in chosen)
+    if failing and not sources:
+        return public_test_sources(case, files, [])
+    return sources
+
+
 def blocks_for(
     case: Case,
     files: Mapping[str, str],
     candidates: list[workspace.Candidate],
     observation: str,
     original: Mapping[str, str],
+    tests: list[str] | None = None,
 ) -> Blocks:
     """The prompt blocks of one turn (no hidden material: task, map, shown code, feedback)."""
     snippets = [
@@ -239,6 +277,7 @@ def blocks_for(
         snippets=snippets,
         observation=observation,
         previous=_previous(original, files),
+        tests=tests or (),
     )
 
 
@@ -253,7 +292,12 @@ def run_instance(
     trace: Trace,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] | None = None,
+    layout: str = "harness",
 ) -> InstanceResult:
+    """Run one instance. ``layout`` is the prompt layout (:data:`prompt.LAYOUTS`); the
+    training layout shows the failing public tests and, on repair turns only, the feedback."""
+    if layout not in LAYOUTS:
+        raise ValueError(f"unknown prompt layout {layout!r}")
     started = clock()
     budgets = case.budgets
     result = InstanceResult(case.id, policy.name, condition.name, decoding.label)
@@ -312,8 +356,14 @@ def run_instance(
             failing = execution.failing_tests(execution.parse_report(last.stdout))
             candidates = workspace.locate(files, case.public_tests, failing, case.allowed_files)
             shown_text = observation if not refusal else f"EDIT refused: {refusal}\n{observation}"
+            tests = None
+            if layout == "training":
+                tests = public_test_sources(case, files, failing)
+                if number == 1:
+                    shown_text = ""
             try:
-                prompt = build(encoder, blocks_for(case, files, candidates, shown_text, original))
+                blocks = blocks_for(case, files, candidates, shown_text, original, tests)
+                prompt = build_layout(encoder, blocks, layout)
             except ContextLimit as error:
                 trace.emit("context_limit", turn=number, reason=str(error))
                 result.ended = "context"
@@ -347,6 +397,13 @@ def run_instance(
             turn.generation_seconds = proposal.seconds
             turn.cached = proposal.cached
             turn.cached_seconds = proposal.cached_seconds
+            turn.recovered = proposal.recovery is not None
+            turn.recovery = proposal.recovery
+            turn.closed_block = (
+                proposal.code is not None and not turn.recovered
+                if proposal.closed_block is None
+                else proposal.closed_block
+            )
             result.cached_generation_seconds += proposal.cached_seconds
             result.generated_tokens += proposal.generated_tokens
             result.generation_seconds += proposal.seconds
@@ -358,17 +415,48 @@ def run_instance(
                 seconds=round(proposal.seconds, 4),
                 cached=proposal.cached,
                 cached_seconds=round(proposal.cached_seconds, 4),
-                closed_block=proposal.code is not None,
+                closed_block=turn.closed_block,
+                recovered=turn.recovered,
+                recovery=proposal.recovery,
                 text=proposal.text[:MAX_TRACE_TEXT],
             )
             shown = [item.function for item in candidates if item.function.key in prompt.shown]
+            facts = reply_facts(proposal.code, shown)
+            turn.parseable = facts["parseable"]
+            turn.defined = facts["defined"]
+            turn.shown_defined = facts["shown_defined"]
+            if len(turn.shown_defined) == 1:
+                keys = [item.key for item in shown if item.name == turn.shown_defined[0]]
+                turn.target_defined = any(key in case.targets for key in keys)
             try:
                 edit = workspace.parse_reply(proposal.code, shown, files, case.allowed_files)
+                if turn.recovered and edit.source not in (proposal.code or ""):
+                    raise workspace.EditRefused("unparsable", "recovered function not verbatim")
                 files = workspace.apply_function(files, edit, case.allowed_files)
             except workspace.EditRefused as error:
                 refusal = workspace.REFUSAL_TEXT[error.reason]
                 turn.edit = error.reason
-                trace.emit("edit", turn=number, verdict="refused", reason=error.reason)
+                if error.reason == "unknown_name":
+                    turn.name_failure = name_failure(turn.defined, shown, files, case.targets)
+                turn.audit = audit_refusal(
+                    error.reason,
+                    tokens=proposal.tokens,
+                    code=proposal.code,
+                    shown=shown,
+                    files=files,
+                    targets=case.targets,
+                )
+                result.harness_defects = sorted(set(result.harness_defects) | set(turn.audit))
+                trace.emit(
+                    "edit",
+                    turn=number,
+                    verdict="refused",
+                    reason=error.reason,
+                    name_failure=turn.name_failure,
+                    audit=turn.audit,
+                    parseable=turn.parseable,
+                    defined=turn.defined,
+                )
                 continue
             refusal = ""
             key = f"{edit.path}::{edit.name}"
@@ -411,6 +499,8 @@ def run_instance(
         result.ended = f"unresolved_{error.args[0]}"
     result.touched = workspace.touched(original, files)
     result.diff = workspace.unified_diff(original, files)
+    if result.turns and not result.target_located:
+        result.harness_defects = sorted(set(result.harness_defects) | {"target_not_shown"})
     result.failure_class = classify(result)
     result.wall_seconds = clock() - started
     trace.emit(

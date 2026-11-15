@@ -69,6 +69,8 @@ class Blocks:
     snippets: Sequence[Snippet]
     observation: str
     previous: Sequence[str] = ()
+    tests: Sequence[str] = ()
+    """Public test function sources, used only by the training layout."""
 
 
 @dataclass(frozen=True)
@@ -214,6 +216,103 @@ def build(encoder: TextEncoder, blocks: Blocks) -> Prompt:
         tuple(snippet.key for snippet in snippets),
         tuple(truncations),
     )
+
+
+LAYOUTS = ("harness", "training")
+TESTS_BUDGET = 150
+"""Token budget of the training layout's public-test block (the observation's budget)."""
+
+
+def build_training(encoder: TextEncoder, blocks: Blocks) -> Prompt:
+    """The training-shaped layout: one user turn shaped like the SFT pool rows::
+
+        {task}
+
+        {function source}          (each shown function, nearest first, no header)
+
+        {public test source}       (the failing public tests' functions)
+
+        {condensed failure}        (repair turns only: the caller passes "" on turn 1)
+
+        {instruction}
+
+    The same budgets apply where a block exists (task 120, functions 250 with 180 each,
+    observation 150, prompt 700); the tests get :data:`TESTS_BUDGET`. Over the total, the
+    farthest functions are dropped, then the tests are cut to the first; still over is a
+    :class:`ContextLimit`. There is no map and no changes block: the shown code is the current
+    workspace."""
+    truncations: list[str] = []
+    task = blocks.task.strip()
+    if _count(encoder, task) > BUDGETS["task"]:
+        raise ContextLimit("the task statement is over its budget")
+    snippets: list[Snippet] = []
+    used = 0
+    for index, snippet in enumerate(blocks.snippets):
+        lines = snippet.source.split("\n")
+        fitted = _fit_lines(encoder, lines, FUNCTION_BUDGET, ELLIPSIS)
+        if fitted != lines:
+            truncations.append(f"function:{snippet.key}")
+        source = "\n".join(fitted)
+        cost = _count(encoder, source)
+        if index and used + cost > BUDGETS["snippet"]:
+            truncations.append(f"snippet_dropped:{snippet.key}")
+            continue
+        snippets.append(Snippet(snippet.key, source))
+        used += cost
+    tests: list[str] = []
+    for index, test in enumerate(blocks.tests):
+        candidate = [*tests, test]
+        if _count(encoder, "\n\n".join(candidate)) <= TESTS_BUDGET:
+            tests = candidate
+        elif not index:
+            tests = [_fit_text(encoder, test, TESTS_BUDGET)]
+            truncations.append("tests")
+        else:
+            truncations.append("tests_dropped")
+    observation = _fit_text(encoder, blocks.observation, BUDGETS["observation"])
+    if observation != blocks.observation:
+        truncations.append("observation")
+
+    def render() -> tuple[str, list[int]]:
+        parts = [task, *(snippet.source for snippet in snippets), *tests]
+        if observation:
+            parts.append(observation)
+        parts.append(INSTRUCTION)
+        text = "\n\n".join(parts)
+        return text, generation_prompt(encoder, [Message("user", text)])
+
+    text, ids = render()
+    while len(ids) > PROMPT_BUDGET and len(snippets) > 1:
+        truncations.append(f"snippet_dropped_for_total:{snippets.pop().key}")
+        text, ids = render()
+    if len(ids) > PROMPT_BUDGET and len(tests) > 1:
+        truncations.append("tests_dropped_for_total")
+        tests = tests[:1]
+        text, ids = render()
+    if len(ids) > PROMPT_BUDGET:
+        raise ContextLimit("the prompt is over its budget after every reduction")
+    block_tokens = {
+        "task": _count(encoder, task),
+        "snippet": sum(_count(encoder, snippet.source) for snippet in snippets),
+        "tests": _count(encoder, "\n\n".join(tests)),
+        "observation": _count(encoder, observation),
+        "instruction": _count(encoder, INSTRUCTION),
+    }
+    return Prompt(
+        tuple(ids),
+        text,
+        block_tokens,
+        tuple(snippet.key for snippet in snippets),
+        tuple(truncations),
+    )
+
+
+def build_layout(encoder: TextEncoder, blocks: Blocks, layout: str) -> Prompt:
+    if layout == "harness":
+        return build(encoder, blocks)
+    if layout == "training":
+        return build_training(encoder, blocks)
+    raise ValueError(f"unknown prompt layout {layout!r}")
 
 
 def fit_bound(prompt_tokens: int, reference_tokens: Sequence[int]) -> dict[str, Any]:

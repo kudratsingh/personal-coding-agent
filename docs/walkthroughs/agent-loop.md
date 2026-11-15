@@ -98,6 +98,40 @@ but never to a target function), `model_capability` (the target was edited, the 
 fail). `grading` marks an instance whose sandbox calls stayed host failures after the retries: it
 is unscored, never a pass or a fail.
 
+## Configurations, recovery and the funnel
+
+`tools/agent_dev_run.py run` takes a named configuration, recorded in the scorecard
+identity. The defaults reproduce the first development configuration exactly (a test pins its
+prompt hashes). Cases, seeds (`turn_seed(case, turn, sample index)`), turns, token budgets, the
+generation cap rule and feedback budgets are the same in every configuration, so a comparison
+changes one factor at a time.
+
+- `--prompt harness|training`. `training` renders the turn like an SFT pool row: the task, the
+  shown functions' code without headers, the failing public tests' source, and on repair turns
+  only the condensed failure, then the instruction. No map and no changes block. Same block
+  budgets; the tests get the observation's 150.
+- `--sampled-temperature`, `--sampled-top-p` change the sampled rows only; greedy rows are
+  unchanged. These are agent decoding settings, separate from the RL screening protocol, which
+  the agent package never imports (a test checks this and the screening constants).
+- `--recovery off|intact-function`. Only for a reply that opens a python block and never closes
+  it. It keeps a **verbatim prefix** of the block text: the whole text when the model ended its
+  turn (end-of-turn token, not the length limit) and the text parses (`eos_whole_parse`), or the
+  longest prefix that parses and is followed by another column-0 line, so every function in it
+  ended before the generation ran out (`followed_by_top_level`). Nothing is added, edited or
+  re-indented, and test outcomes are never consulted. The prefix then meets the same reply rules
+  and editor as any reply. The turn records `recovered`, the rule and the kept span; the trace
+  keeps the full original completion.
+
+The scorecard's **funnel** counts, per generation and per instance: closed block (recovered
+apart), parseable, exactly one shown function, that function is a target, applicable edit,
+public tests passed, solved. `unknown_name` refusals are split into model task-following
+failures (`invented_name`, `public_test_name`, `unshown_repo_function`) and a harness defect
+(`locate_omitted_target`). Every refusal is also re-derived by an independent audit
+(`scratchcoder.agent.audit`); a contradiction (a closed block reported missing, parseable code
+refused as unparsable, a single shown function refused as several, an import the target
+already has) is flagged as a harness defect. `agent_dev_run compare --runs DIR... --out-md
+--out-json` writes one table across runs.
+
 ## Design choices and common mistakes
 
 - **One program per call, not a new sandbox.** The runner takes one program and one test string.

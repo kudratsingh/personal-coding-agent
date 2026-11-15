@@ -39,10 +39,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from scratchcoder.agent import cases as agent_cases
 from scratchcoder.agent import execution, loop, prompt, scorecard, validation, workspace
 from scratchcoder.agent.policy import AGENT_SEED, Generate, ModelPolicy, OraclePolicy
+from scratchcoder.agent.recovery import MODES as RECOVERY_MODES
 from scratchcoder.common.records import atomic_json, git_state, utc_now
 from scratchcoder.data.chat import PROTOCOL, TextDecoder, TextEncoder
 from tools.admission_check import _receipt_image
@@ -101,6 +103,33 @@ def _under(directory: Path, name: str) -> Path:
     return path
 
 
+def config_of(args: argparse.Namespace) -> dict[str, Any]:
+    """The named agent configuration of a run (recorded in the scorecard identity). The
+    defaults are the first development run's configuration."""
+    return {
+        "prompt": args.prompt,
+        "sampled_temperature": args.sampled_temperature,
+        "sampled_top_p": args.sampled_top_p,
+        "recovery": args.recovery,
+    }
+
+
+def compare(args: argparse.Namespace) -> int:
+    for path in (args.out_md, args.out_json):
+        if path.exists():
+            print(f"refused: {path} exists", file=sys.stderr)
+            return 2
+    cards = []
+    for run_dir in args.runs:
+        card = json.loads((run_dir / "scorecard.json").read_text(encoding="utf-8"))
+        cards.append((run_dir.name, card))
+    table = scorecard.comparison(cards)
+    atomic_json(args.out_json, table)
+    args.out_md.write_text(scorecard.comparison_markdown(table), encoding="utf-8")
+    print(json.dumps({"rows": len(table["rows"]), "markdown": str(args.out_md)}))
+    return 0
+
+
 def register(args: argparse.Namespace) -> int:
     target = args.cases / agent_cases.REGISTRY_NAME
     if target.exists():
@@ -137,7 +166,7 @@ def plan(args: argparse.Namespace) -> int:
 def _decodings(args: argparse.Namespace) -> list[loop.Decoding]:
     found = [loop.GREEDY] if args.greedy else []
     found += [
-        loop.Decoding(f"sample-{index}", args.temperature, args.top_p, index)
+        loop.Decoding(f"sample-{index}", args.sampled_temperature, args.sampled_top_p, index)
         for index in range(args.seeds)
     ]
     return found
@@ -197,6 +226,7 @@ def run(
                 execute=execute,
                 trace=loop.Trace(stream),
                 clock=clock,
+                layout=args.prompt,
             )
         loop.write_instance(out / "packets" / name, result, case, str(trace_path.relative_to(out)))
         results.append(result)
@@ -221,7 +251,7 @@ def run(
     if not args.skip_oracle:  # A harness check, through the same encoder as the model rows.
         for case in valid:
             instance(case, OraclePolicy(), loop.REPAIR_3, loop.GREEDY, encoder)
-    model = ModelPolicy(generate, decoder)
+    model = ModelPolicy(generate, decoder, recovery=args.recovery)
     decodings = _decodings(args)
     for case in valid:
         for decoding in decodings:
@@ -243,6 +273,7 @@ def run(
             Path(execution.__file__).parents[1] / "sandbox" / "program.py"
         ),
         "protocol": PROTOCOL,
+        "config": config_of(args),
         "conditions": [asdict(condition) for condition in conditions],
         "decodings": [asdict(decoding) for decoding in decodings],
         "seed_base": AGENT_SEED,
@@ -285,8 +316,23 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--receipt", type=Path, required=True)
     run_parser.add_argument("--seeds", type=int, default=5, help="sampled seeds per case")
     run_parser.add_argument("--no-greedy", dest="greedy", action="store_false")
-    run_parser.add_argument("--temperature", type=float, default=1.0)
-    run_parser.add_argument("--top-p", type=float, default=1.0)
+    run_parser.add_argument(
+        "--sampled-temperature",
+        "--temperature",
+        dest="sampled_temperature",
+        type=float,
+        default=1.0,
+        help="temperature of the sampled rows (greedy rows are unchanged)",
+    )
+    run_parser.add_argument(
+        "--sampled-top-p", "--top-p", dest="sampled_top_p", type=float, default=1.0
+    )
+    run_parser.add_argument("--prompt", choices=prompt.LAYOUTS, default="harness")
+    run_parser.add_argument("--recovery", choices=RECOVERY_MODES, default="off")
+    compare_parser = commands.add_parser("compare")
+    compare_parser.add_argument("--runs", type=Path, nargs="+", required=True)
+    compare_parser.add_argument("--out-md", type=Path, required=True)
+    compare_parser.add_argument("--out-json", type=Path, required=True)
     run_parser.add_argument(
         "--conditions", nargs="+", default=["single", "repair-3"], choices=sorted(loop.CONDITIONS)
     )
@@ -305,12 +351,18 @@ def main(
     parser = build_parser()
     args = parser.parse_args(argv)
     args.argv = list(sys.argv[1:] if argv is None else argv)
-    paths = [args.cases, *(getattr(args, name, None) for name in ("tokenizer", "checkpoint"))]
+    paths = [getattr(args, name, None) for name in ("cases", "tokenizer", "checkpoint")]
+    if args.command == "compare":
+        paths += [*args.runs, args.out_md, args.out_json]
     if args.command == "run":
         paths += [args.out, args.receipt]
         if args.seeds < 0 or not args.greedy and args.seeds == 0:
             parser.error("run needs greedy decoding or at least one sampled seed")
-        if not 0 < args.temperature <= 2 or not 0 < args.top_p <= 1 or args.threads < 1:
+        if (
+            not 0 < args.sampled_temperature <= 2
+            or not 0 < args.sampled_top_p <= 1
+            or args.threads < 1
+        ):
             parser.error("invalid temperature, top-p or thread count")
     present = [path for path in paths if path is not None]
     try:
@@ -319,6 +371,8 @@ def main(
     except SealedPathError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
+    if args.command == "compare":
+        return compare(args)
     if args.command == "register":
         return register(args)
     if args.command == "plan":
