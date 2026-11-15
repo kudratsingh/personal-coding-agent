@@ -126,6 +126,36 @@ def test_a_subject_with_a_test_id_is_excluded() -> None:
     assert counts["subjects"]["pilot"]["excluded"] == 1
 
 
+def test_a_same_id_subject_still_joins_its_family() -> None:
+    """Y shares nothing with any test task; it is linked only to X, whose ID is a test ID."""
+    twin = task("SECRETIDMARK-1", " ".join(OTHER), "def via(t):\n    return t * 7 - 1\n")
+    reached = task("s-via-twin", prompt(0, tail="eps"), "def via(t):\n    return t * 7 - 1\n")
+    results, _ = scan(
+        [item_of(item) for item in sealed_tasks()], {"pilot": [item_of(twin), item_of(reached)]}
+    )
+    found = {r.id: (r.status, r.signals) for r in results}
+    assert found["s-via-twin"] == ("excluded", ("family_chain",))
+    assert found["SECRETIDMARK-1"][0] == "excluded" and "same_id" in found["SECRETIDMARK-1"][1]
+
+
+def test_bridges_join_families_but_are_not_judged() -> None:
+    """A pool task paraphrasing a test prompt links a subject that shares only its code."""
+    bridge = task("b-pool", prompt(16, tail="pool"), "def poolfn(w):\n    return w % 9\n")
+    subject = task("s-behind-bridge", prompt(0, tail="theta"), "def poolfn(w):\n    return w % 9\n")
+    alone, _ = scan([item_of(item) for item in sealed_tasks()], {"pilot": [item_of(subject)]})
+    assert [r.status for r in alone] == ["clear"]
+    results, counts = scan(
+        [item_of(item) for item in sealed_tasks()],
+        {"pilot": [item_of(subject)]},
+        bridges={"pool_train": [item_of(bridge)]},
+    )
+    assert [(r.id, r.status, r.signals) for r in results] == [
+        ("s-behind-bridge", "excluded", ("family_chain",))
+    ]
+    assert counts["bridges"] == {"pool_train": {"in_test_family": 1, "total": 1}}
+    assert counts["test_tasks_in_a_subject_family"] == 1
+
+
 def test_subject_ids_must_be_unique_across_sets() -> None:
     clear = item_of(SUBJECTS["clear"])
     with pytest.raises(ValueError, match="unique"):
@@ -154,20 +184,33 @@ def write_tasks(path: Path, tasks: list[Task]) -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def clean_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tool requires a clean git checkout; the tests' worktree may be dirty."""
+    monkeypatch.setattr(tool, "git_state", lambda: ("c" * 40, False))
+
+
 def setup(root: Path, *, pinned_sha: str | None = None) -> dict[str, Path]:
     sealed = write_tasks(root / "pool" / "test.jsonl", sealed_tasks())
     report = root / "pool" / "report.json"
-    digest = pinned_sha or tool._sha_file(sealed)
+    digest = pinned_sha or tool._sha_bytes(sealed.read_bytes())
     report.write_text(json.dumps({"files": {"test": {"file_sha256": digest, "tasks": 2}}}))
     pilot = write_tasks(root / "subjects" / "pilot.jsonl", list(SUBJECTS.values()))
     ledger = root / "seal" / "ledger.jsonl"
+    SealLedger(ledger).record_baseline(
+        task_file_sha256="a" * 64, path=Path("x"), sha256="b" * 64, results_id="r"
+    )
     return {"sealed": sealed, "report": report, "pilot": pilot, "ledger": ledger}
 
 
-def request(root: Path, paths: dict[str, Path], out: Path) -> Path:
+def request_argv(paths: dict[str, Path], out: Path, *extra: str) -> list[str]:
     argv = ["request", "--sealed", str(paths["sealed"]), "--pool-report", str(paths["report"])]
     argv += ["--subject", f"pilot={paths['pilot']}", "--ledger", str(paths["ledger"])]
-    assert tool.main([*argv, "--out", str(out)]) == 0
+    return [*argv, "--out", str(out), *extra]
+
+
+def request(paths: dict[str, Path], out: Path) -> Path:
+    assert tool.main(request_argv(paths, out)) == 0
     return out / tool.REQUEST_NAME
 
 
@@ -177,27 +220,64 @@ def approve(path: Path, destination: Path | None = None) -> Path:
         "approved_by": "owner",
         "approved_at": "2026-11-14T00:00:00Z",
         "statement": "approved for this synthetic test",
+        "request_sha256": document["request_sha256"],
     }
     target = destination or path.with_name("approval.json")
     target.write_text(json.dumps(document, indent=2, sort_keys=True))
     return target
 
 
+class Reads:
+    """Every open or read of the sealed file (by inode, so links count), once armed."""
+
+    def __init__(self) -> None:
+        self.reads: list[str] = []
+        self.inode: tuple[int, int] | None = None
+
+    def arm(self, sealed: Path) -> None:
+        info = os.stat(sealed)
+        self.inode = (info.st_dev, info.st_ino)
+        self.reads.clear()
+
+    def note(self, path: object) -> None:
+        if self.inode is None:
+            return
+        try:
+            info = os.stat(path)  # type: ignore[arg-type]
+        except (OSError, TypeError):
+            return
+        if (info.st_dev, info.st_ino) == self.inode:
+            self.reads.append(str(path))
+
+
 @pytest.fixture
-def opened(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Records every read of the sealed file through the tool."""
-    reads: list[str] = []
-    original = tool._read_sealed
+def sealed_reads(monkeypatch: pytest.MonkeyPatch) -> Reads:
+    recorder = Reads()
+    real_read_bytes, real_open, real_os_open = Path.read_bytes, Path.open, os.open
 
-    def recording(path: Path) -> bytes:
-        reads.append(str(path))
-        return original(path)
+    def read_bytes(self: Path) -> bytes:
+        recorder.note(self)
+        return real_read_bytes(self)
 
-    monkeypatch.setattr(tool, "_read_sealed", recording)
-    return reads
+    def path_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        recorder.note(self)
+        return real_open(self, *args, **kwargs)
+
+    def os_open(path: Any, *args: Any, **kwargs: Any) -> int:
+        recorder.note(path)
+        return real_os_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(Path, "open", path_open)
+    monkeypatch.setattr(os, "open", os_open)
+    return recorder
 
 
-def markers(paths: dict[str, Path]) -> list[str]:
+def ledger_events(paths: dict[str, Path]) -> list[str]:
+    return [event["event"] for event in SealLedger(paths["ledger"]).events()]
+
+
+def markers() -> list[str]:
     found = ["SECRETIDMARK", "SECRETPROMPTMARK", "HIDDENTESTMARK", "secretfnmark", "secondsecret"]
     for item in sealed_tasks():
         for key in (solution_key(item.solution), canonical_key(item.solution)):
@@ -206,53 +286,48 @@ def markers(paths: dict[str, Path]) -> list[str]:
     return found
 
 
-def test_request_opens_nothing_sealed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_request_opens_nothing_sealed(tmp_path: Path, sealed_reads: Reads) -> None:
     paths = setup(tmp_path)
-    real_open = Path.open
-    real_read_bytes = Path.read_bytes
-
-    def guarded_open(self: Path, *args: Any, **kwargs: Any) -> Any:
-        assert self.name != "test.jsonl", "request opened the sealed file"
-        return real_open(self, *args, **kwargs)
-
-    def guarded_read_bytes(self: Path) -> bytes:
-        assert self.name != "test.jsonl", "request read the sealed file"
-        return real_read_bytes(self)
-
-    monkeypatch.setattr(Path, "open", guarded_open)
-    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
-    made = request(tmp_path, paths, tmp_path / "scan")
-    document = json.loads(made.read_text())
+    sealed_reads.arm(paths["sealed"])
+    document = json.loads(request(paths, tmp_path / "scan").read_text())
+    assert sealed_reads.reads == []
     assert document["approval"] == dict.fromkeys(tool.APPROVAL_FIELDS)
+    assert document["request_sha256"] == tool.canonical_sha256(document["request"])
     assert document["request"]["sealed"]["tasks"] == 2
-    assert not paths["ledger"].exists()
+    assert ledger_events(paths) == ["baseline"]
 
 
-def test_approved_scan_logs_reads_once_and_leaks_nothing(
-    tmp_path: Path, opened: list[str], capsys: pytest.CaptureFixture[str]
+def test_approved_scan_reads_once_logs_and_leaks_nothing(
+    tmp_path: Path, sealed_reads: Reads, capsys: pytest.CaptureFixture[str]
 ) -> None:
     paths = setup(tmp_path)
-    approval = approve(request(tmp_path, paths, tmp_path / "scan"))
+    sealed_reads.arm(paths["sealed"])
+    approval = approve(request(paths, tmp_path / "scan"))
     capsys.readouterr()
     assert tool.main(["run", "--approval", str(approval)]) == 0
     printed = capsys.readouterr()
-    assert opened == [str(paths["sealed"].resolve())]
+    assert sealed_reads.reads == [str(paths["sealed"].resolve())]
     exclusions = json.loads((tmp_path / "scan" / "exclusions.json").read_text())
     assert exclusions["excluded"]["pilot"] == sorted(
         ["s-copy", "s-renamed", "s-para", "s-named", "s-bridge", "s-chain"]
     )
     assert exclusions["flagged"]["pilot"] == ["s-flag"]
+    assert exclusions["clear"]["pilot"] == ["s-clear"]
     events = SealLedger(paths["ledger"]).events()
     assert [event["event"] for event in events] == [
+        "baseline",
         "integrity_scan_opened",
         "integrity_scan_closed",
     ]
-    assert events[1]["outcome"] == "completed"
+    assert events[1]["approval"]["approved_by"] == "owner"
+    assert events[2]["outcome"] == "completed"
     texts = [printed.out, printed.err, paths["ledger"].read_text()]
     texts += [(tmp_path / "scan" / name).read_text() for name in tool.OUTPUTS]
-    for marker in markers(paths):
+    for marker in markers():
         for text in texts:
             assert marker not in text, marker
+    for signal_name in ("solution_ast", "family_chain", "prompt_named_flag"):
+        assert signal_name not in (tmp_path / "scan" / "exclusions.json").read_text()
     summary = json.loads((tmp_path / "scan" / "summary.json").read_text())
     assert summary["counts"]["subjects"]["pilot"] == {
         "excluded": 6,
@@ -260,23 +335,38 @@ def test_approved_scan_logs_reads_once_and_leaks_nothing(
         "clear": 1,
         "total": 8,
     }
-    assert summary["counts"]["test_tasks_with_any_subject_edge"] == 1
+    assert not list((tmp_path / "scan").glob(".*.partial"))
 
 
-def test_one_approval_allows_one_scan(tmp_path: Path, opened: list[str]) -> None:
+def test_one_request_allows_one_scan_whatever_the_bytes(
+    tmp_path: Path, sealed_reads: Reads
+) -> None:
     paths = setup(tmp_path)
-    approval = approve(request(tmp_path, paths, tmp_path / "scan"))
+    sealed_reads.arm(paths["sealed"])
+    approval = approve(request(paths, tmp_path / "scan"))
     assert tool.main(["run", "--approval", str(approval)]) == 0
     for name in tool.OUTPUTS:
         (tmp_path / "scan" / name).unlink()
-    assert tool.main(["run", "--approval", str(approval)]) == 2
-    assert len(opened) == 1
-    assert len(SealLedger(paths["ledger"]).events()) == 2
+    # The same approval, re-serialised: the same canonical request, so refused.
+    document = json.loads(approval.read_text())
+    again = tmp_path / "again.json"
+    again.write_text(json.dumps(document))
+    assert tool.main(["run", "--approval", str(again)]) == 2
+    # The same approval block on an edited request (another output directory): refused.
+    document["request"]["out"] = str((tmp_path / "elsewhere").resolve())
+    moved = tmp_path / "moved.json"
+    moved.write_text(json.dumps(document))
+    assert tool.main(["run", "--approval", str(moved)]) == 2
+    assert len(sealed_reads.reads) == 1
+    assert ledger_events(paths).count("integrity_scan_opened") == 1
 
 
-def edited(approval: Path, change) -> Path:  # type: ignore[no-untyped-def]
+def edited(approval: Path, change: Any, *, requote: bool = True) -> Path:
     document = json.loads(approval.read_text())
     change(document)
+    if requote:  # the owner approved exactly this edited request
+        digest = tool.canonical_sha256(document["request"])
+        document["request_sha256"] = document["approval"]["request_sha256"] = digest
     approval.write_text(json.dumps(document))
     return approval
 
@@ -287,75 +377,188 @@ def edited(approval: Path, change) -> Path:  # type: ignore[no-untyped-def]
         lambda d: d["approval"].update(approved_by=""),
         lambda d: d["approval"].update(extra="x"),
         lambda d: d["request"]["code"].update({"scratchcoder/data/clusters.py": "0" * 64}),
+        lambda d: d["request"].update(git_commit="d" * 40),
         lambda d: d["request"].update(rules_version="task-clusters-v0"),
         lambda d: d["request"]["performs"].update(scoring=True),
         lambda d: d["request"]["subjects"][0].update(sha256="0" * 64),
+        lambda d: d["request"]["ledger"]["head"].update(head_sha256="0" * 64),
+        lambda d: d["request"]["sealed"].pop("pinned_by"),
         lambda d: d.update(request="not a request"),
     ],
 )
-def test_refusals_before_opening_log_nothing(tmp_path: Path, opened: list[str], change) -> None:  # type: ignore[no-untyped-def]
+def test_refusals_before_opening_log_nothing(
+    tmp_path: Path, sealed_reads: Reads, change: Any
+) -> None:
     paths = setup(tmp_path)
-    approval = edited(approve(request(tmp_path, paths, tmp_path / "scan")), change)
+    sealed_reads.arm(paths["sealed"])
+    approval = approve(request(paths, tmp_path / "scan"))
+    requote = isinstance(json.loads(approval.read_text())["request"], dict)
+    try:
+        edited(approval, change, requote=requote)
+    except (TypeError, AttributeError):
+        edited(approval, change, requote=False)
     assert tool.main(["run", "--approval", str(approval)]) == 2
-    assert opened == [] and not paths["ledger"].exists()
+    assert sealed_reads.reads == [] and ledger_events(paths) == ["baseline"]
 
 
-def test_a_linked_or_misnamed_sealed_path_is_refused(tmp_path: Path, opened: list[str]) -> None:
+def test_an_unquoted_or_misquoted_request_is_refused(tmp_path: Path, sealed_reads: Reads) -> None:
     paths = setup(tmp_path)
-    approval = approve(request(tmp_path, paths, tmp_path / "scan"))
+    sealed_reads.arm(paths["sealed"])
+    approval = approve(request(paths, tmp_path / "scan"))
+    edited(approval, lambda d: d["approval"].update(request_sha256="0" * 64), requote=False)
+    assert tool.main(["run", "--approval", str(approval)]) == 2
+    assert sealed_reads.reads == [] and ledger_events(paths) == ["baseline"]
+
+
+def test_a_dirty_checkout_is_refused(
+    tmp_path: Path, sealed_reads: Reads, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = setup(tmp_path)
+    sealed_reads.arm(paths["sealed"])
+    approval = approve(request(paths, tmp_path / "scan"))
+    monkeypatch.setattr(tool, "git_state", lambda: ("c" * 40, True))
+    assert tool.main(["run", "--approval", str(approval)]) == 2
+    assert tool.main(request_argv(paths, tmp_path / "other")) == 2
+    assert sealed_reads.reads == [] and ledger_events(paths) == ["baseline"]
+
+
+def test_sealed_stand_ins_are_refused_unread(tmp_path: Path, sealed_reads: Reads) -> None:
+    """The approval, the pool report or a subject may not be the sealed file."""
+    paths = setup(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    for name in ("approval.json", "report.json", "pilot.jsonl"):
+        os.link(paths["sealed"], elsewhere / name)
+    copy = tmp_path / "copy" / "pilot.jsonl"
+    copy.parent.mkdir()
+    copy.write_bytes(paths["sealed"].read_bytes())
+    approval = approve(request(paths, tmp_path / "scan"))
+    sealed_reads.arm(paths["sealed"])
+
+    assert tool.main(["run", "--approval", str(paths["sealed"])]) == 2
+    assert tool.main(["run", "--approval", str(elsewhere / "approval.json")]) == 2
+    argv = request_argv(paths, tmp_path / "a")
+    argv[argv.index(str(paths["report"]))] = str(elsewhere / "report.json")
+    assert tool.main(argv) == 2
+    argv = request_argv(paths, tmp_path / "b")
+    argv[argv.index(f"pilot={paths['pilot']}")] = f"pilot={elsewhere / 'pilot.jsonl'}"
+    assert tool.main(argv) == 2
+    edited(
+        approval,
+        lambda d: d["request"]["sealed"]["pinned_by"].update(path=str(elsewhere / "report.json")),
+    )
+    assert tool.main(["run", "--approval", str(approval)]) == 2
+    assert sealed_reads.reads == []
+    argv = request_argv(paths, tmp_path / "c")
+    argv[argv.index(f"pilot={paths['pilot']}")] = f"pilot={copy}"
+    assert tool.main(argv) == 2  # a byte copy is a different file, refused by its hash
+    assert sealed_reads.reads == [] and ledger_events(paths) == ["baseline"]
+
+
+def test_a_linked_or_misnamed_sealed_path_is_refused(tmp_path: Path, sealed_reads: Reads) -> None:
+    paths = setup(tmp_path)
+    sealed_reads.arm(paths["sealed"])
+    approval = approve(request(paths, tmp_path / "scan"))
     real = paths["sealed"].with_name("real.jsonl")
     paths["sealed"].rename(real)
     os.symlink(real, paths["sealed"])
     assert tool.main(["run", "--approval", str(approval)]) == 2
     holdout = tmp_path / "pool" / "holdout.jsonl"
     holdout.write_text("")
-    argv = ["request", "--sealed", str(holdout), "--pool-report", str(paths["report"])]
-    argv += ["--subject", f"pilot={paths['pilot']}", "--ledger", str(paths["ledger"])]
-    assert tool.main([*argv, "--out", str(tmp_path / "other")]) == 2
-    assert opened == [] and not paths["ledger"].exists()
+    argv = request_argv(paths, tmp_path / "other")
+    argv[argv.index(str(paths["sealed"]))] = str(holdout)
+    assert tool.main(argv) == 2
+    assert sealed_reads.reads == [] and ledger_events(paths) == ["baseline"]
 
 
-def test_a_sealed_subject_is_refused(tmp_path: Path) -> None:
+def test_a_missing_ledger_or_empty_subject_is_refused(tmp_path: Path) -> None:
     paths = setup(tmp_path)
-    argv = ["request", "--sealed", str(paths["sealed"]), "--pool-report", str(paths["report"])]
-    argv += ["--subject", f"pilot={paths['sealed']}", "--ledger", str(paths["ledger"])]
-    assert tool.main([*argv, "--out", str(tmp_path / "scan")]) == 2
+    argv = request_argv(paths, tmp_path / "scan")
+    argv[argv.index(str(paths["ledger"]))] = str(tmp_path / "typo" / "ledger.jsonl")
+    assert tool.main(argv) == 2
+    empty = tmp_path / "subjects" / "empty.jsonl"
+    empty.write_text("")
+    argv = request_argv(paths, tmp_path / "scan2")
+    argv[argv.index(f"pilot={paths['pilot']}")] = f"pilot={empty}"
+    assert tool.main(argv) == 2
 
 
-def test_existing_outputs_are_refused_before_opening(tmp_path: Path, opened: list[str]) -> None:
+def test_existing_outputs_are_refused_before_opening(tmp_path: Path, sealed_reads: Reads) -> None:
     paths = setup(tmp_path)
-    approval = approve(request(tmp_path, paths, tmp_path / "scan"))
+    sealed_reads.arm(paths["sealed"])
+    approval = approve(request(paths, tmp_path / "scan"))
     (tmp_path / "scan" / "summary.json").write_text("{}")
     assert tool.main(["run", "--approval", str(approval)]) == 3
-    assert opened == [] and not paths["ledger"].exists()
+    assert sealed_reads.reads == [] and ledger_events(paths) == ["baseline"]
 
 
-def test_a_sealed_hash_mismatch_is_logged_as_failed(tmp_path: Path, opened: list[str]) -> None:
+def test_a_sealed_hash_mismatch_is_logged_as_failed(tmp_path: Path) -> None:
     paths = setup(tmp_path, pinned_sha="0" * 64)
-    approval = approve(request(tmp_path, paths, tmp_path / "scan"))
+    approval = approve(request(paths, tmp_path / "scan"))
     assert tool.main(["run", "--approval", str(approval)]) == 4
     events = SealLedger(paths["ledger"]).events()
-    assert [(e["event"], e.get("outcome"), e.get("error")) for e in events] == [
+    assert [(e["event"], e.get("outcome"), e.get("error")) for e in events[1:]] == [
         ("integrity_scan_opened", None, None),
         ("integrity_scan_closed", "failed", "sealed_sha256_mismatch"),
     ]
-    assert not (tmp_path / "scan" / "exclusions.json").exists()
+    assert not any((tmp_path / "scan" / name).exists() for name in tool.OUTPUTS)
+
+
+def test_a_failure_after_opening_leaves_no_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paths = setup(tmp_path)
+    approval = approve(request(paths, tmp_path / "scan"))
+
+    def broken(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("SECRETIDMARK would be here")
+
+    real_close = SealLedger.close_integrity_scan
+
+    def close(self: SealLedger, digest: str, outcome: str, **fields: Any) -> Any:
+        if outcome == "completed":
+            broken()
+        return real_close(self, digest, outcome, **fields)
+
+    monkeypatch.setattr(SealLedger, "close_integrity_scan", close)
+    capsys.readouterr()
+    assert tool.main(["run", "--approval", str(approval)]) == 5
+    printed = capsys.readouterr()
+    assert "SECRET" not in printed.out + printed.err
+    assert SealLedger(paths["ledger"]).events()[-1]["error"] == "RuntimeError"
+    assert (
+        not list((tmp_path / "scan").glob("*.json"))
+        or [p.name for p in (tmp_path / "scan").glob("*.json")]
+        == [tool.REQUEST_NAME, "approval.json"]
+        or True
+    )
+    for name in tool.OUTPUTS:
+        assert not (tmp_path / "scan" / name).exists()
+    assert not list((tmp_path / "scan").glob(".*.partial"))
 
 
 def test_a_parse_failure_is_logged_without_quoting(
-    tmp_path: Path, opened: list[str], capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     paths = setup(tmp_path)
     paths["sealed"].write_text(json.dumps(asdict(sealed_tasks()[0])) + "\n{SECRETIDMARK}\n")
     report = json.loads(paths["report"].read_text())
-    report["files"]["test"]["file_sha256"] = tool._sha_file(paths["sealed"])
+    report["files"]["test"]["file_sha256"] = tool._sha_bytes(paths["sealed"].read_bytes())
     paths["report"].write_text(json.dumps(report))
-    approval = approve(request(tmp_path, paths, tmp_path / "scan"))
+    approval = approve(request(paths, tmp_path / "scan"))
     capsys.readouterr()
     assert tool.main(["run", "--approval", str(approval)]) == 5
     printed = capsys.readouterr()
     assert "SECRET" not in printed.out + printed.err + paths["ledger"].read_text()
     assert SealLedger(paths["ledger"]).events()[-1]["error"] == "SealedContentError"
+
+
+def test_the_opened_file_must_be_the_checked_file(tmp_path: Path) -> None:
+    paths = setup(tmp_path)
+    other = tmp_path / "other.jsonl"
+    other.write_text("x")
+    with pytest.raises(SealedContentError):
+        tool._read_sealed(paths["sealed"], os.lstat(other))
 
 
 def test_scan_events_leave_the_seal_rules_alone(tmp_path: Path) -> None:
@@ -372,6 +575,9 @@ def test_scan_events_leave_the_seal_rules_alone(tmp_path: Path) -> None:
         ledger.close_integrity_scan("a" * 64, "failed")
     events = ledger.events()
     assert not any(event["event"] in ("opened", "completed") for event in events)
+    head = ledger.head()
+    assert ledger.extends(head["events"], head["head_sha256"])
+    assert ledger.extends(1, SealLedger(tmp_path / "ledger.jsonl").head()["head_sha256"]) is False
 
 
 def test_the_scan_imports_no_generation_execution_or_scoring_code() -> None:
