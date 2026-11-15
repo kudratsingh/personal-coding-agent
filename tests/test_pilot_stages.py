@@ -256,10 +256,11 @@ INTAKE_ORDER = [
 
 
 @pytest.fixture(autouse=True)
-def _no_agent_and_no_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+def _no_agent_and_no_waits(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from scratchcoder.eval import parallel
     from tools import task_pool
 
+    monkeypatch.setattr(tool, "REGISTRY", tmp_path / "registry" / "pilot-stages-registry.jsonl")
     monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
     monkeypatch.setattr(task_pool, "RETRY_DELAY_SECONDS", 0.0)
     monkeypatch.setattr(parallel, "host_backoff", lambda failures: 0.0)
@@ -1399,8 +1400,9 @@ def _age(run: Path, seconds: float) -> None:
     from datetime import timedelta
 
     inputs = json.loads((run / "inputs.json").read_text())
-    created = datetime.fromisoformat(inputs["created_at"]) - timedelta(seconds=seconds)
-    inputs["created_at"] = created.isoformat()
+    for name in ("created_at", "chain_started_at"):
+        moved = datetime.fromisoformat(inputs[name]) - timedelta(seconds=seconds)
+        inputs[name] = moved.isoformat()
     (run / "inputs.json").write_text(json.dumps(inputs), encoding="utf-8")
 
 
@@ -1491,15 +1493,12 @@ def test_a_run_that_did_not_stop_on_a_host_failure_cannot_be_superseded(tmp_path
     assert tool.main(again) == tool.EXIT_REFUSED
 
 
-def test_carried_generation_and_wall_time_count_in_the_new_run(tmp_path: Path) -> None:
-    run, paths = new_run(tmp_path)
+def test_carried_generation_time_counts_in_the_new_run(tmp_path: Path) -> None:
+    run, _ = new_run(tmp_path)
     inputs = json.loads((run / "inputs.json").read_text())
-    inputs["carried"] = {"generation_seconds": 5000.0, "wall_seconds": 3600.0}
+    inputs["carried"] = {"generation_seconds": 5000.0}
     (run / "inputs.json").write_text(json.dumps(inputs), encoding="utf-8")
-    directory = tool.RunDir(run)
-    assert tool.generation_seconds_used(directory) == 5000.0
-    created = datetime.fromisoformat(inputs["created_at"])
-    assert (tool.run_deadline(directory) - created).total_seconds() == 11 * 3600
+    assert tool.generation_seconds_used(tool.RunDir(run)) == 5000.0
 
 
 def test_after_a_containment_failure_no_queued_admission_call_starts(tmp_path: Path) -> None:
@@ -1564,3 +1563,193 @@ def test_zero_cleared_candidates_complete_every_stage_and_report_rule_two(tmp_pa
     assert report["decision"]["rule"] == 2
     assert report["decision"]["step"] == "integrity_scan"
     assert not (run / "stop.json").exists()
+
+
+# --------------------------------------------------------------------------------------
+# Second review: one registry, live runs, containment precedence, mid-chunk charging,
+# the chain's wall time and torn or missing records.
+# --------------------------------------------------------------------------------------
+
+
+def test_a_run_in_another_directory_on_the_same_inputs_is_refused(tmp_path: Path) -> None:
+    run, paths = new_run(tmp_path)
+    elsewhere = tmp_path / "other-parent" / "deep" / "run"
+    assert tool.main(init_argv(paths, elsewhere)) == tool.EXIT_REFUSED
+    assert not elsewhere.exists()
+    # The same tasks in another order and other bytes are the same inputs.
+    shuffled = list(reversed(pilot_tasks()))
+    other = pilot_inputs(tmp_path / "copy", tasks=shuffled)
+    assert tool.main(init_argv(other, tmp_path / "copy" / "run")) == tool.EXIT_REFUSED
+    assert (
+        tool.content_key(shuffled) == json.loads((run / "inputs.json").read_text())["registry_key"]
+    )
+
+
+def test_every_stage_refuses_a_run_that_is_not_the_live_registered_one(tmp_path: Path) -> None:
+    import shutil
+
+    first = failed_run(tmp_path)
+    copy = tmp_path / "copied-run"
+    shutil.copytree(first, copy)
+    (copy / "stop.json").unlink()
+    (copy / "verify" / "result.json").unlink()
+    assert execute_stage(copy, "verify", execute=Counting()) == tool.EXIT_REFUSED
+    paths = pilot_inputs(tmp_path / "same")
+    paths["pilot"] = tmp_path / "after-scan" / "pilot-clear.jsonl"
+    second = tmp_path / "run2"
+    assert tool.main([*init_argv(paths, second), "--supersedes", str(first)]) == 0
+    # The superseded run is no longer live: even its report is refused.
+    assert tool.main(["report", "--run", str(first)]) == tool.EXIT_REFUSED
+    assert execute_stage(second, "verify", execute=Counting()) == 0
+
+
+def test_the_registry_entry_is_written_before_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = pilot_inputs(tmp_path)
+    real = tool._write_new
+
+    def fails(path: Path, data: bytes) -> str:
+        if path.name == "inputs.json":
+            assert tool.REGISTRY.read_text().count('"key"') == 1  # Already durable.
+            raise OSError("disk full")
+        return real(path, data)
+
+    monkeypatch.setattr(tool, "_write_new", fails)
+    with pytest.raises(OSError):
+        tool.main(init_argv(paths, tmp_path / "run"))
+    monkeypatch.setattr(tool, "_write_new", real)
+    # The half-made run is not silently replaced: superseding it is refused for inspection.
+    again = [*init_argv(paths, tmp_path / "run2"), "--supersedes", str(tmp_path / "run")]
+    assert tool.main(again) == tool.EXIT_REFUSED
+    assert tool.main(init_argv(paths, tmp_path / "run3")) == tool.EXIT_REFUSED
+
+
+def test_a_containment_failure_wins_over_whatever_ended_the_stage(tmp_path: Path) -> None:
+    run, _ = new_run(tmp_path)
+
+    def races(context: tool.Context) -> dict[str, Any]:
+        assert context.budget is not None
+        context.budget.trip()  # One thread saw a missing protection ...
+        raise tool.Stop("sandbox_failure", "... while another's host failure ended the stage")
+
+    argv = ["verify", "--run", str(run), "--receipt", str(tmp_path / "r.json")]
+    receipt_for(tmp_path / "r.json", argv, "tools.pilot_stages")
+    status = tool.run_stage("verify", run, races, argv=argv, receipt=tmp_path / "r.json")
+    assert status == tool.EXIT_STOP and stop_reason(run) == "containment_failure"
+
+
+def test_a_stop_showing_a_tripped_budget_cannot_be_superseded(tmp_path: Path) -> None:
+    first = failed_run(tmp_path)
+    stop = json.loads((first / "stop.json").read_text())
+    stop["budget"]["tripped"] = True
+    (first / "stop.json").write_text(json.dumps(stop), encoding="utf-8")
+    paths = pilot_inputs(tmp_path / "same")
+    paths["pilot"] = tmp_path / "after-scan" / "pilot-clear.jsonl"
+    again = [*init_argv(paths, tmp_path / "run2"), "--supersedes", str(first)]
+    assert tool.main(again) == tool.EXIT_REFUSED
+
+
+def _log_rows(run: Path, rows: list[dict[str, Any]], torn: str = "") -> None:
+    log = run / "generate" / tool.GENERATION_LOG
+    log.parent.mkdir(exist_ok=True)
+    log.write_text("".join(json.dumps(row) + "\n" for row in rows) + torn, encoding="utf-8")
+
+
+def test_an_interruption_inside_a_chunk_is_charged_its_time_since_the_chunk_started(
+    tmp_path: Path,
+) -> None:
+    from datetime import timedelta
+
+    run, _ = new_run(tmp_path)
+    t = datetime(2026, 11, 15, tzinfo=UTC)
+
+    def at(seconds: float) -> str:
+        return (t + timedelta(seconds=seconds)).isoformat()
+
+    directory = tool.RunDir(run)
+    # Killed in the first chunk: no chunk finished, yet the time since it started counts.
+    _log_rows(run, [{"event": "start", "at": at(0)}, {"event": "chunk_start", "at": at(0)}])
+    assert tool.generation_seconds_used(directory, t + timedelta(seconds=5000)) == 5000.0
+    # Killed in a later chunk, then restarted: charged until the next invocation's start.
+    _log_rows(
+        run,
+        [
+            {"event": "start", "at": at(0)},
+            {"event": "chunk_start", "at": at(0)},
+            {"event": "chunk", "seconds": 1000.0, "at": at(1000)},
+            {"event": "chunk_start", "at": at(1000)},
+            {"event": "start", "at": at(4000)},
+            {"event": "end", "at": at(4001)},
+        ],
+    )
+    assert tool.generation_seconds_used(directory, t) == 1000.0 + 3000.0
+    # Killed between chunks: the longest chunk is still charged.
+    _log_rows(
+        run,
+        [
+            {"event": "start", "at": at(0)},
+            {"event": "chunk_start", "at": at(0)},
+            {"event": "chunk", "seconds": 1000.0, "at": at(1000)},
+        ],
+    )
+    assert tool.generation_seconds_used(directory, t + timedelta(seconds=9999)) == 2000.0
+
+
+def test_a_torn_generation_log_line_keeps_the_invocation_open(tmp_path: Path) -> None:
+    run, _ = new_run(tmp_path)
+    rows: list[dict[str, Any]] = [
+        {"event": "start", "at": "2026-11-15T00:00:00+00:00"},
+        {"event": "chunk", "seconds": 700.0, "at": "2026-11-15T00:11:40+00:00"},
+        {"event": "end", "at": "2026-11-15T00:11:41+00:00"},
+    ]
+    _log_rows(run, rows, torn='{"event": "sta')
+    assert tool.generation_seconds_used(tool.RunDir(run)) == 700.0 + 700.0
+
+
+def test_the_wall_time_runs_from_the_first_init_of_the_chain(tmp_path: Path) -> None:
+    first = failed_run(tmp_path)
+    _age(first, 11 * 3600)
+    started = datetime.fromisoformat(json.loads((first / "inputs.json").read_text())["created_at"])
+    paths = pilot_inputs(tmp_path / "same")
+    paths["pilot"] = tmp_path / "after-scan" / "pilot-clear.jsonl"
+    second = tmp_path / "run2"
+    assert tool.main([*init_argv(paths, second), "--supersedes", str(first)]) == 0
+    deadline = tool.run_deadline(tool.RunDir(second))
+    assert (deadline - started).total_seconds() == 12 * 3600  # The gap counts too.
+    _age(second, 3600)  # The chain is now past 12 h.
+    assert execute_stage(second, "verify", execute=Counting()) == tool.EXIT_STOP
+    assert "run wall time" in json.loads((second / "stop.json").read_text())["detail"]
+
+
+def test_a_gate_without_a_time_zone_is_refused_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run, paths = new_run(tmp_path)
+    through_select(run)
+    naive = gate_file(tmp_path, paths["checkpoint"], created_at="2099-01-01T00:00:00")
+    argv = ["generate", "--run", str(run), "--format-gate", str(naive)]
+    assert tool.main(argv, options={"generator": FakeGenerator}) == tool.EXIT_REFUSED
+    assert "time-zoned" in capsys.readouterr().err
+
+
+def test_missing_ledgers_and_logs_are_refused(tmp_path: Path) -> None:
+    run, paths = new_run(tmp_path)
+    through_select(run)
+    assert run_generate(run, paths, generator=FakeGenerator) == 0
+    # A pinned gate without its generation log, and a run without its budget ledger.
+    other, other_paths = new_run(tmp_path / "b", tasks=[pilot_task("p/solo")])
+    through_select(other)
+    (other / "generate").mkdir()
+    (other / "generate" / tool.GATE_PIN).write_text("{}", encoding="utf-8")
+    assert run_generate(other, other_paths, generator=FakeGenerator) == tool.EXIT_REFUSED
+    (run / "budget.jsonl").unlink()
+    assert execute_stage(run, "score", score=fake_score) == tool.EXIT_REFUSED
+
+
+def test_a_torn_registry_line_is_refused_cleanly(tmp_path: Path) -> None:
+    paths = pilot_inputs(tmp_path)
+    tool.REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    tool.REGISTRY.write_text('{"key": "abc", "ru', encoding="utf-8")
+    assert tool.main(init_argv(paths, tmp_path / "run")) == tool.EXIT_REFUSED
+    assert not (tmp_path / "run").exists()

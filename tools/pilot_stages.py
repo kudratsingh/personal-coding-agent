@@ -14,10 +14,12 @@ Subcommands (every path is explicit; nothing is globbed or walked):
     intake ``record.json``, the pool spec (its ``verification`` policy), the SFT checkpoint
     with its ``record.json`` (the checkpoint must hash to the record's selected SHA-256) and
     the tokenizer. An input beside a ``SHA256SUMS`` must match its line there. Runs nothing.
-    Every run is entered in ``stages-registry.jsonl`` beside it, keyed by the pilot input's
-    SHA-256. A second run on the same inputs needs ``--supersedes PRIOR`` naming the latest
-    one, which must have stopped on a sandbox host failure; it then starts with PRIOR's
-    sandbox calls, generation time and wall time, so no cap is reset by a rerun.
+    Every run is entered, before it is written, in one registry (``runs/`` of this
+    checkout, whatever ``--out`` is), keyed by the content of its pilot tasks. A second run
+    on the same tasks needs ``--supersedes PRIOR`` naming the latest one, which must have
+    stopped on a sandbox host failure with no containment failure; it starts with PRIOR's
+    sandbox calls and generation time, and the 12 h wall time runs from the chain's first
+    init, gaps included. Every stage refuses a run that is not the live registered one.
 ``verify --run RUN --receipt R`` (executes)
     Reference verification: each reference against its public and its hidden tests, once
     per distinct call, through ``tools.task_pool.verify`` (its resumable cache, its retry
@@ -68,7 +70,8 @@ Stopping criteria are hard stops with a recorded reason (``stop.json``, exit 4);
 only ``report`` runs: a containment failure (a supervisor that could not establish a required
 protection: no queued call starts after it); a sandbox host failure that outlasted its
 retries; any cap reached (calls, the run budget, 4 h of generation, or 12 h of wall time from
-``init``, checked at every stage, call and chunk); under 20% of candidates verified; more than
+the first ``init`` of the chain, checked at every stage, call and chunk); under 20% of
+candidates verified; more than
 5% of admission runs unresolved after retries; a failing format gate; a reward grammar or
 facts identity other than v2; a generation projection over 4 h. A stopping stage refuses
 further calls and waits for those in flight before it records the stop. An interrupted
@@ -148,8 +151,9 @@ GENERATION_LOG = "generation.jsonl"
 """Under ``generate/``: one row per invocation start and end and per completed chunk, so the
 4 h generation cap counts every invocation, interrupted ones too."""
 GATE_PIN = "format-gate-pin.json"
-REGISTRY_NAME = "stages-registry.jsonl"
-"""Beside the run directories: every run, keyed by the pilot input's SHA-256."""
+REGISTRY = Path(__file__).resolve().parents[1] / "runs" / "pilot-stages-registry.jsonl"
+"""One registry for every run, wherever its directory: each run keyed by its pilot tasks'
+content (``content_key``). It sits in the ignored ``runs/`` tree; tests point it elsewhere."""
 SUPERSEDABLE = frozenset({"sandbox_failure"})
 """Stops after which a new run on the same inputs may replace the stopped one: only a host
 failure that outlasted its retries (the pilot plan reruns only for host failures)."""
@@ -526,65 +530,124 @@ def init(args: argparse.Namespace) -> int:
         print(f"refused: {out} already exists", file=sys.stderr)
         return EXIT_EXISTS
     paths = {name: Path(getattr(args, name)) for name in INPUTS}
-    registry = out.parent / REGISTRY_NAME
     supersedes: Path | None = args.supersedes
     try:
-        guard([*paths.values(), out, registry, *([supersedes] if supersedes else [])])
+        guard([*paths.values(), out, REGISTRY, *([supersedes] if supersedes else [])])
     except SealedPathError as error:
         print(f"refused: {error}", file=sys.stderr)
         return EXIT_SEALED
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with (out.parent / (REGISTRY_NAME + ".lock")).open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with _registry_lock():
         try:
             record = _pin_inputs(paths)
-            carried = _carried(registry, record["files"]["pilot"]["sha256"], supersedes)
+            carried = _carried(record["registry_key"], supersedes)
         except Refused as error:
             print(f"refused: {error}", file=sys.stderr)
             return EXIT_REFUSED
         if carried is not None:
             record["carried"] = carried
-        out.mkdir()
-        run = RunDir(out)
-        _write_new(run.inputs, _json_bytes(record))
-        seed = [] if carried is None else carried["ledger_rows"]
-        _write_new(run.budget, _jsonl_bytes(seed))
+        record["chain_started_at"] = (
+            record["created_at"] if carried is None else carried["chain_started_at"]
+        )
         entry = {
-            "pilot_sha256": record["files"]["pilot"]["sha256"],
+            "key": record["registry_key"],
             "run": str(out.resolve()),
             "created_at": record["created_at"],
             "supersedes": None if carried is None else carried["from"],
         }
-        with registry.open("a", encoding="utf-8") as stream:
+        # The entry is durable before the run exists: a run is never without its entry.
+        REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+        with REGISTRY.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(entry, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        out.mkdir(parents=True)
+        run = RunDir(out)
+        _write_new(run.inputs, _json_bytes(record))
+        seed = [] if carried is None else carried["ledger_rows"]
+        _write_new(run.budget, _jsonl_bytes(seed))
     _log(f"initialized {out}")
     return 0
 
 
-def _registry(path: Path) -> list[dict[str, Any]]:
+class _registry_lock:
+    """The registry's lock, held for every read that decides and every append."""
+
+    def __enter__(self) -> None:
+        REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+        self.stream = REGISTRY.with_name(REGISTRY.name + ".lock").open("w")
+        fcntl.flock(self.stream, fcntl.LOCK_EX)
+
+    def __exit__(self, *_: object) -> None:
+        self.stream.close()
+
+
+def _jsonl_rows(path: Path) -> tuple[list[dict[str, Any]], bool]:
+    """A JSONL file's complete rows, and whether its last line is torn."""
     if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+        return [], False
+    raw = path.read_bytes()
+    cut = raw.rfind(b"\n") + 1
+    rows = [json.loads(line) for line in raw[:cut].splitlines() if line.strip()]
+    return rows, cut != len(raw)
 
 
-def generation_seconds_used(run: RunDir) -> float:
+def _registry_entries(key: str) -> list[dict[str, Any]]:
+    """Every registered run on these inputs, oldest first. A torn last line could be one of
+    them, so it is refused rather than guessed."""
+    rows, torn = _jsonl_rows(REGISTRY)
+    if torn:
+        raise Refused(f"the run registry {REGISTRY} ends in an incomplete line; inspect it")
+    return [row for row in rows if row.get("key") == key]
+
+
+def require_live(run: RunDir) -> None:
+    """Refuse a run that is not the latest registered run on its inputs."""
+    key = _json(run.inputs).get("registry_key")
+    with _registry_lock():
+        entries = _registry_entries(str(key))
+    if not entries or entries[-1]["run"] != str(run.root.resolve()):
+        raise Refused("this run is not the live registered run on its inputs")
+
+
+def _parse_time(text: object) -> datetime:
+    value = datetime.fromisoformat(str(text))
+    if value.tzinfo is None:
+        raise ValueError("a time without a time zone")
+    return value
+
+
+def generation_seconds_used(run: RunDir, now: datetime | None = None) -> float:
     """Screening generation time this run has used, with any carried from the run it
-    superseded. An invocation that ended without a terminal record is charged its longest
-    measured chunk as well, for the chunk it was in when it was interrupted."""
+    superseded. An invocation that ended without a terminal record was interrupted: it is
+    charged the longer of its longest measured chunk and the time from its last
+    ``chunk_start`` to the next row (or ``now``), for the chunk it was in. A torn last line
+    keeps the invocation open."""
     carried = float(_json(run.inputs).get("carried", {}).get("generation_seconds", 0.0))
     path = run.stage("generate") / GENERATION_LOG
-    if not path.exists():
-        return carried
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    rows, torn = _jsonl_rows(path)
+    now = now or datetime.now(UTC)
     chunks = [float(row["seconds"]) for row in rows if row["event"] == "chunk"]
     longest = max(chunks, default=0.0)
-    open_invocations = 0
+    charged = 0.0
+    open_since: datetime | None = None  # The last chunk_start of an open invocation.
+    is_open = False
     for row in rows:
-        if row["event"] == "start":
-            open_invocations += 1
-        elif row["event"] in {"end", "stopped"}:
-            open_invocations = max(0, open_invocations - 1)
-    return carried + sum(chunks) + longest * open_invocations
+        event = row["event"]
+        if event == "start":
+            if is_open:  # The previous invocation never ended.
+                gap = (_parse_time(row["at"]) - open_since).total_seconds() if open_since else 0
+                charged += max(longest, gap)
+            is_open, open_since = True, None
+        elif event == "chunk_start":
+            open_since = _parse_time(row["at"])
+        elif event == "chunk":
+            open_since = None
+        elif event in {"end", "stopped"}:
+            is_open, open_since = False, None
+    if is_open or torn:
+        gap = (now - open_since).total_seconds() if open_since else 0.0
+        charged += max(longest, gap)
+    return carried + sum(chunks) + charged
 
 
 def _created(run: RunDir) -> datetime:
@@ -592,16 +655,18 @@ def _created(run: RunDir) -> datetime:
 
 
 def run_deadline(run: RunDir) -> datetime:
-    """The run's end-to-end wall-time deadline: 12 h from init, less carried wall time."""
-    carried = float(_json(run.inputs).get("carried", {}).get("wall_seconds", 0.0))
-    return _created(run) + timedelta(seconds=RUN_WALL_CAP_SECONDS - carried)
+    """The end-to-end wall-time deadline: 12 h from the first init of the chain of runs on
+    these inputs (a run and those it superseded), gaps between them included."""
+    inputs = _json(run.inputs)
+    started = datetime.fromisoformat(inputs.get("chain_started_at") or inputs["created_at"])
+    return started + timedelta(seconds=RUN_WALL_CAP_SECONDS)
 
 
-def _carried(registry: Path, pilot_sha256: str, supersedes: Path | None) -> dict[str, Any] | None:
+def _carried(key: str, supersedes: Path | None) -> dict[str, Any] | None:
     """What a new run on these inputs carries from the run it supersedes, or ``None`` for a
     first run. A second run needs ``--supersedes`` naming the latest run on the same inputs,
-    and that run must have stopped on a host failure."""
-    prior = [entry for entry in _registry(registry) if entry["pilot_sha256"] == pilot_sha256]
+    which must have stopped on a host failure with no containment failure."""
+    prior = _registry_entries(key)
     if not prior:
         if supersedes is not None:
             raise Refused("--supersedes names no earlier run on these inputs")
@@ -615,24 +680,33 @@ def _carried(registry: Path, pilot_sha256: str, supersedes: Path | None) -> dict
     if str(supersedes.resolve()) != latest:
         raise Refused(f"--supersedes must name the latest run on these inputs ({latest})")
     run = RunDir(Path(latest))
+    if not run.inputs.is_file() or not run.budget.is_file():
+        raise Refused(f"the latest run on these inputs ({latest}) is incomplete; inspect it")
     if not run.stop.is_file() or _json(run.stop)["reason"] not in SUPERSEDABLE:
         raise Refused("only a run stopped by a sandbox host failure can be superseded")
     stop = _json(run.stop)
+    if (stop.get("budget") or {}).get("tripped"):
+        raise Refused("the run to supersede had a containment failure")
     counts = ledger_counts(run.budget)
     inputs = _json(run.inputs)
-    wall = float(inputs.get("carried", {}).get("wall_seconds", 0.0))
-    wall += (datetime.fromisoformat(stop["stopped_at"]) - _created(run)).total_seconds()
     return {
         "from": latest,
         "stop_reason": stop["reason"],
         "calls": dict(sorted(counts.items())),
         "generation_seconds": generation_seconds_used(run),
-        "wall_seconds": wall,
+        "chain_started_at": inputs.get("chain_started_at") or inputs["created_at"],
         "ledger_rows": [
             {"stage": stage, "calls": calls, "carried_from": latest}
             for stage, calls in sorted(counts.items())
         ],
     }
+
+
+def content_key(tasks: Sequence[Task]) -> str:
+    """The registry key: the SHA-256 of the sorted per-task content hashes, so the same
+    tasks are the same inputs whatever the file's bytes or order."""
+    hashes = sorted(admission.task_sha256(task) for task in tasks)
+    return hashlib.sha256("\n".join(hashes).encode()).hexdigest()
 
 
 def _pin_inputs(paths: Mapping[str, Path]) -> dict[str, Any]:
@@ -683,6 +757,7 @@ def _pin_inputs(paths: Mapping[str, Path]) -> dict[str, Any]:
         "dirty": dirty,
         "files": files,
         "counts": {"pilot": len(pilot), "remainder": len(remainder)},
+        "registry_key": content_key(pilot),
         "limits": {
             "call_caps": CALL_CAPS,
             "run_call_cap": RUN_CALL_CAP,
@@ -794,6 +869,13 @@ def run_stage(
         print("refused: another process holds this run", file=sys.stderr)
         return EXIT_LOCKED
     try:
+        try:
+            if not run.budget.is_file():
+                raise Refused("the run's budget ledger is missing")
+            require_live(run)
+        except Refused as error:
+            print(f"refused: {error}", file=sys.stderr)
+            return EXIT_REFUSED
         return _run_locked(stage, run, body, argv, receipt, options or {}, now)
     finally:
         lock.close()
@@ -853,13 +935,21 @@ def _run_locked(
         try:
             try:
                 result = body(context)
-            except BaseException:
+            except BaseException as error:
                 # Nothing more starts, and calls still in flight (reward containers too)
                 # end before the stop is recorded and the run's lock is released.
                 if context.budget is not None:
                     left = context.budget.close_and_drain()
                     if left:
                         _log(f"{left} calls were still running after {DRAIN_SECONDS:.0f} s")
+                    if context.budget.tripped and not (
+                        isinstance(error, Stop) and error.reason == "containment_failure"
+                    ):
+                        # Whatever ended the stage, a containment failure was reported.
+                        detail = f"tripped during the stage; it ended with {error!r}"
+                        raise Stop(
+                            "containment_failure", detail, getattr(error, "result", None)
+                        ) from error
                 raise
         except CapReached as error:
             raise Stop("cap_reached", str(error), _partial(context)) from error
@@ -1263,9 +1353,9 @@ def _check_gate(
     if inputs.get("tokenizer_sha256") != tokenizer_sha256:
         raise Refused("the format gate used another tokenizer")
     try:
-        created = datetime.fromisoformat(str(gate.get("created_at")))
+        created = _parse_time(gate.get("created_at"))
     except ValueError as error:
-        raise Refused("the format-gate record has no valid created_at") from error
+        raise Refused("the format-gate record has no valid, time-zoned created_at") from error
     if created <= _created(run):
         raise Refused("the format gate was measured before this run was initialized")
     if not pin_path.exists():
@@ -1291,9 +1381,7 @@ def _append_log(path: Path, row: Mapping[str, Any]) -> None:
 
 
 def _longest_chunk(path: Path) -> float:
-    if not path.exists():
-        return 0.0
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    rows, _ = _jsonl_rows(path)
     return max((float(row["seconds"]) for row in rows if row["event"] == "chunk"), default=0.0)
 
 
@@ -1304,10 +1392,25 @@ def generate_stage(context: Context) -> dict[str, Any]:
     checkpoint_sha256 = pinned["checkpoint"]["sha256"]
     if _json(files["checkpoint_record"])["sft"]["selected"]["sha256"] != checkpoint_sha256:
         raise Refused("the checkpoint does not hash to its record's selected SHA-256")
-    gate = _check_gate(
-        run, Path(context.options["format_gate"]), checkpoint_sha256, pinned["tokenizer"]["sha256"]
-    )
+    log = run.stage("generate") / GENERATION_LOG
+    if (run.stage("generate") / GATE_PIN).exists() and not log.exists():
+        raise Refused("the gate is pinned but the generation log is missing")
+    now: Callable[[], datetime] = context.options["now"]
+    prior = generation_seconds_used(run, now())
+    # The log exists before the gate is pinned, and an invocation is open from here on.
+    _append_log(log, {"event": "start", "prior_generation_seconds": prior})
+    try:
+        gate = _check_gate(
+            run,
+            Path(context.options["format_gate"]),
+            checkpoint_sha256,
+            pinned["tokenizer"]["sha256"],
+        )
+    except Refused:
+        _append_log(log, {"event": "end", "reason": "refused"})
+        raise
     if not gate["passed"]:
+        _append_log(log, {"event": "stopped", "reason": "format_gate_failed"})
         raise Stop("format_gate_failed", f"failed checks: {gate['failed_checks']}", {"gate": gate})
     tasks_path = run.output("select", "tasks.jsonl")
     candidates_path = run.output("select", "candidates.jsonl")
@@ -1318,12 +1421,11 @@ def generate_stage(context: Context) -> dict[str, Any]:
     if order_sha256(ids) != selected["candidate_order_sha256"]:
         raise Refused("the selected tasks are not in the recorded order")
     if not tasks:
+        _append_log(log, {"event": "end", "reason": "no candidates"})
         return {"tasks": 0, "skipped": "no candidates were selected", "gate": gate, "outputs": {}}
-    log = run.stage("generate") / GENERATION_LOG
-    prior = generation_seconds_used(run)
-    now: Callable[[], datetime] = context.options["now"]
     deadline = run_deadline(run)
     if prior >= GENERATION_CAP_SECONDS:
+        _append_log(log, {"event": "stopped", "reason": "generation_time_cap"})
         raise Stop(
             "generation_time_cap",
             f"{prior / 3600:.2f} h of generation already used",
@@ -1339,7 +1441,6 @@ def generate_stage(context: Context) -> dict[str, Any]:
     chunk_seconds: list[float] = []
     first: dict[str, Any] = {}
     longest = _longest_chunk(log)
-    _append_log(log, {"event": "start", "prior_generation_seconds": prior})
     started = clock()
 
     def stop(reason: str, detail: str, **extra: Any) -> Stop:
@@ -1367,6 +1468,7 @@ def generate_stage(context: Context) -> dict[str, Any]:
             )
         if now() + timedelta(seconds=longest) >= deadline:
             raise stop("cap_reached", f"run wall time: the next chunk would pass {deadline}")
+        _append_log(log, {"event": "chunk_start", "index": len(chunk_seconds)})
         chunk_started = clock()
         drawn = generator(chunk)
         seconds = clock() - chunk_started
