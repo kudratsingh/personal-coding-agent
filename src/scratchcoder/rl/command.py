@@ -17,7 +17,7 @@ to compare SHA-256s, and every candidate must have exactly the header's samples.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +46,7 @@ from scratchcoder.rl.screening import (
     score_screening,
     screen,
 )
+from scratchcoder.sandbox.reward import RewardResult
 
 
 def read_candidates(tasks_path: Path, candidates_path: Path) -> list[Task]:
@@ -107,11 +108,15 @@ def screen_attempts(
     cap: int = MAX_KEPT,
     floor: int = FLOOR,
     require_header: bool = False,
+    score: Callable[[Task, str], RewardResult] | None = None,
 ) -> dict[str, Any]:
     """Score screening attempts in the sandbox and write the screening record to ``output``.
 
     ``timeout`` bounds each batch of 256 attempts (``None`` for no bound). A header is
     checked against the given files before any attempt runs (``check_attempts_header``).
+    ``score`` replaces the reward channel's ``score_attempt`` in ``LocalRewardSource``
+    (``None``, the default, keeps it); a caller passes a wrapper that counts or bounds the
+    calls it makes to ``score_attempt``.
     """
     if output.exists():
         raise ValueError(f"{output} already exists")
@@ -125,7 +130,8 @@ def screen_attempts(
         )
     elif require_header:
         raise ValueError(f"{attempts_path} has no screening header; it cannot be bound to tasks")
-    source = LocalRewardSource(tasks, timeout=timeout, workers=workers)
+    options: dict[str, Any] = {} if score is None else {"score": score}
+    source = LocalRewardSource(tasks, timeout=timeout, workers=workers, **options)
     rewards = score_screening(source, attempts)
     result = screen(tasks, attempts, rewards, threshold=threshold, cap=cap, floor=floor)
     record = result.to_json()

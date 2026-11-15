@@ -30,13 +30,16 @@ from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from scratchcoder.common.records import atomic_json
 from scratchcoder.data import admission
 from scratchcoder.data.verifier_scan import RULESET_VERSION, scan_task
 from scratchcoder.eval.tasks import Task, load_tasks
 from tools.verifier_scan import SealedPathError, guard
+
+if TYPE_CHECKING:
+    from scratchcoder.eval import parallel
 
 RECEIPT_MAX_AGE = timedelta(minutes=30)
 
@@ -164,7 +167,7 @@ def _repair_tail(path: Path) -> None:
 
 
 def execute(args: argparse.Namespace, sets: dict[str, dict[str, Task]]) -> int:
-    from scratchcoder.eval import harness, parallel
+    from scratchcoder.eval import harness
 
     image_id = _receipt_image(args.receipt, datetime.now(UTC), args.argv)
     ids = identities(image_id)
@@ -177,9 +180,35 @@ def execute(args: argparse.Namespace, sets: dict[str, dict[str, Task]]) -> int:
         return 5
     _repair_tail(args.cache)
     runs = pending_runs(sets, args.cache, ids)[: args.limit]
-    by_key = {run.key: (run, digest) for run, digest in runs}
     print(f"executing {len(runs)} calls", file=sys.stderr)
-    with args.cache.open("a", encoding="utf-8") as stream:
+    record_runs(
+        runs,
+        args.cache,
+        ids,
+        run_id=args.run_id,
+        workers=args.workers,
+        call=harness.isolated_execution,
+    )
+    return 0
+
+
+def record_runs(
+    runs: Sequence[tuple[admission.Run, str]],
+    cache: Path,
+    ids: admission.Identities,
+    *,
+    run_id: str,
+    workers: int,
+    call: "parallel.Execute",
+) -> None:
+    """Execute ``runs`` through ``call`` and append every outcome, unresolved ones too, to
+    ``cache`` as it arrives. ``call`` is the evaluation path of record
+    (``harness.isolated_execution``), or a wrapper that only counts or bounds its calls;
+    the caller holds the cache lock and has repaired a torn tail."""
+    from scratchcoder.eval import parallel
+
+    by_key = {run.key: (run, digest) for run, digest in runs}
+    with cache.open("a", encoding="utf-8") as stream:
 
         def record(outcome: parallel.Outcome) -> None:
             run, digest = by_key[outcome.key]  # type: ignore[index]
@@ -192,18 +221,17 @@ def execute(args: argparse.Namespace, sets: dict[str, dict[str, Task]]) -> int:
                 host_failures=outcome.host_failures,
                 elapsed_seconds=outcome.elapsed_seconds,
             )
-            row["run_id"] = args.run_id
+            row["run_id"] = run_id
             stream.write(json.dumps(row, sort_keys=True) + "\n")
             stream.flush()
 
         parallel.run_calls(
             (parallel.Call(run.key, run.code, run.tests, run.mode) for run, _ in runs),
-            harness.isolated_execution,
+            call,
             on_outcome=record,
-            workers=args.workers,
+            workers=workers,
             max_consecutive_unresolved=20,
         )
-    return 0
 
 
 def decide(args: argparse.Namespace, sets: dict[str, dict[str, Task]]) -> int:
