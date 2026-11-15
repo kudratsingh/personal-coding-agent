@@ -12,8 +12,8 @@ so every turn of the loop is rendered as a fresh single-turn conversation::
     {function source}
     ... (one per located function, nearest first)
 
-    PREVIOUS ATTEMPT
-    {removed and added lines of the last applied edit}
+    CHANGES SO FAR
+    {removed and added lines of the workspace against the original repository}
 
     RESULT run_tests ...
     {condensed failure}
@@ -22,7 +22,7 @@ so every turn of the loop is rendered as a fresh single-turn conversation::
 
 Each block has a token budget (:data:`BUDGETS`), counted with the frozen tokenizer. Over
 budget, a block is truncated (and the truncation logged); if the whole prompt is still over
-:data:`PROMPT_BUDGET`, the previous attempt is dropped, then the map, then the farthest
+:data:`PROMPT_BUDGET`, the changes-so-far block is dropped, then the map, then the farthest
 snippets (the nearest one always stays). If even that does not fit, :class:`ContextLimit` is
 raised and the instance ends as a context failure. The generation cap is
 ``min(GENERATION_CAP, CONTEXT - prompt tokens)``.
@@ -33,6 +33,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from scratchcoder.data.chat import Message, TextEncoder, generation_prompt
 from scratchcoder.eval.harness import ContextLimitError
@@ -43,6 +44,9 @@ GENERATION_CAP = 324
 """Planned generation cap: the room a full 700-token prompt leaves in the 1,024 context."""
 BUDGETS = {"task": 120, "map": 80, "snippet": 250, "previous": 100, "observation": 150}
 FUNCTION_BUDGET = 180
+PREVIOUS_HEADER = "CHANGES SO FAR"
+"""Header of the ``previous`` block: every applied edit so far, as removed and added lines of
+the current workspace against the original repository (cumulative, not only the last edit)."""
 INSTRUCTION = "Reply with the complete corrected version of one function shown above."
 ELLIPSIS = "    ..."
 
@@ -130,7 +134,7 @@ def _text(blocks: Blocks, include_map: bool, snippets: Sequence[Snippet], previo
     for snippet in snippets:
         parts.append(f"SNIPPET {snippet.key}\n{snippet.source}")
     if previous and blocks.previous:
-        parts.append("PREVIOUS ATTEMPT\n" + "\n".join(blocks.previous))
+        parts.append(PREVIOUS_HEADER + "\n" + "\n".join(blocks.previous))
     if blocks.observation:
         parts.append(blocks.observation)
     parts.append(INSTRUCTION)
@@ -165,7 +169,7 @@ def build(encoder: TextEncoder, blocks: Blocks) -> Prompt:
     previous = list(blocks.previous)
     if (
         previous
-        and _count(encoder, "PREVIOUS ATTEMPT\n" + "\n".join(previous)) > BUDGETS["previous"]
+        and _count(encoder, PREVIOUS_HEADER + "\n" + "\n".join(previous)) > BUDGETS["previous"]
     ):
         truncations.append("previous_dropped")
         previous = []
@@ -198,7 +202,7 @@ def build(encoder: TextEncoder, blocks: Blocks) -> Prompt:
         "map": _count(encoder, "MAP\n" + "\n".join(map_lines)) if include_map and map_lines else 0,
         "snippet": sum(_count(encoder, f"SNIPPET {s.key}\n{s.source}") for s in snippets),
         "previous": (
-            _count(encoder, "PREVIOUS ATTEMPT\n" + "\n".join(previous)) if keep_previous else 0
+            _count(encoder, PREVIOUS_HEADER + "\n" + "\n".join(previous)) if keep_previous else 0
         ),
         "observation": _count(encoder, observation),
         "instruction": _count(encoder, INSTRUCTION),
@@ -210,3 +214,25 @@ def build(encoder: TextEncoder, blocks: Blocks) -> Prompt:
         tuple(snippet.key for snippet in snippets),
         tuple(truncations),
     )
+
+
+def fit_bound(prompt_tokens: int, reference_tokens: Sequence[int]) -> dict[str, Any]:
+    """The static fit check of a case (plan section 3.5), from its turn-1 prompt without the
+    observation and changes-so-far blocks and the tokens of each target's reference function.
+
+    The worst-case prompt adds both blocks' full budgets. The whole fix, with a 20% margin,
+    must fit the context after that prompt, and the largest single function (one per turn), with
+    the margin and its two block tokens (python start and end), must fit the generation cap
+    that prompt leaves."""
+    worst = prompt_tokens + BUDGETS["observation"] + BUDGETS["previous"]
+    cap = min(GENERATION_CAP, CONTEXT - worst)
+    largest = max(reference_tokens, default=0)
+    total_bound = worst + 1.2 * sum(reference_tokens)
+    turn_bound = 1.2 * largest + 2
+    return {
+        "worst_prompt_tokens": worst,
+        "generation_cap": cap,
+        "total_bound": total_bound,
+        "largest_function_bound": turn_bound,
+        "fits": total_bound <= CONTEXT and turn_bound <= cap and worst <= PROMPT_BUDGET,
+    }

@@ -85,7 +85,13 @@ class ModelPolicy:
         if key in self.cache:
             hit = self.cache[key]
             return Proposal(
-                hit.code, hit.text, hit.generated_tokens, hit.finish_reason, 0.0, cached=True
+                hit.code,
+                hit.text,
+                hit.generated_tokens,
+                hit.finish_reason,
+                0.0,
+                cached=True,
+                cached_seconds=hit.seconds,
             )
         started = self.clock()
         tokens, finish = self.generate(

@@ -21,7 +21,7 @@ from agent_fixtures import (
 from test_agent_workspace import Bytes
 
 from scratchcoder.agent import cases as agent_cases
-from scratchcoder.agent import loop, scorecard, validation
+from scratchcoder.agent import loop, scorecard, validation, workspace
 from scratchcoder.agent.cases import Case
 from scratchcoder.agent.policy import Generate, ModelPolicy, OraclePolicy, turn_seed
 from scratchcoder.agent.prompt import Prompt
@@ -135,15 +135,28 @@ def test_repair_retries_after_refusals_and_single_stops_after_one_turn(case: Cas
     assert single.grade == {"public": "failed", "correctness": "not_run_null_patch"}
 
 
-def test_the_previous_attempt_is_shown_after_an_applied_edit(case: Case) -> None:
+def test_changes_so_far_are_cumulative_against_the_original(case: Case) -> None:
     wrong = 'def double(x):\n    """Twice ``x``."""\n    return x * 3'
-    policy = Scripted([wrong, FIXED_DOUBLE])
+    scaled = "def scaled(x, low, high):\n    return clamp(double(x), low, high) + 0"
+    policy = Scripted([wrong, scaled, FIXED_DOUBLE])
     result, _, _ = run(case, policy)
-    assert result.solved and len(policy.prompts) == 2
-    assert "PREVIOUS ATTEMPT\narith.py:\n-    return x + x + 1\n+    return x * 3" in (
+    assert len(policy.prompts) == 3
+    assert "CHANGES SO FAR\narith.py:\n-    return x + x + 1\n+    return x * 3" in (
         policy.prompts[1].text
     )
     assert "    return x * 3" in policy.prompts[1].text.split("SNIPPET arith.py::double")[1]
+    # After the second edit the block holds both edits, each against the original (here
+    # over the byte encoder's 100-token budget, so the third prompt drops it, logged).
+    assert result.turns[1].edit == "applied"
+    assert "previous_dropped" in policy.prompts[2].truncations
+    files = dict(case.files)
+    for source, name in ((wrong, "double"), (scaled, "scaled")):
+        edit = workspace.Edit("arith.py", name, source)
+        files = workspace.apply_function(files, edit, case.allowed_files)
+    previous = loop.blocks_for(case, files, [], "", case.files).previous
+    assert "+    return x * 3" in previous
+    assert "+    return clamp(double(x), low, high) + 0" in previous
+    assert "PREVIOUS ATTEMPT" not in "".join(prompt.text for prompt in policy.prompts)
 
 
 @pytest.mark.parametrize(
@@ -210,6 +223,13 @@ def test_model_policy_seeds_caches_and_extracts_the_first_closed_block(case: Cas
     assert calls == [(324, 1.0, turn_seed(case.id, 1, 1))]  # The repair turn 1 is a cache hit.
     assert repair.turns[0].cached and repair.turns[0].generation_seconds == 0.0
     assert single.generation_seconds == 2.0
+    # The reused generation's time is attributed, so the conditions stay comparable.
+    assert repair.turns[0].cached_seconds == 2.0 and repair.cached_generation_seconds == 2.0
+    card = scorecard.build([single, repair], {})
+    assert card["groups"]["model/repair-3"]["all"]["attributed_generation_seconds"] == 2.0
+    assert card["groups"]["model/repair-3"]["all"]["generation_seconds"] == 0.0
+    assert card["groups"]["model/single"]["all"]["attributed_generation_seconds"] == 2.0
+    assert "| 0.0 (+2.0) |" in scorecard.markdown(card)
     greedy, _, _ = run_with(case, policy, loop.SINGLE, loop.GREEDY)
     assert calls[-1] == (324, 0.0, None) and greedy.solved
 
@@ -429,3 +449,92 @@ def test_the_tool_refuses_sealed_and_held_out_paths(tmp_path: Path) -> None:
         )
         == 2
     )
+
+
+# ----------------------------------------------------------------------------- review fixes
+
+
+def test_case_paths_must_stay_inside_the_case_directory(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.py"
+    outside.write_text("assert True\n", encoding="utf-8")
+    changes: list[tuple[str, object]] = [
+        ("hidden", {"correctness": "../outside.py", "preservation": "hidden/preservation.py"}),
+        ("repo", ".."),
+        ("reference", {"arith.py": "/etc/hosts"}),
+    ]
+    for field, value in changes:
+        root = tmp_path / field
+        overrides: dict[str, object] = {field: value}
+        write_case(root, "X01", **overrides)
+        with pytest.raises(agent_cases.CaseError, match="escapes|relative"):
+            agent_cases.load_case(next(root.iterdir()))
+
+
+def test_a_registry_directory_cannot_leave_the_root(tmp_path: Path) -> None:
+    root = tmp_path / "cases"
+    write_case(root)
+    write_registry(root)
+    registry = json.loads((root / "registry.json").read_text("utf-8"))
+    registry["cases"][0]["directory"] = "../cases/X01-double"
+    (root / "registry.json").write_text(json.dumps(registry), encoding="utf-8")
+    assert agent_cases.load_cases(root)  # Resolves back inside: allowed.
+    registry["cases"][0]["directory"] = ".."
+    (root / "registry.json").write_text(json.dumps(registry), encoding="utf-8")
+    with pytest.raises(agent_cases.CaseError):
+        agent_cases.load_cases(root)
+
+
+def test_every_file_read_must_be_registered_with_its_hash(tmp_path: Path) -> None:
+    directory = write_case(tmp_path)
+    write_registry(tmp_path)
+    registry = json.loads((tmp_path / "registry.json").read_text("utf-8"))
+    files = dict(registry["cases"][0]["files"])
+    with pytest.raises(agent_cases.CaseError, match="not the registered file"):
+        agent_cases.load_case(
+            directory, registered={k: v for k, v in files.items() if "correctness" not in k}
+        )
+    files["hidden/correctness.py"] = "0" * 64
+    with pytest.raises(agent_cases.CaseError, match="not the registered file"):
+        agent_cases.load_case(directory, registered=files)
+
+
+@pytest.mark.parametrize("case_id", ["../evil", "a/b", "", "-x", "x y"])
+def test_case_ids_are_safe_file_names(tmp_path: Path, case_id: str) -> None:
+    write_case(tmp_path, case_id="X01", id=case_id)
+    with pytest.raises(agent_cases.CaseError, match="case id"):
+        agent_cases.load_case(next(tmp_path.iterdir()))
+
+
+def test_output_names_cannot_escape_their_directory(tmp_path: Path) -> None:
+    from tools import agent_dev_run
+
+    assert agent_dev_run._under(tmp_path, "X01--model.jsonl") == tmp_path / "X01--model.jsonl"
+    for name in ("../x.jsonl", "a/b", "..", ""):
+        with pytest.raises(ValueError, match="escapes"):
+            agent_dev_run._under(tmp_path, name)
+
+
+def test_public_tests_that_pass_before_the_fix_are_refused(tmp_path: Path) -> None:
+    write_case(tmp_path, public_fails_before_fix=False)
+    with pytest.raises(agent_cases.CaseError, match="fail before the fix"):
+        agent_cases.load_case(next(tmp_path.iterdir()))
+
+
+def test_carriage_returns_in_case_files_are_refused(tmp_path: Path) -> None:
+    directory = write_case(tmp_path)
+    (directory / "repo" / "steps.py").write_bytes(b"def clamp(v, a, b):\r    return v\n")
+    with pytest.raises(agent_cases.CaseError, match="carriage return"):
+        agent_cases.load_case(directory)
+
+
+def test_the_fit_bound_counts_both_feedback_blocks_and_the_generation_cap() -> None:
+    from scratchcoder.agent import prompt
+
+    ok = prompt.fit_bound(300, [100])
+    assert ok["worst_prompt_tokens"] == 300 + 150 + 100 and ok["generation_cap"] == 324
+    assert ok["fits"]
+    # 1.2 x 270 + 2 = 326 > 324: one function too long for a turn, though the total fits.
+    too_long = prompt.fit_bound(100, [270])
+    assert too_long["total_bound"] <= 1024 and not too_long["fits"]
+    # A long prompt shrinks the cap below the function's need.
+    assert not prompt.fit_bound(470, [230])["fits"]

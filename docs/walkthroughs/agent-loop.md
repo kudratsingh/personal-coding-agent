@@ -63,7 +63,9 @@ def test_double():
    `double` (decorators included). A reply that defines `triple` is refused (`unknown_name`);
    an `import re` the function never uses is dropped and recorded.
 5. **Feedback.** The public tests run again. If they pass, the loop stops; otherwise the next
-   prompt shows the refusal or the new failure, plus the edit's changed lines.
+   prompt shows the refusal or the new failure, plus a `CHANGES SO FAR` block: the removed and
+   added lines of the workspace against the original repository (every applied edit, not only
+   the last one).
 6. **Grade.** Two more containers: the hidden correctness checks and the preservation checks,
    each a plain assertion script that imports the edited modules. Solved means the public run,
    the correctness run and the preservation run all have supervisor status `passed`.
@@ -79,14 +81,14 @@ def test_double():
 | Feedback call | (packed workspace, public driver), mode `function` | `Result` -> `SandboxRun(status, resolved, stdout)` |
 | Condense | driver rows (untrusted, bounded) + host copy of the files | observation text |
 | Locate | parsed tests and modules, failing test names | functions, nearest first, allowed files only |
-| Budget | task, map, snippets, previous edit, observation | prompt token IDs; generation cap = min(324, 1,024 − prompt) |
+| Budget | task, map, snippets, changes so far, observation | prompt token IDs; generation cap = min(324, 1,024 − prompt) |
 | Policy | prompt IDs, cap, decoding | first closed python block (or none) |
 | Edit | reply code, shown functions | new file text, or a refusal reason |
 | Grade call | (packed source modules, hidden check script) | supervisor status per check set |
 
-Block budgets (tokens): task 120, map 80, snippets 250 (one function at most 180), previous
-edit 100, observation 150; prompt at most 700. Over budget a block is truncated; then the
-previous edit, the map and the farthest snippets are dropped, in that order. If the prompt still
+Block budgets (tokens): task 120, map 80, snippets 250 (one function at most 180), changes
+so far 100, observation 150; prompt at most 700. Over budget a block is truncated; then the
+changes-so-far block, the map and the farthest snippets are dropped, in that order. If the prompt still
 does not fit, the instance ends as a context failure.
 
 Failure classes for an unsolved, scored instance: `context` (the prompt did not fit, or the
@@ -156,7 +158,7 @@ negative controls fail), runs the oracle, then the model rows.
    `unknown_name`, the next prompt says so, and the turn counts against the budget.
 3. *Why is a host failure not a failure?* It says nothing about the candidate; scoring it would
    mix infrastructure noise into capability numbers.
-4. *Which prompt block is dropped first when the prompt is too long?* The previous edit's
-   changed lines, then the map, then the farthest snippets.
+4. *Which prompt block is dropped first when the prompt is too long?* The changes-so-far
+   block, then the map, then the farthest snippets.
 5. *What does the oracle prove?* That locate, prompt, edit, feedback and grading fit together:
    writing the reference function through the same editor must solve every valid case.

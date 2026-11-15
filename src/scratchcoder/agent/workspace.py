@@ -76,6 +76,11 @@ def functions(text: str, path: str) -> dict[str, Function]:
     return found
 
 
+def _span(node: ast.FunctionDef) -> tuple[int, int]:
+    assert node.end_lineno is not None
+    return min([node.lineno, *(item.lineno for item in node.decorator_list)]), node.end_lineno
+
+
 def function_source(text: str, function: Function) -> str:
     lines = text.split("\n")
     return "\n".join(lines[function.start - 1 : function.end])
@@ -281,6 +286,9 @@ def parse_reply(
     """
     if code is None:
         raise EditRefused("no_python_block")
+    # Python ends a line at "\r\n", "\r" or "\n"; the host splits on "\n" only. Normalizing
+    # first keeps the syntax tree's line numbers and the host's lines the same lines.
+    code = code.replace("\r\n", "\n").replace("\r", "\n")
     try:
         tree = ast.parse(code)
     except (SyntaxError, ValueError, MemoryError, RecursionError) as error:
@@ -319,7 +327,7 @@ def parse_reply(
             )
             raise EditRefused(reason, f"the function depends on: {label}")
         dropped.append(label)
-    lines = code.replace("\r\n", "\n").split("\n")
+    lines = code.split("\n")
     start = min([function.lineno, *(item.lineno for item in function.decorator_list)])
     assert function.end_lineno is not None
     # A top-level definition starts in column 0, so its lines are taken as they are (not
@@ -332,24 +340,41 @@ def apply_function(files: Files, edit: Edit, allowed: Iterable[str]) -> dict[str
     """The workspace with ``edit`` applied: the target's span replaced by the new source.
 
     Refused unless the file is allowed and not a test, the function exists there, and the
-    edited file parses with the same top-level function names."""
+    edited file parses into the same top-level statements: every statement other than the
+    target is unchanged (compared as syntax trees), and the target's place holds one function
+    of the same name whose span is exactly the inserted lines. So an edit can change one
+    function and nothing else, whatever the reply's text holds."""
     if edit.path not in set(allowed) or is_test_file(edit.path) or edit.path not in files:
         raise EditRefused("not_allowed", edit.path)
+    if "\r" in edit.source:
+        raise EditRefused("unparsable", "carriage return in the function source")
     text = files[edit.path]
     defined = functions(text, edit.path)
     if edit.name not in defined:
         raise EditRefused("unknown_name", edit.name)
     target = defined[edit.name]
     lines = text.split("\n")
-    replaced = "\n".join(
-        [*lines[: target.start - 1], *edit.source.split("\n"), *lines[target.end :]]
-    )
+    inserted = edit.source.split("\n")
+    replaced = "\n".join([*lines[: target.start - 1], *inserted, *lines[target.end :]])
     try:
-        after = functions(replaced, edit.path)
+        before_body = parse(text, edit.path).body
+        after_body = parse(replaced, edit.path).body
     except (SyntaxError, ValueError, MemoryError, RecursionError):
         raise EditRefused("breaks_module") from None
-    if set(after) != set(defined):
-        raise EditRefused("breaks_module", "top-level functions changed")
+    index = next(
+        position
+        for position, node in enumerate(before_body)
+        if isinstance(node, ast.FunctionDef) and _span(node) == (target.start, target.end)
+    )
+    if len(after_body) != len(before_body):
+        raise EditRefused("breaks_module", "top-level statements changed")
+    for position, (old, new) in enumerate(zip(before_body, after_body, strict=True)):
+        if position != index and ast.dump(old) != ast.dump(new):
+            raise EditRefused("breaks_module", "code outside the function changed")
+    new = after_body[index]
+    expected = (target.start, target.start + len(inserted) - 1)
+    if not isinstance(new, ast.FunctionDef) or new.name != edit.name or _span(new) != expected:
+        raise EditRefused("breaks_module", "the inserted lines are not exactly one function")
     updated = dict(files)
     updated[edit.path] = replaced
     return updated

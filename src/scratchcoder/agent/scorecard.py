@@ -28,6 +28,12 @@ def _cell(results: Sequence[InstanceResult]) -> dict[str, Any]:
         "edits_applied": sum(result.edits_applied for result in results),
         "generated_tokens": sum(result.generated_tokens for result in results),
         "generation_seconds": round(sum(result.generation_seconds for result in results), 3),
+        "cached_generation_seconds": round(
+            sum(result.cached_generation_seconds for result in results), 3
+        ),
+        "attributed_generation_seconds": round(
+            sum(r.generation_seconds + r.cached_generation_seconds for r in results), 3
+        ),
         "sandbox_calls": sum(result.sandbox_calls for result in results),
         "sandbox_seconds": round(sum(result.sandbox_seconds for result in results), 3),
         "wall_seconds": round(sum(result.wall_seconds for result in results), 3),
@@ -73,10 +79,12 @@ def markdown(card: dict[str, Any]) -> str:
         "",
         "Dev cases only. Solved = public tests, hidden correctness checks and preservation "
         "checks all `passed` (supervisor status). Sampled cells count seeds; greedy is one "
-        "instance.",
+        "instance. Generation seconds are net (time spent); reused generations add their "
+        "original time in brackets, so net + cached is comparable across conditions.",
         "",
         "| Policy/condition | Case | Sampled solved | Greedy solved | Failure classes "
-        "(scored, unsolved) | Turns | Gen tokens | Gen s | Sandbox calls | Sandbox s |",
+        "(scored, unsolved) | Turns | Gen tokens | Gen s net (+ cached) | Sandbox calls | "
+        "Sandbox s |",
         "| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for label, group in card["groups"].items():
@@ -94,6 +102,7 @@ def markdown(card: dict[str, Any]) -> str:
                 }
             )
             gen = sampled["generation_seconds"] + greedy["generation_seconds"]
+            cached = sampled["cached_generation_seconds"] + greedy["cached_generation_seconds"]
             box = sampled["sandbox_seconds"] + greedy["sandbox_seconds"]
             unscored = sampled["unscored"] + greedy["unscored"]
             lines.append(
@@ -101,7 +110,8 @@ def markdown(card: dict[str, Any]) -> str:
                 f"{greedy['solved']}/{greedy['scored']} | "
                 + (", ".join(f"{k} {v}" for k, v in sorted(classes.items())) or "-")
                 + (f" (unscored {unscored})" if unscored else "")
-                + f" | {total['turns_used']} | {total['generated_tokens']} | {gen:.1f} | "
+                + f" | {total['turns_used']} | {total['generated_tokens']} | "
+                f"{gen:.1f} (+{cached:.1f}) | "
                 f"{total['sandbox_calls']} | {box:.1f} |"
             )
     return "\n".join(lines) + "\n"

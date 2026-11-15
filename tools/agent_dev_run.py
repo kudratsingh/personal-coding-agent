@@ -88,6 +88,19 @@ def load_model(
     return model_generate(model), FastEncoder(bpe), bpe, torch.get_num_threads()
 
 
+def _under(directory: Path, name: str) -> Path:
+    """``directory / name``, refused unless it is a direct child of ``directory``."""
+    path = directory / name
+    if (
+        "/" in name
+        or "\\" in name
+        or name in {"", ".", ".."}
+        or (path.resolve().parent != directory.resolve())
+    ):
+        raise ValueError(f"output name escapes {directory}: {name!r}")
+    return path
+
+
 def register(args: argparse.Namespace) -> int:
     target = args.cases / agent_cases.REGISTRY_NAME
     if target.exists():
@@ -105,8 +118,7 @@ def plan(args: argparse.Namespace) -> int:
     for case in agent_cases.load_cases(args.cases):
         candidates = workspace.locate(case.files, case.public_tests, None, case.allowed_files)
         built = prompt.build(encoder, loop.blocks_for(case, case.files, candidates, "", case.files))
-        reference = sum(len(encoder.encode(case.reference_function(k))) for k in case.targets)
-        bound = built.tokens + prompt.BUDGETS["observation"] + 1.2 * reference
+        reference = [len(encoder.encode(case.reference_function(k))) for k in case.targets]
         rows.append(
             {
                 "case": case.id,
@@ -115,8 +127,7 @@ def plan(args: argparse.Namespace) -> int:
                 "shown": list(built.shown),
                 "targets_shown": all(target in built.shown for target in case.targets),
                 "reference_fix_tokens": reference,
-                "bound": bound,
-                "fits": bound <= prompt.CONTEXT,
+                **prompt.fit_bound(built.tokens, reference),
             }
         )
     print(json.dumps({"registry_sha256": agent_cases.registry_sha256(args.cases), "cases": rows}))
@@ -174,7 +185,8 @@ def run(
         encoder: TextEncoder,
     ) -> None:
         name = f"{case.id}--{policy.name}--{condition.name}--{decoding.label}"
-        trace_path = out / "traces" / f"{name}.jsonl"
+        trace_path = _under(out / "traces", f"{name}.jsonl")
+        _under(out / "packets", name)
         with trace_path.open("x", encoding="utf-8") as stream:
             result = loop.run_instance(
                 case,

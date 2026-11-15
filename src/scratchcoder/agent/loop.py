@@ -3,8 +3,9 @@
 1. **Feedback 0.** Run the public tests on the original repository (sandbox).
 2. **Locate.** From the failing tests, follow calls statically to the reachable functions in
    the allowed files (:func:`scratchcoder.agent.workspace.locate`).
-3. **Prompt.** Task, repository map, the located functions as snippets, the last edit's
-   changed lines, the condensed failure; budgeted and counted exactly.
+3. **Prompt.** Task, repository map, the located functions as snippets, the changes so far
+   (removed and added lines of every applied edit, against the original repository), the
+   condensed failure; budgeted and counted exactly.
 4. **Edit.** The policy writes one function. The host applies it as an AST span replacement
    of the same-named shown function, or refuses it (wrong name, no block, unparsable,
    extra code, a file that may not be edited).
@@ -80,7 +81,10 @@ class Proposal:
     generated_tokens: int = 0
     finish_reason: str = ""
     seconds: float = 0.0
+    """Generation time spent for this proposal (0 for a cache hit)."""
     cached: bool = False
+    cached_seconds: float = 0.0
+    """For a cache hit, the time the reused generation took when it was made."""
 
 
 class Policy(Protocol):
@@ -125,6 +129,8 @@ class Turn:
     generation_seconds: float = 0.0
     cached: bool = False
     """The generation was reused from an identical earlier request (same prompt and seed)."""
+    cached_seconds: float = 0.0
+    """For a reused generation, the time it took when it was first made."""
     edit: str = ""
     """``applied`` or the refusal reason."""
     function: str = ""
@@ -153,6 +159,10 @@ class InstanceResult:
     feedback_after: str = ""
     generated_tokens: int = 0
     generation_seconds: float = 0.0
+    """Generation time actually spent by this instance (cache hits add nothing)."""
+    cached_generation_seconds: float = 0.0
+    """Generation time of reused generations, attributed to this instance as well, so that
+    ``generation_seconds + cached_generation_seconds`` is comparable across conditions."""
     sandbox_seconds: float = 0.0
     sandbox_calls: int = 0
     host_failures: int = 0
@@ -195,6 +205,7 @@ def classify(result: InstanceResult) -> str | None:
 
 
 def _previous(original: Mapping[str, str], files: Mapping[str, str]) -> list[str]:
+    """The cumulative change: the current workspace against the original repository."""
     lines: list[str] = []
     for path in workspace.touched(original, files):
         lines.append(f"{path}:")
@@ -335,6 +346,8 @@ def run_instance(
             turn.finish_reason = proposal.finish_reason
             turn.generation_seconds = proposal.seconds
             turn.cached = proposal.cached
+            turn.cached_seconds = proposal.cached_seconds
+            result.cached_generation_seconds += proposal.cached_seconds
             result.generated_tokens += proposal.generated_tokens
             result.generation_seconds += proposal.seconds
             trace.emit(
@@ -344,6 +357,7 @@ def run_instance(
                 finish_reason=proposal.finish_reason,
                 seconds=round(proposal.seconds, 4),
                 cached=proposal.cached,
+                cached_seconds=round(proposal.cached_seconds, 4),
                 closed_block=proposal.code is not None,
                 text=proposal.text[:MAX_TRACE_TEXT],
             )
@@ -409,6 +423,7 @@ def run_instance(
         touched=result.touched,
         generated_tokens=result.generated_tokens,
         generation_seconds=round(result.generation_seconds, 4),
+        cached_generation_seconds=round(result.cached_generation_seconds, 4),
         sandbox_seconds=round(result.sandbox_seconds, 4),
         sandbox_calls=result.sandbox_calls,
         wall_seconds=round(result.wall_seconds, 4),

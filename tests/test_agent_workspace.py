@@ -311,3 +311,47 @@ def test_a_task_over_its_budget_is_a_context_limit() -> None:
     with pytest.raises(prompt.ContextLimit):
         prompt.build(Bytes(), blocks(task="x" * 500))
     assert issubclass(prompt.ContextLimit, harness.ContextLimitError)
+
+
+def test_a_lone_carriage_return_cannot_smuggle_code_past_the_function() -> None:
+    # ast treats a lone "\r" as a line end; the host must see the same lines, so OTHER and g
+    # are dropped (and recorded), never written into the module.
+    code = "def double(x):\r    return x + x\rOTHER = 5\rg = lambda y: y\r"
+    edit = workspace.parse_reply(code, shown("arith.py::double"), FILES, ALLOWED)
+    assert edit.source == "def double(x):\n    return x + x"
+    assert edit.dropped == ("OTHER = 5", "g = lambda y: y")
+    after = workspace.apply_function(FILES, edit, ALLOWED)
+    assert "OTHER" not in after["arith.py"] and "lambda" not in after["arith.py"]
+    crlf = workspace.parse_reply(
+        "def double(x):\r\n    return x + x\r\n", shown("arith.py::double"), FILES, ALLOWED
+    )
+    assert crlf.source == "def double(x):\n    return x + x"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def double(x):\n    return x + x\nOTHER = 5",
+        "def double(x):\n    return x + x\n\ndef extra():\n    pass",
+        "def double(x):\r    return x\rOTHER = 5",
+        "X = 1\ndef double(x):\n    return x",
+        "def double(x):\n    return x\n# trailing comment",
+    ],
+)
+def test_apply_refuses_any_change_outside_exactly_one_function(source: str) -> None:
+    with pytest.raises(workspace.EditRefused):
+        workspace.apply_function(FILES, workspace.Edit("arith.py", "double", source), ALLOWED)
+
+
+def test_apply_compares_every_other_statement_as_a_syntax_tree() -> None:
+    # A function source that closes the def and opens a new one under the same name would
+    # change the statement count; one that rewrites a neighbour changes its tree.
+    two = "def double(x):\n    return 1\n\n\ndef double(x):\n    return 2"
+    with pytest.raises(workspace.EditRefused, match="breaks_module"):
+        workspace.apply_function(FILES, workspace.Edit("arith.py", "double", two), ALLOWED)
+    ok = workspace.apply_function(
+        FILES, workspace.Edit("arith.py", "double", "def double(x):\n    return x + x"), ALLOWED
+    )
+    assert ok["arith.py"] == ARITH.replace(
+        '    """Twice ``x``."""\n    return x + x + 1', "    return x + x"
+    )

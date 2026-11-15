@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,8 @@ CASE_SCHEMA = "agent-case-v1"
 REGISTRY_SCHEMA = "agent-case-registry-v1"
 REGISTRY_NAME = "registry.json"
 MAX_FILE_BYTES = 16384
+CASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+"""Case IDs name output files, so they are restricted to a safe file-name alphabet."""
 FORBIDDEN_PARTS = ("heldout", "heldout-results")
 """Held-out cases are sealed; no development tool reads them."""
 
@@ -155,14 +158,16 @@ def load_cases(root: Path, *, only: set[str] | None = None) -> list[Case]:
             continue
         if entry.get("split") != "dev":
             raise CaseError(f"{entry['id']}: only dev cases are loaded")
-        directory = root / entry["directory"]
+        directory = _inside(root, entry["directory"], what="case directory")
+        if directory.parent != root.resolve():
+            raise CaseError(f"{entry['id']}: a case directory must be a direct child of the root")
         present = {str(path.relative_to(directory)): path for path in _case_files(directory)}
         if set(present) != set(entry["files"]):
             raise CaseError(f"{entry['id']}: files differ from the registry")
         for name, digest in entry["files"].items():
             if _sha256(present[name].read_bytes()) != digest:
                 raise CaseError(f"{entry['id']}: {name} changed since registration")
-        case = load_case(directory)
+        case = load_case(directory, registered=entry["files"])
         if case.id != entry["id"]:
             raise CaseError(f"{entry['id']}: case.json names {case.id}")
         cases.append(case)
@@ -171,23 +176,58 @@ def load_cases(root: Path, *, only: set[str] | None = None) -> list[Case]:
     return cases
 
 
-def _text(path: Path) -> str:
-    data = path.read_bytes()
-    if len(data) > MAX_FILE_BYTES:
-        raise CaseError(f"{path.name} is larger than {MAX_FILE_BYTES} bytes")
-    return data.decode("utf-8")
+def _inside(base: Path, relative: object, *, what: str) -> Path:
+    """``base / relative`` resolved, refused unless it stays inside ``base`` and outside any
+    held-out location."""
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        raise CaseError(f"{what} must be a relative path")
+    root = base.resolve()
+    resolved = (root / relative).resolve()
+    if resolved != root and not resolved.is_relative_to(root):
+        raise CaseError(f"{what} escapes its directory: {relative}")
+    if _forbidden(resolved):
+        raise CaseError("refusing a held-out location")
+    return resolved
 
 
-def load_case(directory: Path) -> Case:
-    raw = (directory / "case.json").read_bytes()
+def load_case(directory: Path, *, registered: Mapping[str, str] | None = None) -> Case:
+    """Load one case. With ``registered`` (relative path -> SHA-256, from the registry), every
+    file read must be listed there and its bytes, as read, must match the listed hash."""
+    root = directory.resolve()
+    if _forbidden(root):
+        raise CaseError("refusing a held-out location")
+
+    def read(relative: str, what: str) -> bytes:
+        path = _inside(root, relative, what=what)
+        data = path.read_bytes()
+        name = str(path.relative_to(root))
+        if registered is not None and (name not in registered or _sha256(data) != registered[name]):
+            raise CaseError(f"{root.name}: {name} is not the registered file")
+        if len(data) > MAX_FILE_BYTES:
+            raise CaseError(f"{name} is larger than {MAX_FILE_BYTES} bytes")
+        return data
+
+    def text(relative: str, what: str) -> str:
+        decoded = read(relative, what).decode("utf-8")
+        if "\r" in decoded:
+            raise CaseError(f"{root.name}: {relative} has a carriage return")
+        return decoded
+
+    raw = read("case.json", "case.json")
     spec = json.loads(raw)
     if spec.get("schema") != CASE_SCHEMA or spec.get("split") != "dev":
-        raise CaseError(f"{directory.name}: not an {CASE_SCHEMA} dev case")
-    repo = directory / spec["repo"]
-    files = {path.name: _text(path) for path in sorted(repo.glob("*.py"))}
-    reference = {name: _text(directory / source) for name, source in spec["reference"].items()}
+        raise CaseError(f"{root.name}: not an {CASE_SCHEMA} dev case")
+    case_id = spec.get("id")
+    if not isinstance(case_id, str) or not CASE_ID.match(case_id):
+        raise CaseError(f"{root.name}: case id must match {CASE_ID.pattern}")
+    repo = _inside(root, spec["repo"], what="repo")
+    files = {
+        path.name: text(str(path.relative_to(root)), "repo file")
+        for path in sorted(repo.glob("*.py"))
+    }
+    reference = {name: text(source, "reference file") for name, source in spec["reference"].items()}
     case = Case(
-        id=spec["id"],
+        id=case_id,
         title=spec["title"],
         category=spec["category"],
         workflow_type=spec["workflow_type"],
@@ -197,8 +237,8 @@ def load_case(directory: Path) -> Case:
         allowed_files=tuple(spec["allowed_files"]),
         public_tests=tuple(spec["public_tests"]),
         public_fails_before_fix=bool(spec["public_fails_before_fix"]),
-        correctness=_text(directory / spec["hidden"]["correctness"]),
-        preservation=_text(directory / spec["hidden"]["preservation"]),
+        correctness=text(spec["hidden"]["correctness"], "hidden check file"),
+        preservation=text(spec["hidden"]["preservation"], "hidden check file"),
         reference=reference,
         targets=tuple(spec["targets"]),
         budgets=Budgets(**spec["budgets"]),
@@ -220,6 +260,11 @@ def validate_static(case: Case) -> None:
         ast.parse(case.preservation)
     except (SyntaxError, ValueError) as error:
         raise CaseError(f"{case.id}: {error}") from None
+    if not case.public_fails_before_fix:
+        raise CaseError(
+            f"{case.id}: harness v0 needs public tests that fail before the fix (the loop "
+            "stops when they pass, so the policy would never be asked)"
+        )
     if not case.public_tests or any(
         path not in case.files or not workspace.is_test_file(path) for path in case.public_tests
     ):
