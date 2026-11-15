@@ -116,21 +116,32 @@ changes one factor at a time.
 - `--recovery off|intact-function`. Only for a reply that opens a python block and never closes
   it. It keeps a **verbatim prefix** of the block text: the whole text when the model ended its
   turn (end-of-turn token, not the length limit) and the text parses (`eos_whole_parse`), or the
-  longest prefix that parses and is followed by another column-0 line, so every function in it
-  ended before the generation ran out (`followed_by_top_level`). Nothing is added, edited or
+  longest prefix that parses and is followed by a new logical line at indentation 0 (found with
+  the tokenizer, so a bracket or backslash continuation is not a boundary): every function in
+  it ended before the generation ran out (`followed_by_top_level`). The dropped tail must be
+  inert: at column 0 only expression statements (example calls) and comments. A definition,
+  decorator, import, class or any assignment there could change what the kept function means,
+  so recovery refuses instead. Nothing is added, edited or
   re-indented, and test outcomes are never consulted. The prefix then meets the same reply rules
   and editor as any reply. The turn records `recovered`, the rule and the kept span; the trace
   keeps the full original completion.
 
-The scorecard's **funnel** counts, per generation and per instance: closed block (recovered
-apart), parseable, exactly one shown function, that function is a target, applicable edit,
-public tests passed, solved. `unknown_name` refusals are split into model task-following
+The scorecard's **funnel** counts nested stages, per generation and per instance: closed or
+recovered block, parseable, exactly one shown function, that function is a target, an applied
+edit to it, public tests passed, solved. Each stage counts only what reached the previous one;
+side columns hold fresh generations, closed and recovered blocks apart, applied edits to a
+function that is not a target, and instances solved without a target edit. `unknown_name` refusals are split into model task-following
 failures (`invented_name`, `public_test_name`, `unshown_repo_function`) and a harness defect
 (`locate_omitted_target`). Every refusal is also re-derived by an independent audit
 (`scratchcoder.agent.audit`); a contradiction (a closed block reported missing, parseable code
 refused as unparsable, a single shown function refused as several, an import the target
 already has) is flagged as a harness defect. `agent_dev_run compare --runs DIR... --out-md
---out-json` writes one table across runs.
+--out-json` writes one table across runs. The first run is the baseline; every run must share
+its cases, case registry, checkpoint, tokenizer, seeds, decoding rows, conditions, budgets,
+threads, batch size, supervisor and runtime image, or the comparison is refused (unless
+`--allow-noncomparable`, which marks those rows). Each row names the configuration fields that
+differ and is labelled baseline, single factor (prompt, sampled decoding as one factor, or
+recovery) or combined.
 
 ## Design choices and common mistakes
 

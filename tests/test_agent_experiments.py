@@ -103,9 +103,9 @@ def test_the_oracle_solves_under_the_training_layout(case: Case) -> None:
 @pytest.mark.parametrize(
     ("text", "eos", "rule", "kept"),
     [
-        # A complete function, then the start of another one cut off by the length limit.
+        # A complete function, then an example call cut off by the length limit.
         (
-            "def f(x):\n    return x\n\ndef g(y):\n    return (y +",
+            "def f(x):\n    return x\n\nprint(f(2), f(",
             False,
             "followed_by_top_level",
             "def f(x):\n    return x\n",
@@ -117,12 +117,12 @@ def test_the_oracle_solves_under_the_training_layout(case: Case) -> None:
             "eos_whole_parse",
             "import re\n\ndef f(x):\n    return x",
         ),
-        # Trailing junk at column 0 after a complete function.
+        # Complete example calls and comments may follow; the longest parseable prefix stays.
         (
-            "def f(x):\n    return x\nThis is junk (",
+            "def f(x):\n    return x\n# usage\nf(1)\nprint(f(",
             False,
             "followed_by_top_level",
-            "def f(x):\n    return x",
+            "def f(x):\n    return x\n# usage\nf(1)",
         ),
         # Nested defs belong to the outer function.
         (
@@ -133,7 +133,7 @@ def test_the_oracle_solves_under_the_training_layout(case: Case) -> None:
         ),
         # A decorated function keeps its decorator.
         (
-            "@cache\ndef f(x):\n    return x\n\nx = (",
+            "@cache\ndef f(x):\n    return x\n\nf(",
             False,
             "followed_by_top_level",
             "@cache\ndef f(x):\n    return x\n",
@@ -158,6 +158,20 @@ def test_recovery_keeps_only_a_verbatim_prefix_of_complete_statements(
         ('def f():\n    s = """\ndef g():\n    pass\nend', False),  # cut inside a string
         ("import os\nimport re", True),  # parses but no function
         ("def f(x):\r    return x\rx = 1", False),  # carriage returns are not normalized
+        # The dropped tail could change the kept function: a helper defined after it, ...
+        ("def f(x):\n    return helper(x)\ndef helper(y):\n    return (y", False),
+        # ... a used name bound by a truncated assignment, ...
+        ("def f(x):\n    return SCALE * x\nSCALE = (3 +", False),
+        # ... f redefined later, ...
+        ("def f(x):\n    return 1\nprint(f(1))\ndef f(x):\n    return (2", False),
+        # ... a second shown function after another one, or any import or annotation.
+        ("def f(x):\n    return x\ndef g(y):\n    return y\ndef h(z):\n    return (", False),
+        ("def f(x):\n    return x\nfrom math import (", False),
+        ("def f(x):\n    return x\nclass K(", False),
+        ("def f(x):\n    return x\n@cache\ndef g(", False),
+        ("def f(x):\n    return x\nLIMIT: int = (", False),
+        ("def f(x):\n    return x\ncount += f(", False),
+        ("def f(x):\n    return x\nif f(1):\n    y = (", False),
     ],
 )
 def test_recovery_refuses_anything_not_provably_complete(text: str, eos: bool) -> None:
@@ -189,7 +203,7 @@ def model_policy(replies: list[list[int]], mode: str, finish: str = "length") ->
 
 
 def test_a_recovered_function_goes_through_the_same_reply_rules(case: Case) -> None:
-    unclosed = [PYTHON_START, *(FIXED_DOUBLE + "\n\ndef double(y):\n    return (y").encode()]
+    unclosed = [PYTHON_START, *(FIXED_DOUBLE + "\n\nprint(double(2))\nprint(double(").encode()]
     off, _ = instance(case, model_policy([list(unclosed)] * 3, "off"), condition=loop.SINGLE)
     assert not off.solved and off.turns[0].edit == "no_python_block"
     on, trace = instance(
@@ -197,13 +211,13 @@ def test_a_recovered_function_goes_through_the_same_reply_rules(case: Case) -> N
     )
     turn = on.turns[0]
     assert on.solved and turn.recovered and not turn.closed_block
-    assert turn.recovery == {"rule": "followed_by_top_level", "end_line": 4, "block_lines": 6}
+    assert turn.recovery == {"rule": "followed_by_top_level", "end_line": 5, "block_lines": 6}
     generation = next(event for event in trace.events if event["event"] == "generation")
-    assert generation["recovered"] and generation["text"].endswith("return (y")  # full original
+    assert generation["recovered"] and generation["text"].endswith("print(double(")  # full original
     # A recovered prefix with two shown functions is refused like a normal reply.
     two = [
         PYTHON_START,
-        *(FIXED_DOUBLE + "\n\ndef scaled(x, a, b):\n    return 0\n\nx = (").encode(),
+        *(FIXED_DOUBLE + "\n\ndef scaled(x, a, b):\n    return 0\n\nprint(scaled(").encode(),
     ]
     refused, _ = instance(case, model_policy([two], "intact-function"), condition=loop.SINGLE)
     assert refused.turns[0].recovered and refused.turns[0].edit == "multiple_functions"
@@ -219,14 +233,16 @@ def test_the_funnel_counts_every_stage_per_generation_and_per_instance(case: Cas
     found = scorecard.funnel([failed, wrong_then_right])
     assert found["per_generation"] == {
         "generations": 5,
-        "fresh_generations": 5,
-        "closed_block": 4,
-        "recovered": 0,
+        "closed_or_recovered": 4,
         "parseable": 3,
         "one_shown_function": 2,
         "target_function": 2,
-        "applied_edit": 2,
+        "applied_target_edit": 2,
         "public_passed": 1,
+        "fresh_generations": 5,
+        "closed_block": 4,
+        "recovered": 0,
+        "applied_non_target_edit": 0,
     }
     assert found["per_instance"] == {
         "instances": 2,
@@ -234,9 +250,11 @@ def test_the_funnel_counts_every_stage_per_generation_and_per_instance(case: Cas
         "parseable": 2,
         "one_shown_function": 1,
         "target_function": 1,
-        "applied_edit": 1,
+        "applied_target_edit": 1,
         "public_passed": 1,
         "solved": 1,
+        "applied_non_target_edit": 0,
+        "solved_without_target_edit": 0,
     }
     assert found["refusals"] == {"no_python_block": 1, "unknown_name": 1, "unparsable": 1}
     assert found["name_failures"] == {"invented_name": 1}
@@ -288,6 +306,13 @@ def test_the_audit_flags_refusals_that_contradict_the_rules() -> None:
     assert flags("no_python_block", None, (PYTHON_START, *b"def f():")) == []
     uses_new = "import math\n\ndef double(x):\n    return math.fsum([x, x])"
     assert flags("extra_statements", uses_new) == []
+    # The same name from another source is a different import: no defect.
+    other = "from other import clamp\n\ndef double(x):\n    return clamp(x + x, 0, 9)"
+    assert flags("extra_statements", other) == []
+    renamed = "import steps as clamp\n\ndef double(x):\n    return clamp(x + x, 0, 9)"
+    assert flags("extra_statements", renamed) == []
+    aliased = "from steps import clamp as c\n\ndef double(x):\n    return c(x, 0, 9)"
+    assert flags("extra_statements", aliased) == []
 
 
 def test_real_refusals_in_the_loop_are_audited_clean(case: Case) -> None:
@@ -358,7 +383,15 @@ def test_run_records_the_configuration_and_compare_writes_one_table(
         1,
         1,
     ]
-    assert "| A | single | harness | 1.0 / 1.0 | off |" in md.read_text("utf-8")
+    text = md.read_text("utf-8")
+    assert "| A | single | baseline | yes | harness | 1.0 / 1.0 | off |" in text
+    assert "| E | single | combined: prompt + sampled_decoding + recovery | yes |" in text
+    assert table["comparable"] and table["rows"][2]["differs_from_baseline"] == [
+        "prompt",
+        "sampled_temperature",
+        "sampled_top_p",
+        "recovery",
+    ]
     assert agent_dev_run.main(command) == 2  # never overwrites
 
 
@@ -388,3 +421,144 @@ def test_the_agent_package_never_imports_or_alters_the_rl_screening_protocol() -
     assert defaults["temperature"].default == 1.0 and defaults["top_p"].default == 1.0
     assert defaults["max_new_tokens"].default == rollout.ROLLOUT_TOKENS
     assert policy.AGENT_SEED != rollout.SCREENING_SEED
+
+
+def test_boundaries_are_logical_lines_not_backslash_continuations() -> None:
+    assert recovery.logical_line_starts("a = 1 + \\\n2\nb = (3,\n4)\nc = 5\n") == [0, 2, 4]
+    # The column-0 "1" continues the return statement, so it is kept with the function.
+    found = recovery.recover_text("def f(x):\n    return x + \\\n1\nprint(f(", ended_by_eos=False)
+    assert found is not None and found.code == "def f(x):\n    return x + \\\n1"
+    # A truncated tail stops the tokenizer without losing the starts before it.
+    assert recovery.logical_line_starts('x = 1\ny = """\nz = 2') == [0, 1]
+
+
+def test_funnel_stages_nest_and_non_target_edits_stay_beside_them(case: Case) -> None:
+    non_target = "def scaled(x, low, high):\n    return low"
+    results = [
+        instance(case, Scripted(replies))[0]
+        for replies in (
+            [non_target] * 3,  # applied, but never to a target
+            [None, "def (", FIXED_DOUBLE],
+            [WRONG, non_target, FIXED_DOUBLE],
+            ["def triple(x):\n    return 1", WRONG, WRONG],
+        )
+    ]
+    found = scorecard.funnel(results)
+    for level, stages in (
+        ("per_generation", scorecard.GENERATION_STAGES),
+        ("per_instance", scorecard.INSTANCE_STAGES),
+    ):
+        counts = [found[level][stage] for stage in stages]
+        pairs = zip(counts, counts[1:], strict=False)
+        assert all(later <= earlier for earlier, later in pairs), (level, counts)
+    assert found["per_generation"]["applied_non_target_edit"] == 4
+    assert found["per_instance"]["applied_non_target_edit"] == 1
+    assert found["per_instance"]["applied_target_edit"] == 3
+    assert found["per_instance"]["solved"] == 2
+
+
+def card(**identity: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "valid_cases": ["X01"],
+        "cases_registry_sha256": "r",
+        "checkpoint_sha256": "c",
+        "tokenizer_sha256": "t",
+        "seed_base": 1,
+        "decodings": [
+            {"label": "greedy", "index": 0, "temperature": 0.0, "top_p": 1.0},
+            {"label": "sample-0", "index": 0, "temperature": 1.0, "top_p": 1.0},
+        ],
+        "conditions": [{"name": "single", "edit_turns": 1}],
+        "budgets": {"prompt": 700},
+        "threads": 1,
+        "batch_size": 1,
+        "supervisor_sha256": "s",
+        "runtime_image_id": "i",
+        "precision": "float32",
+        "device": "cpu",
+        "protocol": "chat-v1",
+        "config": {
+            "prompt": "harness",
+            "sampled_temperature": 1.0,
+            "sampled_top_p": 1.0,
+            "recovery": "off",
+        },
+    }
+    base.update(identity)
+    cell = {
+        "solved": 0,
+        "scored": 1,
+        "unscored": 0,
+        "failure_classes": {},
+        "generation_seconds": 0.0,
+        "sandbox_calls": 1,
+        "wall_seconds": 0.0,
+    }
+    group = {"all": cell, "sampled": cell, "greedy": cell}
+    return {"identity": base, "groups": {"model/single": group}}
+
+
+def config(**changes: object) -> dict[str, object]:
+    return {
+        "prompt": "harness",
+        "sampled_temperature": 1.0,
+        "sampled_top_p": 1.0,
+        "recovery": "off",
+        **changes,
+    }
+
+
+def test_compare_labels_factors_and_flags_runs_that_differ_outside_the_config() -> None:
+    table = scorecard.comparison(
+        [
+            ("A", card()),
+            ("B", card(config=config(prompt="training"))),
+            ("C", card(config=config(sampled_temperature=0.6, sampled_top_p=0.95))),
+            ("D", card(config=config(recovery="intact-function"))),
+            ("E", card(config=config(prompt="training", recovery="intact-function"))),
+            ("A2", card()),
+        ]
+    )
+    labels = [row["label"] for row in table["rows"]]
+    assert labels == [
+        "baseline",
+        "single factor: prompt",
+        "single factor: sampled_decoding",
+        "single factor: recovery",
+        "combined: prompt + recovery",
+        "same configuration as baseline",
+    ]
+    assert table["comparable"]
+    for change in (
+        {"checkpoint_sha256": "other"},
+        {"threads": 6},
+        {"valid_cases": ["X01", "X02"]},
+        {"decodings": [{"label": "greedy", "index": 0, "temperature": 0.0, "top_p": 1.0}]},
+        {"seed_base": 2},
+        {"runtime_image_id": "j"},
+    ):
+        mixed = scorecard.comparison([("A", card()), ("X", card(**change))])
+        assert not mixed["comparable"] and mixed["rows"][1]["noncomparable_fields"]
+        assert mixed["rows"][0]["comparable"]
+
+
+def test_the_compare_command_refuses_noncomparable_runs_unless_allowed(tmp_path: Path) -> None:
+    from tools import agent_dev_run
+
+    for name, identity in (("A", {}), ("B", {"threads": 6})):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "scorecard.json").write_text(json.dumps(card(**identity)), "utf-8")
+    md, js = tmp_path / "c.md", tmp_path / "c.json"
+    command = [
+        "compare",
+        "--runs",
+        str(tmp_path / "A"),
+        str(tmp_path / "B"),
+        "--out-md",
+        str(md),
+        "--out-json",
+        str(js),
+    ]
+    assert agent_dev_run.main(command) == 2 and not md.exists() and not js.exists()
+    assert agent_dev_run.main([*command, "--allow-noncomparable"]) == 0
+    assert "NO: threads" in md.read_text("utf-8")

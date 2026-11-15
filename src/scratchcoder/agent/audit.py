@@ -113,12 +113,31 @@ def _stored(node: ast.AST) -> set[str]:
     }
 
 
-def _bound_by_imports(tree: ast.Module) -> set[str]:
-    names: set[str] = set()
+def _import_bindings(node: ast.Import | ast.ImportFrom) -> dict[str, tuple[object, ...]]:
+    """Each name an import binds, with its exact source: ``import a.b as c`` binds ``c`` to
+    ``("import", "a.b")``; ``import a.b`` binds ``a`` to ``("import", "a")`` (the package);
+    ``from m import x as y`` binds ``y`` to ``("from", level, "m", "x")``."""
+    bindings: dict[str, tuple[object, ...]] = {}
+    for alias in node.names:
+        if alias.name == "*":
+            continue
+        if isinstance(node, ast.Import):
+            if alias.asname:
+                bindings[alias.asname] = ("import", alias.name)
+            else:
+                top = alias.name.split(".")[0]
+                bindings[top] = ("import", top)
+        else:
+            bindings[alias.asname or alias.name] = ("from", node.level, node.module, alias.name)
+    return bindings
+
+
+def _module_bindings(tree: ast.Module) -> dict[str, tuple[object, ...]]:
+    found: dict[str, tuple[object, ...]] = {}
     for node in tree.body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            names |= {(a.asname or a.name).split(".")[0] for a in node.names if a.name != "*"}
-    return names
+            found.update(_import_bindings(node))
+    return found
 
 
 def audit_refusal(
@@ -179,10 +198,11 @@ def audit_refusal(
             flags.append("single_function_refused")
         if reason == "extra_statements" and not helpers and not assigned and needed_imports:
             target = next(item for item in shown if item.name == function.name)
-            present = _bound_by_imports(workspace.parse(files[target.path], target.path))
-            wanted = set().union(
-                *({(a.asname or a.name).split(".")[0] for a in n.names} for n in needed_imports)
-            )
-            if wanted & used <= present:
+            present = _module_bindings(workspace.parse(files[target.path], target.path))
+            wanted: dict[str, tuple[object, ...]] = {}
+            for node in needed_imports:
+                assert isinstance(node, (ast.Import, ast.ImportFrom))
+                wanted.update({k: v for k, v in _import_bindings(node).items() if k in used})
+            if wanted and all(present.get(name) == source for name, source in wanted.items()):
                 flags.append("import_already_present")
     return flags

@@ -25,6 +25,9 @@ characters).
 from __future__ import annotations
 
 import ast
+import io
+import re
+import tokenize
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -75,6 +78,88 @@ def block_text(tokens: Sequence[int], decoder: TextDecoder) -> tuple[str, int | 
     return decoder.decode(tokens[start:end]), ender
 
 
+def logical_line_starts(text: str) -> list[int]:
+    """0-based indices of the lines on which a new logical line starts at indentation 0, by
+    the tokenizer: not a continuation inside brackets or after a backslash, not inside a
+    string. Tokens are read until the text stops tokenizing (a truncated tail)."""
+    starts: list[int] = []
+    at_start = True
+    ignored = {tokenize.NL, tokenize.COMMENT, tokenize.ENCODING}
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type in ignored:
+                continue
+            if token.type in {tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT}:
+                at_start = token.type != tokenize.INDENT or at_start
+                if token.type == tokenize.NEWLINE:
+                    at_start = True
+                continue
+            if token.type == tokenize.ENDMARKER:
+                break
+            if at_start and token.start[1] == 0:
+                starts.append(token.start[0] - 1)
+            at_start = False
+    except (tokenize.TokenError, SyntaxError, ValueError):
+        pass
+    return starts
+
+
+_DEFINES = re.compile(r"(async\s+def|def|class|import|from)\b|@")
+
+
+def _depth_zero_assignment(line: str) -> bool:
+    """Whether ``line`` has an ``=`` (or ``:=``/augmented form) outside brackets that is not a
+    comparison; strings are skipped roughly (any quote toggles)."""
+    depth, quote = 0, ""
+    for index, char in enumerate(line):
+        if quote:
+            if char == quote:
+                quote = ""
+            continue
+        if char in "'\"":
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "=" and depth <= 0:
+            before = line[index - 1] if index else ""
+            after = line[index + 1] if index + 1 < len(line) else ""
+            if before not in "=!<>" and after != "=":
+                return True
+        elif char == ":" and depth <= 0:
+            return True  # an annotation, or a compound statement header
+    return False
+
+
+def tail_is_inert(tail: Sequence[str]) -> bool:
+    """Whether the dropped tail can only hold expression statements and comments at column 0:
+    no definition, decorator, import, assignment (plain, annotated, augmented, walrus) or
+    compound statement. Anything else could change what the kept function means, so the
+    normal rules would have to see it, and recovery refuses instead."""
+    for line in tail:
+        if not line or line[0].isspace() or line.startswith("#"):
+            continue
+        if _DEFINES.match(line):
+            return False
+        try:
+            tree = ast.parse(line)
+        except (SyntaxError, ValueError, MemoryError, RecursionError):
+            tree = None
+        if tree is not None:
+            if not all(isinstance(node, ast.Expr) for node in tree.body):
+                return False
+            if any(isinstance(node, ast.NamedExpr) for node in ast.walk(tree)):
+                return False
+            continue
+        # A truncated line: only the start of a call, with no assignment outside brackets.
+        if not re.match(r"[A-Za-z_][\w.]*\(", line) or _depth_zero_assignment(line):
+            return False
+        if ":=" in line:
+            return False
+    return True
+
+
 def recover_text(text: str, *, ended_by_eos: bool) -> Recovery | None:
     """Apply the two rules to an unclosed block's text."""
     if "\r" in text:
@@ -86,17 +171,15 @@ def recover_text(text: str, *, ended_by_eos: bool) -> Recovery | None:
         and any(isinstance(node, ast.FunctionDef) for node in ast.parse(text).body)
     ):
         return Recovery(text, "eos_whole_parse", len(lines), len(lines))
-    starts = [
-        index
-        for index, line in enumerate(lines)
-        if index and line and not line[0].isspace() and not line.startswith("#")
-    ]
+    starts = [index for index in logical_line_starts(text) if index]
     for following in reversed(starts):
         prefix = "\n".join(lines[:following])
         if not _parses(prefix):
             continue
         if not any(isinstance(node, ast.FunctionDef) for node in ast.parse(prefix).body):
             continue
+        if not tail_is_inert(lines[following:]):
+            return None
         return Recovery(prefix, "followed_by_top_level", following, len(lines))
     return None
 

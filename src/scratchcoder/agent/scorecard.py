@@ -15,55 +15,80 @@ from scratchcoder.agent.loop import FAILURE_CLASSES, InstanceResult
 
 GENERATION_STAGES = (
     "generations",
-    "fresh_generations",
-    "closed_block",
-    "recovered",
+    "closed_or_recovered",
     "parseable",
     "one_shown_function",
     "target_function",
-    "applied_edit",
+    "applied_target_edit",
     "public_passed",
 )
+"""Nested stages: each counts only turns that reached the stage before it."""
+GENERATION_SIDE = ("fresh_generations", "closed_block", "recovered", "applied_non_target_edit")
 INSTANCE_STAGES = (
     "instances",
     "closed_or_recovered",
     "parseable",
     "one_shown_function",
     "target_function",
-    "applied_edit",
+    "applied_target_edit",
     "public_passed",
     "solved",
 )
+"""Nested stages per instance; public and solved count only instances with a target edit."""
+INSTANCE_SIDE = ("applied_non_target_edit", "solved_without_target_edit")
+
+
+def _turn_stages(turn: Any) -> dict[str, bool]:
+    reached: dict[str, bool] = {}
+    reached["closed_or_recovered"] = turn.closed_block or turn.recovered
+    reached["parseable"] = reached["closed_or_recovered"] and turn.parseable
+    reached["one_shown_function"] = reached["parseable"] and len(turn.shown_defined) == 1
+    reached["target_function"] = reached["one_shown_function"] and turn.target_defined
+    reached["applied_target_edit"] = reached["target_function"] and turn.edit == "applied"
+    reached["public_passed"] = reached["applied_target_edit"] and turn.feedback == "passed"
+    return reached
 
 
 def funnel(results: Sequence[InstanceResult]) -> dict[str, Any]:
-    """How far replies got, per generation (every turn; ``fresh_generations`` excludes cache
-    reuse) and per instance (any turn reaching the stage; ``solved`` = public, correctness and
-    preservation all passed). Recovered blocks are counted apart from closed ones."""
+    """How far replies got, as nested stages: per generation (every turn) and per instance
+    (any turn reaching the stage; public and solved also need a target edit). Side counts:
+    fresh generations (no cache reuse), closed and recovered blocks apart, applied edits to a
+    function that is not a target, and instances solved without editing a target."""
     turns = [turn for result in results for turn in result.turns]
-    generations = {
-        "generations": len(turns),
-        "fresh_generations": sum(not turn.cached for turn in turns),
-        "closed_block": sum(turn.closed_block for turn in turns),
-        "recovered": sum(turn.recovered for turn in turns),
-        "parseable": sum(turn.parseable for turn in turns),
-        "one_shown_function": sum(len(turn.shown_defined) == 1 for turn in turns),
-        "target_function": sum(turn.target_defined for turn in turns),
-        "applied_edit": sum(turn.edit == "applied" for turn in turns),
-        "public_passed": sum(turn.feedback == "passed" for turn in turns),
-    }
-    instances = {
-        "instances": len(results),
-        "closed_or_recovered": sum(
-            any(t.closed_block or t.recovered for t in r.turns) for r in results
+    staged = [_turn_stages(turn) for turn in turns]
+    generations: dict[str, int] = {"generations": len(turns)}
+    for stage in GENERATION_STAGES[1:]:
+        generations[stage] = sum(row[stage] for row in staged)
+    generations.update(
+        fresh_generations=sum(not turn.cached for turn in turns),
+        closed_block=sum(turn.closed_block for turn in turns),
+        recovered=sum(turn.recovered for turn in turns),
+        applied_non_target_edit=sum(
+            turn.edit == "applied" and not row["applied_target_edit"]
+            for turn, row in zip(turns, staged, strict=True)
         ),
-        "parseable": sum(any(t.parseable for t in r.turns) for r in results),
-        "one_shown_function": sum(any(len(t.shown_defined) == 1 for t in r.turns) for r in results),
-        "target_function": sum(any(t.target_defined for t in r.turns) for r in results),
-        "applied_edit": sum(any(t.edit == "applied" for t in r.turns) for r in results),
-        "public_passed": sum(r.grade.get("public") == "passed" for r in results),
-        "solved": sum(r.scored and r.solved for r in results),
-    }
+    )
+    instances: dict[str, int] = {"instances": len(results)}
+    per_result = [[_turn_stages(turn) for turn in result.turns] for result in results]
+    for stage in INSTANCE_STAGES[1:6]:
+        instances[stage] = sum(any(row[stage] for row in rows) for rows in per_result)
+    targeted = [any(row["applied_target_edit"] for row in rows) for rows in per_result]
+    instances["public_passed"] = sum(
+        hit and result.grade.get("public") == "passed"
+        for hit, result in zip(targeted, results, strict=True)
+    )
+    instances["solved"] = sum(
+        hit and result.scored and result.solved
+        for hit, result in zip(targeted, results, strict=True)
+    )
+    instances["applied_non_target_edit"] = sum(
+        any(t.edit == "applied" for t in result.turns) and not hit
+        for hit, result in zip(targeted, results, strict=True)
+    )
+    instances["solved_without_target_edit"] = sum(
+        result.scored and result.solved and not hit
+        for hit, result in zip(targeted, results, strict=True)
+    )
     return {
         "per_generation": generations,
         "per_instance": instances,
@@ -185,24 +210,25 @@ def markdown(card: dict[str, Any]) -> str:
         "",
         "## Funnel",
         "",
-        "Per generation (every turn; fresh excludes reuse), then per instance (any turn).",
+        "Nested stages (each counts only what reached the one before), per generation, then "
+        "per instance; side columns follow the stages.",
         "",
-        "| Policy/condition | Level | " + " | ".join(GENERATION_STAGES) + " |",
-        "| --- | --- | " + " | ".join("---:" for _ in GENERATION_STAGES) + " |",
+        "| Policy/condition | Level | " + " | ".join(GENERATION_STAGES + GENERATION_SIDE) + " |",
+        "| --- | --- | " + " | ".join("---:" for _ in GENERATION_STAGES + GENERATION_SIDE) + " |",
     ]
     for label, group in card["groups"].items():
         stages = group["all"]["funnel"]["per_generation"]
         lines.append(
             f"| {label} | generation | "
-            + " | ".join(str(stages[s]) for s in GENERATION_STAGES)
+            + " | ".join(str(stages[s]) for s in GENERATION_STAGES + GENERATION_SIDE)
             + " |"
         )
     lines += [
         "",
         "| Policy/condition | "
-        + " | ".join(INSTANCE_STAGES)
+        + " | ".join(INSTANCE_STAGES + INSTANCE_SIDE)
         + " | name failures | harness defects |",
-        "| --- | " + " | ".join("---:" for _ in INSTANCE_STAGES) + " | --- | --- |",
+        "| --- | " + " | ".join("---:" for _ in INSTANCE_STAGES + INSTANCE_SIDE) + " | --- | --- |",
     ]
     for label, group in card["groups"].items():
         found = group["all"]["funnel"]
@@ -211,22 +237,13 @@ def markdown(card: dict[str, Any]) -> str:
         defects = ", ".join(f"{k} {v}" for k, v in found["instances_with_harness_defects"].items())
         lines.append(
             f"| {label} | "
-            + " | ".join(str(stages[s]) for s in INSTANCE_STAGES)
+            + " | ".join(str(stages[s]) for s in INSTANCE_STAGES + INSTANCE_SIDE)
             + f" | {names} | {defects or '-'} |"
         )
     return "\n".join(lines) + "\n"
 
 
-COMPARE_GENERATION = (
-    "fresh_generations",
-    "closed_block",
-    "recovered",
-    "parseable",
-    "one_shown_function",
-    "target_function",
-    "applied_edit",
-    "public_passed",
-)
+COMPARE_GENERATION = (*GENERATION_STAGES, *GENERATION_SIDE)
 
 
 def _inferred_config(identity: dict[str, Any]) -> dict[str, Any]:
@@ -242,13 +259,82 @@ def _inferred_config(identity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+INVARIANT_FIELDS = (
+    "valid_cases",
+    "cases_registry_sha256",
+    "checkpoint_sha256",
+    "tokenizer_sha256",
+    "seed_base",
+    "decoding_rows",
+    "conditions",
+    "budgets",
+    "threads",
+    "batch_size",
+    "supervisor_sha256",
+    "runtime_image_id",
+    "precision",
+    "device",
+    "protocol",
+)
+"""Identity fields every compared run must share: only the configuration may differ."""
+FACTORS = {
+    "prompt": ("prompt",),
+    "sampled_decoding": ("sampled_temperature", "sampled_top_p"),
+    "recovery": ("recovery",),
+}
+"""Configuration factors. The sampled temperature and top-p move together as one factor."""
+
+
+def invariants(identity: dict[str, Any]) -> dict[str, Any]:
+    values = {field: identity.get(field) for field in INVARIANT_FIELDS}
+    values["decoding_rows"] = [
+        [row.get("label"), row.get("index")]
+        + ([row.get("temperature"), row.get("top_p")] if row.get("label") == "greedy" else [])
+        for row in identity.get("decodings", [])
+    ]
+    return values
+
+
+def _label(changed: list[str], first: bool) -> str:
+    if first:
+        return "baseline"
+    if not changed:
+        return "same configuration as baseline"
+    if len(changed) == 1:
+        return f"single factor: {changed[0]}"
+    return "combined: " + " + ".join(changed)
+
+
 def comparison(cards: Sequence[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
-    """One row per run and model condition: configuration, funnel, solved and cost. A run
-    without funnel data (an earlier scorecard) shows ``None`` for those columns."""
+    """One row per run and model condition: configuration, funnel, solved and cost. The first
+    run is the baseline. Every run must share :data:`INVARIANT_FIELDS` with it, or its rows are
+    marked non-comparable (with the fields named); each row lists the configuration fields and
+    factors that differ from the baseline. A run without funnel data (an earlier scorecard)
+    shows ``None`` for those columns."""
     rows = []
-    for name, card in cards:
+    if not cards:
+        raise ValueError("compare needs at least one run")
+    base_identity = cards[0][1].get("identity", {})
+    base_invariants = invariants(base_identity)
+    base_config = base_identity.get("config") or _inferred_config(base_identity)
+    for position, (name, card) in enumerate(cards):
         identity = card.get("identity", {})
         config = identity.get("config") or _inferred_config(identity)
+        own = invariants(identity)
+        noncomparable = [
+            field for field in INVARIANT_FIELDS if own[field] != base_invariants[field]
+        ]
+        fields = [
+            field
+            for names in FACTORS.values()
+            for field in names
+            if config.get(field) != base_config.get(field)
+        ]
+        changed = [
+            factor
+            for factor, names in FACTORS.items()
+            if any(config.get(field) != base_config.get(field) for field in names)
+        ]
         for label, group in card["groups"].items():
             if not label.startswith("model/"):
                 continue
@@ -259,6 +345,11 @@ def comparison(cards: Sequence[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
                     "run": name,
                     "condition": label.split("/", 1)[1],
                     "config": config,
+                    "label": _label(changed, position == 0),
+                    "differs_from_baseline": fields,
+                    "factors_changed": changed,
+                    "comparable": not noncomparable,
+                    "noncomparable_fields": noncomparable,
                     "funnel": {stage: per_generation.get(stage) for stage in COMPARE_GENERATION},
                     "sampled_solved": [group["sampled"]["solved"], group["sampled"]["scored"]],
                     "greedy_solved": [group["greedy"]["solved"], group["greedy"]["scored"]],
@@ -275,7 +366,13 @@ def comparison(cards: Sequence[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
                     "wall_seconds": everything["wall_seconds"],
                 }
             )
-    return {"schema": "agent-dev-comparison-v1", "rows": rows}
+    return {
+        "schema": "agent-dev-comparison-v2",
+        "baseline": cards[0][0],
+        "comparable": all(row["comparable"] for row in rows),
+        "invariant_fields": list(INVARIANT_FIELDS),
+        "rows": rows,
+    }
 
 
 def _counts(values: dict[str, int] | None) -> str:
@@ -286,7 +383,7 @@ def _counts(values: dict[str, int] | None) -> str:
 
 def comparison_markdown(table: dict[str, Any]) -> str:
     head = (
-        "| Run | Condition | Prompt | T / top-p | Recovery | "
+        "| Run | Condition | Label | Comparable | Prompt | T / top-p | Recovery | "
         + " | ".join(COMPARE_GENERATION)
         + " | Sampled solved | Greedy solved | Failure classes | Name failures | "
         "Harness defects | Gen s | Sandbox calls | Wall s |"
@@ -294,12 +391,15 @@ def comparison_markdown(table: dict[str, Any]) -> str:
     lines = [
         "# Agent development comparison",
         "",
-        "Funnel columns count generations (fresh = excluding reuse). Solved counts instances: "
+        f"Baseline: {table['baseline']}. Every run must share the baseline's cases, case "
+        "registry, checkpoint, tokenizer, seeds, decoding rows, conditions, budgets, threads, "
+        "batch size, supervisor and runtime image; only the configuration may differ. Funnel "
+        "columns are nested generation stages, then side counts. Solved counts instances: "
         "public tests, correctness and preservation checks all passed.",
         "",
         head,
         "| "
-        + " | ".join(["---"] * 5 + ["---:"] * (len(COMPARE_GENERATION) + 2))
+        + " | ".join(["---"] * 7 + ["---:"] * (len(COMPARE_GENERATION) + 2))
         + " | "
         + " | ".join(["---"] * 3 + ["---:"] * 3)
         + " |",
@@ -311,7 +411,9 @@ def comparison_markdown(table: dict[str, Any]) -> str:
             for stage in COMPARE_GENERATION
         ]
         lines.append(
-            f"| {row['run']} | {row['condition']} | {config['prompt']} | "
+            f"| {row['run']} | {row['condition']} | {row['label']} | "
+            + ("yes" if row["comparable"] else "NO: " + ", ".join(row["noncomparable_fields"]))
+            + f" | {config['prompt']} | "
             f"{config['sampled_temperature']} / {config['sampled_top_p']} | {config['recovery']} | "
             + " | ".join(funnel_cells)
             + f" | {row['sampled_solved'][0]}/{row['sampled_solved'][1]}"

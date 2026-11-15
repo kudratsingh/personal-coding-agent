@@ -124,6 +124,15 @@ def compare(args: argparse.Namespace) -> int:
         card = json.loads((run_dir / "scorecard.json").read_text(encoding="utf-8"))
         cards.append((run_dir.name, card))
     table = scorecard.comparison(cards)
+    if not table["comparable"] and not args.allow_noncomparable:
+        for row in table["rows"]:
+            if not row["comparable"]:
+                print(
+                    f"refused: {row['run']} differs from the baseline outside its "
+                    f"configuration: {', '.join(row['noncomparable_fields'])}",
+                    file=sys.stderr,
+                )
+        return 2
     atomic_json(args.out_json, table)
     args.out_md.write_text(scorecard.comparison_markdown(table), encoding="utf-8")
     print(json.dumps({"rows": len(table["rows"]), "markdown": str(args.out_md)}))
@@ -333,6 +342,11 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--runs", type=Path, nargs="+", required=True)
     compare_parser.add_argument("--out-md", type=Path, required=True)
     compare_parser.add_argument("--out-json", type=Path, required=True)
+    compare_parser.add_argument(
+        "--allow-noncomparable",
+        action="store_true",
+        help="write the table even when runs differ outside their configuration (flagged)",
+    )
     run_parser.add_argument(
         "--conditions", nargs="+", default=["single", "repair-3"], choices=sorted(loop.CONDITIONS)
     )
