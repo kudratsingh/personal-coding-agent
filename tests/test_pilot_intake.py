@@ -1,7 +1,7 @@
 """Pilot intake: the row offset, and every drop reason in order, on authored fixtures only."""
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -129,10 +129,14 @@ class Encoder:
         return list(range(len(text.split())))
 
 
-def fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+def fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[tuple[dict[str, Any], str | None]] = ROWS,
+) -> list[str]:
     source = write_parquet(
         tmp_path / "raw" / "oc.parquet",
-        {key: [entry[key] for entry, _ in ROWS] for key in ("id", "input", "output", "unit_tests")},
+        {key: [entry[key] for entry, _ in rows] for key in ("id", "input", "output", "unit_tests")},
         group=4,
     )
     digest = tool._sha(source)
@@ -238,7 +242,7 @@ def fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
         "--arc-record", str(tmp_path / "bench" / "arc.json"),
         "--file", FILE,
         "--start-row", str(START),
-        "--rows", str(COUNT),
+        "--rows", str(len(rows) - 3),
         "--remainder", str(tmp_path / "remainder.json"),
         "--out", str(tmp_path / "out"),
     ]  # fmt: skip
@@ -270,7 +274,28 @@ def test_every_reason_fires_in_order_and_only_the_range_is_read(
     assert record["executed_code"] is False and record["sealed_files_opened"] is False
     remainder = list(load_tasks(out / "remainder.jsonl"))
     assert [task.id for task in remainder] == ["nvidia/OpenCodeInstruct/r1"]
-    assert set(record["outputs"]) == {"candidates.jsonl", "rows.jsonl", "remainder.jsonl"}
+    assert set(record["outputs"]) == {
+        "candidates.jsonl",
+        "rows.jsonl",
+        "remainder.jsonl",
+        "scan-bridges.jsonl",
+    }
+    # Every adapted row that was dropped is a scan bridge, in row order, as a train task;
+    # the row the adapter refused has no task to link.
+    bridges = list(load_tasks(out / "scan-bridges.jsonl"))
+    adapted_drops = [
+        f"nvidia/OpenCodeInstruct/{entry['id']}"
+        for entry, reason in ROWS[START : START + COUNT]
+        if reason not in ("kept", "unsupported_schema")
+    ]
+    assert [task.id for task in bridges] == adapted_drops
+    assert all(task.split == "train" for task in bridges)
+    # Two of them repeat an ID (a pool task's and a candidate's) with other content.
+    assert record["scan_bridges"] == {
+        "tasks": len(adapted_drops),
+        "identical_repeats_omitted": 0,
+        "repeated_ids": 2,
+    }
 
 
 def test_a_range_past_the_end_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -370,3 +395,197 @@ def test_the_arc_export_must_match_its_record_and_the_reviewed_split(tmp_path: P
     (tmp_path / "arc-export.json").write_text(json.dumps(record))
     with pytest.raises(tool.Refused, match="SHA-256"):
         tool.arc_questions(export, tmp_path / "arc-export.json")
+
+
+def test_scan_bridges_omit_only_identical_repeats() -> None:
+    held = pool_task("p1", words("held", 14), "def h(x):\n    return 1\n", "dev")
+    same = replace(held, split="train", public_tests="assert 2 == 2")  # same family fields
+    other = replace(held, prompt=words("changed", 14))
+    first = pool_task("n1", words("new", 14), "def n(x):\n    return 2\n", "dev")
+    again = replace(first, hidden_tests="assert 3 == 3")
+    linked, counts = tool.scan_bridges([same, other, first, again], [held])
+    assert [(task.id, task.prompt) for task in linked] == [
+        ("p1", other.prompt),
+        ("n1", first.prompt),
+    ]
+    assert all(task.split == "train" for task in linked)
+    assert counts == {"tasks": 2, "identical_repeats_omitted": 2, "repeated_ids": 1}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"prompt": words("changed", 14)},
+        {"solution": "def h(x):\n    return 99\n"},
+        {"entry_point": "h"},
+        {"source": "other/source"},
+        {
+            "mode": "io",
+            "solution": "print(input())\n",
+            "public_tests": json.dumps([{"input": "1", "output": "1"}]),
+            "hidden_tests": json.dumps([{"input": "2", "output": "2"}]),
+        },
+    ],
+)
+def test_a_repeat_differing_in_any_family_field_is_kept_and_counted(
+    change: dict[str, Any],
+) -> None:
+    held = pool_task("p1", words("held", 14), "def h(x):\n    return 1\n", "dev")
+    changed = replace(held, **change)
+    linked, counts = tool.scan_bridges([changed], [held])
+    assert [task.id for task in linked] == ["p1"]
+    assert counts == {"tasks": 1, "identical_repeats_omitted": 0, "repeated_ids": 1}
+
+
+def test_scan_bridges_keep_row_order_across_the_family_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dev-family drop is decided last, but its row comes before a later drop."""
+    family_row = next(entry for entry in ROWS if entry[1] == "dev_family")
+    long_row = next(entry for entry in ROWS if entry[1] == "over_rl_prompt_tokens")
+    rows = [*ROWS[:START], family_row, long_row, ROWS[-1]]
+    assert tool.main(fixture(tmp_path, monkeypatch, rows)) == 0
+    bridges = list(load_tasks(tmp_path / "out" / "scan-bridges.jsonl"))
+    assert [task.id for task in bridges] == [
+        "nvidia/OpenCodeInstruct/fam",
+        "nvidia/OpenCodeInstruct/long",
+    ]
+
+
+# The integrity scan over the intake's outputs --------------------------------------------
+
+SECRET_PROMPT = words("sealedword", 20) + " SEALEDPROMPTMARK"
+SECRET_SOLUTION = (
+    "def sealedfnmark(values):\n    out = []\n    for v in values:\n"
+    "        out.append(v * 13 - 1)\n    return out\n"
+)
+CHAIN_PROMPT = words("chainword", 20)
+CHAIN_ROWS: list[tuple[dict[str, Any], str | None]] = [
+    *ROWS[:START],
+    (row("survivor", CHAIN_PROMPT, "survivor_fn"), "kept"),
+    (
+        {
+            **row("dropped", CHAIN_PROMPT + " again", "sealedfnmark"),
+            "output": "```python\n" + SECRET_SOLUTION + "```",
+            "unit_tests": json.dumps(
+                [
+                    "assert sealedfnmark([1]) == [12]",
+                    "assert sealedfnmark([]) == []",
+                    "assert sealedfnmark([2]) == [25]",
+                ]
+            ),
+        },
+        "near_duplicate",
+    ),
+    ROWS[-1],
+]
+
+
+def sealed_fixture(root: Path) -> tuple[Path, Path, Path]:
+    from scratchcoder.eval.seal import SealLedger
+    from tools import holdout_integrity_scan as scan_tool
+
+    sealed = root / "sealed" / "test.jsonl"
+    sealed.parent.mkdir(parents=True)
+    test_task = replace(
+        pool_task("SEALEDIDMARK", SECRET_PROMPT, SECRET_SOLUTION, "test"),
+        hidden_tests="assert SEALEDTESTMARK == 1",
+    )
+    sealed.write_text(json.dumps(asdict(test_task)) + "\n")
+    report = root / "sealed" / "report.json"
+    digest = scan_tool._sha_bytes(sealed.read_bytes())
+    report.write_text(json.dumps({"files": {"test": {"file_sha256": digest, "tasks": 1}}}))
+    ledger = root / "seal" / "ledger.jsonl"
+    SealLedger(ledger).record_baseline(
+        task_file_sha256="a" * 64, path=Path("x"), sha256="b" * 64, results_id="r"
+    )
+    return sealed, report, ledger
+
+
+def test_a_candidate_linked_to_a_test_task_only_through_a_dropped_row_is_excluded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Surviving candidate -> dropped intake row -> sealed test task: the dropped row is a
+    scan bridge, so the candidate is excluded, and no output names the row or the test."""
+    from scratchcoder.data.integrity_scan import item_of, scan
+    from tools import holdout_integrity_scan as scan_tool
+
+    argv = fixture(tmp_path, monkeypatch, CHAIN_ROWS)
+    assert tool.main(argv) == 0
+    out = tmp_path / "out"
+    survivor, dropped = "nvidia/OpenCodeInstruct/survivor", "nvidia/OpenCodeInstruct/dropped"
+    assert [task.id for task in load_tasks(out / "candidates.jsonl")] == [survivor]
+    assert [task.id for task in load_tasks(out / "scan-bridges.jsonl")] == [dropped]
+    sealed, report, ledger = sealed_fixture(tmp_path)
+    test_items = [item_of(task) for task in load_tasks(sealed)]
+    pilot = [item_of(task) for task in load_tasks(out / "candidates.jsonl")]
+    linked = [item_of(task) for task in load_tasks(out / "scan-bridges.jsonl")]
+    # Without the dropped row the candidate looks clear; with it, it is in the family.
+    assert [r.status for r in scan(test_items, {"pilot": pilot})[0]] == ["clear"]
+    with_range = scan(test_items, {"pilot": pilot}, bridges={"range_dropped": linked})[0]
+    assert [(r.id, r.status) for r in with_range] == [(survivor, "excluded")]
+
+    # The command, end to end: request (nothing sealed opened), approval, one logged scan.
+    monkeypatch.setattr(scan_tool, "git_state", lambda: ("c" * 40, False))
+    scan_out = tmp_path / "scan"
+    request_argv = [
+        "request", "--sealed", str(sealed), "--pool-report", str(report),
+        "--subject", f"pilot={out / 'candidates.jsonl'}",
+        "--subject", f"remainder={out / 'remainder.jsonl'}",
+        "--bridge", f"pool_train={tmp_path / 'pool' / 'train.jsonl'}",
+        "--bridge", f"pool_dev={tmp_path / 'pool' / 'dev.jsonl'}",
+        "--bridge", f"range_dropped={out / 'scan-bridges.jsonl'}",
+        "--ledger", str(ledger), "--out", str(scan_out),
+    ]  # fmt: skip
+    assert scan_tool.main(request_argv) == 0
+    document = json.loads((scan_out / scan_tool.REQUEST_NAME).read_text())
+    document["approval"] = {
+        "approved_by": "owner",
+        "approved_at": "2026-11-15T00:00:00Z",
+        "statement": "approved for this synthetic test",
+        "request_sha256": document["request_sha256"],
+    }
+    approval = scan_out / "approval.json"
+    approval.write_text(json.dumps(document))
+    capsys.readouterr()
+    assert scan_tool.main(["run", "--approval", str(approval)]) == 0
+    printed = capsys.readouterr()
+    exclusions = json.loads((scan_out / "exclusions.json").read_text())
+    assert exclusions["excluded"] == {"pilot": [survivor], "remainder": []}
+    assert exclusions["clear"] == {"pilot": [], "remainder": ["nvidia/OpenCodeInstruct/r1"]}
+    summary = json.loads((scan_out / "summary.json").read_text())
+    assert summary["counts"] == {
+        "subjects": {
+            "pilot": {"excluded": 1, "flagged": 0, "clear": 0, "total": 1},
+            "remainder": {"excluded": 0, "flagged": 0, "clear": 1, "total": 1},
+        }
+    }
+    texts = [printed.out, printed.err, ledger.read_text()]
+    texts += [(scan_out / name).read_text() for name in scan_tool.OUTPUTS]
+    for text in texts:
+        for marker in ("SEALEDIDMARK", "SEALEDPROMPTMARK", "SEALEDTESTMARK", "sealedfnmark"):
+            assert marker not in text, marker
+        assert dropped not in text and "chainword" not in text
+
+
+def test_a_range_bridge_repeating_a_pool_id_is_refused_by_the_scan_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A repeated ID with other content cannot be scanned silently: the request refuses."""
+    from tools import holdout_integrity_scan as scan_tool
+
+    argv = fixture(tmp_path, monkeypatch)
+    assert tool.main(argv) == 0
+    sealed, report, ledger = sealed_fixture(tmp_path)
+    monkeypatch.setattr(scan_tool, "git_state", lambda: ("c" * 40, False))
+    request_argv = [
+        "request", "--sealed", str(sealed), "--pool-report", str(report),
+        "--subject", f"pilot={tmp_path / 'out' / 'candidates.jsonl'}",
+        "--bridge", f"pool_train={tmp_path / 'pool' / 'train.jsonl'}",
+        "--bridge", f"range_dropped={tmp_path / 'out' / 'scan-bridges.jsonl'}",
+        "--ledger", str(ledger), "--out", str(tmp_path / "scan"),
+    ]  # fmt: skip
+    capsys.readouterr()
+    assert scan_tool.main(request_argv) == 2
+    assert "bridge IDs must be unique" in capsys.readouterr().err
+    assert not (tmp_path / "scan" / scan_tool.REQUEST_NAME).exists()

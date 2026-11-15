@@ -46,6 +46,15 @@ Outputs, written under ``--out`` only when none of them exists:
 - ``candidates.jsonl``: the kept tasks, train split, in file order;
 - ``rows.jsonl``: every row's index, ID (when adapted) and outcome (``kept`` or the reason);
 - ``remainder.jsonl``: with ``--remainder``, those pool train tasks, for the integrity scan;
+- ``scan-bridges.jsonl``: every adapted row that was dropped (any reason after adaptation,
+  ``dev_family`` included), as a train-split task in row order, for the integrity scan's
+  family graph only. These rows are rejected: they are never training candidates. A row whose
+  family fields (source, prompt, reference, mode, entry point) equal a task already held under
+  its ID (pool train or dev, a candidate, an earlier dropped row) adds no family link and is
+  left out. Any other repeated ID is kept and counted in the record; the scan's request
+  refuses repeated bridge IDs, so such a range needs a reviewed change before it is scanned.
+  When the record's ``scan_bridges.tasks`` is 0 the file is empty and is left out of the
+  scan request (the scan refuses an empty set; an empty set links nothing);
 - ``record.json``: the row range, every input's SHA-256, the rules, counts by reason, the
   tool commit and the software versions.
 
@@ -65,6 +74,7 @@ import sys
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, replace
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any
 
@@ -111,7 +121,13 @@ REASONS = (
     "dev_paraphrase",
     "dev_family",
 )
-OUTPUTS = ("candidates.jsonl", "rows.jsonl", "remainder.jsonl", "record.json")
+OUTPUTS = (
+    "candidates.jsonl",
+    "rows.jsonl",
+    "remainder.jsonl",
+    "scan-bridges.jsonl",
+    "record.json",
+)
 ARC_SOURCE = "allenai/ai2_arc"
 REPOSITORY = Path(__file__).resolve().parents[1]
 
@@ -234,6 +250,43 @@ def dev_family_ids(
     }
 
 
+def _family_fields(task: Task) -> tuple[object, ...]:
+    """Every field the family rules see (``Item``), except the ID and the split."""
+    item = _item(task, "")
+    names = [name.name for name in dataclass_fields(item) if name.name not in {"id", "split"}]
+    return tuple(getattr(item, name) for name in names)
+
+
+def scan_bridges(
+    dropped: Sequence[Task], held: Sequence[Task]
+) -> tuple[list[Task], dict[str, int]]:
+    """The integrity scan's bridge set from a range's adapted, dropped rows (in row order).
+
+    Each row becomes a train-split task, the only split the scan accepts for a range row. A
+    row whose family fields equal those of a task already held under its ID adds no family
+    link and is left out. Any other row whose ID is already held is kept and counted: the
+    scan's request refuses it (repeated bridge IDs, or a subject ID with other content), so
+    a repeated ID can never be silently dropped from the family graph."""
+    seen = {task.id: _family_fields(task) for task in held}
+    kept: list[Task] = []
+    omitted = repeated = 0
+    for task in dropped:
+        fields_now = _family_fields(task)
+        if task.id in seen:
+            if seen[task.id] == fields_now:
+                omitted += 1
+                continue
+            repeated += 1
+        else:
+            seen[task.id] = fields_now
+        kept.append(replace(task, split="train"))
+    return kept, {
+        "tasks": len(kept),
+        "identical_repeats_omitted": omitted,
+        "repeated_ids": repeated,
+    }
+
+
 def intake(args: argparse.Namespace) -> dict[str, Any]:
     spec = load_spec(args.spec)
     source = _source(spec, KIND)
@@ -302,7 +355,7 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
     counts: Counter[str] = Counter()
     outcomes: list[dict[str, Any]] = []
     survivors: list[tuple[int, Task]] = []
-    bridges: list[Task] = []
+    bridges: list[tuple[int, Task]] = []
     seen: set[str] = set()
     taken = 0
 
@@ -351,15 +404,18 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
             duplicates.add(task.prompt)
             survivors.append((index, task))
         if not survivors or survivors[-1][1] is not task:
-            bridges.append(task)
+            bridges.append((index, task))
         seen.add(task.id)
     if taken != args.rows:
         raise Refused(f"{args.file} holds {taken} rows from row {args.start_row}, not {args.rows}")
-    family = dev_family_ids([task for _, task in survivors], dev, train, bridges)
+    family = dev_family_ids(
+        [task for _, task in survivors], dev, train, [task for _, task in bridges]
+    )
     kept = []
     for index, task in survivors:
         if task.id in family:
             drop(index, task.id, "dev_family")
+            bridges.append((index, task))
         else:
             kept.append(replace(task, split="train"))
             outcomes.append({"row": index, "id": task.id, "reason": "kept"})
@@ -379,6 +435,10 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
             stream.write(json.dumps(entry, sort_keys=True) + "\n")
     if args.remainder is not None:
         save_tasks(args.out / "remainder.jsonl", remainder)
+    linked, linked_counts = scan_bridges(
+        [task for _, task in sorted(bridges, key=lambda pair: pair[0])], [*train, *dev, *kept]
+    )
+    save_tasks(args.out / "scan-bridges.jsonl", linked)
     commit, dirty = git_state()
     inputs = {
         name: {"path": str(given), "sha256": _sha(given)}
@@ -421,6 +481,7 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
         },
         "counts": {reason: counts.get(reason, 0) for reason in (*REASONS, "kept", "rows")},
         "remainder_tasks": len(remainder) if args.remainder is not None else None,
+        "scan_bridges": linked_counts,
         "inputs": inputs,
         "outputs": {
             name: _sha(args.out / name) for name in OUTPUTS[:-1] if (args.out / name).exists()

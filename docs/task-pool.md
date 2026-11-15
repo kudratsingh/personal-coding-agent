@@ -85,9 +85,14 @@ A pool spec may set `splits.family_grouping` to `"task-clusters-v1"`. The holdou
   7. The build's holdout-paraphrase rule against dev.
   8. The frozen family rules against dev. Families are computed over dev, pool train and every adapted row of the range, so a row dropped for any other reason still links its family-mates. This is stricter than the build, which put only verified tasks in its family graph: it can drop a candidate the build would keep, never the reverse.
 - **What it does not do.** It runs no code and opens no sealed split.
-- **Outputs.** It writes the kept candidates, every row's outcome, and a record with:
+- **Outputs.** It writes the kept candidates, every row's outcome, the scan bridges, and a record with:
   - the inputs and rules;
-  - counts;
+  - counts, including the scan bridges';
   - software, lockfile and tokenizer identities.
-- **What comes next.** Protection against the sealed test split is a separate, approved step: the [holdout integrity scan](walkthroughs/holdout-integrity-scan.md) runs on this output. Reference verification follows.
+- **Scan bridges.** `scan-bridges.jsonl` holds every adapted row the intake dropped, for any reason including the family rule, as train-split tasks in row order. These rows are rejected and never train. They exist so that the sealed-test scan uses the same family graph as the dev check: pass them to the scan as a bridge set, so a candidate linked to a test task only through a dropped row is still excluded.
+  - A dropped row whose family fields (source, prompt, reference, mode, entry point) equal a task already held under its ID adds no link, and is left out.
+  - Any other repeated ID is kept and counted. The scan's request refuses repeated bridge IDs, so a repeat can never drop out of the family graph unnoticed; such a range needs a reviewed change before it is scanned.
+  - Rows the adapter refused have no task and cannot link anything.
+  - When the record's `scan_bridges.tasks` is 0, the file is empty: leave it out of the scan request, which refuses an empty set. An empty set links nothing.
+- **What comes next.** Protection against the sealed test split is a separate, approved step: the [holdout integrity scan](walkthroughs/holdout-integrity-scan.md) runs on this output, with pool train, pool dev and the scan bridges as bridge sets. Reference verification follows.
 - **Row offset.** `tools.task_pool._parquet_rows` takes the 0-based offset `start`. The pool build itself still reads from row 0.
