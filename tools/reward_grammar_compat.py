@@ -96,7 +96,9 @@ def summarize(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     kept_wrappers: Counter[str] = Counter()
     for row in rows:
         if row["v2"]["parseable"]:
-            kept_wrappers.update(form for form in row["kept_checks"] if " on call " not in form)
+            kept_wrappers.update(
+                form for form in row["kept_checks"] if not form.endswith(" on candidate call")
+            )
     return {
         "tasks": len(rows),
         "v1_parseable": sum(row["v1"]["parseable"] for row in rows),
@@ -180,11 +182,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     dev = list(load_tasks(args.dev))
     train = {task.id: task for task in load_tasks(args.train)}
-    candidates = [train[task_id] for task_id in _ids(args.candidates)]
-    remainder = [
-        train[task_id]
-        for task_id in remainder_ids(args.screening, args.exclusions, args.verifier_filter)
-    ]
+    candidate_ids = _ids(args.candidates)
+    if len(set(candidate_ids)) != len(candidate_ids):
+        print("refused: duplicate candidate IDs", file=sys.stderr)
+        return 4
+    candidates = [train[task_id] for task_id in candidate_ids]
+    kept = remainder_ids(args.screening, args.exclusions, args.verifier_filter)
+    recorded = json.loads(args.verifier_filter.read_text(encoding="utf-8")).get(
+        "remainder_after_clear_verifier_quarantine"
+    )
+    if recorded is not None and recorded != len(kept):
+        print(f"refused: derived remainder {len(kept)} != recorded {recorded}", file=sys.stderr)
+        return 4
+    remainder = [train[task_id] for task_id in kept]
     sets = {"dev": dev, "rl_candidates": candidates, "remainder": remainder}
     summary: dict[str, Any] = {
         "format": "reward-grammar-compat-v1",

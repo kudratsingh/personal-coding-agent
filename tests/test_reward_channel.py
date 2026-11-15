@@ -937,7 +937,7 @@ def test_the_supervisors_own_overrun_stays_far_inside_the_host_slack() -> None:
         ("assert f(products) == 5\nassert f(products, 1) == 5", "", 1.0, "constant 5"),
         # Only direct calls of a candidate function take the answer: ``len(f(3))`` needs the
         # candidate's value, and ``floor`` is the tests' own import.
-        ("assert len(f(3)) == 0\nassert f(1) == -1", "", 0.5, "constant -1"),
+        ("assert len(f(3)) == 4\nassert f(1) == -1", "", 0.5, "constant -1"),
     ],
 )
 def test_degenerate_baseline_for_function_tasks(

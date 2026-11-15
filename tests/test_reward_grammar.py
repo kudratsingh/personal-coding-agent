@@ -102,11 +102,32 @@ REFUSED: list[tuple[str, str, str | None]] = [
     ("assert Account(0).open is False", "guessable_wrapper", "is False on attribute .open"),
     ("assert (f(1) + 1) is None", "guessable_wrapper", "is None on BinOp"),
     # Checks that never depend on the candidate.
-    ("assert abs(-1) == 1", "candidate_independent", "== literal on builtin abs()"),
+    ("assert abs(-1) == 1", "candidate_independent", "== 1 on builtin abs()"),
     ("import math\nassert math.sqrt(4) == 2.0", "candidate_independent", None),
     ("assert [x for x in range(3)] == [0, 1, 2]", "candidate_independent", None),
     ("from solution import f\nassert f(1) == 2", "candidate_independent", None),
     ("from math import *\nassert f(1) == 2", "star_import", None),
+    # Review findings: literals equal to True/False, late imports, namespace dunders.
+    ("import math\nassert math.isclose(f(1), 2.5) == 1", "guessable_wrapper", None),
+    ("assert isinstance(f(1), int) == 1.0", "guessable_wrapper", None),
+    (
+        "import math\nassert [math.isclose(f(1), 2.5), math.isclose(f(2), 3.5)] == [True, True]",
+        "guessable_wrapper",
+        None,
+    ),
+    ("assert (isinstance(f(1), int),) == (True,)", "guessable_wrapper", None),
+    ("import math\nassert int(math.isclose(f(1), 2.5)) == 1", "guessable_wrapper", None),
+    ("import math\nassert str(math.isclose(f(1), 2.5)) == 'True'", "guessable_wrapper", None),
+    ("assert len(f(3)) == 0", "guessable_wrapper", "== 0 on builtin len()"),
+    (
+        "assert isclose(f(1), 2.0) is True\nfrom math import isclose",
+        "guessable_wrapper",
+        "is True on imported isclose()",
+    ),
+    ("assert floor(2.5) == 2\nfrom math import floor", "candidate_independent", None),
+    ("assert math.floor(2.5) == 2\nimport math", "candidate_independent", None),
+    ("assert __builtins__.abs(-1) == 1", "candidate_independent", None),
+    ("assert len(__file__) == 17", "candidate_independent", None),
 ]
 
 
@@ -184,3 +205,22 @@ def test_the_demonstrated_attacks_tasks_are_refused(name: str) -> None:
     case = conformance.by_name()[name]
     refused = unsupported_reason(case.task())
     assert refused is not None and refused.reason in GRAMMAR_V2_REASONS
+
+
+@pytest.mark.parametrize(
+    "hidden,reward",
+    [
+        ("assert f(1)[0] is True\nassert f(2)[0] is True", 1.0),
+        ("assert len(f(1)) == 3\nassert len(f(2)) == 3", 1.0),
+        ("assert round(f(1), 2) == 7\nassert round(f(2), 2) == 7\nassert f(3) == 8", 2 / 3),
+    ],
+)
+def test_the_baseline_covers_every_accepted_check(hidden: str, reward: float) -> None:
+    """A constant answer applies to a wrapper's or a subscript's value too: the candidate
+    controls it, so screening must see what a constant earns there."""
+    best = degenerate_baseline(task(hidden))
+    assert best is not None and best.reward == pytest.approx(reward)
+
+
+def test_check_forms_report_star_imports() -> None:
+    assert check_forms("from math import *\nassert f(1) == 2")[0] == (0, "star_import", None)

@@ -206,7 +206,11 @@ GRAMMAR_V2_REASONS = frozenset({"star_import", "candidate_independent", "guessab
 """The reasons v2 added. Every other reason already made a task unparseable under v1."""
 
 ENTRY_EXCLUDED_NAMES = frozenset(dir(builtins))
-"""Names that are never the candidate's: the host interpreter's builtins."""
+"""Names that are never the candidate's: the host interpreter's builtins. Names of the form
+``__name__`` (the module namespace's own entries, such as ``__builtins__`` or ``__file__``)
+are never the candidate's either."""
+
+GUESSABLE_STRINGS = frozenset({"True", "False", "None"})
 
 
 @dataclass(frozen=True)
@@ -307,6 +311,14 @@ def _import_bindings(node: ast.Import | ast.ImportFrom) -> set[str]:
     return names
 
 
+def _all_import_bindings(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names |= _import_bindings(node)
+    return names
+
+
 def _locally_bound(node: ast.expr) -> set[str]:
     """Names bound inside an expression: comprehension targets, lambda arguments and
     assignment-expression targets."""
@@ -339,6 +351,7 @@ def _entry_names(target: ast.expr, imported: set[str]) -> set[str]:
         if isinstance(node, ast.Name)
         and isinstance(node.ctx, ast.Load)
         and node.id not in ENTRY_EXCLUDED_NAMES
+        and not (node.id.startswith("__") and node.id.endswith("__"))
         and node.id not in imported
         and node.id not in bound
     }
@@ -358,12 +371,32 @@ def _is_entry_call(node: ast.expr, entries: set[str]) -> bool:
     )
 
 
+def _guessable_value(value: object, depth: int = 0) -> bool:
+    """Whether ``value`` is what a trusted boolean predicate's result would be compared
+    with: a value equal to ``None``, ``True`` or ``False`` (so ``1``, ``0``, ``1.0`` and
+    ``0.0`` too, as ``True == 1``), their names as text, or a non-empty container of only
+    such values."""
+    if depth > 32:
+        return True
+    if value is None or (isinstance(value, (bool, int, float)) and value in (0, 1)):
+        return True
+    if isinstance(value, str):
+        return value.strip() in GUESSABLE_STRINGS
+    if isinstance(value, dict):
+        items = [*value.keys(), *value.values()]
+        return bool(items) and all(_guessable_value(item, depth + 1) for item in items)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return bool(value) and all(_guessable_value(item, depth + 1) for item in value)
+    return False
+
+
 def _guessable(check: Check) -> bool:
     """Whether the expected answer of ``check`` is one a program can produce without solving
-    anything: ``None``, ``True`` or ``False`` (by identity or by ``==``), or falsiness."""
+    anything: ``is None/True/False``, falsiness, or ``==`` against a value equal to
+    ``None``, ``True`` or ``False`` (``1``, ``0.0``, ``[True, True]``, ``'True'``, ...)."""
     if check.predicate in {"is", "falsy"}:
         return True
-    return check.expected is None or type(check.expected) is bool
+    return _guessable_value(check.expected)
 
 
 def _attribute_base(node: ast.expr) -> ast.expr:
@@ -377,12 +410,11 @@ def _describe_root(root: ast.expr, imported: set[str]) -> str:
     if isinstance(root, ast.Call):
         func = root.func
         if isinstance(func, ast.Name):
-            kind = "builtin" if func.id in ENTRY_EXCLUDED_NAMES else "imported"
-            return (
-                f"{kind} {func.id}()"
-                if func.id in ENTRY_EXCLUDED_NAMES | imported
-                else (f"call {func.id}()")
-            )
+            if func.id in ENTRY_EXCLUDED_NAMES:
+                return f"builtin {func.id}()"
+            if func.id in imported:
+                return f"imported {func.id}()"
+            return "candidate call"
         if isinstance(func, ast.Attribute):
             base = _attribute_base(func)
             if isinstance(base, ast.Name) and base.id in imported:
@@ -451,11 +483,12 @@ def check_forms(hidden_tests: str) -> list[tuple[int, str, str | None]]:
         tree = ast.parse(hidden_tests)
     except (SyntaxError, ValueError, MemoryError, RecursionError):
         return []
-    imported: set[str] = set()
+    imported = _all_import_bindings(tree)
     rows: list[tuple[int, str, str | None]] = []
     for index, node in enumerate(tree.body):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            imported |= _import_bindings(node)
+            if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+                rows.append((index, "star_import", None))
             continue
         if not isinstance(node, ast.Assert):
             continue
@@ -484,17 +517,26 @@ def explain_function_checks(
       ``assert CALL is True``, ``assert CALL is False`` and ``assert not CALL``, where
       ``LITERAL`` is an :func:`ast.literal_eval` value of a reportable type and ``CALL`` has no
       comparison, boolean operator, ``not`` or bare constant at its top (otherwise ``form``).
-    - ``CALL`` must read at least one candidate name, a name that is not a builtin, not bound
-      by an import and not bound inside ``CALL`` (otherwise ``candidate_independent``).
+    - ``CALL`` must read at least one candidate name, a name that is not a builtin, not a
+      ``__dunder__`` name, not bound by an import anywhere in the tests and not bound inside
+      ``CALL`` (otherwise ``candidate_independent``). Naming the candidate is enough: a check
+      such as ``f.__name__ == 'f'`` passes for any program that defines ``f``.
     - When the expected answer is guessable (``is None/True/False``, ``not``, or ``==``
       against ``None``, ``True`` or ``False``), ``CALL`` must be a direct call of a
       candidate name, ``f(...)``, or a subscript of one, ``f(...)[0]`` (otherwise
-      ``guessable_wrapper``). A wrapper the test author trusted, such as
-      ``isinstance(f(x), list) is True`` or ``math.isclose(f(x), 3.14) is True``, runs in the
-      candidate's process, where the candidate can replace it and answer ``True``. Wrappers
-      stay supported against an informative literal (``len(f(x)) == 3``,
-      ``sorted(f(x)) == [1, 2]``, ``round(f(x), 2) == 3.14``): the expected value never
-      enters the container, so a replaced wrapper still has to produce it unseen.
+      ``guessable_wrapper``). Guessable includes every value equal to ``None``, ``True`` or
+      ``False`` (``1``, ``0.0``), their names as text and containers of only such values. A
+      wrapper the test author trusted, such as ``isinstance(f(x), list) is True`` or
+      ``math.isclose(f(x), 3.14) == 1``, runs in the candidate's process, where the candidate
+      can replace it and answer ``True``. Values produced by a method or an operator are
+      treated the same way, even on the candidate's own class (``Book(1900).is_classic() is
+      True``): the grammar cannot tell a method the candidate is asked to write from one of a
+      built-in type it returned. Against any other literal a wrapper stays supported
+      (``len(f(x)) == 3``, ``sorted(f(x)) == [1, 2]``, ``round(f(x), 2) == 3.14``). That does
+      not make such a check unforgeable: the candidate controls the value (by replacing the
+      wrapper, or through operators on its own return value), and only the expected literal
+      is hidden from it. A constant that happens to equal it still passes, which
+      :func:`degenerate_baseline` measures on every accepted check.
     - Every expected value must fit one result row (``row_size``), the call sources and the
       import lines must fit the sandbox input limit (``input_size``), and there must be at
       least one check (``no_checks``).
@@ -509,7 +551,9 @@ def explain_function_checks(
     except (SyntaxError, ValueError, MemoryError, RecursionError):
         return Unsupported("syntax")
     setup_lines: list[str] = []
-    imported: set[str] = set()
+    # Every import line runs as setup before any call in the container, so a name an import
+    # binds is never the candidate's, wherever that import stands.
+    imported = _all_import_bindings(tree)
     checks: list[Check] = []
     for index, node in enumerate(tree.body):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -517,7 +561,6 @@ def explain_function_checks(
             if star and current:
                 return Unsupported("star_import", index)
             setup_lines.append(ast.unparse(node))
-            imported |= _import_bindings(node)
             continue
         if not isinstance(node, ast.Assert):
             return Unsupported("statement", index, type(node).__name__)
@@ -897,6 +940,10 @@ def _public_outputs(task: Task) -> list[str]:
     ]
 
 
+_PLACEHOLDER_CALL = ast.Call(func=ast.Name(id="_", ctx=ast.Load()), args=[], keywords=[])
+_ECHO_LABELS = frozenset(label for label, _ in _ARGUMENT_ECHOES)
+
+
 def _function_baseline(task: Task, parsed: FunctionChecks) -> DegenerateBaseline:
     foreign = set(dir(builtins)) | _imported_names(parsed.setup)
     calls = [_direct_call(check.call, foreign) for check in parsed.checks]
@@ -908,8 +955,13 @@ def _function_baseline(task: Task, parsed: FunctionChecks) -> DegenerateBaseline
         passed = 0
         for check, call in zip(parsed.checks, calls, strict=True):
             if call is None:
-                continue  # not a direct call of a candidate function: counted as failed
-            known, value = answer_for(call)
+                if label in _ECHO_LABELS:
+                    continue  # an argument echo needs a direct call to take the argument of
+                # A constant or public-example answer applies to any accepted check's value:
+                # the candidate controls a wrapper's, a method's or a subscript's result too.
+                known, value = answer_for(_PLACEHOLDER_CALL)
+            else:
+                known, value = answer_for(call)
             if not known:
                 continue
             try:
@@ -948,9 +1000,10 @@ def degenerate_baseline(task: Task, *, limits: Limits | None = None) -> Degenera
     task is not parseable.
 
     It is computed on the host from the parsed hidden tests with the channel's own
-    comparison, and runs no code. For a function task an answer is applied only to checks
-    whose call is a direct call of a function the candidate defines (``f(1, 2)``, not
-    ``len(f(1))`` or ``Stack().pop()``); other checks count as failed, so the value is a
+    comparison, and runs no code. For a function task a constant or public-example answer is
+    applied to the value of every accepted check (``f(1, 2)``, ``len(f(1))``, ``f(1)[0]``),
+    since the candidate controls each of those values; an echo answer applies only to direct
+    calls of a candidate function, which have arguments to echo. The value is a
     lower bound, and a policy that reads the task can do better than any answer here. A
     check whose call uses a name the tests' reference defines (module data such as
     ``f(products)``, or ``os`` without an import in the tests) is counted as the answer
