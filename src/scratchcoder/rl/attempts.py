@@ -71,6 +71,10 @@ class ScreeningHeader:
     created_at: str
     git_commit: str | None = None
     dirty: bool | None = None
+    environment: Mapping[str, Any] | None = None
+    """Optional: the generating host's record (thread count, software versions, candidate
+    order, seed digest), as a JSON object. Omitted from the JSON when ``None``, so a header
+    written without it reads and writes exactly as before."""
 
     def __post_init__(self) -> None:
         for name in (
@@ -99,13 +103,24 @@ class ScreeningHeader:
         for name in ("precision", "device", "created_at"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"{name} is required")
+        if self.environment is not None:
+            if not isinstance(self.environment, Mapping) or not all(
+                isinstance(key, str) and key for key in self.environment
+            ):
+                raise ValueError("environment must be a JSON object with text keys")
+            json.dumps(dict(self.environment), allow_nan=False)  # Raises if not JSON.
 
     def to_json(self) -> dict[str, Any]:
+        values = asdict(self)
+        if values["environment"] is None:
+            del values["environment"]
+        else:
+            values["environment"] = dict(self.environment or {})
         return {
             "kind": "header",
             "format": FORMAT,
             "schema_version": SCHEMA_VERSION,
-            **asdict(self),
+            **values,
         }
 
     @classmethod
@@ -115,8 +130,10 @@ class ScreeningHeader:
         if raw.get("schema_version") != SCHEMA_VERSION:
             raise ValueError("unsupported screening attempts schema version")
         fields = {k: v for k, v in raw.items() if k not in ("kind", "format", "schema_version")}
-        if set(fields) != set(cls.__dataclass_fields__):
+        if set(fields) - {"environment"} != set(cls.__dataclass_fields__) - {"environment"}:
             raise ValueError("screening attempts header fields differ from the schema")
+        if "environment" in fields and fields["environment"] is None:
+            raise ValueError("a written environment must be an object")
         return cls(**fields)
 
 

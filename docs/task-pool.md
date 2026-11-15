@@ -94,5 +94,59 @@ A pool spec may set `splits.family_grouping` to `"task-clusters-v1"`. The holdou
   - Any other repeated ID is kept and counted. The scan's request refuses repeated bridge IDs, so a repeat can never drop out of the family graph unnoticed; such a range needs a reviewed change before it is scanned.
   - Rows the adapter refused have no task and cannot link anything.
   - When the record's `scan_bridges.tasks` is 0, the file is empty: leave it out of the scan request, which refuses an empty set. An empty set links nothing.
-- **What comes next.** Protection against the sealed test split is a separate, approved step: the [holdout integrity scan](walkthroughs/holdout-integrity-scan.md) runs on this output, with pool train, pool dev and the scan bridges as bridge sets. Reference verification follows.
+- **What comes next.** Protection against the sealed test split is a separate, approved step: the [holdout integrity scan](walkthroughs/holdout-integrity-scan.md) runs on this output, with pool train, pool dev and the scan bridges as bridge sets. Reference verification follows ([pilot stages](#pilot-stages-after-the-integrity-scan)).
 - **Row offset.** `tools.task_pool._parquet_rows` takes the 0-based offset `start`. The pool build itself still reads from row 0.
+
+## Pilot stages after the integrity scan
+
+`python -m tools.pilot_stages` takes a pilot's clear candidates from the [holdout integrity scan](walkthroughs/holdout-integrity-scan.md) to a screening report, in one run directory, with every limit enforced in code. It reuses the reviewed pieces and loosens none of them.
+
+- **`init --out RUN`.** Creates the run directory, which must not exist, and pins every input by SHA-256:
+  - the clear pilot candidates and the surviving RL remainder;
+  - the scan's `summary.json` and the intake `record.json`;
+  - the pool spec, for its verification policy;
+  - the SFT checkpoint, with its record, and the tokenizer.
+
+  The checkpoint must hash to its record's selected SHA-256. An input listed in a `SHA256SUMS` beside it must match that line. Every later stage checks the inputs it reads against these hashes again.
+- **Stages, in order.** Each needs the previous one completed and refuses to run twice.
+
+  | Stage | What it does | Runs code |
+  | --- | --- | --- |
+  | `verify` | Each reference against its public and hidden tests, once per distinct call, through `tools.task_pool.verify` (its resumable cache and retry rules). The evaluation path's deadline must equal the pool's rule under the spec's policy for every call. | yes, at most 20,000 sandbox calls |
+  | `admit` | [Admission](walkthroughs/admission.md) through `tools.admission_check`'s planning and recording: the static gate, three breadth-first reference runs and the negative controls. An admitted task must also be parseable under the reward grammar, and its best constant answer must earn less than the keep rule's threshold. | yes, at most 25,000 |
+  | `select` | The first 1,000 admitted candidates in `rl-candidate-v1` hash order, with their positions. The rest is a reserve. | no |
+  | `generate` | Needs a passing `scratchcoder sft-format-gate` record of the same checkpoint. The existing seeded sampler draws the screening protocol's 8 samples per candidate on the CPU, in `float32`, at batch 64, in chunks of 64 candidates, at torch's default thread count. | no |
+  | `score` | Rewards through the local reward channel and the unchanged keep rule (`scratchcoder.rl.command.screen_attempts`, header required), under reward grammar v2 only. | yes, at most 9,000 reward calls |
+  | `report` | The measured outcome and one recommendation by the pilot's fixed decision rule. It also runs after a stop, and then draws no decision. | no |
+
+- **Execution window.** `verify`, `admit` and `score` refuse to start without a passing receipt from `tools.mac_window_check exec` for that exact command line, under 30 minutes old (`tools.admission_check`'s rule). The receipt's image ID is bound to the run on first use, and a later stage under another image or evaluator identity is refused.
+- **Budget.** A ledger in the run directory counts every sandbox try, retries included. Each try is charged before it is made, against its stage's cap and 60,000 for the whole run, and a try that would pass either cap is not made.
+- **Hard stops.** Each is recorded with its reason, after which only `report` runs:
+  - a containment failure: a supervisor that could not establish a required protection, on its first occurrence;
+  - a sandbox host failure that outlasted its retries;
+  - any cap reached: calls, the run budget, or 4 h of generation;
+  - under 20% of candidates verified;
+  - more than 5% of admission runs unresolved after retries;
+  - a failing format gate;
+  - a reward grammar or facts identity other than v2;
+  - a first chunk of generation that projects past 4 h.
+
+  An interrupted stage with no stop recorded resumes from its cache.
+- **The attempts header.** Besides the usual fields, the header carries an optional `environment` record:
+  - the torch thread count actually in use;
+  - the torch, Python and NumPy versions;
+  - the candidate order's SHA-256 and the seeds' SHA-256;
+  - the first chunk's timing and its projection.
+
+  A header without it reads and writes exactly as before. `scratchcoder.eval.checkpoint.load_checkpoint` sets torch to one thread, so the generator restores the default count after loading.
+- **Report.** It gives:
+  - the combined pool and the shortfall to the floor;
+  - the yield, the all-zero share and the formatting, execution and genuine failure shares, with Wilson intervals;
+  - per-task pass@8;
+  - each step's drops by reason;
+  - the remainder before and after the scan;
+  - every stopping criterion's status.
+
+  It states that CPU and CUDA screening are different numerical executions of the same intended protocol, and that the decision thresholds are planning heuristics.
+- **Outputs.** Every output is a new file, and each stage writes a `SHA256SUMS`. The report adds one for the whole run.
+- **What it does not do.** Nothing runs automatically after the report. Any further intake or screening is a proposal for the owner.
