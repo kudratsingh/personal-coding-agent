@@ -152,8 +152,7 @@ def test_bridges_join_families_but_are_not_judged() -> None:
     assert [(r.id, r.status, r.signals) for r in results] == [
         ("s-behind-bridge", "excluded", ("family_chain",))
     ]
-    assert counts["bridge_tasks"] == {"in_test_family": 1, "total": 1}
-    assert counts["test_tasks_in_a_subject_family"] == 1
+    assert counts == {"subjects": {"pilot": {"excluded": 1, "flagged": 0, "clear": 0, "total": 1}}}
 
 
 def test_subject_ids_must_be_unique_across_sets() -> None:
@@ -637,8 +636,12 @@ def test_subjects_inside_the_train_bridge_are_judged_as_subjects(
     exclusions = json.loads((tmp_path / "scan" / "exclusions.json").read_text())
     assert exclusions["excluded"]["remainder"] == ["s-behind"]
     summary = json.loads((tmp_path / "scan" / "summary.json").read_text())
-    assert summary["counts"]["bridge_tasks_judged_as_subjects"] == 9
-    assert summary["counts"]["bridge_tasks"] == {"in_test_family": 1, "total": 1}
+    assert summary["counts"]["subjects"]["remainder"] == {
+        "excluded": 1,
+        "flagged": 0,
+        "clear": 0,
+        "total": 1,
+    }
     assert sealed_reads.reads == [str(paths["sealed"].resolve())]
 
 
@@ -705,9 +708,11 @@ def test_a_sealed_file_swapped_after_the_check_exits_4(
 
     def open_then_swap(self: SealLedger, digest: str, **fields: Any) -> Any:
         event = real_open(self, digest, **fields)
-        data = paths["sealed"].read_bytes()
-        paths["sealed"].unlink()
-        paths["sealed"].write_bytes(data)  # same bytes, a new inode
+        # Same bytes, another file renamed over the checked one. Writing the replacement
+        # before the old file goes guarantees a distinct inode on every platform.
+        replacement = paths["sealed"].with_name("replacement.tmp")
+        replacement.write_bytes(paths["sealed"].read_bytes())
+        os.replace(replacement, paths["sealed"])
         return event
 
     monkeypatch.setattr(SealLedger, "open_integrity_scan", open_then_swap)
@@ -770,3 +775,136 @@ def test_an_event_logged_before_a_failing_head_write_is_handled(
     assert last["outcome"] == "completed"
     kept = (tmp_path / "scan2" / ".exclusions.json.partial").read_bytes()
     assert tool._sha_bytes(kept) == last["outputs"]["exclusions.json"]
+
+
+def test_a_replacement_reusing_the_inode_number_is_still_detected(tmp_path: Path) -> None:
+    """Some filesystems hand a freed inode number to the next file (seen on Linux CI): the
+    change and modification times still tell the replacement apart."""
+    paths = setup(tmp_path)
+    checked = os.lstat(paths["sealed"])
+    forged = os.stat_result(
+        (
+            checked.st_mode,
+            checked.st_ino,
+            checked.st_dev,
+            checked.st_nlink,
+            checked.st_uid,
+            checked.st_gid,
+            checked.st_size,
+            int(checked.st_atime),
+            int(checked.st_mtime),
+            int(checked.st_ctime),
+        )
+    )
+    assert tool._identity(forged)[:3] == tool._identity(checked)[:3]
+    if tool._identity(forged) != tool._identity(checked):
+        with pytest.raises(tool.SealedFileChanged):
+            tool._read_sealed(paths["sealed"], forged)
+    assert tool._read_sealed(paths["sealed"], checked) == paths["sealed"].read_bytes()
+
+
+# Exact output schema: statuses, status counts and provenance, nothing else --------------
+
+STATUS_COUNT_KEYS = {"excluded", "flagged", "clear", "total"}
+OPENED_KEYS = {
+    "format",
+    "event",
+    "at",
+    "previous_sha256",
+    "request_sha256",
+    "approval",
+    "tool",
+    "code",
+    "git_commit",
+    "rules_version",
+    "scan_format",
+    "sealed_path",
+    "sealed_sha256_pinned",
+    "sets",
+}
+CLOSED_COMPLETED_KEYS = {
+    "format",
+    "event",
+    "at",
+    "previous_sha256",
+    "request_sha256",
+    "outcome",
+    "outputs",
+    "counts",
+}
+CLOSED_FAILED_KEYS = CLOSED_COMPLETED_KEYS - {"outputs", "counts"} | {"error"}
+
+
+def assert_status_counts(counts: Any, labels: set[str]) -> None:
+    assert set(counts) == {"subjects"}
+    assert set(counts["subjects"]) == labels
+    for tally in counts["subjects"].values():
+        assert set(tally) == STATUS_COUNT_KEYS
+        assert all(type(value) is int for value in tally.values())
+        assert tally["total"] == tally["excluded"] + tally["flagged"] + tally["clear"]
+
+
+def test_every_output_channel_has_exactly_the_approved_schema(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paths = setup(tmp_path)
+    linker = task("b-linker", prompt(16, tail="lnk"), "def linkfn(z):\n    return z + 13\n")
+    train = write_tasks(tmp_path / "pool" / "train.jsonl", [*SUBJECTS.values(), linker])
+    argv = request_argv(paths, tmp_path / "scan", "--bridge", f"pool_train={train}")
+    assert tool.main(argv) == 0
+    approval = approve(tmp_path / "scan" / tool.REQUEST_NAME)
+    capsys.readouterr()
+    assert tool.main(["run", "--approval", str(approval)]) == 0
+    printed = capsys.readouterr()
+    out = tmp_path / "scan"
+    assert sorted(path.name for path in out.iterdir()) == sorted(
+        [tool.REQUEST_NAME, "approval.json", *tool.OUTPUTS]
+    )
+    exclusions = json.loads((out / "exclusions.json").read_text())
+    assert set(exclusions) == {
+        "format",
+        "request_sha256",
+        "valid_only_with",
+        "excluded",
+        "flagged",
+        "clear",
+    }
+    subject_ids = {item.id for item in SUBJECTS.values()}
+    for status in ("excluded", "flagged", "clear"):
+        assert set(exclusions[status]) == {"pilot"}
+        assert set(exclusions[status]["pilot"]) <= subject_ids
+    listed = [i for status in ("excluded", "flagged", "clear") for i in exclusions[status]["pilot"]]
+    assert sorted(listed) == sorted(subject_ids)  # each subject exactly once; no bridge task
+    summary = json.loads((out / "summary.json").read_text())
+    assert set(summary) == {"format", "request_sha256", "rules_version", "counts"}
+    assert_status_counts(summary["counts"], {"pilot"})
+    record = json.loads((out / "record.json").read_text())
+    assert set(record) == {
+        "format",
+        "request_sha256",
+        "approval",
+        "request",
+        "sealed_sha256_read",
+        "outputs",
+        "performed",
+    }
+    assert record["request"] == json.loads(approval.read_text())["request"]
+    assert record["sealed_sha256_read"] == record["request"]["sealed"]["sha256"]
+    assert set(record["outputs"]) == {"exclusions.json", "summary.json"}
+    events = SealLedger(paths["ledger"]).events()[1:]
+    assert set(events[0]) == OPENED_KEYS
+    assert all(set(entry) == {"label", "sha256", "tasks", "role"} for entry in events[0]["sets"])
+    assert set(events[1]) == CLOSED_COMPLETED_KEYS
+    assert set(events[1]["outputs"]) == set(tool.OUTPUTS)
+    assert_status_counts(events[1]["counts"], {"pilot"})
+    assert json.loads(printed.out) == summary["counts"]  # the console: status counts only
+    assert printed.err == ""
+
+
+def test_a_failed_close_has_exactly_the_failed_schema(tmp_path: Path) -> None:
+    paths = setup(tmp_path, pinned_sha="0" * 64)
+    approval = approve(request(paths, tmp_path / "scan"))
+    assert tool.main(["run", "--approval", str(approval)]) == 4
+    closed = SealLedger(paths["ledger"]).events()[-1]
+    assert set(closed) == CLOSED_FAILED_KEYS
+    assert closed["error"] == "sealed_sha256_mismatch"

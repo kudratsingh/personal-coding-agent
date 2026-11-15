@@ -114,7 +114,7 @@ def scan(
     *,
     bridges: Mapping[str, Sequence[Item]] | None = None,
 ) -> tuple[list[SubjectResult], dict[str, Any]]:
-    """Each subject's status, and aggregate counts.
+    """Each subject's status, and the subject counts by status (:func:`aggregates`).
 
     ``bridges`` are tasks that are not judged (for example pool train and dev tasks) but
     take part in the family scan, so a subject joined to a test task's family only through
@@ -148,27 +148,20 @@ def scan(
         joined.union(test_position, other_position)
     test_roots = {joined.find(index) for index in range(first_other)}
     direct: dict[int, set[str]] = {}
-    touched: set[int] = set()
     for edge in edges:
         a_test, b_test = edge.a < first_other, edge.b < first_other
         if a_test == b_test:
             continue  # test-test or other-other: only chains matter, via the union-find
-        other, test_position = (edge.b, edge.a) if a_test else (edge.a, edge.b)
+        other = edge.b if a_test else edge.a
         direct.setdefault(other, set()).update(name for name in edge.signals if name != "evidence")
-        touched.add(test_position)
-    for test_position, other_position in same_id:
+    for _, other_position in same_id:
         direct.setdefault(other_position, set()).add(SAME_ID_SIGNAL)
-        touched.add(test_position)
     results: list[SubjectResult] = []
-    bridge_counts: dict[str, Counter[str]] = {label: Counter() for label in bridges}
-    subject_roots: set[int] = set()
     for offset, (kind, label, item) in enumerate(others):
         index = first_other + offset
         in_family = joined.find(index) in test_roots
         if kind == "bridge":
-            bridge_counts[label]["in_test_family" if in_family else "outside"] += 1
-            continue
-        subject_roots.add(joined.find(index))
+            continue  # bridges join families; they are never judged or counted
         names = direct.get(index, set())
         signals = set(names)
         if in_family and not names & {*UNION_SIGNALS, SAME_ID_SIGNAL}:
@@ -180,28 +173,20 @@ def scan(
         else:
             status = "clear"
         results.append(SubjectResult(item.id, label, status, tuple(sorted(signals))))
-    counts = aggregates(results, labels=list(subjects), test_tasks=len(test))
-    counts["test_tasks_with_direct_subject_or_bridge_edge"] = len(touched)
-    counts["test_tasks_in_a_subject_family"] = sum(
-        joined.find(index) in subject_roots for index in range(first_other)
-    )
-    counts["bridge_tasks"] = {
-        "in_test_family": sum(tally["in_test_family"] for tally in bridge_counts.values()),
-        "total": sum(sum(tally.values()) for tally in bridge_counts.values()),
-    }
+    counts = aggregates(results, labels=list(subjects))
     return results, counts
 
 
-def aggregates(
-    results: Sequence[SubjectResult], *, labels: Sequence[str], test_tasks: int
-) -> dict[str, Any]:
-    """Counts by status only. Signal counts are never reported: with few exclusions any
-    signal count maps onto the excluded IDs, and says what an unnamed test task looks like."""
+def aggregates(results: Sequence[SubjectResult], *, labels: Sequence[str]) -> dict[str, Any]:
+    """Subject counts by status, per label: the only counts the scan reports.
+
+    Nothing about the test split or the bridges is counted. Signal counts would map onto the
+    excluded IDs when exclusions are few, and test-side or bridge-side family counts describe
+    the sealed split; only the approved statuses and their counts leave the scan."""
     by_label: dict[str, Counter[str]] = {label: Counter() for label in labels}
     for result in results:
         by_label[result.label][result.status] += 1
     return {
-        "test_tasks_scanned": test_tasks,
         "subjects": {
             label: {status: counts.get(status, 0) for status in STATUSES}
             | {"total": sum(counts.values())}

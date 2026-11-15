@@ -361,9 +361,9 @@ def request(args: argparse.Namespace) -> int:
 
 def _checked(
     document: Any,
-) -> tuple[dict[str, Any], str, dict[str, str], dict[str, list[Task]], dict[str, list[Task]], int]:
-    """The approved request, its hash, the approval, the subject and (merged) bridge sets
-    and the number of bridge tasks judged as subjects, all re-verified."""
+) -> tuple[dict[str, Any], str, dict[str, str], dict[str, list[Task]], dict[str, list[Task]]]:
+    """The approved request, its hash, the approval and the subject and (merged) bridge
+    sets, all re-verified."""
     if not isinstance(document, dict) or set(document) != {
         "request",
         "request_sha256",
@@ -418,7 +418,7 @@ def _checked(
                 sets[which][entry["label"]] = tasks
         if not sets[0]:
             raise Refused("at least one subject set is required")
-        sets[1], dropped = _merge(sets[0], sets[1])
+        sets[1], _ = _merge(sets[0], sets[1])
         ledger = Path(body["ledger"]["path"])
         _not_sealed(ledger, sealed_info, "the seal ledger")
         _not_sealed(SealLedger(ledger).head_path, sealed_info, "the seal ledger's head record")
@@ -438,7 +438,7 @@ def _checked(
     out = Path(body["out"])
     if any((out / name).exists() for name in OUTPUTS):
         raise FileExistsError("an output already exists")
-    return body, request_sha256, approval, sets[0], sets[1], dropped
+    return body, request_sha256, approval, sets[0], sets[1]
 
 
 def _write_partial(path: Path, value: dict[str, Any]) -> str:
@@ -454,6 +454,10 @@ def _partial(out: Path, name: str) -> Path:
     return out / f".{name}.partial"
 
 
+def _identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
 class SealedFileChanged(SealedContentError):
     """The file opened is not the sealed file whose metadata was checked."""
 
@@ -467,11 +471,9 @@ def _read_sealed(path: Path, checked: os.stat_result) -> bytes:
         raise SealedFileChanged("the sealed file could not be opened as checked") from None
     with os.fdopen(descriptor, "rb") as stream:
         info = os.fstat(stream.fileno())
-        same = (info.st_dev, info.st_ino, info.st_size) == (
-            checked.st_dev,
-            checked.st_ino,
-            checked.st_size,
-        )
+        # Device and inode alone are not enough: a filesystem may reuse a freed inode number
+        # for a replacement file. Its change and modification times still differ.
+        same = _identity(info) == _identity(checked)
         if not stat.S_ISREG(info.st_mode) or not same:
             raise SealedFileChanged("the opened sealed file is not the file that was checked")
         return stream.read()
@@ -549,7 +551,7 @@ def run(args: argparse.Namespace) -> int:
     except ValueError:
         raise Refused("the approval document is not JSON") from None
     try:
-        body, request_sha256, approval, subjects, bridges, dropped = _checked(document)
+        body, request_sha256, approval, subjects, bridges = _checked(document)
     except FileExistsError:
         print("refused: an output already exists", file=sys.stderr)
         return 3
@@ -574,7 +576,7 @@ def run(args: argparse.Namespace) -> int:
             return 5
         try:
             return _scan_and_close(
-                body, request_sha256, approval, subjects, bridges, dropped, checked, state
+                body, request_sha256, approval, subjects, bridges, checked, state
             )
         except BaseException as error:  # noqa: BLE001 - every failure is logged, never quoted
             if state["completed"] or _has_event(ledger, request_sha256, "integrity_scan_closed"):
@@ -602,7 +604,6 @@ def _scan_and_close(
     approval: dict[str, str],
     subjects: dict[str, list[Task]],
     bridges: dict[str, list[Task]],
-    dropped: int,
     checked: os.stat_result,
     state: dict[str, bool],
 ) -> int:
@@ -632,7 +633,6 @@ def _scan_and_close(
         bridges={label: [item_of(task) for task in tasks] for label, tasks in bridges.items()},
     )
     del test
-    counts["bridge_tasks_judged_as_subjects"] = dropped
     exclusions = {
         "format": SCAN_FORMAT,
         "request_sha256": request_sha256,

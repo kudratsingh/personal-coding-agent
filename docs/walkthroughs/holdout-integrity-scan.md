@@ -52,14 +52,11 @@ The output lists only `excluded: A B C D F G`, `flagged: E` and `clear: H`. Whic
    - no output exists.
 
    Any failure exits with status 2 or 3 and logs nothing.
-4. **Ledger, then read.** `integrity_scan_opened` is appended to the seal ledger. It carries the request SHA-256, the approval block, the code identity and the set hashes. Then the sealed file is opened once, without following links. The opened descriptor must be the file whose metadata was checked (device, inode and size), and its SHA-256 and task count must match the pinned values (exit 4 otherwise).
+4. **Ledger, then read.** `integrity_scan_opened` is appended to the seal ledger. It carries the request SHA-256, the approval block, the code identity and the set hashes. Then the sealed file is opened once, without following links. The opened descriptor must be the file whose metadata was checked: device, inode, size, and modification and change times. The times matter because a filesystem may give a freed inode number to a replacement file, and its SHA-256 and task count must match the pinned values (exit 4 otherwise).
 5. **Scan.** Test, subject and bridge items go through `clusters.find_edges`. Union-signal edges join items with a union-find. A subject or bridge whose ID equals a test ID is scanned under an internal ID and joined to that test task. Each subject gets its status from its direct edges to test items and from whether it shares a family with any test item.
 6. **Outputs and close.** The outputs are written under temporary names:
    - `exclusions.json`: subject IDs by status only;
-   - `summary.json`, with these counts:
-     - by status;
-     - test tasks scanned, test tasks with a direct edge, and test tasks in a subject's family;
-     - bridge tasks in test families, and bridge tasks judged as subjects;
+   - `summary.json`: subject counts by status, per label, and nothing else;
    - `record.json`: the request, the approval and the output hashes.
 
    Then `integrity_scan_closed` (`completed`, with the output hashes and counts) is appended, and only then are the files renamed into place. From the completed close on, SIGTERM is ignored and nothing deletes the outputs. If a rename still fails, the `.partial` files whose hashes the close records stay on disk.
@@ -74,7 +71,12 @@ Any failure before the close, SIGTERM included, removes the temporary files and 
   - Prompt shingles and function names alone would miss a renamed copy of a reference.
 - **Bridges matter.** Families chain through any task. Without the pool's train and dev splits passed as bridges, a subject linked to a test task only through a pool task would come out clear.
 - **Flags are not decided here.** Deciding a flag would mean showing someone the test task. The scan lists flagged subjects separately and the owner decides what they mean.
-- **Nothing about a test task leaves the process.** Edges carry signal keys (AST hash prefixes) and per-pair Jaccard values, and per-subject signal names say what an unnamed test task looks like. So only statuses are written, and no signal counts at all: when there are few exclusions, any signal count maps onto the excluded IDs. Parse errors name a line number at most. The tests plant marker strings in a synthetic sealed file and check every output, the ledger and the console for them.
+- **Nothing about a test task leaves the process.** Edges carry signal keys (AST hash prefixes) and per-pair Jaccard values, and per-subject signal names say what an unnamed test task looks like. So every output channel carries only three things:
+  - the subjects' statuses;
+  - subject counts by status;
+  - provenance: the request, the approval, code and file hashes, and output hashes.
+
+  That covers the three files, the ledger events and the console. There are no signal counts, because when exclusions are few they map onto the excluded IDs. There are no test-side or bridge-side family counts either, because they describe the sealed split. Parse errors name a line number at most. The tests plant marker strings in a synthetic sealed file and check every output, the ledger and the console for them.
 - **What an exclusion still reveals.** Listing subject `A` as excluded says that some test task resembles `A`. A subject whose ID equals a test ID is listed as excluded under that ID. No dedup output can avoid this. Keep the outputs private, and never inspect excluded subjects to learn about the test split.
 - **The approval is bound to the request, not to the file's bytes.** Single use is keyed by the canonical request hash, so re-serialising the approval file does not buy a second scan, and approval wording that has already been used, word for word, is refused for a new request. Changed wording is a new approval as far as the tool can tell. The approval block is unauthenticated text: the binding guards against accidents and edits, not against forgery by someone who can run the tool.
 - **Log first, then open.** The ledger event is written before the file is opened, so a crash can never leave an unlogged read.
@@ -104,7 +106,8 @@ The tests cover:
 - a bridge whose ID matches a subject but whose content differs;
 - a sealed file swapped after the check (exit 4);
 - a failure after the completed close, which keeps the outputs;
-- the absence of any signal count;
+- the exact schema of every output file, both ledger events and the console;
+- a replacement file that reuses the checked file's inode number;
 - an event logged before a failing head-record write;
   - existing outputs;
 - one scan per request, whatever the approval file's bytes;
