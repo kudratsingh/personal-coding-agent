@@ -21,7 +21,7 @@ Take one sealed test task, `T`: a 20-word prompt and a reference `def f(values):
 
 `F` and `G` are excluded because families are connected components: `C` joins `F` to `T`, and `P` joins `G` to `T`. A family member is excluded however it is reached.
 
-The output lists only `excluded: A B C D F G`, `flagged: E` and `clear: H`. Which signals fired appears only as totals over all subjects, and not at all below 20 subjects. Nothing says which test task matched, or what it says.
+The output lists only `excluded: A B C D F G`, `flagged: E` and `clear: H`. Which signal fired is never written, not even as a count. Nothing says which test task matched, or what it says.
 
 ## Data flow and shapes
 
@@ -39,7 +39,7 @@ The output lists only `excluded: A B C D F G`, `flagged: E` and `clear: H`. Whic
    The pool report, subjects, bridges, ledger and ledger head record are each refused if they are a sealed file, checked three ways:
    - by name;
    - by inode, against the test, holdout and RL-only files beside the sealed path;
-   - by hash, against every sealed file the report pins.
+   - by hash, for subject and bridge files, against every sealed file the report pins.
 
    The report must pin the test file with a 64-hex SHA-256 and at least one task. A task that is both a subject and a bridge is judged as the subject (RL candidates are pool train tasks); the same ID with different content is refused.
 2. **Approval.** The owner fills `approved_by`, `approved_at` and `statement`, and quotes `request_sha256`. The approval covers exactly that request. Editing any part of it (output directory, a path, a hash) changes the hash, so the quote no longer matches.
@@ -58,7 +58,6 @@ The output lists only `excluded: A B C D F G`, `flagged: E` and `clear: H`. Whic
    - `exclusions.json`: subject IDs by status only;
    - `summary.json`, with these counts:
      - by status;
-     - by signal, totalled over every subject;
      - test tasks scanned, test tasks with a direct edge, and test tasks in a subject's family;
      - bridge tasks in test families, and bridge tasks judged as subjects;
    - `record.json`: the request, the approval and the output hashes.
@@ -75,9 +74,9 @@ Any failure before the close, SIGTERM included, removes the temporary files and 
   - Prompt shingles and function names alone would miss a renamed copy of a reference.
 - **Bridges matter.** Families chain through any task. Without the pool's train and dev splits passed as bridges, a subject linked to a test task only through a pool task would come out clear.
 - **Flags are not decided here.** Deciding a flag would mean showing someone the test task. The scan lists flagged subjects separately and the owner decides what they mean.
-- **Nothing about a test task leaves the process.** Edges carry signal keys (AST hash prefixes) and per-pair Jaccard values, and per-subject signal names say what an unnamed test task looks like. So only statuses are written per subject. Signal counts are totals over all subjects, suppressed below 20 subjects, so a small set label cannot expose one subject's signals. Parse errors name a line number at most. The tests plant marker strings in a synthetic sealed file and check every output, the ledger and the console for them.
+- **Nothing about a test task leaves the process.** Edges carry signal keys (AST hash prefixes) and per-pair Jaccard values, and per-subject signal names say what an unnamed test task looks like. So only statuses are written, and no signal counts at all: when there are few exclusions, any signal count maps onto the excluded IDs. Parse errors name a line number at most. The tests plant marker strings in a synthetic sealed file and check every output, the ledger and the console for them.
 - **What an exclusion still reveals.** Listing subject `A` as excluded says that some test task resembles `A`. A subject whose ID equals a test ID is listed as excluded under that ID. No dedup output can avoid this. Keep the outputs private, and never inspect excluded subjects to learn about the test split.
-- **The approval is bound to the request, not to the file's bytes.** Single use is keyed by the canonical request hash, so re-serialising the approval file does not buy a second scan, and approval wording that has already been used is refused for a new request. The approval block is unauthenticated text: the binding guards against accidents and edits, not against forgery by someone who can run the tool.
+- **The approval is bound to the request, not to the file's bytes.** Single use is keyed by the canonical request hash, so re-serialising the approval file does not buy a second scan, and approval wording that has already been used, word for word, is refused for a new request. Changed wording is a new approval as far as the tool can tell. The approval block is unauthenticated text: the binding guards against accidents and edits, not against forgery by someone who can run the tool.
 - **Log first, then open.** The ledger event is written before the file is opened, so a crash can never leave an unlogged read.
 - **Static only.** The command imports no sandbox, generation, RL or scoring code (a test checks the imports). It runs no task code.
 - **Ledger compatibility.** Seal code from before these events refuses a ledger that contains them. Run a real scan only with code that knows the events, on every machine that reads that ledger.
@@ -105,7 +104,8 @@ The tests cover:
 - a bridge whose ID matches a subject but whose content differs;
 - a sealed file swapped after the check (exit 4);
 - a failure after the completed close, which keeps the outputs;
-- suppressed and totalled signal counts;
+- the absence of any signal count;
+- an event logged before a failing head-record write;
   - existing outputs;
 - one scan per request, whatever the approval file's bytes;
 - a hash mismatch, a parse failure and a failure during the close, each logged as failed without quoting and leaving no outputs;

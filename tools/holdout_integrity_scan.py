@@ -491,6 +491,38 @@ def _terminate_as_exit() -> Iterator[None]:
         signal.signal(signal.SIGTERM, previous)
 
 
+def _open(
+    ledger: SealLedger, request_sha256: str, body: dict[str, Any], approval: dict[str, str]
+) -> None:
+    ledger.open_integrity_scan(
+        request_sha256,
+        approval=approval,
+        tool="tools/holdout_integrity_scan.py",
+        code=body["code"],
+        git_commit=body["git_commit"],
+        rules_version=body["rules_version"],
+        scan_format=body["scan_format"],
+        sealed_path=body["sealed"]["path"],
+        sealed_sha256_pinned=body["sealed"]["sha256"],
+        sets=[
+            {key: entry[key] for key in ("label", "sha256", "tasks")} | {"role": role}
+            for role in ("subjects", "bridges")
+            for entry in body[role]
+        ],
+    )
+
+
+def _has_event(ledger: SealLedger, request_sha256: str, kind: str) -> bool:
+    """Whether the ledger holds ``kind`` for this request (False if it cannot be read)."""
+    try:
+        return any(
+            event["event"] == kind and event.get("request_sha256") == request_sha256
+            for event in ledger.events()
+        )
+    except BaseException:  # noqa: BLE001
+        return False
+
+
 def _close_failed(ledger: SealLedger, request_sha256: str, error: str) -> bool:
     try:
         ledger.close_integrity_scan(request_sha256, "failed", error=error)
@@ -530,28 +562,22 @@ def run(args: argparse.Namespace) -> int:
         _partial(out, name).unlink(missing_ok=True)
     state = {"completed": False}
     with _terminate_as_exit():
-        ledger.open_integrity_scan(
-            request_sha256,
-            approval=approval,
-            tool="tools/holdout_integrity_scan.py",
-            code=body["code"],
-            git_commit=body["git_commit"],
-            rules_version=body["rules_version"],
-            scan_format=body["scan_format"],
-            sealed_path=body["sealed"]["path"],
-            sealed_sha256_pinned=body["sealed"]["sha256"],
-            sets=[
-                {key: entry[key] for key in ("label", "sha256", "tasks")} | {"role": role}
-                for role in ("subjects", "bridges")
-                for entry in body[role]
-            ],
-        )
+        try:
+            _open(ledger, request_sha256, body, approval)
+        except (SealError, Refused):
+            raise
+        except BaseException as error:  # noqa: BLE001 - e.g. the head record write failed
+            if not _has_event(ledger, request_sha256, "integrity_scan_opened"):
+                raise
+            _close_failed(ledger, request_sha256, type(error).__name__)
+            print(f"failed: {type(error).__name__} (the sealed file was not opened)")
+            return 5
         try:
             return _scan_and_close(
                 body, request_sha256, approval, subjects, bridges, dropped, checked, state
             )
         except BaseException as error:  # noqa: BLE001 - every failure is logged, never quoted
-            if state["completed"]:
+            if state["completed"] or _has_event(ledger, request_sha256, "integrity_scan_closed"):
                 # The ledger already records a completed scan with these outputs' hashes:
                 # keep whatever is on disk (final or .partial names), never delete it.
                 print(

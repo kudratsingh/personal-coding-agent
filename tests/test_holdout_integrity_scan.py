@@ -604,22 +604,18 @@ def test_the_scan_imports_no_generation_execution_or_scoring_code() -> None:
                 assert not name.startswith(forbidden), f"{path.name} imports {name}"
 
 
-def test_signal_counts_are_totals_and_suppressed_for_few_subjects() -> None:
-    few, counts = scan(
-        [item_of(item) for item in sealed_tasks()],
-        {label: [item_of(item)] for label, item in SUBJECTS.items()},
-    )
-    assert len(few) == 8 and str(counts["subject_signals_total"]).startswith("suppressed")
+def test_no_signal_counts_are_reported() -> None:
+    """With one exclusion among many subjects, any signal count would describe it."""
     many = [
         task(f"s-many-{n}", f"kappa{n} " * 3 + " ".join(OTHER), f"def many{n}():\n    return {n}\n")
-        for n in range(20)
+        for n in range(24)
     ]
-    _, counts = scan(
+    results, counts = scan(
         [item_of(item) for item in sealed_tasks()],
-        {"a": [item_of(item) for item in many[:10]], "b": [item_of(item) for item in many[10:]]},
+        {"a": [item_of(item) for item in [*many, SUBJECTS["renamed"]]]},
     )
-    assert isinstance(counts["subject_signals_total"], dict)
-    assert "subjects_by_signal" not in counts
+    assert [r.id for r in results if r.status == "excluded"] == ["s-renamed"]
+    assert "canonical_ast" not in json.dumps(counts)
 
 
 def test_subjects_inside_the_train_bridge_are_judged_as_subjects(
@@ -738,3 +734,39 @@ def test_a_failure_after_the_completed_close_keeps_the_outputs(
     recorded = events[-1]["outputs"]
     on_disk = (tmp_path / "scan" / ".summary.json.partial").read_bytes()
     assert tool._sha_bytes(on_disk) == recorded["summary.json"]
+
+
+def test_an_event_logged_before_a_failing_head_write_is_handled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sealed_reads: Reads
+) -> None:
+    """The ledger line lands but the call fails (say, the head record write): an opened
+    scan is closed as failed without reading; a completed close keeps the outputs."""
+    paths = setup(tmp_path)
+    sealed_reads.arm(paths["sealed"])
+    approval = approve(request(paths, tmp_path / "scan"))
+    real_open = SealLedger.open_integrity_scan
+
+    def open_then_fail(self: SealLedger, digest: str, **fields: Any) -> Any:
+        real_open(self, digest, **fields)
+        raise OSError("head record write failed")
+
+    monkeypatch.setattr(SealLedger, "open_integrity_scan", open_then_fail)
+    assert tool.main(["run", "--approval", str(approval)]) == 5
+    assert sealed_reads.reads == []
+    assert SealLedger(paths["ledger"]).events()[-1]["outcome"] == "failed"
+
+    monkeypatch.setattr(SealLedger, "open_integrity_scan", real_open)
+    second = approve(request(paths, tmp_path / "scan2"))
+    edited(second, lambda d: d["approval"].update(statement="a second approval"))
+    real_close = SealLedger.close_integrity_scan
+
+    def close_then_fail(self: SealLedger, digest: str, outcome: str, **fields: Any) -> Any:
+        real_close(self, digest, outcome, **fields)
+        raise OSError("head record write failed")
+
+    monkeypatch.setattr(SealLedger, "close_integrity_scan", close_then_fail)
+    assert tool.main(["run", "--approval", str(second)]) == 5
+    last = SealLedger(paths["ledger"]).events()[-1]
+    assert last["outcome"] == "completed"
+    kept = (tmp_path / "scan2" / ".exclusions.json.partial").read_bytes()
+    assert tool._sha_bytes(kept) == last["outputs"]["exclusions.json"]
