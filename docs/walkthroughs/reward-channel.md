@@ -77,9 +77,13 @@ host: classify the invocation from the frames → validate and decode each row i
   `isinstance`, patched `math.isclose` or patched `builtins` earned full credit on
   `... is True` checks, because each call is evaluated in the candidate's own process, and
   `abs(-1) == 1` paid any program. The same rule refuses `Logger().log('a') is None`, which a
-  trivial class satisfies while the constant baseline scores it 0.0. A wrapper against an
-  informative literal stays supported (`len(f(x)) == 3`, `str(f(x)) == '3'`): the expected
-  value never enters the container. A star import is unsupported because it hides which names
+  trivial class satisfies while the constant baseline scored it 0.0. Guessable answers include
+  every value equal to `None`, `True` or `False` (`1`, `0.0`, `[True, True]`) and the text
+  `'True'`, `'False'` or `'None'`. A wrapper against any other literal stays supported
+  (`len(f(x)) == 3`, `str(f(x)) == '3'`). That is not unforgeable: the candidate controls the
+  value, and only the literal is hidden from it, so a constant that equals it passes; the
+  baseline measures that. Imports count wherever they stand in the tests, because every
+  import runs before any call. A star import is unsupported because it hides which names
   are the candidate's. Every refusal is explicit: `unsupported_reason(task)` names the rule
   (`UNSUPPORTED_REASONS`), RL screening records it per task (`unsupported`) and counts it
   (`not_parseable_by_cause`), and the screening record names the grammar version. The static
@@ -215,9 +219,11 @@ host: classify the invocation from the frames → validate and decode each row i
   (falsy, or one singleton), and a bare `assert CALL` would too (any truthy value). What
   protects them is not the channel but that the candidate never sees which form a check uses;
   a constant answer still passes every check of its form, which `degenerate_baseline` counts.
-  Since grammar v2 these forms are accepted only on a direct call of a candidate name, the one
-  place the baseline's constant answers apply; on a builtin, an imported function, a method
-  or an operator the candidate could answer for trusted code, so the task is refused.
+  Since grammar v2 these forms are accepted only on a direct call of a candidate name (or a
+  subscript of one); on a builtin, an imported function, a method or an operator the
+  candidate could answer for trusted code, so the task is refused. The baseline's constant
+  and public-example answers now apply to every accepted check's value, wrappers included,
+  because the candidate controls each of those values.
   Supporting bare asserts would add the same kind of exposure; whether to do so is open.
 - **Why a degenerate-answer baseline.** The RL advantage is a reward minus its group's mean,
   so on a task where returning `None` or printing `YES` earns 0.3, that answer beats a typical

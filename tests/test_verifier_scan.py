@@ -361,8 +361,10 @@ def test_check_forms_mirror_the_reward_channel_parser_exactly(test: str) -> None
     if mine is not None and predicate is not None:
         assert predicate.call == ast.unparse(mine)
     # Whole-task parseability agrees with parse_function_checks (small inputs, no size limit).
-    assert verifier_scan._task_parseable(tree) == (
-        reward.parse_function_checks(test + "\n") is not None
+    # The scan mirrors the previous grammar (v1), whose exposure R11 measures.
+    assert verifier_scan._task_parseable(tree) == isinstance(
+        reward.explain_function_checks(test + "\n", grammar=reward.GRAMMAR_V1),
+        reward.FunctionChecks,
     )
 
 
