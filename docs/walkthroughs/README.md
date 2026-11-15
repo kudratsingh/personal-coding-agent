@@ -61,3 +61,5 @@ Implemented: [static verifier scan](verifier-scan.md).
 Implemented: [task-family clusters and adjudication](task-clusters.md).
 
 Implemented: [task admission: static gate, negative controls and reference checks](admission.md).
+
+Implemented: [holdout integrity scan](holdout-integrity-scan.md).

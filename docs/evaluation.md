@@ -55,6 +55,7 @@ Generation and execution are separate steps joined by a hashed completions file;
   - **One read:** each test completions file is executed once, as a logged read that can resume after an interruption. A second execution is refused.
   - **No second look by regeneration:** one unseal record governs a ledger. Once any read has opened, no file can be sealed and every later read must present the same record, and a record may not list two files of one checkpoint, protocol and decoding (greedy or sampled).
   - **Refusals come first:** the ledger and the record are checked before the sealed task file is opened.
+  - **Integrity scans:** `tools/holdout_integrity_scan.py` may open the sealed task file once per owner approval, for a static task-family scan whose outputs name only the tasks it checks. It appends `integrity_scan_opened` before opening and `integrity_scan_closed` after. These events are not reads of any completions file and change no rule above. See the [holdout integrity scan walkthrough](walkthroughs/holdout-integrity-scan.md).
 - **`scratchcoder eval-baseline`:** writes the constant-answer baseline of the pool dev split.
   - **Definition:** the reward channel's degenerate answers, best per task, reported as the mean best-constant reward and the share of tasks fully passed.
   - **Unparseable tasks:** constant-answer programs run through the runner. Tasks covered neither way are counted.

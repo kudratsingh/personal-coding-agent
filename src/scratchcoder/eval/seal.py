@@ -16,6 +16,14 @@ removed line is detected on the next read. Events:
   for that endpoint. A withdrawn file can never be sealed again, listed in an unseal record
   or executed, and nothing more of that checkpoint can be sealed. It is written only before
   any read has opened, and it is final.
+- ``integrity_scan_opened``: a holdout integrity scan (``tools.holdout_integrity_scan``) is
+  about to open the sealed task file: the approved request's SHA-256 (canonical JSON), the
+  owner's approval block, the scan's code identity and the task file it may open. It is
+  written before the file is opened, and one approved request allows one scan. It is not
+  a read of any completions file and changes nothing the other events govern.
+- ``integrity_scan_closed``: that scan ended (``completed`` with its outputs' SHA-256 values
+  and aggregate counts, or ``failed`` with an error class name only), keyed by the same
+  request SHA-256.
 
 Execution of a test completions file needs an *unseal record*, a JSON file the lead writes
 once all four endpoints (``base``, ``sft``, ``rl``, ``more-sft``) are frozen::
@@ -78,7 +86,19 @@ weights it started from (the owner's run 2 gate rulings), never base or the othe
 UNSEAL_KIND = "unseal"
 LEDGER_FORMAT = "scratchcoder-seal-ledger"
 GENESIS = "0" * 64
-EVENTS = ("sealed", "opened", "resumed", "completed", "baseline", "withdrawn")
+INTEGRITY_SCAN_OPENED = "integrity_scan_opened"
+INTEGRITY_SCAN_CLOSED = "integrity_scan_closed"
+INTEGRITY_SCAN_OUTCOMES = ("completed", "failed")
+EVENTS = (
+    "sealed",
+    "opened",
+    "resumed",
+    "completed",
+    "baseline",
+    "withdrawn",
+    INTEGRITY_SCAN_OPENED,
+    INTEGRITY_SCAN_CLOSED,
+)
 HEAD_FORMAT = "scratchcoder-seal-ledger-head"
 HEAD_SUFFIX = ".head"
 
@@ -611,6 +631,64 @@ class SealLedger:
                 raise SealError("the listed test completions name different task files")
             last = [event for event in events if event["event"] == "completed"][-1]
             return {"task_file_sha256": task_files.pop(), "results_id": last["results_id"]}
+
+    def open_integrity_scan(self, request_sha256: str, **fields: Any) -> dict[str, Any]:
+        """Log a holdout integrity scan before it opens the sealed task file.
+
+        One approved request allows one scan: a request whose scan was ever opened is
+        refused, so a second look needs a new request and a new approval. ``fields`` name the
+        approval, the scan's identity and the file."""
+        _check_sha(request_sha256, "request_sha256")
+        with self._locked() as (events, handle):
+            if any(
+                event["event"] == INTEGRITY_SCAN_OPENED
+                and event.get("request_sha256") == request_sha256
+                for event in events
+            ):
+                raise SealError(
+                    "this integrity-scan request was already used; a new scan needs a new "
+                    "request and a new approval"
+                )
+            return self._append(
+                events, handle, INTEGRITY_SCAN_OPENED, request_sha256=request_sha256, **fields
+            )
+
+    def close_integrity_scan(
+        self, request_sha256: str, outcome: str, **fields: Any
+    ) -> dict[str, Any]:
+        """Log the end of an opened integrity scan (``completed`` or ``failed``), once."""
+        _check_sha(request_sha256, "request_sha256")
+        if outcome not in INTEGRITY_SCAN_OUTCOMES:
+            raise ValueError(f"outcome must be one of {INTEGRITY_SCAN_OUTCOMES}")
+        with self._locked() as (events, handle):
+            mine = [event for event in events if event.get("request_sha256") == request_sha256]
+            if not any(event["event"] == INTEGRITY_SCAN_OPENED for event in mine):
+                raise SealError("no integrity scan was opened under this request")
+            if any(event["event"] == INTEGRITY_SCAN_CLOSED for event in mine):
+                raise SealError("this integrity scan is already closed")
+            return self._append(
+                events,
+                handle,
+                INTEGRITY_SCAN_CLOSED,
+                request_sha256=request_sha256,
+                outcome=outcome,
+                **fields,
+            )
+
+    def extends(self, count: int, head_sha256: str) -> bool:
+        """Whether the ledger exists and its event number ``count`` hashes to
+        ``head_sha256``: the same ledger as when that head was read, at most extended."""
+        if not self.path.exists() or count < 1:
+            return False
+        with self._locked() as (_, handle):
+            handle.seek(0)
+            _, hashes = _parse(handle.read())
+        return len(hashes) >= count and hashes[count - 1] == head_sha256
+
+
+def _check_sha(value: object, name: str) -> None:
+    if not isinstance(value, str) or not SHA256.fullmatch(value):
+        raise ValueError(f"{name} must be a lower-case hex SHA-256")
 
 
 def withdraw_endpoint(
