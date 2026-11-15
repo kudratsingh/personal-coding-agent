@@ -75,16 +75,15 @@ A pool spec may set `splits.family_grouping` to `"task-clusters-v1"`. The holdou
 
 `python -m tools.pilot_intake` prepares further training candidates from a row range of a pool source file the pool build already pinned, without rebuilding the pool.
 - **Reading.** It reads rows `[--start-row, --start-row + --rows)` of the receipted OpenCodeInstruct file, in file order. The file's size and SHA-256 must match the pool's completed download receipt. Rows the pool build itself read are refused, because they include the pool's holdouts.
-- **Rules.** Each row goes through the reviewed adapter and then the rules below, in a fixed order; the first rule that fails is the drop reason.
-  - The build's intake screens: the context fit and the sandbox input limit.
-  - Two rules borrowed from the build's RL-only intake, which are stricter than its train intake:
-    - the RL prompt limit;
-    - n-gram contamination against dev, checked over all four task fields.
-  - ARC-Easy and benchmark protection.
-  - Pool and range ID checks.
-  - Near-duplicates of pool train, dev or earlier rows, keeping the first in file order.
-  - The build's holdout-paraphrase rule against dev.
-  - The frozen family rules against dev. Families are computed over dev, pool train and every adapted row of the range, so a row dropped for another reason still links its family-mates. The build likewise assigned families before it dropped paraphrases.
+- **Rules.** Each row goes through the reviewed adapter and then these rules, in this order; the first rule that fails is the drop reason.
+  1. The build's intake screens: the context fit and the sandbox input limit.
+  2. The RL prompt limit, which is the build's RL-only rule.
+  3. ARC-Easy and benchmark protection.
+  4. Pool and range ID checks.
+  5. n-gram contamination against dev, checked over all four task fields. This is the build's RL-only rule, made stricter.
+  6. Near-duplicates of pool train, dev or earlier rows, keeping the first in file order.
+  7. The build's holdout-paraphrase rule against dev.
+  8. The frozen family rules against dev. Families are computed over dev, pool train and every adapted row of the range, so a row dropped for any other reason still links its family-mates. This is stricter than the build, which put only verified tasks in its family graph: it can drop a candidate the build would keep, never the reverse.
 - **What it does not do.** It runs no code and opens no sealed split.
 - **Outputs.** It writes the kept candidates, every row's outcome, and a record with:
   - the inputs and rules;

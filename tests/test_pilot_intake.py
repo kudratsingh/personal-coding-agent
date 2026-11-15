@@ -149,7 +149,7 @@ def fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
                 "dataset": "nvidia/OpenCodeInstruct",
                 "revision": REVISION,
                 "files": [FILE],
-                "rows": None,
+                "rows": START,
                 "license": "CC-BY-4.0",
                 "attribution": "NVIDIA",
                 "terms": "CC BY 4.0",

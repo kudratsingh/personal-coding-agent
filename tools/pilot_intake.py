@@ -31,8 +31,9 @@ that fails is its drop reason:
    of the same name).
 10. ``dev_family``: the frozen task-family rules (``task-clusters-v1``) put it in one family
     with a dev task. Families are computed over the dev split, the pool's train split and
-    every adapted row of the range, so a row dropped for another reason still links its
-    family-mates (the pool build likewise assigned families before dropping paraphrases).
+    every adapted row of the range, so a row dropped for any other reason still links its
+    family-mates. This is stricter than the pool build, which put only verified tasks in its
+    family graph: it can drop a candidate the build would keep, never the reverse.
 
 Rows the pool build already read (before the source's ``rows`` in its first file) are
 refused: they include the pool's holdouts. Where a rule is stricter than the build's train
@@ -112,6 +113,7 @@ REASONS = (
 )
 OUTPUTS = ("candidates.jsonl", "rows.jsonl", "remainder.jsonl", "record.json")
 ARC_SOURCE = "allenai/ai2_arc"
+REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 class Refused(Exception):
@@ -248,11 +250,9 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
     )
     if receipt is None or args.file not in source["files"]:
         raise Refused(f"{args.file} is not a receipted {KIND} file of the spec")
-    if (
-        source["rows"] is not None
-        and args.file == source["files"][0]
-        and args.start_row < source["rows"]
-    ):
+    if source["rows"] is None:
+        raise Refused("the pool build read every row of this source; no rows are unused")
+    if args.file == source["files"][0] and args.start_row < source["rows"]:
         raise Refused(f"rows before {source['rows']} of {args.file} were read by the pool build")
     path = Path(receipt["path"])
     guard([path])
@@ -431,7 +431,9 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
             "dirty": dirty,
             "python": platform.python_version(),
             "pyarrow": importlib.metadata.version("pyarrow"),
-            "uv_lock_sha256": _sha(Path("uv.lock")) if Path("uv.lock").exists() else None,
+            "uv_lock_sha256": _sha(REPOSITORY / "uv.lock")
+            if (REPOSITORY / "uv.lock").exists()
+            else None,
             "package": str(Path(scratchcoder.__file__).parent),
         },
         "executed_code": False,
