@@ -30,13 +30,20 @@ that fails is its drop reason:
    (3-word shingle Jaccard at least 0.5, or at least 0.25 when the two define a function
    of the same name).
 10. ``dev_family``: the frozen task-family rules (``task-clusters-v1``) put it in one family
-    with a dev task. Families are computed over the dev split, the pool's train split (a
-    bridge) and the surviving candidates.
+    with a dev task. Families are computed over the dev split, the pool's train split and
+    every adapted row of the range, so a row dropped for another reason still links its
+    family-mates (the pool build likewise assigned families before dropping paraphrases).
+
+Rows the pool build already read (before the source's ``rows`` in its first file) are
+refused: they include the pool's holdouts. Where a rule is stricter than the build's train
+intake it says so: the RL prompt limit and dev n-grams are the build's RL-only rules (here
+over all four fields, the solution included), and near-duplicates keep the first row in file
+order.
 
 Outputs, written under ``--out`` only when none of them exists:
 
 - ``candidates.jsonl``: the kept tasks, train split, in file order;
-- ``drops.jsonl``: each dropped row's index, ID (when adapted) and reason;
+- ``rows.jsonl``: every row's index, ID (when adapted) and outcome (``kept`` or the reason);
 - ``remainder.jsonl``: with ``--remainder``, those pool train tasks, for the integrity scan;
 - ``record.json``: the row range, every input's SHA-256, the rules, counts by reason, the
   tool commit and the software versions.
@@ -56,14 +63,15 @@ import platform
 import sys
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 import scratchcoder
 from scratchcoder.common.records import atomic_json, git_state, utc_now
 from scratchcoder.data.adapters import adapt_row, canonical_id
-from scratchcoder.data.clusters import RULES_VERSION, Item, components, find_edges
+from scratchcoder.data.arc import arc_splits
+from scratchcoder.data.clusters import RULES_VERSION, Item, UnionFind, find_edges
 from scratchcoder.data.evalplus import read_release, release
 from scratchcoder.data.filters import ContaminationIndex
 from scratchcoder.data.manifest import ManifestEntry
@@ -102,7 +110,7 @@ REASONS = (
     "dev_paraphrase",
     "dev_family",
 )
-OUTPUTS = ("candidates.jsonl", "drops.jsonl", "remainder.jsonl", "record.json")
+OUTPUTS = ("candidates.jsonl", "rows.jsonl", "remainder.jsonl", "record.json")
 ARC_SOURCE = "allenai/ai2_arc"
 
 
@@ -153,7 +161,12 @@ def arc_questions(path: Path, record: Path) -> list[ChoiceTask]:
         raise Refused("the ARC export's size differs from its record")
     if _sha(path) != meta["output"]["sha256"]:
         raise Refused("the ARC export's SHA-256 differs from its record")
-    revision = meta["source"]["manifests"]["test"]["revision"]
+    pinned = asdict(arc_splits()["test"].manifest)
+    if meta["source"]["manifests"]["test"] != pinned or meta["questions"] != (
+        arc_splits()["test"].task_count
+    ):
+        raise Refused("the ARC export record does not name the reviewed ARC-Easy test split")
+    revision = pinned["revision"]
     questions = []
     for line in path.read_text(encoding="utf-8").splitlines():
         row = json.loads(line)
@@ -178,19 +191,45 @@ def _item(task: Task, split: str) -> Item:
 
 
 def dev_family_ids(
-    candidates: Sequence[Task], dev: Sequence[Task], train: Sequence[Task]
+    candidates: Sequence[Task],
+    dev: Sequence[Task],
+    train: Sequence[Task],
+    range_bridges: Sequence[Task] = (),
 ) -> set[str]:
-    """Candidates in one task family with any dev task (train joins families as a bridge)."""
+    """Candidates in one task family with any dev task.
+
+    Pool train and every other adapted row of the range (``range_bridges``: rows dropped for
+    another reason) join families as bridges, as in the pool build, which assigned families
+    before it dropped paraphrases. A bridge row whose ID repeats a pool or range ID is
+    scanned under an internal ID and joined to the item that holds that ID."""
     items = [
         *(_item(task, "dev") for task in dev),
         *(_item(task, "train") for task in train),
         *(_item(task, "pilot") for task in candidates),
     ]
-    found: set[str] = set()
-    for members in components(len(items), find_edges(items)):
-        if any(items[index].split == "dev" for index in members):
-            found.update(items[index].id for index in members if items[index].split == "pilot")
-    return found
+    position = {item.id: index for index, item in enumerate(items)}
+    if len(position) != len(items):
+        raise ValueError("dev, pool train and candidate IDs must be unique")
+    joins: list[tuple[int, int]] = []
+    for number, task in enumerate(range_bridges):
+        if task.id in position:
+            joins.append((position[task.id], len(items)))
+            items.append(_item(replace(task, id=f"\x00range-{number}"), "bridge"))
+        else:
+            position[task.id] = len(items)
+            items.append(_item(task, "bridge"))
+    joined = UnionFind(len(items))
+    for edge in find_edges(items):
+        if edge.union:
+            joined.union(edge.a, edge.b)
+    for a, b in joins:
+        joined.union(a, b)
+    dev_roots = {joined.find(index) for index, item in enumerate(items) if item.split == "dev"}
+    return {
+        item.id
+        for index, item in enumerate(items)
+        if item.split == "pilot" and joined.find(index) in dev_roots
+    }
 
 
 def intake(args: argparse.Namespace) -> dict[str, Any]:
@@ -209,7 +248,14 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
     )
     if receipt is None or args.file not in source["files"]:
         raise Refused(f"{args.file} is not a receipted {KIND} file of the spec")
+    if (
+        source["rows"] is not None
+        and args.file == source["files"][0]
+        and args.start_row < source["rows"]
+    ):
+        raise Refused(f"rows before {source['rows']} of {args.file} were read by the pool build")
     path = Path(receipt["path"])
+    guard([path])
     if not _verified(path, receipt["size_bytes"], receipt["sha256"]):
         raise Refused(f"{args.file}: bytes differ from the receipt")
     tokenizer = _load_tokenizer(
@@ -254,14 +300,15 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
 
     provenance = _provenance(source, receipt)
     counts: Counter[str] = Counter()
-    drops: list[dict[str, Any]] = []
+    outcomes: list[dict[str, Any]] = []
     survivors: list[tuple[int, Task]] = []
+    bridges: list[Task] = []
     seen: set[str] = set()
     taken = 0
 
     def drop(row: int, identifier: str | None, reason: str) -> None:
         counts[reason] += 1
-        drops.append({"row": row, "id": identifier, "reason": reason})
+        outcomes.append({"row": row, "id": identifier, "reason": reason})
 
     for offset, row in enumerate(_parquet_rows(path, COLUMNS[KIND], start=args.start_row)):
         if offset >= args.rows:
@@ -303,16 +350,19 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
         else:
             duplicates.add(task.prompt)
             survivors.append((index, task))
+        if not survivors or survivors[-1][1] is not task:
+            bridges.append(task)
         seen.add(task.id)
     if taken != args.rows:
         raise Refused(f"{args.file} holds {taken} rows from row {args.start_row}, not {args.rows}")
-    family = dev_family_ids([task for _, task in survivors], dev, train)
+    family = dev_family_ids([task for _, task in survivors], dev, train, bridges)
     kept = []
     for index, task in survivors:
         if task.id in family:
             drop(index, task.id, "dev_family")
         else:
             kept.append(replace(task, split="train"))
+            outcomes.append({"row": index, "id": task.id, "reason": "kept"})
     counts["kept"] = len(kept)
     counts["rows"] = taken
     remainder: list[Task] = []
@@ -324,8 +374,8 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
             raise Refused("every remainder ID must be a distinct pool train task")
         remainder = [by_id[identifier] for identifier in sorted(wanted)]
     save_tasks(args.out / "candidates.jsonl", kept)
-    with (args.out / "drops.jsonl").open("x", encoding="utf-8") as stream:
-        for entry in sorted(drops, key=lambda item: item["row"]):
+    with (args.out / "rows.jsonl").open("x", encoding="utf-8") as stream:
+        for entry in sorted(outcomes, key=lambda item: item["row"]):
             stream.write(json.dumps(entry, sort_keys=True) + "\n")
     if args.remainder is not None:
         save_tasks(args.out / "remainder.jsonl", remainder)
@@ -356,6 +406,8 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
             "file": args.file,
             "license": source["license"],
             "terms_reviewed_on": source["terms_reviewed_on"],
+            "attribution": source["attribution"],
+            "obligations": source["obligations"],
             "start_row": args.start_row,
             "rows": args.rows,
         },
@@ -365,6 +417,7 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
             "context_tokens": spec["context_tokens"],
             "rl_prompt_tokens": prompt_limit,
             "min_alpha_tokens": min_alpha,
+            "tokenizer_identity": spec["tokenizer"]["identity"],
         },
         "counts": {reason: counts.get(reason, 0) for reason in (*REASONS, "kept", "rows")},
         "remainder_tasks": len(remainder) if args.remainder is not None else None,
@@ -378,6 +431,7 @@ def intake(args: argparse.Namespace) -> dict[str, Any]:
             "dirty": dirty,
             "python": platform.python_version(),
             "pyarrow": importlib.metadata.version("pyarrow"),
+            "uv_lock_sha256": _sha(Path("uv.lock")) if Path("uv.lock").exists() else None,
             "package": str(Path(scratchcoder.__file__).parent),
         },
         "executed_code": False,
@@ -414,7 +468,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 3
         args.out.mkdir(parents=True, exist_ok=True)
         record = intake(args)
-    except (Refused, SealedPathError, ValueError) as error:
+    except (Refused, SealedPathError, ValueError, KeyError, TypeError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
     print(json.dumps(record["counts"], indent=2, sort_keys=True))

@@ -46,7 +46,9 @@ def assertions_for(name: str) -> list[str]:
     return [f"assert {name}({i}) == {i * 2}" for i in range(3)]
 
 
-def row(identifier: str, prompt: str, name: str, body: str = "x * 2") -> dict[str, Any]:
+def row(identifier: str, prompt: str, name: str, body: str | None = None) -> dict[str, Any]:
+    # A distinct program per row: equal programs would form one task family.
+    body = body or f"x * 2 + {sum(map(ord, identifier)) * 1000 + len(identifier)}"
     return {
         "id": identifier,
         "input": prompt,
@@ -254,13 +256,11 @@ def test_every_reason_fires_in_order_and_only_the_range_is_read(
         "nvidia/OpenCodeInstruct/keep2",
     ]
     assert all(task.split == "train" and task.solution for task in kept)
-    drops = [json.loads(line) for line in (out / "drops.jsonl").read_text().splitlines()]
+    rows = [json.loads(line) for line in (out / "rows.jsonl").read_text().splitlines()]
     expected = [
-        (START + offset, reason)
-        for offset, (_, reason) in enumerate(ROWS[START : START + COUNT])
-        if reason not in (None, "kept")
+        (START + offset, reason) for offset, (_, reason) in enumerate(ROWS[START : START + COUNT])
     ]
-    assert [(entry["row"], entry["reason"]) for entry in drops] == expected
+    assert [(entry["row"], entry["reason"]) for entry in rows] == expected
     record = json.loads((out / "record.json").read_text())
     counts = record["counts"]
     assert counts["rows"] == COUNT and counts["kept"] == 2
@@ -270,7 +270,7 @@ def test_every_reason_fires_in_order_and_only_the_range_is_read(
     assert record["executed_code"] is False and record["sealed_files_opened"] is False
     remainder = list(load_tasks(out / "remainder.jsonl"))
     assert [task.id for task in remainder] == ["nvidia/OpenCodeInstruct/r1"]
-    assert set(record["outputs"]) == {"candidates.jsonl", "drops.jsonl", "remainder.jsonl"}
+    assert set(record["outputs"]) == {"candidates.jsonl", "rows.jsonl", "remainder.jsonl"}
 
 
 def test_a_range_past_the_end_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -289,7 +289,7 @@ def test_existing_outputs_and_sealed_inputs_are_refused(
     refused[refused.index("--pool-dev") + 1] = str(sealed)
     assert tool.main(refused) == 2
     (tmp_path / "out").mkdir()
-    (tmp_path / "out" / "drops.jsonl").write_text("")
+    (tmp_path / "out" / "rows.jsonl").write_text("")
     assert tool.main(argv) == 3
 
 
@@ -301,3 +301,72 @@ def test_a_source_file_that_differs_from_its_receipt_is_refused(
     receipts["files"][0]["sha256"] = "0" * 64
     (tmp_path / "receipts.json").write_text(json.dumps(receipts))
     assert tool.main(argv) == 2
+
+
+def test_a_dropped_row_still_bridges_its_family_to_dev() -> None:
+    """A paraphrase of a dev prompt is dropped, but a candidate with the same program is in
+    that dev task's family and must be dropped too (the reviewer's reproduction)."""
+    solution = "def zeta_fn(x):\n    return x * 7 + 1\n"
+    dev = [pool_task("d1", DEV_PROMPT, "def devname(x):\n    return 5\n", "dev")]
+    paraphrase = pool_task("ca", DEV_PROMPT.replace("devword12", "zz1"), solution, "train")
+    candidate = pool_task("cb", words("beta", 14), solution, "train")
+    assert tool.dev_family_ids([candidate], dev, []) == set()
+    assert tool.dev_family_ids([candidate], dev, [], [paraphrase]) == {"cb"}
+
+
+def test_a_bridge_row_repeating_a_pool_id_is_joined_to_it() -> None:
+    linked = pool_task("t1", words("trainonly", 14), "def tq(x):\n    return x - 3\n", "train")
+    dev = [pool_task("d1", DEV_PROMPT, "def tq(x):\n    return x - 3\n", "dev")]
+    # The range row repeats train task t1's ID with other content; t1 shares dev's program.
+    repeat = pool_task("t1", words("repeat", 14), "def other(x):\n    return x // 4\n", "train")
+    candidate = pool_task("cc", words("gamma", 14), "def other(x):\n    return x // 4\n", "train")
+    assert tool.dev_family_ids([candidate], dev, [linked], [repeat]) == {"cc"}
+
+
+def test_rows_the_pool_build_read_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv = fixture(tmp_path, monkeypatch)
+    spec = tool.load_spec(Path("unused"))  # type: ignore[attr-defined]
+    spec["sources"][0]["rows"] = START + 1  # the build read rows 0..START
+    assert tool.main(argv) == 2
+    spec["sources"][0]["rows"] = START
+    assert tool.main(argv) == 0
+
+
+def arc_record(tmp_path: Path, path: Path, **changes: Any) -> Path:
+    from scratchcoder.data.arc import arc_splits
+
+    record = {
+        "kind": "pod-task-export",
+        "export": "arc",
+        "output": {"path": str(path), "bytes": path.stat().st_size, "sha256": tool._sha(path)},
+        "questions": arc_splits()["test"].task_count,
+        "source": {"manifests": {"test": asdict(arc_splits()["test"].manifest)}},
+    }
+    for key, value in changes.items():
+        record[key] = value
+    target = tmp_path / "arc-export.json"
+    target.write_text(json.dumps(record))
+    return target
+
+
+def test_the_arc_export_must_match_its_record_and_the_reviewed_split(tmp_path: Path) -> None:
+    export = tmp_path / "arc-easy-test.jsonl"
+    export.write_text('{"id": "x"}\n')
+    other = tmp_path / "other.jsonl"
+    other.write_text('{"id": "y"}\n')
+    with pytest.raises(tool.Refused, match="file its record names"):
+        tool.arc_questions(other, arc_record(tmp_path, export))
+    with pytest.raises(tool.Refused, match="reviewed ARC-Easy"):
+        tool.arc_questions(export, arc_record(tmp_path, export, questions=1))
+    record = json.loads(arc_record(tmp_path, export).read_text())
+    record["output"]["bytes"] += 1
+    (tmp_path / "arc-export.json").write_text(json.dumps(record))
+    with pytest.raises(tool.Refused, match="size"):
+        tool.arc_questions(export, tmp_path / "arc-export.json")
+    record["output"]["bytes"] -= 1
+    record["output"]["sha256"] = "0" * 64
+    (tmp_path / "arc-export.json").write_text(json.dumps(record))
+    with pytest.raises(tool.Refused, match="SHA-256"):
+        tool.arc_questions(export, tmp_path / "arc-export.json")
