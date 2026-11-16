@@ -5,6 +5,7 @@ sources as a literal; nothing generated is executed."""
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -249,6 +250,45 @@ def test_oracle_files_are_read_as_text_and_checked_statically(tmp_path: Path) ->
             independent.check_text(text, "toy1")
     with pytest.raises(independent.OracleError, match="no oracle file"):
         independent.load(tmp_path, "toy9")
+
+
+def _write_sums(directory: Path, *, skip: str = "", extra: str = "") -> str:
+    lines = [
+        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+        for path in sorted(directory.iterdir())
+        if path.name not in {independent.SUMS, skip}
+    ]
+    (directory / independent.SUMS).write_text("".join(lines) + extra, encoding="utf-8")
+    return hashlib.sha256((directory / independent.SUMS).read_bytes()).hexdigest()
+
+
+def test_the_independent_directory_is_pinned_by_its_sums_file(tmp_path: Path) -> None:
+    (tmp_path / "toy1.py").write_text(ORACLE, encoding="utf-8")
+    (tmp_path / "README.md").write_text("notes\n", encoding="utf-8")
+    with pytest.raises(independent.OracleError, match="no SHA256SUMS"):
+        independent.pin(tmp_path)
+    digest = _write_sums(tmp_path)
+    pinned = independent.pin(tmp_path, expected=digest)
+    assert pinned.sums_sha256 == digest and set(pinned.files) == {"toy1.py", "README.md"}
+    assert independent.load(tmp_path, "toy1", pinned).sha256 == pinned.files["toy1.py"]
+    with pytest.raises(independent.OracleError, match="not the pinned"):
+        independent.pin(tmp_path, expected="0" * 64)
+    (tmp_path / "toy1.py").write_text(ORACLE + "\n# changed\n", encoding="utf-8")
+    with pytest.raises(independent.OracleError, match="does not match its SHA256SUMS"):
+        independent.pin(tmp_path)
+    # A file changed after the pin was taken is refused when it is loaded.
+    with pytest.raises(independent.OracleError, match="pinned SHA256SUMS"):
+        independent.load(tmp_path, "toy1", pinned)
+    _write_sums(tmp_path, skip="README.md")
+    with pytest.raises(independent.OracleError, match="does not list README.md"):
+        independent.pin(tmp_path)
+    _write_sums(tmp_path, extra=f"{'a' * 64}  toy2.py\n")
+    with pytest.raises(independent.OracleError, match="lists missing toy2.py"):
+        independent.pin(tmp_path)
+    for bad in ("nothex  toy1.py\n", f"{'a' * 64}  ../toy1.py\n"):
+        (tmp_path / independent.SUMS).write_text(bad, encoding="utf-8")
+        with pytest.raises(independent.OracleError, match="malformed"):
+            independent.pin(tmp_path)
 
 
 def test_the_ledger_counts_before_each_call_and_refuses_over_the_cap(tmp_path: Path) -> None:

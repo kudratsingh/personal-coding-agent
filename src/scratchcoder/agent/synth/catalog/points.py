@@ -262,7 +262,8 @@ TEMPLATES = (
         spec=(
             "walk(pts) takes a list of (x, y) tuples of ints and returns the sum, over i in "
             "0..len(pts)-1, of the grid distance |dx| + |dy| from pts[i] to pts[(i + 1) % "
-            "len(pts)] (the walk closes back to the first point). An empty list gives 0."
+            "len(pts)] (the walk closes back to the first point). An empty list gives 0, and "
+            "a single point gives 0 (its one step returns to itself)."
         ),
         domain="pts: list of 0..6 (int, int) tuples with coordinates in -10..10.",
         returns="int",

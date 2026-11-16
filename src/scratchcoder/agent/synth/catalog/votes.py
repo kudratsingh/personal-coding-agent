@@ -200,7 +200,7 @@ TEMPLATES = (
         spec=(
             "winner(ballots) takes a list of candidate names, one per vote. Return None for an "
             "empty list. Otherwise return the name with the most votes; when several names "
-            "share the most votes, the one that is smallest in sorted (str) order."
+            "share the most votes, the one that is smallest in Python str order."
         ),
         domain="ballots: list of 0..8 short lowercase str names.",
         returns="str or None",
@@ -217,9 +217,11 @@ TEMPLATES = (
             "eliminate(ranked) takes a list of ballots, each a list of str names (most "
             "preferred first, possibly empty), with at least one non-empty ballot. Count, for "
             "each name that is the first element of at least one ballot, how many ballots it is "
-            "first on. The weakest is the counted name with the smallest count; among names "
-            "with that count, the largest in sorted (str) order. Return a new list of ballots, "
-            "in the same order, each with every occurrence of the weakest name removed."
+            "first on; a name that is never first is not counted and cannot be the weakest. "
+            "The weakest is the counted name with the smallest count; among names with that "
+            "count, the largest in Python str order. Return a new list of new ballot lists, in "
+            "the same order, each with every occurrence of the weakest name removed; a ballot "
+            "that becomes empty stays as []. The input is not changed."
         ),
         domain=(
             "ranked: list of 1..6 lists of 0..3 distinct short lowercase names; at least one "

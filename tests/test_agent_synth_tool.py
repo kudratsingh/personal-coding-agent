@@ -224,8 +224,30 @@ def test_the_tool_refuses_sealed_and_held_out_paths(tmp_path: Path) -> None:
     )
 
 
+STOCK1_ORACLE = (
+    "def inputs(params, rng):\n    return [({}, 'a', 1)]\n\n\n"
+    "def oracle(params, levels, item, amount):\n"
+    "    return min(levels.get(item, 0) + amount, params['cap'])\n"
+)
+
+
+def _independent(tmp_path: Path, files: dict[str, str] | None = None) -> str:
+    """An independent directory with its SHA256SUMS; returns the SHA-256 of SHA256SUMS."""
+    directory = tmp_path / "independent"
+    directory.mkdir(exist_ok=True)
+    for name, text in (files if files is not None else {"stock1.py": STOCK1_ORACLE}).items():
+        (directory / name).write_text(text, encoding="utf-8")
+    sums = "".join(
+        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+        for path in sorted(directory.iterdir())
+        if path.name != "SHA256SUMS"
+    )
+    (directory / "SHA256SUMS").write_text(sums, encoding="utf-8")
+    return hashlib.sha256(sums.encode("utf-8")).hexdigest()
+
+
 def _build_argv(
-    tmp_path: Path, out: Path, instances: Path, receipt: Path, *extra: str
+    tmp_path: Path, out: Path, instances: Path, receipt: Path, pin: str, *extra: str
 ) -> list[str]:
     tokenizer = tmp_path / "tokenizer.json"
     return [
@@ -234,6 +256,8 @@ def _build_argv(
         str(instances),
         "--independent",
         str(tmp_path / "independent"),
+        "--independent-sha256",
+        pin,
         "--tokenizer",
         str(tokenizer),
         "--out",
@@ -306,10 +330,11 @@ def test_validate_and_build_needs_a_receipt_and_respects_the_cap(
 ) -> None:
     monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
     instances = _generate(tmp_path, ["stock1"])
+    pin = _independent(tmp_path)
     receipt = tmp_path / "receipt.json"
     executor = CaseExecutor(instances)
     out = tmp_path / "build"
-    argv = _build_argv(tmp_path, out, instances, receipt, "--max-calls", "10", "--controls")
+    argv = _build_argv(tmp_path, out, instances, receipt, pin, "--max-calls", "10", "--controls")
     _receipt(receipt, ["something", "else"])
     assert agent_sft_data.main(argv, execute=executor, loader=_loader) == 2
     _receipt(receipt, argv)
@@ -323,20 +348,22 @@ def test_validate_and_build_writes_rows_records_and_ledger(
 ) -> None:
     monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
     instances = _generate(tmp_path, ["stock1"])
-    (tmp_path / "independent").mkdir()
-    (tmp_path / "independent" / "stock1.py").write_text(
-        "def inputs(params, rng):\n    return [({}, 'a', 1)]\n\n\n"
-        "def oracle(params, levels, item, amount):\n"
-        "    return min(levels.get(item, 0) + amount, params['cap'])\n",
-        encoding="utf-8",
-    )
+    pin = _independent(tmp_path, {"stock1.py": STOCK1_ORACLE, "README.md": "notes\n"})
     receipt = tmp_path / "receipt.json"
     executor = CaseExecutor(instances)
     out = tmp_path / "build"
-    argv = _build_argv(tmp_path, out, instances, receipt, "--controls", "--per-template", "2")
+    argv = _build_argv(tmp_path, out, instances, receipt, pin, "--controls", "--per-template", "2")
     _receipt(receipt, argv)
     assert agent_sft_data.main(argv, execute=executor, loader=_loader) == 0
     record = json.loads((out / "record.json").read_text())
+    oracle_sha = hashlib.sha256(STOCK1_ORACLE.encode("utf-8")).hexdigest()
+    assert record["independent"]["sums_sha256"] == pin
+    assert record["independent"]["files"]["stock1.py"] == oracle_sha
+    assert record["independent"]["missing_templates"] == []
+    for name in ("instances.jsonl", "controls.jsonl", "rows-meta.jsonl"):
+        lines = [json.loads(line) for line in (out / name).read_text().splitlines()]
+        assert lines and all(line["independent_sums_sha256"] == pin for line in lines), name
+        assert all(line["oracle_sha256"] == oracle_sha for line in lines), name
     assert record["totals"] == {"accepted": 2, "rows": 6}
     assert record["planned_calls"] == 2 * 6 + 4 == executor.calls
     assert record["controls"] == {"rows": 4, "all_failed": True}
@@ -368,3 +395,30 @@ def test_validate_and_build_writes_rows_records_and_ledger(
     assert document["builds"][0]["rows_by_kind"] == {"edit": 2, "repair": 4}
     assert document["ledger"]["total"] == executor.calls
     assert len(document["templates"]) >= 40
+
+
+def test_validate_and_build_refuses_an_unpinned_or_changed_independent_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    instances = _generate(tmp_path, ["stock1"])
+    pin = _independent(tmp_path)
+    receipt = tmp_path / "receipt.json"
+    executor = CaseExecutor(instances)
+    out = tmp_path / "build"
+    wrong = _build_argv(tmp_path, out, instances, receipt, "0" * 64)
+    _receipt(receipt, wrong)
+    assert agent_sft_data.main(wrong, execute=executor, loader=_loader) == 2
+    assert "not the pinned" in capsys.readouterr().err
+    # The pinned hash, but a file edited after SHA256SUMS was written.
+    argv = _build_argv(tmp_path, out, instances, receipt, pin)
+    _receipt(receipt, argv)
+    (tmp_path / "independent" / "stock1.py").write_text(STOCK1_ORACLE + "# edited\n")
+    assert agent_sft_data.main(argv, execute=executor, loader=_loader) == 2
+    assert "does not match its SHA256SUMS" in capsys.readouterr().err
+    # A file SHA256SUMS does not list.
+    _independent(tmp_path)
+    (tmp_path / "independent" / "stock2.py").write_text(STOCK1_ORACLE)
+    assert agent_sft_data.main(argv, execute=executor, loader=_loader) == 2
+    assert "does not list stock2.py" in capsys.readouterr().err
+    assert executor.calls == 0 and not out.exists()

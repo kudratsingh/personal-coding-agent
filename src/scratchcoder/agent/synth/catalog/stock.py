@@ -194,7 +194,8 @@ TEMPLATES = (
         spec=(
             "restock(levels, item, amount) adds stock. Let current be levels[item] when item is "
             "a key of levels, otherwise 0. The new level is min(current + amount, params['cap']). "
-            "The function stores the new level in levels[item] and returns it."
+            "The function stores the new level in levels[item] and returns it; when item is "
+            "absent the key is added, even when amount is 0."
         ),
         domain=(
             "levels: dict mapping short lowercase item names (str) to ints 0..params['cap']; "
@@ -212,9 +213,10 @@ TEMPLATES = (
         bugs={"stub_raise": Bug(stub="raise"), "stub_none": Bug(stub="none")},
         spec=(
             "reserve(levels, item, amount) takes units out of stock. Let current be levels[item] "
-            "when item is a key of levels, otherwise 0. If amount > current it changes nothing "
-            "and returns -1. Otherwise it sets levels[item] = current - amount and returns "
-            "current - amount."
+            "when item is a key of levels, otherwise 0. If amount > current it leaves levels "
+            "unchanged (no key is added) and returns -1. Otherwise it sets levels[item] = "
+            "current - amount and returns current - amount; when item is absent (so amount is "
+            "0) the key is added with the value 0."
         ),
         domain=(
             "levels: dict mapping short lowercase item names (str) to ints >= 0; item: str (may "

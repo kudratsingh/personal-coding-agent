@@ -229,7 +229,7 @@ TEMPLATES = (
         spec=(
             "evaluate(cs, x) takes polynomial coefficients, lowest power first (cs[i] is the "
             "coefficient of x**i), and an int x, and returns the sum of cs[i] * x**i (0 for an "
-            "empty list)."
+            "empty list). x**0 is 1 for every x, 0 included, so at x == 0 the result is cs[0]."
         ),
         domain="cs: list of 0..6 ints in -9..9; x: int in -5..5.",
         returns="int",

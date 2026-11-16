@@ -262,7 +262,9 @@ TEMPLATES = (
         spec=(
             "in_degree(graph) maps every key of graph, and every node that appears in a "
             "successor list, to the number of times it appears in the successor lists of all "
-            "keys (0 when it appears in none)."
+            "keys (0 when it appears in none). Every appearance counts: a node listed twice in "
+            "one list counts twice, and a self-loop counts for its own node. Key order of the "
+            "result does not matter."
         ),
         domain=(
             "graph: dict mapping short str node names to lists of str node names (0..6 keys); "
@@ -290,7 +292,9 @@ TEMPLATES = (
             "adjacency(edges) builds successor lists. edges is a list of (source, target) pairs "
             "of str nodes. The result is a dict whose keys are every node that occurs in any "
             "edge; each value is the sorted list of targets of the edges leaving that key "
-            "(with repeats if an edge repeats; [] when none leave it)."
+            "(with repeats if an edge repeats; [] when none leave it, so a node that is only "
+            "ever a target maps to []). Lists are sorted in Python str order; key order of the "
+            "result does not matter."
         ),
         domain="edges: list of 0..6 (str, str) tuples of short lowercase node names.",
         returns="dict str -> list of str",
@@ -310,8 +314,9 @@ TEMPLATES = (
         },
         spec=(
             "reach(graph, start) returns the sorted list of nodes reachable from start by "
-            "following successor lists any number of times, start included. A node that is "
-            "not a key of graph has no successors."
+            "following successor lists any number of times, start included, sorted in Python "
+            "str order. A node that is not a key of graph has no successors, so a start that "
+            "is not a key gives [start]."
         ),
         domain=(
             "graph: dict mapping short str node names to lists of str node names (0..6 keys; "

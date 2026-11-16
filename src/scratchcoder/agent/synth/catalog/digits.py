@@ -242,7 +242,8 @@ TEMPLATES = (
             "luhn(number) takes a non-negative int. Write its decimal digits; going from the "
             "rightmost digit leftwards, index them 0, 1, 2, ...; double each digit at an odd "
             "index and subtract 9 from a doubled value greater than 9. Return True when the "
-            "sum of all resulting values is divisible by 10, else False."
+            "sum of all resulting values is divisible by 10, else False. The number 0 has the "
+            "single digit 0, so it gives True."
         ),
         domain="number: int in 0..10**17.",
         returns="bool",

@@ -253,8 +253,8 @@ TEMPLATES = (
             "clip(values) returns a new list of the same length. The first value is copied. "
             "Each later value x is compared with k, the previous value of the result: if "
             "x - k > params['jump'] the result gets k + params['jump']; if k - x > "
-            "params['jump'] it gets k - params['jump']; otherwise it gets x. The input list "
-            "is not changed."
+            "params['jump'] it gets k - params['jump']; otherwise it gets x. An empty list "
+            "gives []. The input list is not changed."
         ),
         domain="values: list of 0..12 ints in -200..200.",
         returns="list of int",

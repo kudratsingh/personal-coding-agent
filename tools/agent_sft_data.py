@@ -16,7 +16,11 @@ anything is opened:
 - ``validate-and-build``: everything that executes. It refuses to start without
   ``--receipt``, a passing execution-window receipt written by ``tools.mac_window_check exec``
   for this very command in the last 30 minutes, and without a new ``--out`` directory; it
-  refuses when the planned calls exceed what the ledger cap leaves. Per instance it drives
+  refuses when the planned calls exceed what the ledger cap leaves. It also refuses unless
+  ``--independent`` verifies against its ``SHA256SUMS`` and that file's SHA-256 equals
+  ``--independent-sha256``; every oracle is read (never imported) and checked against the pin
+  before the first call, and the pin is written into every validation record, control row and
+  row-metadata line. Per instance it drives
   the harness loop with a scripted policy (``scratchcoder.agent.synth.rows``), at
   ``k + 4`` sandbox calls for ``k`` mutants, and writes rows, row metadata, per-instance
   validation records and traces; with ``--controls`` it runs the four negative controls once
@@ -263,6 +267,11 @@ def validate_and_build(
     except (agent_cases.CaseError, OSError, ValueError, KeyError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
+    try:
+        pinned = independent.pin(args.independent, expected=args.independent_sha256)
+    except (independent.OracleError, OSError, UnicodeDecodeError) as error:
+        print(f"refused: independent oracles: {error}", file=sys.stderr)
+        return 2
     records = {record["id"]: record for record in _synth_records(args.instances)}
     excluded = contamination.rejected_ids(args.exclude)
     chosen: list[agent_cases.Case] = []
@@ -279,6 +288,15 @@ def validate_and_build(
             break
     book = call_ledger.Ledger.open(args.ledger, args.max_calls)
     templates = {records[case.id]["template_id"] for case in chosen}
+    # Every oracle is read and checked against the pin once, before any call; later edits to
+    # the directory cannot reach this run.
+    oracles: dict[str, independent.Oracle | independent.OracleError] = {}
+    for template_id in sorted(templates):
+        try:
+            oracles[template_id] = independent.load(args.independent, template_id, pinned)
+        except independent.OracleError as error:
+            oracles[template_id] = error
+    pin_sha = pinned.sums_sha256
     planned = sum(rows.calls_per_instance(len(records[c.id]["mutants"])) for c in chosen)
     planned += len(mutation.CONTROL_KINDS) * len(templates) if args.controls else 0
     if planned > book.remaining:
@@ -302,28 +320,32 @@ def validate_and_build(
     for case in chosen:
         record = records[case.id]
         template_id = record["template_id"]
-        try:
-            oracle = independent.load(args.independent, template_id)
-        except independent.OracleError as error:
+        oracle = oracles[template_id]
+        if isinstance(oracle, independent.OracleError):
             rows.append_jsonl(
                 out / "instances.jsonl",
                 [
                     {
                         "instance": case.id,
                         "accepted": False,
-                        "reasons": [f"oracle: {error}"],
+                        "reasons": [f"oracle: {oracle}"],
                         "calls": 0,
+                        "independent_sums_sha256": pin_sha,
                     }
                 ],
             )
             totals["no_oracle"] += 1
             continue
+        stamp = {"independent_sums_sha256": pin_sha, "oracle_sha256": oracle.sha256}
         try:
             if args.controls and template_id not in controlled:
                 context["value"] = f"{case.id}/controls"
                 rows.append_jsonl(
                     out / "controls.jsonl",
-                    rows.run_controls(case, record, oracle, execute=counted),
+                    [
+                        {**row, **stamp}
+                        for row in rows.run_controls(case, record, oracle, execute=counted)
+                    ],
                 )
                 controlled.add(template_id)
             context["value"] = case.id
@@ -341,10 +363,10 @@ def validate_and_build(
         except call_ledger.CallCapReached as error:
             stopped = str(error)
             break
-        rows.append_jsonl(out / "instances.jsonl", [built.record()])
+        rows.append_jsonl(out / "instances.jsonl", [{**built.record(), **stamp}])
         if built.accepted:
             rows.append_rows(out / "rows.jsonl", built.rows)
-            rows.append_jsonl(out / "rows-meta.jsonl", built.meta)
+            rows.append_jsonl(out / "rows-meta.jsonl", [{**row, **stamp} for row in built.meta])
             totals["accepted"] += 1
             totals["rows"] += len(built.rows)
         else:
@@ -379,10 +401,14 @@ def validate_and_build(
         ),
         "instances_registry_sha256": agent_cases.registry_sha256(args.instances),
         "tokenizer_sha256": _sha_file(args.tokenizer),
-        "independent_sha256": {
-            template: _sha_file(independent.path_for(args.independent, template))
-            for template in sorted(templates)
-            if independent.path_for(args.independent, template).is_file()
+        "independent": {
+            "directory": str(args.independent),
+            **pinned.record(),
+            "missing_templates": sorted(
+                template
+                for template, item in oracles.items()
+                if not isinstance(item, independent.Oracle)
+            ),
         },
         "planned_calls": planned,
         "selected_instances": len(chosen),
@@ -562,6 +588,11 @@ def build_parser() -> argparse.ArgumentParser:
     v = commands.add_parser("validate-and-build")
     v.add_argument("--instances", type=Path, required=True)
     v.add_argument("--independent", type=Path, required=True)
+    v.add_argument(
+        "--independent-sha256",
+        required=True,
+        help="the SHA-256 of the independent directory's SHA256SUMS; the run refuses another",
+    )
     v.add_argument("--tokenizer", type=Path, required=True)
     v.add_argument("--out", type=Path, required=True)
     v.add_argument("--receipt", type=Path, required=True)

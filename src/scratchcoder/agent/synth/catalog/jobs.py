@@ -242,9 +242,10 @@ TEMPLATES = (
         spec=(
             "cool(names) simulates running jobs in list order, one per time slot, slots "
             "numbered from 0. A job may run in slot s only if it has not run before, or s - t > "
-            "params['gap'] where t is the slot of its previous run. Each job runs in the first "
-            "slot that is at least the slot after the previous job's and that satisfies the "
-            "rule. Return the number of slots used, i.e. the last job's slot + 1 (0 for no "
+            "params['gap'] where t is the slot of the most recent earlier run of the same name. "
+            "Each job runs in the first slot that satisfies the rule and is at least the lower "
+            "bound: 0 for the first job, otherwise the slot of the previous list entry + 1. "
+            "Return the number of slots used, i.e. the last job's slot + 1 (0 for no "
             "jobs)."
         ),
         domain="names: list of 0..8 short str job names (repeats allowed).",

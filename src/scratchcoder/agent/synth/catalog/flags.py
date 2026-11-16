@@ -179,8 +179,10 @@ TEMPLATES = (
             "reversed": Bug(edits=(("enumerate($order)", "enumerate(reversed($order))"),)),
         },
         spec=(
-            "names_of(mask) returns, in the order of the tuple params['order'], the names "
-            "params['order'][i] whose bit i (value 1 << i) is set in the non-negative int mask."
+            "names_of(mask) returns, in the order of params['order'] (a sequence of 3 or 4 "
+            "distinct str; a list in the instance params, a tuple constant in the code), the "
+            "names params['order'][i] whose bit i (value 1 << i) is set in the non-negative int "
+            "mask. Set bits at positions i >= len(params['order']) are ignored."
         ),
         domain="mask: int in 0..63.",
         returns="list of str",
@@ -200,7 +202,8 @@ TEMPLATES = (
         spec=(
             "mask_of(names) takes a list of str and returns the int whose bit i (value 1 << i) "
             "is set exactly when params['order'][i] is in names; names not in params['order'] "
-            "are ignored."
+            "are ignored. Names match by exact equality only (a prefix or plural of a flag "
+            "name does not match), and a repeated name does not change the result."
         ),
         domain=(
             "names: list of 0..4 str, each one of params['order'] or another short lowercase word."

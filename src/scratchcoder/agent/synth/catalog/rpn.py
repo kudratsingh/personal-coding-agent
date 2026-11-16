@@ -217,11 +217,12 @@ TEMPLATES = (
             "eval_rpn(tokens) evaluates a well-formed postfix program. tokens is a list of ints "
             "and operator strings '+', '-', '*', '//'. Process tokens in order on a stack: an "
             "int is pushed; an operator pops b (top) then a and pushes a + b, a - b, a * b or "
-            "a // b. Return the top of the stack at the end."
+            "a // b, where // is Python floor division (it rounds towards negative infinity, "
+            "e.g. -5 // 3 == -2). Return the top of the stack at the end."
         ),
         domain=(
             "tokens: well-formed program (exactly one value left at the end) of 1..9 tokens, "
-            "ints in 0..9, no '//' by 0."
+            "ints in 0..9; the divisor b of every '//' is non-zero when it is applied."
         ),
         returns="int",
         caller="run_all",
@@ -240,8 +241,9 @@ TEMPLATES = (
         spec=(
             "valid(tokens) checks a postfix program of ints and operator strings. Walk the "
             "tokens with a counter starting at 0: an int adds 1; an operator needs the counter "
-            "to be at least 2 (otherwise return False) and then lowers it by 1. Return True "
-            "when the counter is exactly 1 at the end."
+            "to be at least 2 (otherwise return False at once, whatever follows) and then "
+            "lowers it by 1. Return True when the counter is exactly 1 at the end, so an empty "
+            "list gives False. Every token that is not an int is an operator."
         ),
         domain="tokens: list of 0..9 items, each an int in 0..9 or one of '+', '-', '*'.",
         returns="bool",
@@ -260,7 +262,10 @@ TEMPLATES = (
             "operator string lowers it by 1 (it takes two values and pushes one). An empty "
             "program gives 0."
         ),
-        domain="tokens: well-formed postfix program of 0..9 tokens (ints 0..9 and '+', '-', '*').",
+        domain=(
+            "tokens: the empty list, or a well-formed postfix program (exactly one value left "
+            "at the end) of 1..9 tokens (ints 0..9 and '+', '-', '*')."
+        ),
         returns="int",
         include=("run_all",),
     ),

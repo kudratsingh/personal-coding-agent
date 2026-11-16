@@ -164,6 +164,73 @@ def test_the_reference_spec_must_not_raise() -> None:
         outcome(W5, "first_item", {"k": 3}, ([],))
 
 
+def _target_spec(template_id: str, *args: object, **params: object) -> object:
+    """The target's spec function (project code) on ``args``, with the template's constants
+    set to their first candidates unless given."""
+    template = next(item for item in catalog().templates if item.id == template_id)
+    values = {key: choices[0] for key, choices in template.family.consts.items()}
+    values.update(params)
+    return template.family.func(template.target).spec(values, *args)
+
+
+@pytest.mark.parametrize(
+    ("template_id", "args", "params", "expected", "phrase"),
+    [
+        ("stock1", ({}, "a", 0), {}, 0, "even when amount is 0"),
+        ("stock2", ({}, "a", 0), {}, 0, "added with the value 0"),
+        ("stock2", ({"a": 1}, "b", 1), {}, -1, "no key is added"),
+        ("grid2", ([[1, 1], [1, 1]], -1, 0), {}, 0, "does not wrap around"),
+        ("grid2", ([[1, 1], [1, 1]], 0, -1), {}, 0, "does not wrap around"),
+        ("grid3", ([[1, 0]],), {}, [[1], [0]], "rows are new lists"),
+        ("sensor2", ([],), {}, [], "An empty list gives []"),
+        ("graph1", ({"a": ["a", "b", "b"], "b": []},), {}, {"a": 1, "b": 2}, "self-loop"),
+        ("graph2", ([("b", "a")],), {}, {"b": ["a"], "a": []}, "only ever a target"),
+        ("graph3", ({"a": ["b"]}, "z"), {}, ["z"], "gives [start]"),
+        ("jobs2", (["a", "b", "a"],), {"gap": 2}, 4, "previous list entry + 1"),
+        ("jobs2", (["a", "a"],), {"gap": 1}, 3, "0 for the first job"),
+        ("votes1", (["b", "a", "b", "a"],), {}, "a", "Python str order"),
+        ("votes2", ([["a", "c"], ["a"]],), {}, [["c"], []], "never first is not counted"),
+        ("votes2", ([["a"], ["b", "a"], ["b"]],), {}, [[], ["b"], ["b"]], "stays as []"),
+        ("digits3", (0,), {}, True, "The number 0"),
+        ("points3", ([(3, 4)],), {}, 0, "a single point gives 0"),
+        ("poly2", ([7, 2, 5], 0), {}, 7, "0 included"),
+        ("rpn1", ([2, 7, "-", 3, "//"],), {}, -2, "floor division"),
+        ("rpn1", ([1, 0, 3, "-", "//"],), {}, -1, "floor division"),
+        ("rpn2", ([1, "+", 2, 3, "+"],), {}, False, "at once, whatever follows"),
+        ("rpn2", ([],), {}, False, "empty list gives False"),
+        ("rpn3", ([],), {}, 0, "the empty list"),
+        ("flags1", (63,), {"order": ["r", "w", "x"]}, ["r", "w", "x"], "are ignored"),
+        ("flags1", (5,), {"order": ("r", "w", "x")}, ["r", "x"], "a list in the instance"),
+        ("flags2", (["r", "r", "rs", "w"],), {"order": ("r", "w", "x")}, 3, "exact equality"),
+    ],
+)
+def test_spec_text_states_each_edge_case_the_spec_function_settles(
+    template_id: str,
+    args: tuple[object, ...],
+    params: dict[str, object],
+    expected: object,
+    phrase: str,
+) -> None:
+    """Edge cases an independent reader found ambiguous: the spec text (what the oracle author
+    reads) must state the case, and the spec function (what the expected values come from)
+    must give the stated answer, with the stated type."""
+    template = next(item for item in catalog().templates if item.id == template_id)
+    assert phrase in template.spec + " " + template.domain
+    found = _target_spec(template_id, *args, **params)
+    assert type(found) is type(expected) and found == expected
+
+
+def test_spec_functions_leave_their_inputs_unchanged() -> None:
+    levels = {"a": 1}
+    grid = [[1, 0], [0, 1]]
+    ballots = [["a", "b"], ["b"]]
+    _target_spec("stock2", levels, "a", 1)
+    rotated = _target_spec("grid3", grid)
+    _target_spec("votes2", ballots)
+    assert levels == {"a": 1} and grid == [[1, 0], [0, 1]] and ballots == [["a", "b"], ["b"]]
+    assert isinstance(rotated, list) and all(row is not grid[0] for row in rotated)
+
+
 def test_mutants_keep_name_and_signature_and_differ_from_reference_and_forbidden() -> None:
     source = (
         "def pick(values, limit=3):\n"

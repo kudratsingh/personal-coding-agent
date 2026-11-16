@@ -14,7 +14,9 @@ the standard library only and never imports the repository.
 
 The host **never imports or runs** this file. :func:`load` reads it as text and checks it with
 :mod:`ast`; :func:`block` embeds the text as a string literal in the grading call's test
-string, where it is compiled and run inside the sandbox next to the reference function. The
+string, where it is compiled and run inside the sandbox next to the reference function.
+:func:`pin` verifies the whole directory against its ``SHA256SUMS`` manifest first; the
+manifest's own hash identifies the oracle set in every validation record. The
 differential check compares the reference's result with the oracle's (same type and equal)
 on every input; the property check runs after it. Any failure fails the whole grading call,
 so the generator's references and tests and the independent author's oracle must agree for
@@ -34,6 +36,9 @@ from typing import Any
 
 MAX_BYTES = 65536
 MAX_INPUTS = 200
+SUMS = "SHA256SUMS"
+"""The directory's manifest, in ``sha256sum`` format: one ``<hex>  <name>`` line per other
+file. Its own SHA-256 pins the directory in every validation record."""
 REQUIRED = ("inputs", "oracle")
 OPTIONAL = ("check_properties",)
 FORMAT = {
@@ -56,6 +61,14 @@ FORMAT = {
         ),
     },
     "params": "the instance's constants: the 'params' object listed for the instance",
+    "manifest": (
+        "SHA256SUMS in the same directory, sha256sum format, listing every other file of the "
+        "directory; its own SHA-256 pins the directory in every validation record"
+    ),
+    "copies": (
+        "the target and oracle each get their own deep copy of every argument tuple and of "
+        "params, so a target that changes its arguments does not affect the oracle"
+    ),
     "run": (
         "never on the host: the text is embedded in the grading call and runs in the sandbox; "
         "every input must give an equal result of the same type from the target and from "
@@ -76,8 +89,66 @@ class Oracle:
     has_properties: bool
 
 
+@dataclass(frozen=True)
+class Pin:
+    """The independent directory as its ``SHA256SUMS`` file lists it, every hash verified."""
+
+    sums_sha256: str
+    """SHA-256 of the ``SHA256SUMS`` file: the one value that identifies the whole directory."""
+    files: Mapping[str, str]
+    """File name -> SHA-256, every file of the directory except ``SHA256SUMS``."""
+
+    def record(self) -> dict[str, Any]:
+        return {"sums_sha256": self.sums_sha256, "files": dict(sorted(self.files.items()))}
+
+
 def path_for(directory: Path, template_id: str) -> Path:
     return directory / f"{template_id}.py"
+
+
+def _sums_line(line: str) -> tuple[str, str]:
+    digest, sep, name = line.partition("  ")
+    if not sep and " *" in line:  # The binary-mode marker of sha256sum.
+        digest, _, name = line.partition(" *")
+    valid_digest = len(digest) == 64 and all(ch in "0123456789abcdef" for ch in digest)
+    if not valid_digest or not name or "/" in name or "\\" in name or name in {".", ".."}:
+        raise OracleError(f"{SUMS}: malformed line {line!r}")
+    return name, digest
+
+
+def pin(directory: Path, expected: str | None = None) -> Pin:
+    """Verify ``directory`` against its ``SHA256SUMS`` (files are hashed, never run).
+
+    Every entry of the directory other than ``SHA256SUMS`` must be a regular file listed
+    exactly once with its correct hash, and every listed file must exist; with ``expected``,
+    the hash of ``SHA256SUMS`` itself must equal it."""
+    sums = directory / SUMS
+    if sums.is_symlink() or not sums.is_file():
+        raise OracleError(f"no {SUMS} in {directory}")
+    raw = sums.read_bytes()
+    sums_sha256 = hashlib.sha256(raw).hexdigest()
+    if expected is not None and sums_sha256 != expected.lower():
+        raise OracleError(f"{SUMS} hash {sums_sha256} is not the pinned {expected}")
+    listed: dict[str, str] = {}
+    for line in raw.decode("utf-8").splitlines():
+        if not line.strip():
+            continue
+        name, digest = _sums_line(line)
+        if name in listed or name == SUMS:
+            raise OracleError(f"{SUMS}: {name} listed twice or lists itself")
+        listed[name] = digest
+    present = {entry.name for entry in directory.iterdir() if entry.name != SUMS}
+    if present - set(listed):
+        raise OracleError(f"{SUMS} does not list {', '.join(sorted(present - set(listed)))}")
+    if set(listed) - present:
+        raise OracleError(f"{SUMS} lists missing {', '.join(sorted(set(listed) - present))}")
+    for name, digest in listed.items():
+        entry = directory / name
+        if entry.is_symlink() or not entry.is_file():
+            raise OracleError(f"{name} is not a regular file")
+        if hashlib.sha256(entry.read_bytes()).hexdigest() != digest:
+            raise OracleError(f"{name} does not match its {SUMS} hash")
+    return Pin(sums_sha256, listed)
 
 
 def check_text(text: str, template_id: str) -> Oracle:
@@ -111,12 +182,20 @@ def check_text(text: str, template_id: str) -> Oracle:
     )
 
 
-def load(directory: Path, template_id: str) -> Oracle:
-    """Read (never import) and check the oracle file of ``template_id``."""
+def load(directory: Path, template_id: str, pinned: Pin | None = None) -> Oracle:
+    """Read (never import) and check the oracle file of ``template_id``; with ``pinned``,
+    its bytes must have the hash the pinned ``SHA256SUMS`` lists for it."""
     path = path_for(directory, template_id)
     if path.is_symlink() or not path.is_file():
         raise OracleError(f"{template_id}: no oracle file at {path}")
-    return check_text(path.read_text(encoding="utf-8"), template_id)
+    raw = path.read_bytes()
+    if pinned is not None and pinned.files.get(path.name) != hashlib.sha256(raw).hexdigest():
+        raise OracleError(f"{template_id}: oracle file does not match the pinned {SUMS}")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise OracleError(f"{template_id}: oracle file is not UTF-8") from None
+    return check_text(text, template_id)
 
 
 def block(oracle: Oracle, module: str, function: str, params: Mapping[str, Any], seed: int) -> str:

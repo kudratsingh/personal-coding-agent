@@ -83,6 +83,15 @@ leaves.
 - **The oracle is text.** The host reads the oracle file, checks it with `ast` (required
   functions, standard-library imports) and embeds it as a string literal in the test string.
   It never imports it.
+- **The oracle set is pinned.** The oracle directory carries a `SHA256SUMS` manifest of every
+  other file in it. `validate-and-build` takes the manifest's own SHA-256 as
+  `--independent-sha256`, verifies every listed hash and refuses an unlisted, missing or
+  changed file. It reads every oracle once, before the first call. Each validation record,
+  control row and row-metadata line carries the manifest hash and the oracle file's hash.
+- **Ambiguity is settled in the spec text.** When the oracle author reads a spec in a way the
+  template did not intend, the spec text is clarified and `specs.json` is exported again. The
+  author's files are never edited. A parametrised test checks that the spec text states each
+  settled edge case and that the spec function gives the stated answer.
 - **Sources are canonical.** Every template source must equal what `ast.unparse` prints. A
   mutant printed by `ast.unparse` then differs from the reference only on its mutated lines,
   so the `CHANGES SO FAR` block shows the real change rather than formatting noise.
@@ -105,14 +114,15 @@ leaves.
 - `tests/test_agent_synth.py`: catalog breadth and uniqueness rules; every template and bug kind
   builds, parses and passes the case loader's static validation; determinism; expected values
   and designed failing tests from the spec model; cross-module, stub and traceback layouts;
-  mutant and control properties; static checks and the blocklist.
+  mutant and control properties; static checks and the blocklist; spec-text edge cases.
 - `tests/test_agent_synth_rows.py`: rows from the real loop with a scripted executor (edit and
   repair rows, user-turn IDs equal to the harness prompt IDs, loss mask on the reply only);
   rejection when a mutant passes, when the original passes correctness, or when a traceback is
-  not observed; negative controls; the loop's `grade_checks`; oracle text handling; the ledger.
+  not observed; negative controls; the loop's `grade_checks`; oracle text handling and the
+  `SHA256SUMS` pin; the ledger.
 - `tests/test_agent_synth_tool.py`: contamination signals and status-only output, mixing by
-  loss tokens, and the `tools/agent_sft_data.py` subcommands, including the receipt and cap
-  refusals.
+  loss tokens, and the `tools/agent_sft_data.py` subcommands, including the receipt, cap and
+  oracle-pin refusals.
 
 Run them with `uv run --locked pytest tests/test_agent_synth*.py`.
 

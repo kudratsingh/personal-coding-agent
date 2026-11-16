@@ -275,7 +275,9 @@ TEMPLATES = (
         spec=(
             "region(grid, r, c) returns the size of the group of live cells containing (r, c). "
             "grid is a non-empty list of equal-length rows of 0/1 ints. If (r, c) is outside "
-            "the grid or grid[r][c] is 0, return 0. Otherwise return the number of live cells "
+            "the grid (r < 0, r >= len(grid), c < 0 or c >= len(grid[0]); a negative index "
+            "does not wrap around) or grid[r][c] is 0, return 0. Otherwise return the number "
+            "of live cells "
             "reachable from (r, c) by repeated steps up, down, left or right through live "
             "cells, (r, c) included. Diagonal steps do not connect."
         ),
@@ -291,7 +293,8 @@ TEMPLATES = (
         concept="quarter-turn clockwise rotation",
         bugs={"stub_raise": Bug(stub="raise"), "stub_none": Bug(stub="none")},
         spec=(
-            "rotate(grid) returns a new grid: the input turned a quarter turn clockwise. For an "
+            "rotate(grid) returns a new grid (a new outer list whose rows are new lists too): "
+            "the input turned a quarter turn clockwise. For an "
             "input with h rows and w columns the result has w rows and h columns, and "
             "result[i][j] == grid[h - 1 - j][i]. The input is not changed."
         ),
