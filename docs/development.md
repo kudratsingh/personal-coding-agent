@@ -38,7 +38,7 @@ docs/          public documentation
 private/       ignored owner-only material
 ```
 
-Tokenizer, data, model, optimizer, training, engine, evaluation, development sandbox and RL modules are implemented; the RL run and its more-SFT control are CPU-tested but have not run on a GPU ([rehearsal RL](rl.md)). Agent repair-loop and serving namespaces remain future work. Consult [status](status.md) for acceptance gaps rather than inferring completion from a package name.
+Tokenizer, data, model, optimizer, training, engine, evaluation, development sandbox and RL modules are implemented; the RL run and its more-SFT control are CPU-tested but have not run on a GPU ([rehearsal RL](rl.md)). The agent loop's harness v0 (`scratchcoder.agent`, run by `tools/agent_dev_run.py` on development cases) is implemented and tested with scripted executors and fake policies; it claims no capability result ([walkthrough](walkthroughs/agent-loop.md)). Serving remains future work. Consult [status](status.md) for acceptance gaps rather than inferring completion from a package name.
 
 ## Reproducibility expectations
 
