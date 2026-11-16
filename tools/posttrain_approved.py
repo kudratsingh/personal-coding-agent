@@ -1041,10 +1041,10 @@ train at the plain rate), a fresh optimizer (SFT always starts one), the final w
 the parent's dev loss measured before the first update. ``train_rows`` and ``planned_updates``
 are ``null`` here; ``run1c_specification`` fills them from ``RUN1C_TRAIN_ROWS``."""
 RUN1C_TRAIN_ROWS: dict[str, Any] = {
-    "sha256": "62f21ed88ecb9d9a0628f494cf24a27733cdf4d96497c902e8c2dd8a0babc827",
-    "size_bytes": 1_682_063,
-    "train_rows": 861,
-    "planned_updates": 27,
+    "sha256": "81c49286dc4d41e6986b5701108b23043b0e22d9e782f136cbcfd49aae0a7b56",
+    "size_bytes": 10_514_065,
+    "train_rows": 5_511,
+    "planned_updates": 173,
 }
 """The approved training rows of run 1c, frozen before its launch request: the file's SHA-256
 and size, its row count and the update count one pass of 32 rows per update gives
