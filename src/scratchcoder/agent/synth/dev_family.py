@@ -1092,9 +1092,11 @@ class _Direct:
                         continue
                     kinds_a = first[a] | second.get(a, empty)
                     kinds_b = second[b] | first.get(b, empty)
-                    if a > b:
-                        a, b, kinds_a, kinds_b = b, a, kinds_b, kinds_a
-                    yield "prompt_paraphrase", a, b, kinds_a, kinds_b, frozenset()
+                    # Ordered copies: the loop variables themselves are never reassigned.
+                    if a < b:
+                        yield "prompt_paraphrase", a, b, kinds_a, kinds_b, frozenset()
+                    else:
+                        yield "prompt_paraphrase", b, a, kinds_b, kinds_a, frozenset()
 
 
 def _pair(first: str, second: str) -> tuple[str, str]:

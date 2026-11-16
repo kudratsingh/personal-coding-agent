@@ -1232,3 +1232,34 @@ def test_private_records_are_refused_in_a_work_tree_that_does_not_ignore_them(
         evidence=ignored,
     )
     assert agent_sft_data.main(argv) == 0 and ignored.exists()
+
+
+def test_link_changes_list_each_paraphrase_pair_with_its_own_kinds() -> None:
+    """Two similar prompt sets whose holders interleave (a later holder of the first set
+    before an earlier holder of the second): every pair is listed once, with the kinds of
+    its own two nodes."""
+    first = words("shared", 10) + " tail0"
+    second = words("shared", 10) + " tail1"
+    assert jaccard_of(first, second) >= DEFAULT_RULES.paraphrase
+    kinds = ("user_text", "task", "user_text", "task")
+    texts = (first, second, first, second)
+    old = [
+        dev_family.Labeled(f"synth:n{i}", f"template:t{i}", ((kinds[i], texts[i]),))
+        for i in range(4)
+    ]
+    new = [dev_family.Labeled(f"synth:n{i}", f"template:t{i}") for i in range(4)]
+    removed = dev_family.link_changes(old, new, 0)["removed"]
+    assert removed["summary"]["links"] == 6
+    assert removed["summary"]["by_category"] == {
+        "generated_task_statement": 5,
+        "harness_text": 5,
+    }
+    by_pair = {tuple(row["groups"]): row["item_kinds"] for row in removed["rows"]}
+    assert by_pair[("template:t0", "template:t2")] == ["user_text"]
+    assert by_pair[("template:t1", "template:t3")] == ["task"]
+    assert by_pair[("template:t1", "template:t2")] == ["task", "user_text"]
+
+
+def jaccard_of(a: str, b: str) -> float:
+    x, y = shingles(a, 3), shingles(b, 3)
+    return len(x & y) / len(x | y)
