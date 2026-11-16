@@ -142,7 +142,7 @@ def compare(args: argparse.Namespace) -> int:
         card = json.loads((run_dir / "scorecard.json").read_text(encoding="utf-8"))
         cards.append((run_dir.name, card))
     try:
-        table = scorecard.comparison(cards)
+        table = scorecard.comparison(cards, vary_checkpoint=args.vary_checkpoint)
     except agent_cases.CaseError as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
@@ -406,6 +406,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-noncomparable",
         action="store_true",
         help="write the table even when runs differ outside their configuration (flagged)",
+    )
+    compare_parser.add_argument(
+        "--vary-checkpoint",
+        action="store_true",
+        help="compare checkpoints: the checkpoint may differ, as the one differing factor",
     )
     run_parser.add_argument(
         "--conditions", nargs="+", default=["single", "repair-3"], choices=sorted(loop.CONDITIONS)

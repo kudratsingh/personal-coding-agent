@@ -524,6 +524,8 @@ def _factor_text(factor: str, config: Mapping[str, Any]) -> str:
         )
     if factor == "prefill_name":
         return "prefill_name (harness-supplied function name)"
+    if factor == CHECKPOINT_FACTOR:
+        return f"checkpoint {str(config.get('checkpoint_sha256'))[:12]}"
     return factor
 
 
@@ -555,12 +557,23 @@ def check_cards(cards: Sequence[tuple[str, Mapping[str, Any]]]) -> None:
         check_case_ids(_card_case_ids(card), what=f"run {name}")
 
 
-def comparison(cards: Sequence[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+CHECKPOINT_FACTOR = "checkpoint"
+"""The one identity field a comparison may opt to vary (``vary_checkpoint``): the trained
+checkpoint, as the only factor that differs from the baseline."""
+
+
+def comparison(
+    cards: Sequence[tuple[str, dict[str, Any]]], *, vary_checkpoint: bool = False
+) -> dict[str, Any]:
     """One row per run and model condition: configuration, funnel, solved and cost. The first
     run is the baseline. Every run must share :data:`INVARIANT_FIELDS` with it, or its rows are
     marked non-comparable (with the fields named); each row lists the configuration fields and
     factors that differ from the baseline. A run without funnel data (an earlier scorecard)
-    shows ``None`` for those columns."""
+    shows ``None`` for those columns.
+
+    With ``vary_checkpoint`` the checkpoint leaves the invariants and becomes a factor: a run
+    may then differ from the baseline in its checkpoint only when nothing else differs
+    (``checkpoint_with_another_factor`` otherwise makes the row non-comparable)."""
     rows = []
     if not cards:
         raise ValueError("compare needs at least one run")
@@ -573,7 +586,10 @@ def comparison(cards: Sequence[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
         config = _config(identity)
         own = invariants(identity)
         noncomparable = [
-            field for field in INVARIANT_FIELDS if own[field] != base_invariants[field]
+            field
+            for field in INVARIANT_FIELDS
+            if own[field] != base_invariants[field]
+            and not (vary_checkpoint and field == "checkpoint_sha256")
         ]
         fields = [
             field
@@ -588,6 +604,12 @@ def comparison(cards: Sequence[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
         ]
         if "prefill_name" in changed and len(changed) > 1:
             noncomparable.append("prefill_name_with_another_factor")
+        checkpoint = identity.get("checkpoint_sha256")
+        if vary_checkpoint and checkpoint != base_identity.get("checkpoint_sha256"):
+            if changed:
+                noncomparable.append("checkpoint_with_another_factor")
+            changed = [*changed, CHECKPOINT_FACTOR]
+            fields = [*fields, "checkpoint_sha256"]
         report = card.get("prefill_report") or {}
         for label, group in card["groups"].items():
             if not label.startswith("model/"):
@@ -599,7 +621,10 @@ def comparison(cards: Sequence[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
                     "run": name,
                     "condition": label.split("/", 1)[1],
                     "config": config,
-                    "label": _label(changed, position == 0, config),
+                    "label": _label(
+                        changed, position == 0, {**config, "checkpoint_sha256": checkpoint}
+                    ),
+                    "checkpoint_sha256": checkpoint,
                     "differs_from_baseline": fields,
                     "factors_changed": changed,
                     "comparable": not noncomparable,
@@ -630,10 +655,15 @@ def comparison(cards: Sequence[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
                 }
             )
     return {
-        "schema": "agent-dev-comparison-v3",
+        "schema": "agent-dev-comparison-v4",
         "baseline": cards[0][0],
         "comparable": all(row["comparable"] for row in rows),
-        "invariant_fields": list(INVARIANT_FIELDS),
+        "invariant_fields": [
+            field
+            for field in INVARIANT_FIELDS
+            if not (vary_checkpoint and field == "checkpoint_sha256")
+        ],
+        "varied": [CHECKPOINT_FACTOR] if vary_checkpoint else [],
         "rows": rows,
     }
 
@@ -657,7 +687,14 @@ def comparison_markdown(table: dict[str, Any]) -> str:
         "(and clean tree), cases, case "
         "registry, checkpoint, tokenizer, seeds, decoding rows, conditions, budgets, threads, "
         "batch size, supervisor and runtime image; only the configuration may differ, and the "
-        "name prefill only as the one differing factor. Funnel columns are nested generation "
+        "name prefill only as the one differing factor"
+        + (
+            "; this comparison varies the checkpoint, which may differ only as the one "
+            "differing factor (the label names it)"
+            if table.get("varied")
+            else ""
+        )
+        + ". Funnel columns are nested generation "
         "stages, then side counts, each out of the row's generations. Solved counts instances: "
         "public tests, correctness and preservation checks all passed. Failure classes count "
         "scored instances, name failures generations, harness defects instances, each with its "

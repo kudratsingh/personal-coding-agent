@@ -195,7 +195,9 @@ recovery, or the name prefill) or combined. Sampled decoding is named by what ch
 default T 1.0, top-p 1.0: T 0.6 with top-p 0.95 is "lower temperature plus nucleus sampling
 (T 0.6, top-p 0.95)", never just a lower temperature. The name prefill may differ from the
 baseline only as the one differing factor; combined with another factor the row is marked
-non-comparable. In both markdown tables every count carries its denominator: funnel stages out
+non-comparable. `--vary-checkpoint` compares checkpoints (a trained model against its parent on
+the same cases, seeds and code): the checkpoint then leaves the shared fields and may differ only
+as the one differing factor, labelled with its hash prefix; every other field must still match. In both markdown tables every count carries its denominator: funnel stages out
 of the row's generations or instances, failure classes out of scored instances, name failures
 out of generations and harness defects out of instances.
 

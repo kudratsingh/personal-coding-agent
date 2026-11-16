@@ -616,3 +616,44 @@ def test_inert_tails_are_complete_expressions_that_bind_nothing(tail: list[str])
     found = recovery.recover_text("def f(x):\n    return x\n" + "\n".join(tail), ended_by_eos=False)
     if any(line.strip() and not line.lstrip().startswith("#") for line in tail):
         assert found is not None and found.code == "def f(x):\n    return x"
+
+
+def test_compare_can_vary_the_checkpoint_only_as_the_one_differing_factor() -> None:
+    base, trained = card(), card(checkpoint_sha256="f" * 64)
+    # By default the checkpoint is an invariant.
+    assert not scorecard.comparison([("A", base), ("T", trained)])["comparable"]
+    table = scorecard.comparison([("A", base), ("T", trained)], vary_checkpoint=True)
+    assert table["comparable"] and table["varied"] == ["checkpoint"]
+    assert "checkpoint_sha256" not in table["invariant_fields"]
+    row = table["rows"][-1]
+    assert row["label"] == "single factor: checkpoint ffffffffffff"
+    assert (
+        row["factors_changed"] == ["checkpoint"]
+        and "checkpoint_sha256" in row["differs_from_baseline"]
+    )
+    # The checkpoint together with a configuration factor is not comparable.
+    both = card(checkpoint_sha256="f" * 64, config=config(prompt="training"))
+    mixed = scorecard.comparison([("A", base), ("X", both)], vary_checkpoint=True)
+    assert "checkpoint_with_another_factor" in mixed["rows"][-1]["noncomparable_fields"]
+    # Every other invariant still holds.
+    other = card(checkpoint_sha256="f" * 64, threads=6)
+    held = scorecard.comparison([("A", base), ("Y", other)], vary_checkpoint=True)
+    assert held["rows"][-1]["noncomparable_fields"] == ["threads"]
+    # Same checkpoint: no checkpoint factor.
+    same = scorecard.comparison([("A", base), ("B", card())], vary_checkpoint=True)
+    assert same["rows"][-1]["label"] == "same configuration as baseline"
+    assert "the label names it" in scorecard.comparison_markdown(table)
+
+
+def test_the_compare_command_varies_the_checkpoint_on_request(tmp_path: Path) -> None:
+    from tools import agent_dev_run
+
+    for name, identity in (("A", {}), ("T", {"checkpoint_sha256": "e" * 64})):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "scorecard.json").write_text(json.dumps(card(**identity)), "utf-8")
+    md, js = tmp_path / "c.md", tmp_path / "c.json"
+    command = ["compare", "--runs", str(tmp_path / "A"), str(tmp_path / "T")]
+    command += ["--out-md", str(md), "--out-json", str(js)]
+    assert agent_dev_run.main(command) == 2 and not md.exists()
+    assert agent_dev_run.main([*command, "--vary-checkpoint"]) == 0
+    assert json.loads(js.read_text("utf-8"))["comparable"]
