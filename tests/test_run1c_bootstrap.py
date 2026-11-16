@@ -22,6 +22,7 @@ from test_rehearsal_bootstrap import (
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash is required")
 RUN1C_TESTS = (
     "tests/test_run1c_posttrain.py",
+    "tests/test_run1c_train_rows.py",
     "tests/test_run1c_integration.py",
     "tests/test_executed_specifications.py",
 )

@@ -6,6 +6,10 @@ or a real checkpoint).
 
 Runs 1, 1b and 2 are unchanged: their own tests pass untouched, and the tests at the end of
 this file pin that the new keys and stops are run 1c's only.
+
+The approved specification pins the frozen training rows (``RUN1C_TRAIN_ROWS``). These tests
+bind authored rows, so every test here runs with that pin unset (``unpinned_rows``); the pin
+itself and the tracked file are tested in ``test_run1c_train_rows.py``.
 """
 
 from __future__ import annotations
@@ -88,13 +92,24 @@ def rows_file(path: Path, count: int, *, longer: int = 0, source: str | None = N
     return path
 
 
+UNPINNED = {key: None for key in posttrain_approved.RUN1C_TRAIN_ROWS}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def unpinned_rows() -> Iterator[None]:
+    """The approved specification with the training rows' pin unset, so authored rows bind."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(posttrain_approved, "RUN1C_TRAIN_ROWS", UNPINNED)
+        yield
+
+
 def bind(rows: Path) -> dict[str, Any]:
     """The bind of ``rows`` with their own SHA-256 as the approved one."""
     return posttrain_approved.bind_run1c(rows, expected_sha256=file_sha256(rows))
 
 
 @pytest.fixture(scope="module")
-def bound(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+def bound(unpinned_rows: None, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     """Run 1c's specification bound to 100 authored rows (4 updates of 32)."""
     return bind(rows_file(tmp_path_factory.mktemp("rows") / "train.jsonl", 100))
 
@@ -106,11 +121,8 @@ def fresh(bound: dict[str, Any]) -> dict[str, Any]:
 # The approved specification -----------------------------------------------------------------
 
 
-def test_the_tracked_specification_is_the_approved_run_1c_with_its_placeholders() -> None:
-    assert SPEC_1C.read_bytes() == posttrain_approved.specification_bytes(
-        posttrain_approved.run1c_specification()
-    )
-    raw = json.loads(SPEC_1C.read_text())
+def test_the_unpinned_specification_has_every_bind_value_as_a_placeholder() -> None:
+    raw = posttrain_approved.run1c_specification()
     for field in ("train_rows", "planned_updates"):
         assert raw["sft"][field] is None
     assert raw["inputs"]["sft-train"]["size_bytes"] is None

@@ -62,7 +62,7 @@
     "precision": "bfloat16"
   },
   "sft": {
-    "train_rows": null,
+    "train_rows": 861,
     "planned_dev_tokens": 813765,
     "learning_rate": 6e-05,
     "warmup_fraction": 0.03,
@@ -87,7 +87,7 @@
     "speed_check_warmup_updates": 2,
     "reference_slots_per_second": 59141.39181007806,
     "minimum_speed_fraction": 0.9,
-    "planned_updates": null,
+    "planned_updates": 27,
     "kept_weights": "final",
     "parent_dev_loss": true
   },
@@ -203,8 +203,8 @@
     "sft-train": {
       "kind": "sft-rows",
       "key": null,
-      "size_bytes": null,
-      "sha256": null
+      "size_bytes": 1682063,
+      "sha256": "62f21ed88ecb9d9a0628f494cf24a27733cdf4d96497c902e8c2dd8a0babc827"
     },
     "sft-code-dev": {
       "kind": "sft-rows",

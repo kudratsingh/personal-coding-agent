@@ -27,11 +27,12 @@ plans generation at the floors the standing rule derives with run 1b's host adde
 (``SUPERSEDED_RUN2_TEMPLATES``).
 
 Run 1c (agent SFT, prepared for the owner's launch decision): ``run1c_specification()`` is
-the tracked ``configs/rehearsal-a40-s-post-1c.json`` with its bind values ``null`` (the
-training rows' count, size and SHA-256, the update count, the estimate and the cost limit it
-derives); ``python -m tools.posttrain_approved run1c-bind`` fills them from the frozen rows and
-writes the launch specification, and ``check_run1c`` is what the readiness receipt applies to
-it. Its protocol: the probe on run 1b's SFT weights, one SFT pass from them with run 1b's
+the tracked ``configs/rehearsal-a40-s-post-1c.json``. It pins the approved training rows (their
+count, size and SHA-256 and the update count, ``RUN1C_TRAIN_ROWS``) and leaves ``null`` the
+estimate and the cost limit it derives; ``python -m tools.posttrain_approved run1c-bind`` reads
+the frozen rows, refuses any file but the approved one, fills the estimate and the cost limit
+and writes the launch specification, and ``check_run1c`` is what the readiness receipt applies
+to it. Its protocol: the probe on run 1b's SFT weights, one SFT pass from them with run 1b's
 optimizer, schedule and batch, no special-row redraw, the final weights kept and the parent's
 dev loss measured before the first update, run 1b's format gate, and a greedy evaluation of
 pool dev and the three benchmarks; its floors are the standing rule's over the four hosts
@@ -1034,7 +1035,17 @@ RUN1C_SFT: dict[str, Any] = {
 redraw (the ``special_rows_*`` keys are absent, so the trained rows of the parent are kept and
 train at the plain rate), a fresh optimizer (SFT always starts one), the final weights kept and
 the parent's dev loss measured before the first update. ``train_rows`` and ``planned_updates``
-are fixed at the bind."""
+are ``null`` here; ``run1c_specification`` fills them from ``RUN1C_TRAIN_ROWS``."""
+RUN1C_TRAIN_ROWS: dict[str, Any] = {
+    "sha256": "62f21ed88ecb9d9a0628f494cf24a27733cdf4d96497c902e8c2dd8a0babc827",
+    "size_bytes": 1_682_063,
+    "train_rows": 861,
+    "planned_updates": 27,
+}
+"""The approved training rows of run 1c, frozen before its launch request: the file's SHA-256
+and size, its row count and the update count one pass of 32 rows per update gives
+(``SFTLoader.planned_updates``). ``run1c_specification`` writes them into ``sft`` and the
+``sft-train`` pin, so ``check_run1c`` refuses a launch specification bound to any other rows."""
 RUN1C_PARENT: dict[str, Any] = {
     "kind": "checkpoint",
     "key": "posttrain-runs/1b/23wqovsc9gm8h4/sft-weights/checkpoint.pt",
@@ -1054,8 +1065,9 @@ RUN1C_INPUTS: dict[str, dict[str, Any]] = {
     "humaneval-plus": dict(INPUTS["humaneval-plus"]),
     "mbpp-plus": dict(INPUTS["mbpp-plus"]),
 }
-"""Run 1c's inputs: the tokenizer, run 1b's SFT weights, the agent training rows (their pin
-``null`` until the bind), run 1b's two dev sets, the pool dev export and the three benchmark
+"""Run 1c's inputs: the tokenizer, run 1b's SFT weights, the agent training rows (their size
+and SHA-256 ``null`` here, filled from ``RUN1C_TRAIN_ROWS`` by ``run1c_specification``), run 1b's
+two dev sets, the pool dev export and the three benchmark
 releases. No pool test export, no RL input, no ARC questions and no base checkpoint."""
 RUN1C_EVAL_FILES = (
     "pool-dev-greedy",
@@ -1090,8 +1102,10 @@ def run1c_stages() -> list[dict[str, Any]]:
 
 
 def run1c_specification() -> dict[str, Any]:
-    """Run 1c's approved specification with every bind value ``null`` (the tracked file)."""
-    return {
+    """Run 1c's approved specification, the tracked file: the approved training rows pinned
+    (``RUN1C_TRAIN_ROWS``), the estimate and the cost limit ``null`` until the bind."""
+    rows = RUN1C_TRAIN_ROWS
+    raw = {
         "schema_version": 1,
         "kind": "posttrain-run-specification",
         "run": "1c",
@@ -1106,6 +1120,9 @@ def run1c_specification() -> dict[str, Any]:
         "inputs": json.loads(json.dumps(RUN1C_INPUTS)),
         "r2": {"storage_cap_usd_per_month": 5.0},
     }
+    raw["sft"].update({key: rows[key] for key in RUN1C_BIND_SFT})
+    raw["inputs"]["sft-train"].update(size_bytes=rows["size_bytes"], sha256=rows["sha256"])
+    return raw
 
 
 def write_specification_1c(path: Path = SPECIFICATION_PATH_1C) -> None:
@@ -1151,8 +1168,9 @@ def check_run1c(raw: Mapping[str, Any]) -> None:
     filled. In order: a placeholder still ``null``; a pool test export, any RL or screening
     input, a screening stage; a special-row redraw or another row learning rate; more than one
     pass; a ceiling above $1.50; then any approved value changed (every section equal but for
-    the bind values; every input pin field equal, ``null`` included, but the training rows' size
-    and SHA-256, ``RUN1C_BIND_INPUTS``). The update count must be
+    the bind values; every input pin field equal, ``null`` included; the training rows' count,
+    update count, size and SHA-256 equal to the approved rows' when ``RUN1C_TRAIN_ROWS`` pins
+    them). The update count must be
     the one the rows give, the estimate the projection of this specification at its planning
     rates (``run1c_estimate_usd``), the cost limit the lower of the ceiling and 120% of it, and
     that limit must hold the planned setup and the whole run at the planning rates."""
@@ -1207,6 +1225,9 @@ def check_run1c(raw: Mapping[str, Any]) -> None:
     unbound = {key: value for key, value in sft.items() if key not in RUN1C_BIND_SFT}
     if unbound != {k: v for k, v in approved["sft"].items() if k not in RUN1C_BIND_SFT}:
         differ.append("sft")
+    for key in RUN1C_BIND_SFT:  # The approved rows' count and update count, when pinned.
+        if approved["sft"][key] is not None and sft.get(key) != approved["sft"][key]:
+            differ.append(f"sft.{key}")
     if {k: v for k, v in limits.items() if k not in RUN1C_BIND_LIMITS} != {
         k: v for k, v in approved["limits"].items() if k not in RUN1C_BIND_LIMITS
     } or set(limits) != set(approved["limits"]):
@@ -1255,8 +1276,9 @@ def check_run1c(raw: Mapping[str, Any]) -> None:
 def bind_run1c(train_rows: Path, *, expected_sha256: str) -> dict[str, Any]:
     """Run 1c's launch specification: the tracked one with its bind values filled from the
     training rows file. The file must be the frozen mix the owner approved: its SHA-256 equal to
-    ``expected_sha256`` (the hash quoted in the launch request), never the file of another input
-    (a dev set), and every row of a code-only source (``RUN1C_ROW_SOURCES``). The rows are read
+    ``expected_sha256`` (the hash quoted in the launch request) and to the pinned one
+    (``RUN1C_TRAIN_ROWS``), never the file of another input (a dev set), and every row of a
+    code-only source (``RUN1C_ROW_SOURCES``). The rows are read
     and counted (every row must fit the sequence length, or the run would fail on the Pod), the
     file pinned by size and SHA-256, the update count derived, then the estimate projected from
     the filled specification and the cost limit derived from it. The result passes
@@ -1272,7 +1294,17 @@ def bind_run1c(train_rows: Path, *, expected_sha256: str) -> dict[str, Any]:
             f"{train_rows} has SHA-256 {digest}, not the approved training rows' {expected}"
         )
     raw = run1c_specification()
-    others = [name for name, pin in raw["inputs"].items() if pin.get("sha256") == digest]
+    pinned = raw["inputs"]["sft-train"]["sha256"]
+    if pinned is not None and digest != pinned:
+        raise ValueError(
+            f"{train_rows} has SHA-256 {digest}, not run 1c's approved training rows' {pinned} "
+            "(RUN1C_TRAIN_ROWS)"
+        )
+    others = [
+        name
+        for name, pin in raw["inputs"].items()
+        if name != "sft-train" and pin.get("sha256") == digest
+    ]
     if others:
         raise ValueError(f"{train_rows} is the file of run 1c's {others} input, not training rows")
     sft = raw["sft"]

@@ -407,10 +407,10 @@ if [[ "$RUN_TESTS" == "1" ]]; then
     fi
     if [[ "$RUN" == "1c" ]]; then
       # Run 1c's approved specification, its bind and its worker (the final weights, the
-      # parent's dev loss, the estimate stop), its replay into the Mac side, and the frozen
-      # executed specifications.
-      TESTS+=(tests/test_run1c_posttrain.py tests/test_run1c_integration.py
-        tests/test_executed_specifications.py)
+      # parent's dev loss, the estimate stop), the approved rows' pin, its replay into the Mac
+      # side, and the frozen executed specifications.
+      TESTS+=(tests/test_run1c_posttrain.py tests/test_run1c_train_rows.py
+        tests/test_run1c_integration.py tests/test_executed_specifications.py)
     fi
   fi
   python3 -m pytest "${TESTS[@]}" -q -p no:cacheprovider 2>&1 | tail -5

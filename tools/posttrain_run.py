@@ -303,12 +303,12 @@ RUN1C_BIND_FIELDS: tuple[tuple[str, ...], ...] = (
     ("limits", "gate_estimate_usd"),
     ("limits", "cost_limit_usd"),
 )
-"""Run 1c's values fixed when its training rows are bound, ``null`` placeholders in the
-tracked specification: the rows' count, the update count, the file's size and SHA-256, the
-estimate (the cost projection of the filled specification at its planning rates) and the cost
-limit it derives (the lower of the ceiling and 120% of it). ``python -m
-tools.posttrain_approved run1c-bind`` fills them; the worker and the readiness receipt refuse
-a placeholder."""
+"""Run 1c's values fixed when its training rows are bound: the rows' count, the update count,
+the file's size and SHA-256 (pinned to the approved rows in the tracked specification,
+``posttrain_approved.RUN1C_TRAIN_ROWS``), the estimate (the cost projection of the filled
+specification at its planning rates) and the cost limit it derives (the lower of the ceiling
+and 120% of it), both ``null`` in the tracked file. ``python -m tools.posttrain_approved
+run1c-bind`` fills them; the worker and the readiness receipt refuse a placeholder."""
 RUN1C_ESTIMATE_FIELDS = ("limits.gate_estimate_usd", "limits.cost_limit_usd")
 
 
