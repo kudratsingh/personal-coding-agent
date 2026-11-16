@@ -40,7 +40,9 @@ def test_the_catalog_meets_the_breadth_rules() -> None:
             assert template.caller and template.family.func(template.caller).module != (
                 template.family.func(template.target).module
             )
-        assert cases.CASE_ID.match(instances.instance_id(template.id, max(template.bugs), 999))
+        longest = max(template.bugs, key=len)
+        assert cases.CASE_ID.match(instances.instance_id(template.id, longest, 999))
+        assert cases.CASE_ID.match(instances.instance_id(template.id, longest, 999, 9999))
 
 
 def test_every_template_and_bug_kind_builds_with_parseable_canonical_sources() -> None:

@@ -80,8 +80,14 @@ def instance_seed(seed_base: int, template_id: str, bug: str, index: int) -> int
     return int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big")
 
 
-def instance_id(template_id: str, bug: str, index: int) -> str:
-    return f"{template_id}-{bug}-{index:03d}"
+def instance_id(template_id: str, bug: str, index: int, seed_base: int = 0) -> str:
+    """``<template>-<bug>-<index>``; a non-zero seed base is part of the ID
+    (``<template>-<bug>-s<base>-<index>``), so builds from different seed bases never share
+    an ID for different content."""
+    if seed_base < 0:
+        raise TemplateError(f"seed base {seed_base} is negative")
+    base = f"-s{seed_base}" if seed_base else ""
+    return f"{template_id}-{bug}{base}-{index:03d}"
 
 
 def _literal(value: Any) -> str:
@@ -443,7 +449,7 @@ def build(
         }
     )
     instance = Instance(
-        id=instance_id(template.id, bug, index),
+        id=instance_id(template.id, bug, index, seed_base),
         template=template,
         bug=bug,
         index=index,

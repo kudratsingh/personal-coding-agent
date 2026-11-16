@@ -140,11 +140,16 @@ def generate(args: argparse.Namespace, loader: Loader = _tokenizer) -> int:
         for template in catalog().templates
         if not args.templates or template.id in args.templates
     ]
+    per_reply: Counter[str] = Counter()
+    try:
+        prior_ids, prior = _prior_instances(args.prior_instances or (), per_reply)
+    except (OSError, ValueError, KeyError) as error:
+        print(f"refused: prior instances: {error}", file=sys.stderr)
+        return 2
     out.mkdir(parents=True)
     kept: list[dict[str, Any]] = []
     dropped: list[dict[str, Any]] = []
     per_template: Counter[str] = Counter()
-    per_reply: Counter[str] = Counter()
     for template, bug, index in instances.plan_instances(selected, args.per_bug):
         start = per_template[template.id] * args.mutants
         try:
@@ -196,6 +201,9 @@ def generate(args: argparse.Namespace, loader: Loader = _tokenizer) -> int:
                 }
             )
             continue
+        if instance.id in prior_ids:
+            print(f"refused: {instance.id} is already in a prior build", file=sys.stderr)
+            return 2
         static = instances.static_check(instance, encoder, blocklist)
         if static["problems"]:
             dropped.append(
@@ -244,6 +252,7 @@ def generate(args: argparse.Namespace, loader: Loader = _tokenizer) -> int:
         "per_bug": args.per_bug,
         "mutants_per_instance": args.mutants,
         "max_instances_per_reply": args.max_per_reply,
+        "prior_instances": prior,
         "replies": _reply_report(kept, selected, args.capacity_draws, args.seed_base),
         "tokenizer_sha256": _sha_file(args.tokenizer),
         "families_sha256": _sha_file(args.families),
@@ -261,6 +270,37 @@ def generate(args: argparse.Namespace, loader: Loader = _tokenizer) -> int:
     atomic_json(out / "generate.json", record)
     print(json.dumps(record["counts"]))
     return 0
+
+
+def _prior_instances(
+    directories: Sequence[Path], per_reply: Counter[str]
+) -> tuple[set[str], list[dict[str, Any]]]:
+    """Count the replies of earlier generated instance sets toward the reply cap.
+
+    Each directory's ``generate.json`` must name the registry the directory holds now, so the
+    counts are those of exactly the instances that may be built. Returns the prior instance
+    IDs (a new instance may not reuse one) and a record of each directory.
+    """
+    ids: set[str] = set()
+    record: list[dict[str, Any]] = []
+    for directory in directories:
+        generated = json.loads((directory / "generate.json").read_text(encoding="utf-8"))
+        registry = agent_cases.registry_sha256(directory)
+        if generated["registry_sha256"] != registry:
+            raise ValueError(f"{directory}: generate.json names another registry")
+        for row in generated["kept"]:
+            if row["id"] in ids:
+                raise ValueError(f"{row['id']} appears in two prior builds")
+            ids.add(row["id"])
+            per_reply[row["reference_sha256"]] += 1
+        record.append(
+            {
+                "directory": str(directory),
+                "registry_sha256": registry,
+                "instances": len(generated["kept"]),
+            }
+        )
+    return ids, record
 
 
 def _reply_report(
@@ -769,6 +809,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="at most this many instances share one reference target (0: no cap)",
     )
     g.add_argument(
+        "--prior-instances",
+        type=Path,
+        nargs="+",
+        help="earlier generated sets whose replies count toward --max-per-reply",
+    )
+    g.add_argument(
         "--capacity-draws",
         type=int,
         default=200,
@@ -887,7 +933,14 @@ PATH_ARGS = (
     "replay_rejected",
     "specs",
 )
-PATH_LIST_ARGS = ("seed_from", "cases", "benchmarks", "build", "controls_from")
+PATH_LIST_ARGS = (
+    "seed_from",
+    "cases",
+    "benchmarks",
+    "build",
+    "controls_from",
+    "prior_instances",
+)
 
 
 def main(

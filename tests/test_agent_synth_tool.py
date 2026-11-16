@@ -15,7 +15,7 @@ from agent_fixtures import ARITH, write_case, write_registry
 from synth_fixtures import Chunks, SynthExecutor, claim_errors, families_json
 
 from scratchcoder.agent import cases, workspace
-from scratchcoder.agent.synth import contamination, mix
+from scratchcoder.agent.synth import contamination, instances, mix
 from scratchcoder.agent.synth import ledger as call_ledger
 from scratchcoder.data.chat import Rendered
 from scratchcoder.data.sft import SFTRow, read_rows
@@ -749,3 +749,51 @@ def test_generate_passes_over_a_kind_whose_only_mutant_an_earlier_kind_took(
     for row in record["kept"]:
         assert len(row["mutation_kinds"]) == 2 == len(set(row["mutation_kinds"]))
         assert set(row["mutation_kinds"]) <= set(row["applicable_mutation_kinds"])
+
+
+def test_generate_with_another_seed_base_gets_new_ids_and_counts_prior_replies(
+    tmp_path: Path,
+) -> None:
+    tokenizer = tmp_path / "tokenizer.json"
+    tokenizer.write_text("{}", encoding="utf-8")
+    families = families_json(tmp_path / "families.json")
+
+    def generate(out: Path, *extra: str) -> int:
+        argv = [
+            "generate",
+            "--out",
+            str(out),
+            "--tokenizer",
+            str(tokenizer),
+            "--families",
+            str(families),
+            "--templates",
+            "stock1",
+            "--capacity-draws",
+            "30",
+            *extra,
+        ]
+        return agent_sft_data.main(argv, loader=_loader)
+
+    first = tmp_path / "first"
+    assert generate(first, "--per-bug", "1", "--max-per-reply", "1") == 0
+    before = json.loads((first / "generate.json").read_text())
+    used = {row["reference_sha256"] for row in before["kept"]}
+    # The same seed base again would reuse the prior IDs: refused.
+    assert generate(tmp_path / "again", "--prior-instances", str(first)) == 2
+    second = tmp_path / "second"
+    argv = ["--seed-base", "7", "--per-bug", "3", "--max-per-reply", "1"]
+    assert generate(second, *argv, "--prior-instances", str(first)) == 0
+    after = json.loads((second / "generate.json").read_text())
+    assert all("-s7-" in row["id"] for row in after["kept"])
+    # With a cap of one, a reply the prior set used is never used again.
+    assert not used & {row["reference_sha256"] for row in after["kept"]}
+    assert after["prior_instances"][0]["instances"] == len(before["kept"])
+    # A prior set whose registry changed after generation is refused.
+    (first / "registry.json").write_text("{}", encoding="utf-8")
+    assert generate(tmp_path / "third", *argv, "--prior-instances", str(first)) == 2
+
+
+def test_instance_ids_name_a_non_zero_seed_base() -> None:
+    assert instances.instance_id("dice2", "ascending", 4) == "dice2-ascending-004"
+    assert instances.instance_id("dice2", "ascending", 4, 7) == "dice2-ascending-s7-004"

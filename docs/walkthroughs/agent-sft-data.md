@@ -130,7 +130,10 @@ hash; a copy of a counted record is skipped and reported.
   same reply (the reference target), and a template renders only a limited number of distinct
   targets. So `generate` caps the instances that share one reply (`--max-per-reply`, three by
   default) and reports, per template, the distinct replies kept and the distinct replies its
-  seeds can reach. Size an expansion by that reach, not by the call budget. `mix` applies the
+  seeds can reach. Size an expansion by that reach, not by the call budget. An expansion uses
+  a new `--seed-base`, which becomes part of each instance ID (`<template>-<bug>-s<base>-<n>`),
+  and names the earlier sets with `--prior-instances`: their replies count toward the cap, and
+  an ID they already hold is refused. `mix` applies the
   same cap and reports distinct replies, distinct (prompt, reply) pairs and the most rows on one
   reply, beside distinct templates, families, workflow types and mutation kinds.
 - **Contamination results are bound to their inputs.** `mix` needs both results (agent rows
