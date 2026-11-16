@@ -21,6 +21,7 @@ Modules:
 - :mod:`.ledger`: the persisted sandbox-call ledger and its cap.
 - :mod:`.rows`: driving the harness loop with a scripted policy and rendering chat-v1 rows.
 - :mod:`.contamination`: the status-only agent-case contamination check.
+- :mod:`.dev_family`: the development task-family rule on synthetic and replay rows.
 - :mod:`.mix`: mixing agent and replay rows by assistant-loss tokens.
 """
 

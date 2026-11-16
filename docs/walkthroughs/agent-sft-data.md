@@ -60,7 +60,8 @@ row and two repair rows.
 | Loop | case, mutants, reference, oracle text | prompts of every turn, the loop's statuses |
 | Render rows | prompt, reference | chat-v1 `SFTRow` (`id`, `ids`, `source`, `spans`) plus a metadata line |
 | Contamination | rows | rejected row IDs only, the input's SHA-256 and the case registries checked |
-| Mix | agent rows, replay rows, both contamination results | rows at a target ratio of assistant-loss tokens, at most a few instances per distinct reply |
+| Dev family | pool dev and train, instance sets and builds, specs, rows metadata, replay index | one status-only result: dropped instances and rows with reason classes, newly excluded replay rows, both inputs' SHA-256 |
+| Mix | agent rows, replay rows, both contamination results, the dev-family result | rows at a target ratio of assistant-loss tokens, at most a few instances per distinct reply |
 
 Sandbox calls per instance, with `k` mutants: the original's public tests (F0), one public run
 per mutant, the reference's public run, one grading call and the original against the hidden
@@ -144,12 +145,111 @@ hash; a copy of a counted record is skipped and reported.
   reply, beside distinct templates, families, workflow types and mutation kinds.
 - **Contamination results are bound to their inputs.** `mix` needs both results (agent rows
   and replay rows). Each must have been computed on exactly the file being mixed (by SHA-256)
-  and against exactly the evaluation-case registries named with `--case-registry-sha256`. The
-  development-task check on these rows is an n-gram check only, and every result and manifest
-  says so.
+  and against exactly the evaluation-case registries named with `--case-registry-sha256`.
+  Their development-task signal is an n-gram check; the development task-family rule is a
+  separate result that `mix` also requires (next section).
 - **Training instances are not evaluation cases.** Generated instances keep the case format,
   but the case loader refuses them unless asked for them (`synthetic=True`), so they cannot be
   scored as development cases. A path with any part starting with `heldout` is refused.
+
+## Development task families (`dev-family`)
+
+An n-gram check misses a row that asks for the same behaviour as a development task in other
+words. The pool's development split is protected by a task-family rule, `task-clusters-v1`
+([walkthrough](task-clusters.md)), and `dev-family` applies that same rule to the
+synthetic rows and to the replay rows (`scratchcoder.agent.synth.dev_family`). It runs
+nothing: it reads text and parses it with `ast`.
+
+**Nodes.** The rule needs a prompt and a solution per task. A pool task has one of each. A
+synthetic instance gets several, so that no reading of "its prompt" or "its solution" is
+missed:
+
+- prompts: the task statement, the template's specification text (from every `specs.json`
+  given), the target function's docstring and the user text of each of its rows;
+- solutions: the reference target (every row's reply), the original buggy or stub target,
+  each module of the fixed repository, and each top-level function or class of those modules
+  on its own (test modules are left out; tests are never a signal).
+
+The instance stands for every (prompt, solution) pair of these, joined into one family, so a
+link through any pair marks the whole instance. Its node ID is `synth:<instance>`, which can
+never equal a pool task's upstream ID. Two nodes under one instance ID (two instance sets that
+reuse an ID) are joined, as the pilot intake joins repeated IDs.
+
+**Links and families.** Two nodes are linked by a union signal: equal docstring-stripped
+solution AST, equal AST up to renaming, equal upstream ID, or 3-word prompt shingle Jaccard at
+least 0.5. A family is a connected component. The graph holds every pool development task,
+every pool training task and every synthetic instance: accepted ones, the builds' rejected
+ones, and superseded sets (`--bridge-instances`). Rejected and superseded instances are never
+judged, but their links count, so a kept instance that reaches a development task only through
+a rejected one is still caught ("bridge protection"). Excluded instances stay in the graph.
+
+**Judging an accepted instance**, as the holdout integrity scan judges a subject:
+
+| Status | When | Reason class |
+| --- | --- | --- |
+| excluded | its family holds any development task | `dev_family` |
+| excluded | it shares a defined function or class name with a development task at prompt Jaccard ≥ 0.25 | `dev_named_paraphrase` |
+| flagged | otherwise, a shared name at prompt Jaccard ≥ 0.10 | `dev_named_flag` |
+| clear | otherwise | |
+
+Excluded and flagged instances are both dropped: a flag cannot be adjudicated without
+behaviour runs, so it is treated as unresolved and kept out. Then every instance of a template
+that holds a dropped instance is dropped too (`template`), since a template is one task family
+with renamed variants. A dropped instance loses all its rows (the edit row and both repair
+rows). The result reports instance-level and template-expanded counts; the expanded set is the
+one `mix` uses.
+
+**Replay rows** are pool training tasks, judged by the family rule when the replay set was
+built. A replay row is dropped only when synthetic nodes create a new chain: its family holds
+a development task with them and did not without them. Rows whose family held a development
+task without synthetic nodes keep their adjudicated outcome and are counted; so are rows with
+a direct shared-name edge to a development task (pending flag edges stay as the replay stage
+reported them).
+
+**Why the efficient form is the same rule.** The cross product of an instance's prompts and
+solutions can hold hundreds of items, and pairwise edges among identical keys are quadratic.
+The port keeps only what decides the outcome: nodes sharing a key are chained instead of
+linked pairwise (same components); identical shingle sets are chained and every other prompt
+pair is found once by the exact prefix-filtered search; and an instance's strongest
+shared-name edge to a development task is its highest prompt Jaccard over the targets that
+define one of its names. The reference tests run copies of the original `dev_family_ids` and
+`scan` on the cross-product items of small fixtures and check that the port decides the same.
+
+### Worked example
+
+Development task `d0` sums `values` times three. Accepted instance `A` ships a helper
+`shared_helper(z)`. Rejected instance `R` ships the same helper, and its task statement
+paraphrases `d0`'s prompt (Jaccard ≥ 0.5). Without `R`, `A` is clear. With `R` in the graph,
+`A`—`R` share a solution AST and `R`—`d0` share a paraphrase, so `A` is in `d0`'s family and
+is excluded. Instance `F` defines a function with `d0`'s name and its task shares a few
+3-word shingles with `d0`'s prompt (Jaccard 0.13): it is flagged and dropped. `F`'s template
+sibling `G` is clear on its own; it is dropped by template expansion. A pool training task
+`t` shares only its program with a superseded instance whose module also holds `d1`'s
+program renamed: `t` is a replay row newly excluded.
+
+### Results and binding
+
+`dev-family` writes one result for both sides, status only (instance and row IDs, reason
+classes, counts): `dev_family: "task-clusters-v1"`, the thresholds, the pool development and
+training files' SHA-256, every instance set's registry SHA-256 and build file SHA-256, the
+specification files' SHA-256, and per side `input_kind` and `input_sha256` (the rows metadata
+and the decoded replay index). It never writes a prompt, solution, signal or development
+task ID. `mix --dev-family` refuses a result for another input, another rule or other
+thresholds, one that did not judge every mixed replay kind, or one whose development file
+differs from the file a contamination result checked; the agent-case and benchmark
+contamination results are still required. The mix record states both development checks.
+
+```bash
+uv run --locked python -m tools.agent_sft_data dev-family \
+  --dev POOL/dev.jsonl --train POOL/train.jsonl \
+  --judged INSTANCES_A BUILD_A --judged INSTANCES_B BUILD_B \
+  --bridge-instances SUPERSEDED --specs SPECS_1 SPECS_2 \
+  --rows-meta ROWS_META --decoded REPLAY_INDEX --out DEV_FAMILY.json
+```
+
+Limits: the rule is static, so two programs that behave alike but share no signal are not
+linked; and because every instance of a template shares its specification text, one link
+usually puts the whole template in a development family.
 
 ## Verification
 
@@ -166,10 +266,16 @@ hash; a copy of a counted record is skipped and reported.
   seeding, lock and record keys.
 - `tests/test_agent_synth_tool.py`: contamination signals and status-only output, mixing by
   loss tokens and the reply cap, and the `tools/agent_sft_data.py` subcommands, including the
-  receipt, cap, ledger, oracle-pin, control-gate, contamination-binding, held-out and
-  synthetic-case refusals.
+  receipt, cap, ledger, oracle-pin, control-gate, contamination-binding, dev-family-binding,
+  held-out and synthetic-case refusals.
+- `tests/test_agent_dev_family.py`: the reference tests against copies of `dev_family_ids` and
+  `scan` (`tests/dev_family_reference.py`) on cross-product items, the link construction
+  against `find_edges` components, each status and reason, the bridge regressions (kept
+  instance and replay row reaching a development task through a rejected instance), template
+  expansion, flagged instances dropped, the subcommand's result and refusals, and the reader
+  on `generate` output.
 
-Run them with `uv run --locked pytest tests/test_agent_synth*.py`.
+Run them with `uv run --locked pytest tests/test_agent_synth*.py tests/test_agent_dev_family.py`.
 
 ## Questions and answers
 
@@ -184,3 +290,7 @@ Run them with `uv run --locked pytest tests/test_agent_synth*.py`.
    locate, budgets, truncations and condensed sandbox output.
 4. *What does a 1:1 mixture mean here?* Equal assistant-loss tokens on the agent and replay
    sides. Row counts are reported beside it.
+5. *Why drop a whole template when one instance matches a development task?* A template's
+   instances differ only in names, constants and bug kinds; they are one task family. A
+   flagged or named-paraphrase match cannot be resolved without behaviour runs, so the whole
+   family stays out.

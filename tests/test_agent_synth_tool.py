@@ -9,9 +9,20 @@ import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from agent_fixtures import ARITH, write_case, write_registry
+from dev_family_fixtures import (
+    dev_family_argv,
+    pool_task,
+    register,
+    words,
+    write_build,
+    write_instance,
+    write_pool,
+    write_specs,
+)
 from synth_fixtures import Chunks, SynthExecutor, claim_errors, families_json
 
 from scratchcoder.agent import cases, workspace
@@ -457,7 +468,8 @@ def test_validate_and_build_writes_rows_records_and_ledger(
     assert document["builds"][0]["distinct_prompt_reply_pairs"] == 6
     assert document["builds"][0]["max_rows_per_reply"] <= 6
     assert document["instances"]["distinct_replies"] >= 1
-    assert "not applied" in document["contamination_scope"]["development_tasks"]
+    assert "task-clusters-v1" in document["contamination_scope"]["development_tasks"]
+    assert "not applied" not in document["contamination_scope"]["development_tasks"]
     assert document["ledger"]["total"] == PRIOR_CALLS + executor.calls
     assert len(document["templates"]) >= 40
 
@@ -580,12 +592,12 @@ def _mix_inputs(tmp_path: Path) -> dict[str, Path]:
                     "id": row.id,
                     "kind": "edit",
                     "instance": f"i{n}",
-                    "template_id": "t",
+                    "template_id": f"t{n}",
                     "family": "f",
                     "workflow_type": "W1",
                     "mutation_kind": None,
                     "prompt_sha256": row.id,
-                    "user_text": f"fix the area helper number {n}",
+                    "user_text": words(f"fix{n}area", 8),
                     "reply": f"def area{n}(w, h):\n    return w * h",
                 }
             )
@@ -622,7 +634,31 @@ def _mix_inputs(tmp_path: Path) -> dict[str, Path]:
         ]
         assert agent_sft_data.main(argv) == 0
         results[side] = out
-    return {"meta": meta, "index": index, **results}
+    # The dev-family result: instance i2 shares its target program with a dev task.
+    root = tmp_path / "synth-instances"
+    for n in range(3):
+        write_instance(
+            root,
+            f"i{n}",
+            template=f"t{n}",
+            task=words(f"task{n}", 12),
+            reference=f"def area{n}(w, h):\n    return w * h + {n}\n",
+        )
+    register(root)
+    dev = write_pool(
+        tmp_path / "pool" / "dev.jsonl",
+        [pool_task("d0", words("devp", 20), "def other(w, h):\n    return w * h + 2\n", "dev")],
+    )
+    train = write_pool(
+        tmp_path / "pool" / "train.jsonl",
+        [pool_task(f"r{n}", words(f"trainp{n}", 20), None, "train") for n in range(3)],
+    )
+    build = write_build(tmp_path / "synth-build", {f"i{n}": True for n in range(3)})
+    specs = write_specs(tmp_path / "specs.json", {f"t{n}": words(f"spec{n}", 12) for n in range(3)})
+    family = tmp_path / "dev-family.json"
+    argv = dev_family_argv(dev, train, [(root, build)], [specs], meta, index, family)
+    assert agent_sft_data.main(argv) == 0
+    return {"meta": meta, "index": index, "family": family, **results}
 
 
 def _mix_argv(tmp_path: Path, paths: dict[str, Path], out: str, *registries: str) -> list[str]:
@@ -640,6 +676,8 @@ def _mix_argv(tmp_path: Path, paths: dict[str, Path], out: str, *registries: str
         str(paths["agent"]),
         "--replay-rejected",
         str(paths["replay"]),
+        "--dev-family",
+        str(paths["family"]),
         "--case-registry-sha256",
         *registries,
         "--out",
@@ -660,6 +698,13 @@ def test_mix_needs_both_contamination_results_for_these_inputs_and_case_sets(
     record = json.loads((tmp_path / "mix-ok" / "mix-record.json").read_text())
     assert record["case_registries"] == [registry]
     assert record["contamination"]["agent"]["input_sha256"] == result["input_sha256"]
+    # The dev-family result drops every row of i2; the record states the family rule.
+    assert record["dev_family"]["rule"] == "task-clusters-v1"
+    assert record["dev_family"]["agent_rejected"] == 1 and record["agent"]["rows"] == 2
+    assert "task-clusters-v1" in record["dev_method"]
+    assert "not applied" not in json.dumps(record)
+    mixed = {row.id for row in read_rows(tmp_path / "mix-ok" / "mix.jsonl")}
+    assert "agent-sft1/i2/edit" not in mixed
     # A case set the results were not checked against (e.g. the second evaluation set).
     argv = _mix_argv(tmp_path, paths, "mix-more", registry, "e" * 64)
     assert agent_sft_data.main(argv) == 2
@@ -854,3 +899,47 @@ def test_older_control_rows_without_a_checks_key_still_gate(tmp_path: Path) -> N
     marked = [{**row, "checks": "independent"} for row in rows]
     target.write_text("".join(json.dumps(row) + "\n" for row in marked))
     assert _prior_controls([target], {"t": oracle}) == {}
+
+
+def test_mix_requires_the_dev_family_result_for_these_inputs(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression (e): mix refuses without the dev-family result, or with one for another
+    input, another rule or thresholds, or fewer replay kinds."""
+    paths = _mix_inputs(tmp_path)
+    registry = cases.registry_sha256(tmp_path / "evalcases")
+    argv = _mix_argv(tmp_path, paths, "mix-none", registry)
+    del argv[argv.index("--dev-family") : argv.index("--dev-family") + 2]
+    with pytest.raises(SystemExit):
+        agent_sft_data.main(argv)
+    # A contamination result where the dev-family result belongs.
+    wrong = {**paths, "family": paths["agent"]}
+    assert agent_sft_data.main(_mix_argv(tmp_path, wrong, "mix-wrong", registry)) == 2
+    assert "not a dev-family result" in capsys.readouterr().err
+    original = json.loads(paths["family"].read_text())
+
+    def variant(name: str, change: dict[str, Any]) -> int:
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps({**original, **change}))
+        return agent_sft_data.main(_mix_argv(tmp_path, {**paths, "family": path}, name, registry))
+
+    other_input = {**original["agent"], "input_sha256": "0" * 64}
+    assert variant("mix-other-input", {"agent": other_input}) == 2
+    assert "was not computed on" in capsys.readouterr().err
+    swapped = {"agent": original["replay"], "replay": original["agent"]}
+    assert variant("mix-swapped", swapped) == 2
+    assert "another kind of input" in capsys.readouterr().err
+    assert variant("mix-rule", {"dev_family": "task-clusters-v0"}) == 2
+    assert variant("mix-rules", {"rules": {**original["rules"], "named_flag": 0.2}}) == 2
+    assert variant("mix-kinds", {"replay": {**original["replay"], "kinds": []}}) == 2
+    assert "did not judge replay kinds" in capsys.readouterr().err
+    pool = {**original["pool"], "dev_sha256": "0" * 64}
+    agent_result = json.loads(paths["agent"].read_text())
+    agent_result["index"]["dev_sha256"] = "1" * 64
+    paths["agent"].write_text(json.dumps(agent_result))
+    assert variant("mix-dev", {"pool": pool}) == 2
+    assert "another development file" in capsys.readouterr().err
+    # The rows metadata changed after the check.
+    paths["meta"].write_text(paths["meta"].read_text() + "\n")
+    assert agent_sft_data.main(_mix_argv(tmp_path, paths, "mix-stale", registry)) == 2
+    assert not any(path.name.startswith("mix-") and path.is_dir() for path in tmp_path.iterdir())

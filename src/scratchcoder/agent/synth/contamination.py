@@ -17,9 +17,9 @@ holds; the output names rejected row IDs only, never the matching case, signal o
 5. **Benchmarks.** It shares a 13-gram with a benchmark prompt or reference solution
    (HumanEval, HumanEval+, MBPP+), counting only 13-grams with at least three word tokens.
 6. **Development tasks.** The same with the pool's development split (prompt and solution).
-   This is an n-gram check only (:data:`DEV_METHOD`): a row on the same concept as a
-   development task in different words is not caught, and the task-family rule used for
-   replay rows is not applied here. Every result says so in ``index.dev_method``.
+   This signal is an n-gram check (:data:`DEV_METHOD`). The development task-family rule is
+   applied by :mod:`scratchcoder.agent.synth.dev_family`, whose result ``mix`` requires
+   beside this one.
 
 A result records its input file's SHA-256 and kind (``input_sha256``, ``input_kind``) and
 the registry SHA-256 of every evaluation-case root it was checked against, so that a later
@@ -49,7 +49,8 @@ from scratchcoder.data.filters import ContaminationIndex
 SCHEMA = "agent-case-contamination-v1"
 DEV_METHOD = (
     "13-gram overlap (at least three word tokens) with the pool development split's prompts "
-    "and solutions; the development task-family rule is not applied to these rows"
+    "and solutions; the development task-family rule is applied by the separate dev-family "
+    "result, which mix requires"
 )
 NGRAM = 13
 JACCARD = 0.25

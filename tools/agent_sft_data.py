@@ -38,9 +38,17 @@ anything is opened:
   (``scratchcoder.agent.synth.contamination``) on generated instances, built rows or a decoded
   replay index; writes the rejected row IDs only, with the input's SHA-256 and kind and the
   registry of every case set checked.
+- ``dev-family``: the development task-family rule (``task-clusters-v1``,
+  ``scratchcoder.agent.synth.dev_family``) on the accepted instances of every ``--judged``
+  build, with pool development and training tasks, the builds' rejected instances and any
+  ``--bridge-instances`` set in the family graph, and on the replay index's rows (new chains
+  through synthetic nodes only). Drops every row of an excluded or flagged instance and of
+  every instance of its template; writes one status-only result bound to the rows metadata
+  and the replay index. Runs nothing.
 - ``mix``: agent rows plus replay rows at a target ratio of assistant-loss tokens. It needs
   both contamination results, computed on exactly these inputs and against exactly the case
-  registries named by ``--case-registry-sha256``, and caps instances per distinct reply.
+  registries named by ``--case-registry-sha256``, and the dev-family result for both sides,
+  and caps instances per distinct reply.
 - ``manifest``: families, templates, bug and mutation kinds, workflow types, counts, file
   hashes and ledger totals.
 
@@ -65,6 +73,7 @@ from scratchcoder.agent import execution
 from scratchcoder.agent.synth import (
     GENERATOR_VERSION,
     contamination,
+    dev_family,
     independent,
     instances,
     mutation,
@@ -78,6 +87,7 @@ from scratchcoder.agent.synth.template import TemplateError
 from scratchcoder.common.records import atomic_json, git_state, utc_now
 from scratchcoder.data.chat import TextDecoder, TextEncoder
 from scratchcoder.data.sft import read_rows
+from scratchcoder.eval.tasks import Task
 from tools.admission_check import _receipt_image
 from tools.verifier_scan import SealedPathError, guard
 
@@ -98,6 +108,11 @@ MUTATION_PREFERENCE = (
 """Order in which a template's applicable kinds are cycled (kinds more likely to change the
 public tests' outcome first); every applicable kind is still used across the instances."""
 Loader = Callable[[Path], tuple[TextEncoder, TextDecoder]]
+DEV_CHECKS = (
+    f"development tasks: the task-family rule {dev_family.RULE} on both sides (dev-family "
+    "result), and 13-gram overlap with development prompts and solutions where a "
+    "contamination result names a development file (dev_ngram_sha256)"
+)
 
 
 def _tokenizer(path: Path) -> tuple[TextEncoder, TextDecoder]:
@@ -751,6 +766,222 @@ def run_contamination(args: argparse.Namespace) -> int:
     return 0
 
 
+def _jsonl(path: Path) -> list[dict[str, Any]]:
+    return _hashed_jsonl(path)[0]
+
+
+def _hashed_jsonl(path: Path) -> tuple[list[dict[str, Any]], str]:
+    """The rows of a JSONL file and the SHA-256 of exactly the bytes they were parsed from."""
+    data = path.read_bytes()
+    rows = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+    return rows, hashlib.sha256(data).hexdigest()
+
+
+def _pool_tasks(path: Path, split: str) -> list[Task]:
+    tasks = [Task(**row) for row in _jsonl(path)]
+    if any(task.split != split for task in tasks):
+        raise ValueError(f"{path}: every task must be a {split} task")
+    if len({task.id for task in tasks}) != len(tasks):
+        raise ValueError(f"{path}: repeated task IDs")
+    return tasks
+
+
+def _dev_family_inputs(
+    args: argparse.Namespace, meta: Sequence[dict[str, Any]]
+) -> tuple[dict[str, Any], list[dev_family.Node], list[dev_family.Node], dict[str, str]]:
+    """Subject and bridge nodes, each subject's template, and the record of every source."""
+    spec_texts = dev_family.load_specs(args.spec_files)
+    rows_by_instance: dict[str, list[dict[str, Any]]] = {}
+    if len({str(row["id"]) for row in meta}) != len(meta):
+        raise ValueError("the rows metadata repeats a row ID")
+    for row in meta:
+        rows_by_instance.setdefault(str(row["instance"]), []).append(row)
+    subjects: list[dev_family.Instance] = []
+    bridges: list[dev_family.Instance] = []
+    record: dict[str, Any] = {"judged": [], "bridges": []}
+    for directory, build in args.judged:
+        found, registry = dev_family.read_instances(directory)
+        outcome = {}
+        for line in _jsonl(build / "instances.jsonl"):
+            if str(line["instance"]) in outcome:
+                raise ValueError(f"{build}: {line['instance']} is recorded twice")
+            outcome[str(line["instance"])] = bool(line["accepted"])
+        unknown = set(outcome) - {item.id for item in found}
+        if unknown:
+            raise ValueError(f"{build}: {len(unknown)} built instances are not in {directory}")
+        accepted = [item for item in found if outcome.get(item.id)]
+        subjects.extend(accepted)
+        bridges.extend(item for item in found if not outcome.get(item.id))
+        record["judged"].append(
+            {
+                "instances": str(directory),
+                "registry_sha256": registry,
+                "build": str(build),
+                "build_instances_sha256": _sha_file(build / "instances.jsonl"),
+                "accepted": len(accepted),
+                "rejected": sum(1 for item in found if outcome.get(item.id) is False),
+                "not_built": sum(1 for item in found if item.id not in outcome),
+            }
+        )
+    for directory in args.bridge_instances or []:
+        found, registry = dev_family.read_instances(directory)
+        bridges.extend(found)
+        record["bridges"].append(
+            {
+                "instances": str(directory),
+                "registry_sha256": registry,
+                "count": len(found),
+            }
+        )
+    template_of = {item.id: item.template_id for item in subjects}
+    if len(template_of) != len(subjects):
+        raise ValueError("an accepted instance ID appears in two builds")
+    for identifier, rows_of in rows_by_instance.items():
+        if identifier not in template_of:
+            raise ValueError(f"rows of {identifier}, which no build accepted")
+        if any(str(row["template_id"]) != template_of[identifier] for row in rows_of):
+            raise ValueError(f"rows of {identifier} name another template")
+    missing = sorted({item.template_id for item in [*subjects, *bridges]} - set(spec_texts))
+    if missing:
+        raise ValueError(f"no specification text for templates {missing}")
+    record["specs"] = [{"path": str(path), "sha256": _sha_file(path)} for path in args.spec_files]
+    record["subjects_without_rows"] = sum(1 for item in subjects if item.id not in rows_by_instance)
+    nodes = [
+        dev_family.instance_node(
+            item,
+            spec_texts[item.template_id],
+            (str(row["user_text"]) for row in rows_by_instance.get(item.id, [])),
+        )
+        for item in subjects
+    ]
+    bridge_nodes = [
+        dev_family.instance_node(item, spec_texts[item.template_id], ()) for item in bridges
+    ]
+    record["item_mapping"] = {
+        "prompts": "task statement, template specification text, target docstring, every "
+        "row's user text",
+        "solutions": "reference target, original target, every fixed-repository module and "
+        "each of its top-level functions and classes",
+        "node_ids": dev_family.NAMESPACE + "<instance>",
+    }
+    return record, nodes, bridge_nodes, template_of
+
+
+def run_dev_family(args: argparse.Namespace) -> int:
+    if args.out.exists():
+        print(f"refused: {args.out} exists", file=sys.stderr)
+        return 2
+    try:
+        dev = _pool_tasks(args.dev, "dev")
+        train = _pool_tasks(args.train, "train")
+        meta, meta_sha256 = _hashed_jsonl(args.rows_meta)
+        index, index_sha256 = _hashed_jsonl(args.decoded)
+        synthetic, subjects, bridges, template_of = _dev_family_inputs(args, meta)
+        if len({str(row["id"]) for row in index}) != len(index):
+            raise ValueError("the replay index repeats a row ID")
+        replay = [str(row["id"]) for row in index if str(row["kind"]) in set(args.replay_kinds)]
+        found = dev_family.assess(
+            [dev_family.task_node(task) for task in dev],
+            [dev_family.task_node(task) for task in train],
+            subjects,
+            bridges,
+            replay=replay,
+        )
+    except (ValueError, KeyError, TypeError, OSError) as error:
+        print(f"refused: dev-family: {error}", file=sys.stderr)
+        return 2
+    prefix = len(dev_family.NAMESPACE)
+    judged = [
+        dev_family.Judgement(item.id[prefix:], item.status, item.reason) for item in found.subjects
+    ]
+    dropped = dev_family.expand_templates(judged, template_of)
+    rejected = sorted(str(row["id"]) for row in meta if str(row["instance"]) in dropped)
+    kept = [row for row in meta if str(row["instance"]) not in dropped]
+    rows_dropped = {
+        reason: sum(1 for row in meta if dropped.get(str(row["instance"])) == reason)
+        for reason in dev_family.REASONS
+    }
+    commit, dirty = git_state()
+    result: dict[str, Any] = {
+        "schema": dev_family.SCHEMA,
+        "dev_family": dev_family.RULE,
+        "rules": dev_family.rules_record(),
+        "method": dev_family.METHOD,
+        "created_at": utc_now(),
+        "git_commit": commit,
+        "dirty": dirty,
+        "pool": {
+            "dev": str(args.dev),
+            "dev_sha256": _sha_file(args.dev),
+            "dev_tasks": len(dev),
+            "train": str(args.train),
+            "train_sha256": _sha_file(args.train),
+            "train_tasks": len(train),
+        },
+        "synthetic": synthetic,
+        "families": found.families,
+        "agent": {
+            "input": str(args.rows_meta),
+            "input_kind": "rows_meta",
+            "input_sha256": meta_sha256,
+            "checked": len(meta),
+            "rejected": rejected,
+            "instances": {
+                "judged": len(judged),
+                "by_status": {
+                    status: sorted(item.id for item in judged if item.status == status)
+                    for status in ("excluded", "flagged")
+                },
+                "by_status_count": {
+                    status: sum(1 for item in judged if item.status == status)
+                    for status in dev_family.STATUSES
+                },
+                "dropped": dict(sorted(dropped.items())),
+                "dropped_by_reason": {
+                    reason: sum(1 for value in dropped.values() if value == reason)
+                    for reason in dev_family.REASONS
+                },
+                "templates_dropped": sorted({template_of[i] for i in dropped}),
+            },
+            "rows_dropped_by_reason": rows_dropped,
+            "rows_dropped_instance_level": sum(
+                count for reason, count in rows_dropped.items() if reason != "template"
+            ),
+            "surviving": {
+                "rows": len(kept),
+                "instances": len({row["instance"] for row in kept}),
+                "templates": len({row["template_id"] for row in kept}),
+                "families": len({row["family"] for row in kept}),
+                "workflow_types": sorted({str(row["workflow_type"]) for row in kept}),
+                "loss_tokens": sum(int(row.get("loss_tokens", 0)) for row in kept),
+                **mixing.reply_diversity(kept),
+            },
+        },
+        "replay": {
+            "input": str(args.decoded),
+            "input_kind": "decoded",
+            "input_sha256": index_sha256,
+            "kinds": sorted(set(args.replay_kinds)),
+            "checked": len(replay),
+            "rejected": found.replay_excluded,
+            "kept_in_dev_family_without_synthetic": len(found.replay_in_dev_family),
+            "kept_direct_named_edge_without_synthetic": len(found.replay_named),
+            "not_judged_other_kinds": len(index) - len(replay),
+        },
+    }
+    atomic_json(args.out, result)
+    print(
+        json.dumps(
+            {
+                "agent_rejected": len(rejected),
+                "instances_dropped": len(dropped),
+                "replay_rejected": len(found.replay_excluded),
+            }
+        )
+    )
+    return 0
+
+
 def run_mix(args: argparse.Namespace) -> int:
     if args.out.exists():
         print(f"refused: {args.out} exists", file=sys.stderr)
@@ -771,13 +1002,28 @@ def run_mix(args: argparse.Namespace) -> int:
                 "result": str(path),
                 "result_sha256": _sha_file(path),
                 "input_sha256": result["input_sha256"],
-                "dev_method": result.get("index", {}).get("dev_method"),
+                "dev_ngram_sha256": result.get("index", {}).get("dev_sha256"),
             }
     except (ValueError, KeyError, OSError) as error:
         print(f"refused: contamination: {error}", file=sys.stderr)
         return 2
-    agent_skip = contamination.rejected_ids(args.agent_rejected)
-    replay_skip = contamination.rejected_ids(args.replay_rejected)
+    # The development task-family rule, required for both sides in addition to the above.
+    try:
+        family = dev_family.load_result(args.dev_family)
+        dev_family.require_result(
+            family,
+            agent_meta=args.agent_meta,
+            replay_index=args.replay_index,
+            replay_kinds=args.replay_kinds,
+            dev_sha256=[side["dev_ngram_sha256"] for side in checked.values()],
+        )
+    except (ValueError, KeyError, OSError) as error:
+        print(f"refused: dev-family: {error}", file=sys.stderr)
+        return 2
+    family_agent = set(family["agent"]["rejected"])
+    family_replay = set(family["replay"]["rejected"])
+    agent_skip = contamination.rejected_ids(args.agent_rejected) | family_agent
+    replay_skip = contamination.rejected_ids(args.replay_rejected) | family_replay
     meta = {
         row["id"]: row
         for row in (
@@ -812,6 +1058,16 @@ def run_mix(args: argparse.Namespace) -> int:
             "agent_rejected": len(agent_skip),
             "replay_rejected": len(replay_skip),
             "contamination": checked,
+            "dev_family": {
+                "result": str(args.dev_family),
+                "result_sha256": _sha_file(args.dev_family),
+                "rule": family["dev_family"],
+                "pool_dev_sha256": family["pool"]["dev_sha256"],
+                "pool_train_sha256": family["pool"]["train_sha256"],
+                "agent_rejected": len(family_agent),
+                "replay_rejected": len(family_replay),
+            },
+            "dev_method": DEV_CHECKS,
             "case_registries": sorted(args.case_registry_sha256),
             "mix_sha256": _sha_file(args.out / "mix.jsonl"),
         }
@@ -884,7 +1140,7 @@ def manifest(args: argparse.Namespace) -> int:
         "contamination_scope": {
             "evaluation_cases": "13-gram overlap, reference AST and defined-name Jaccard "
             "against every registered evaluation case, plus the family blocklist",
-            "development_tasks": contamination.DEV_METHOD,
+            "development_tasks": DEV_CHECKS,
             "benchmarks": "13-gram overlap (at least three word tokens) with benchmark "
             "prompts and reference solutions",
         },
@@ -987,6 +1243,37 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--rows-meta", type=Path)
     group.add_argument("--decoded", type=Path)
     c.add_argument("--out", type=Path, required=True)
+    d = commands.add_parser("dev-family")
+    d.add_argument("--dev", type=Path, required=True, help="the pool's development split")
+    d.add_argument("--train", type=Path, required=True, help="the pool's training split")
+    d.add_argument(
+        "--judged",
+        type=Path,
+        nargs=2,
+        action="append",
+        required=True,
+        metavar=("INSTANCES", "BUILD"),
+        help="an instance set and its build: accepted instances are judged, the others are "
+        "bridges (repeatable)",
+    )
+    d.add_argument(
+        "--bridge-instances",
+        type=Path,
+        nargs="+",
+        help="instance sets whose every instance is an unjudged bridge (superseded sets)",
+    )
+    d.add_argument(
+        "--specs",
+        dest="spec_files",
+        type=Path,
+        nargs="+",
+        required=True,
+        help="specs.json files giving each template's specification text",
+    )
+    d.add_argument("--rows-meta", type=Path, required=True)
+    d.add_argument("--decoded", type=Path, required=True, help="the decoded replay index")
+    d.add_argument("--replay-kinds", nargs="+", default=["code"])
+    d.add_argument("--out", type=Path, required=True)
     m = commands.add_parser("mix")
     m.add_argument("--agent-rows", type=Path, required=True)
     m.add_argument("--agent-meta", type=Path, required=True)
@@ -1004,6 +1291,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="the contamination result of --replay-index (contamination --decoded)",
+    )
+    m.add_argument(
+        "--dev-family",
+        type=Path,
+        required=True,
+        help="the dev-family result of --agent-meta and --replay-index (dev-family)",
     )
     m.add_argument(
         "--case-registry-sha256",
@@ -1048,6 +1341,8 @@ PATH_ARGS = (
     "agent_rejected",
     "replay_rejected",
     "specs",
+    "train",
+    "dev_family",
 )
 PATH_LIST_ARGS = (
     "seed_from",
@@ -1056,6 +1351,8 @@ PATH_LIST_ARGS = (
     "build",
     "controls_from",
     "prior_instances",
+    "bridge_instances",
+    "spec_files",
 )
 
 
@@ -1071,6 +1368,8 @@ def main(
     paths: list[Path | None] = [getattr(args, name, None) for name in PATH_ARGS]
     for name in PATH_LIST_ARGS:
         paths.extend(getattr(args, name, None) or [])
+    for pair in getattr(args, "judged", None) or []:
+        paths.extend(pair)
     if getattr(args, "per_bug", 1) < 1 or getattr(args, "mutants", 1) < 1:
         parser.error("--per-bug and --mutants must be at least 1")
     try:
@@ -1087,6 +1386,8 @@ def main(
         return ledger(args)
     if args.command == "contamination":
         return run_contamination(args)
+    if args.command == "dev-family":
+        return run_dev_family(args)
     if args.command == "mix":
         return run_mix(args)
     if args.command == "manifest":
