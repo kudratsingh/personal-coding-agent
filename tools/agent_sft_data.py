@@ -8,14 +8,20 @@ anything is opened:
   catalog (``scratchcoder.agent.synth``), one per (template, bug kind) by default
   (``--per-bug``), check each statically (parse, sizes, the ``tools.agent_dev_run plan`` fit
   rule, target shown, case-ID rule, evaluation-family blocklist) and write the kept ones as
-  harness v0 case directories with a registry. Runs nothing.
+  harness v0 case directories with a registry. At most ``--max-per-reply`` instances share
+  one reference target (every row of an instance has it as its reply); the record reports
+  distinct replies per template beside the distinct replies its seeds can reach. Runs
+  nothing.
 - ``specs --instances DIR --out PATH``: the natural-language specification of every template,
   the constants of every instance and the independent-oracle file format. Runs nothing.
 - ``ledger --ledger PATH [--seed-from DIR ...]``: record earlier sandbox calls (run records
-  of evaluation-case validation) as prior entries, once each, and print the totals.
+  of evaluation-case validation) as prior entries, once each (keyed by resolved path and
+  file hash), and print the totals.
 - ``validate-and-build``: everything that executes. It refuses to start without
   ``--receipt``, a passing execution-window receipt written by ``tools.mac_window_check exec``
   for this very command in the last 30 minutes, and without a new ``--out`` directory; it
+  refuses a ledger that does not exist or has no prior entries, a ``--max-calls`` above the
+  approved cap and a ledger another run holds (the lock is kept for the whole run); it
   refuses when the planned calls exceed what the ledger cap leaves. It also refuses unless
   ``--independent`` verifies against its ``SHA256SUMS`` and that file's SHA-256 equals
   ``--independent-sha256``; every oracle is read (never imported) and checked against the pin
@@ -24,12 +30,17 @@ anything is opened:
   the harness loop with a scripted policy (``scratchcoder.agent.synth.rows``), at
   ``k + 4`` sandbox calls for ``k`` mutants, and writes rows, row metadata, per-instance
   validation records and traces; with ``--controls`` it runs the four negative controls once
-  per template (four calls each). Every call is counted in the ledger first and refused over
-  the cap.
+  per template (four calls each) before the template's first instance. Only templates whose
+  four controls all failed (here, or in ``--controls-from`` against the same oracle) give
+  rows; the others' instances are recorded as rejected without calls. Every call is counted
+  in the ledger first and refused over the cap.
 - ``contamination``: the status-only agent-case contamination check
   (``scratchcoder.agent.synth.contamination``) on generated instances, built rows or a decoded
-  replay index; writes the rejected row IDs only.
-- ``mix``: agent rows plus replay rows at a target ratio of assistant-loss tokens.
+  replay index; writes the rejected row IDs only, with the input's SHA-256 and kind and the
+  registry of every case set checked.
+- ``mix``: agent rows plus replay rows at a target ratio of assistant-loss tokens. It needs
+  both contamination results, computed on exactly these inputs and against exactly the case
+  registries named by ``--case-registry-sha256``, and caps instances per distinct reply.
 - ``manifest``: families, templates, bug and mutation kinds, workflow types, counts, file
   hashes and ledger totals.
 
@@ -71,6 +82,9 @@ from tools.admission_check import _receipt_image
 from tools.verifier_scan import SealedPathError, guard
 
 DEFAULT_MUTANTS = 2
+DEFAULT_MAX_PER_REPLY = 3
+"""Instances that may share one reference target (the whole assistant turn of each of their
+rows): with ``k = 2`` mutants, at most 9 rows train on one reply text."""
 MUTATION_PREFERENCE = (
     "off_by_one",
     "wrong_return",
@@ -105,7 +119,7 @@ def _sha_file(path: Path) -> str:
 def _refuse(paths: Sequence[Path | None]) -> None:
     present = [path for path in paths if path is not None]
     for path in present:
-        if any(part.lower() in agent_cases.FORBIDDEN_PARTS for part in path.resolve().parts):
+        if any(agent_cases.forbidden_part(part) for part in path.resolve().parts):
             raise SealedPathError(f"refusing {path}: held-out agent cases are sealed")
     guard(present)
 
@@ -130,16 +144,45 @@ def generate(args: argparse.Namespace, loader: Loader = _tokenizer) -> int:
     kept: list[dict[str, Any]] = []
     dropped: list[dict[str, Any]] = []
     per_template: Counter[str] = Counter()
+    per_reply: Counter[str] = Counter()
     for template, bug, index in instances.plan_instances(selected, args.per_bug):
         start = per_template[template.id] * args.mutants
         try:
             probe = instances.build(template, bug, index, args.seed_base, encoder=encoder)
+            reply = instances.reply_sha256(probe.reference_target)
+            if args.max_per_reply and per_reply[reply] >= args.max_per_reply:
+                dropped.append(
+                    {
+                        "template_id": template.id,
+                        "bug_kind": bug,
+                        "index": index,
+                        "problems": [f"reply cap: {args.max_per_reply} instances share it"],
+                    }
+                )
+                continue
             kinds = _ordered_kinds(
-                mutation.applicable(probe.reference_target, forbid=[probe.original_target])
+                mutation.applicable(
+                    probe.reference_target,
+                    forbid=[probe.original_target],
+                    symmetric=probe.symmetric,
+                )
             )
-            chosen = instances.mutation_cycle(kinds, start, args.mutants)
+            # Kinds in cycle order from this template's position; a kind left with no mutant
+            # once the earlier ones are chosen (its only mutant equals one of theirs, after
+            # the canonical rewrite) is passed over for the next.
+            chosen: list[str] = []
+            for kind in instances.mutation_cycle(kinds, start, len(kinds)):
+                try:
+                    instances.build(
+                        template, bug, index, args.seed_base, mutation_kinds=[*chosen, kind]
+                    )
+                except mutation.MutationError:
+                    continue
+                chosen.append(kind)
+                if len(chosen) == args.mutants:
+                    break
             if len(chosen) < args.mutants:
-                raise TemplateError(f"only {len(chosen)} applicable mutation kinds")
+                raise TemplateError(f"only {len(chosen)} usable mutation kinds")
             instance = instances.build(
                 template, bug, index, args.seed_base, mutation_kinds=chosen, encoder=encoder
             )
@@ -167,6 +210,7 @@ def generate(args: argparse.Namespace, loader: Loader = _tokenizer) -> int:
             continue
         written = instances.write(out, instance, static)
         per_template[template.id] += 1
+        per_reply[reply] += 1
         kept.append(
             {
                 "id": instance.id,
@@ -176,6 +220,7 @@ def generate(args: argparse.Namespace, loader: Loader = _tokenizer) -> int:
                 "bug_kind": bug,
                 "mutation_kinds": chosen,
                 "applicable_mutation_kinds": kinds,
+                "reference_sha256": reply,
                 "files": written,
             }
         )
@@ -186,7 +231,8 @@ def generate(args: argparse.Namespace, loader: Loader = _tokenizer) -> int:
     (out / agent_cases.REGISTRY_NAME).write_text(
         json.dumps(registry, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    loaded = agent_cases.load_cases(out)  # Hash-checked and statically validated again.
+    # Hash-checked and statically validated again.
+    loaded = agent_cases.load_cases(out, synthetic=True)
     commit, dirty = git_state()
     record = {
         "schema": "agent-synth-generate-v1",
@@ -197,6 +243,8 @@ def generate(args: argparse.Namespace, loader: Loader = _tokenizer) -> int:
         "seed_base": args.seed_base,
         "per_bug": args.per_bug,
         "mutants_per_instance": args.mutants,
+        "max_instances_per_reply": args.max_per_reply,
+        "replies": _reply_report(kept, selected, args.capacity_draws, args.seed_base),
         "tokenizer_sha256": _sha_file(args.tokenizer),
         "families_sha256": _sha_file(args.families),
         "registry_sha256": agent_cases.registry_sha256(out),
@@ -215,6 +263,39 @@ def generate(args: argparse.Namespace, loader: Loader = _tokenizer) -> int:
     return 0
 
 
+def _reply_report(
+    kept: Sequence[dict[str, Any]],
+    templates: Sequence[Any],
+    draws: int,
+    seed_base: int,
+) -> dict[str, Any]:
+    """Distinct replies (reference targets) of the kept instances, per template, beside how
+    many distinct replies ``draws`` seeds per bug kind can render (the reach of an
+    expansion; size it by distinct replies, not by the call budget)."""
+    by_template: dict[str, Counter[str]] = {}
+    for row in kept:
+        by_template.setdefault(row["template_id"], Counter())[row["reference_sha256"]] += 1
+    every = Counter(row["reference_sha256"] for row in kept)
+    return {
+        "distinct": len(every),
+        "max_instances_per_reply": max(every.values(), default=0),
+        "capacity_draws_per_bug": draws,
+        "capacity_total": sum(
+            instances.reply_capacity(template, draws, seed_base) for template in templates
+        )
+        if draws
+        else None,
+        "per_template": {
+            template.id: {
+                "instances": sum(by_template.get(template.id, Counter()).values()),
+                "distinct": len(by_template.get(template.id, Counter())),
+                "capacity": instances.reply_capacity(template, draws, seed_base) if draws else None,
+            }
+            for template in templates
+        },
+    }
+
+
 def _synth_records(root: Path) -> list[dict[str, Any]]:
     found = []
     for directory in sorted(path for path in root.iterdir() if (path / "synth.json").is_file()):
@@ -227,7 +308,7 @@ def specs(args: argparse.Namespace) -> int:
     if out.exists():
         print(f"refused: {out} exists", file=sys.stderr)
         return 2
-    agent_cases.load_cases(args.instances)  # The instances are the registered ones.
+    agent_cases.load_cases(args.instances, synthetic=True)  # The registered instances.
     document = spec_export.specs(catalog(), _synth_records(args.instances))
     document["instances_registry_sha256"] = agent_cases.registry_sha256(args.instances)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -241,10 +322,39 @@ def specs(args: argparse.Namespace) -> int:
 
 
 def ledger(args: argparse.Namespace) -> int:
-    book = call_ledger.Ledger.open(args.ledger, args.max_calls)
-    added = call_ledger.prior_from_records(book, args.seed_from or [])
-    print(json.dumps({"added": added, **book.summary()}))
+    try:
+        with call_ledger.Ledger.locked(args.ledger, args.max_calls) as book:
+            skipped: list[dict[str, Any]] = []
+            added = call_ledger.prior_from_records(book, args.seed_from or [], skipped=skipped)
+            print(json.dumps({"added": added, "skipped": skipped, **book.summary()}))
+    except call_ledger.LedgerError as error:
+        print(f"refused: ledger: {error}", file=sys.stderr)
+        return 2
     return 0
+
+
+def _prior_controls(paths: Sequence[Path], oracles: dict[str, Any]) -> dict[str, bool]:
+    """Templates whose negative controls an earlier build already ran against the oracle
+    pinned now: template -> whether every control failed (all four kinds present)."""
+    rows_by_template: dict[str, list[dict[str, Any]]] = {}
+    for path in paths:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                row = json.loads(line)
+                rows_by_template.setdefault(str(row["template_id"]), []).append(row)
+    found: dict[str, bool] = {}
+    for template_id, found_rows in rows_by_template.items():
+        oracle = oracles.get(template_id)
+        if not isinstance(oracle, independent.Oracle):
+            continue
+        current = [row for row in found_rows if row.get("oracle_sha256") == oracle.sha256]
+        kinds = {str(row["control"]) for row in current}
+        if not current:
+            continue
+        found[template_id] = kinds >= set(mutation.CONTROL_KINDS) and all(
+            row["ok"] for row in current
+        )
+    return found
 
 
 def validate_and_build(
@@ -263,7 +373,7 @@ def validate_and_build(
         print(f"refused: {out} exists; every run writes a new directory", file=sys.stderr)
         return 2
     try:
-        loaded = agent_cases.load_cases(args.instances)
+        loaded = agent_cases.load_cases(args.instances, synthetic=True)
     except (agent_cases.CaseError, OSError, ValueError, KeyError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 2
@@ -272,6 +382,27 @@ def validate_and_build(
     except (independent.OracleError, OSError, UnicodeDecodeError) as error:
         print(f"refused: independent oracles: {error}", file=sys.stderr)
         return 2
+    try:
+        with call_ledger.Ledger.locked(args.ledger, args.max_calls) as book:
+            book.require_seeded()
+            return _build(args, book, loaded, pinned, image_id, execute=execute, loader=loader)
+    except call_ledger.LedgerError as error:
+        print(f"refused: ledger: {error}", file=sys.stderr)
+        return 2
+
+
+def _build(
+    args: argparse.Namespace,
+    book: call_ledger.Ledger,
+    loaded: Sequence[agent_cases.Case],
+    pinned: independent.Pin,
+    image_id: str,
+    *,
+    execute: execution.Execute,
+    loader: Loader,
+) -> int:
+    """The executing part of validate-and-build, run while the ledger lock is held."""
+    out: Path = args.out
     records = {record["id"]: record for record in _synth_records(args.instances)}
     excluded = contamination.rejected_ids(args.exclude)
     chosen: list[agent_cases.Case] = []
@@ -286,7 +417,6 @@ def validate_and_build(
         chosen.append(case)
         if args.limit and len(chosen) >= args.limit:
             break
-    book = call_ledger.Ledger.open(args.ledger, args.max_calls)
     templates = {records[case.id]["template_id"] for case in chosen}
     # Every oracle is read and checked against the pin once, before any call; later edits to
     # the directory cannot reach this run.
@@ -297,8 +427,13 @@ def validate_and_build(
         except independent.OracleError as error:
             oracles[template_id] = error
     pin_sha = pinned.sums_sha256
+    # Negative controls gate rows: a template's instances are built only when all four
+    # controls failed its grading script, in this run (--controls) or in an earlier build
+    # against the same oracle (--controls-from).
+    passed = _prior_controls(args.controls_from or [], oracles)
+    to_control = sorted(t for t in templates if t not in passed) if args.controls else []
     planned = sum(rows.calls_per_instance(len(records[c.id]["mutants"])) for c in chosen)
-    planned += len(mutation.CONTROL_KINDS) * len(templates) if args.controls else 0
+    planned += len(mutation.CONTROL_KINDS) * len(to_control)
     if planned > book.remaining:
         print(
             f"refused: {planned} planned sandbox calls exceed the {book.remaining} the ledger "
@@ -314,40 +449,39 @@ def validate_and_build(
     started = utc_now()
     context = {"value": ""}
     counted = book.execute(execute, run=out.name, context=lambda: context["value"])
-    controlled: set[str] = set()
     stopped = ""
     totals: Counter[str] = Counter()
+
+    def reject(case_id: str, reason: str, stamp: dict[str, Any], key: str) -> None:
+        rows.append_jsonl(
+            out / "instances.jsonl",
+            [{"instance": case_id, "accepted": False, "reasons": [reason], "calls": 0, **stamp}],
+        )
+        totals[key] += 1
+
     for case in chosen:
         record = records[case.id]
         template_id = record["template_id"]
         oracle = oracles[template_id]
         if isinstance(oracle, independent.OracleError):
-            rows.append_jsonl(
-                out / "instances.jsonl",
-                [
-                    {
-                        "instance": case.id,
-                        "accepted": False,
-                        "reasons": [f"oracle: {oracle}"],
-                        "calls": 0,
-                        "independent_sums_sha256": pin_sha,
-                    }
-                ],
-            )
-            totals["no_oracle"] += 1
+            reject(case.id, f"oracle: {oracle}", {"independent_sums_sha256": pin_sha}, "no_oracle")
             continue
         stamp = {"independent_sums_sha256": pin_sha, "oracle_sha256": oracle.sha256}
         try:
-            if args.controls and template_id not in controlled:
+            if template_id in to_control and template_id not in passed:
                 context["value"] = f"{case.id}/controls"
-                rows.append_jsonl(
-                    out / "controls.jsonl",
-                    [
-                        {**row, **stamp}
-                        for row in rows.run_controls(case, record, oracle, execute=counted)
-                    ],
-                )
-                controlled.add(template_id)
+                found = [
+                    {**row, **stamp}
+                    for row in rows.run_controls(case, record, oracle, execute=counted)
+                ]
+                rows.append_jsonl(out / "controls.jsonl", found)
+                passed[template_id] = all(row["ok"] for row in found)
+            if template_id not in passed:
+                reject(case.id, "controls_not_run", stamp, "no_controls")
+                continue
+            if not passed[template_id]:
+                reject(case.id, "controls_not_all_failed", stamp, "controls_failed")
+                continue
             context["value"] = case.id
             with (out / "traces" / f"{case.id}.jsonl").open("x", encoding="utf-8") as stream:
                 built = rows.build_instance(
@@ -413,7 +547,15 @@ def validate_and_build(
         "planned_calls": planned,
         "selected_instances": len(chosen),
         "totals": dict(totals),
-        "controls": {"rows": len(controls), "all_failed": all(row["ok"] for row in controls)},
+        "controls": {
+            "rows": len(controls),
+            # None, not True, when no control ran: "all failed" needs at least one control.
+            "all_failed": all(row["ok"] for row in controls) if controls else None,
+            "from": [str(path) for path in args.controls_from or []],
+            "templates_passed": sorted(t for t, ok in passed.items() if ok and t in templates),
+            "templates_failed": sorted(t for t, ok in passed.items() if not ok),
+            "templates_without_controls": sorted(templates - set(passed)),
+        },
         "stopped": stopped,
         "ledger": book.summary(),
     }
@@ -440,15 +582,19 @@ def run_contamination(args: argparse.Namespace) -> int:
     )
     if args.instances is not None:
         found = contamination.instance_rows(args.instances)
-        source = args.instances
+        source, kind = args.instances, "instances"
+        digest = agent_cases.registry_sha256(args.instances)
     elif args.rows_meta is not None:
         found = contamination.meta_rows(args.rows_meta)
-        source = args.rows_meta
+        source, kind, digest = args.rows_meta, "rows_meta", _sha_file(args.rows_meta)
     else:
         found = contamination.decoded_rows(args.decoded)
-        source = args.decoded
+        source, kind, digest = args.decoded, "decoded", _sha_file(args.decoded)
     result = contamination.check(index, found)
     result["input"] = str(source)
+    result["input_kind"] = kind
+    # For instances, the hash of their registry (which pins every file); otherwise the file.
+    result["input_sha256"] = digest
     result["index"] = dict(contamination.describe(index))
     atomic_json(args.out, result)
     print(json.dumps({"checked": result["checked"], "rejected": len(result["rejected"])}))
@@ -458,6 +604,27 @@ def run_contamination(args: argparse.Namespace) -> int:
 def run_mix(args: argparse.Namespace) -> int:
     if args.out.exists():
         print(f"refused: {args.out} exists", file=sys.stderr)
+        return 2
+    # Both sides must have been checked, on exactly these inputs, against exactly the named
+    # evaluation-case sets.
+    checked = {}
+    try:
+        for side, path, source, kind in (
+            ("agent", args.agent_rejected, args.agent_meta, "rows_meta"),
+            ("replay", args.replay_rejected, args.replay_index, "decoded"),
+        ):
+            result = contamination.load_result(path)
+            contamination.require_result(
+                result, input_path=source, kind=kind, case_registries=args.case_registry_sha256
+            )
+            checked[side] = {
+                "result": str(path),
+                "result_sha256": _sha_file(path),
+                "input_sha256": result["input_sha256"],
+                "dev_method": result.get("index", {}).get("dev_method"),
+            }
+    except (ValueError, KeyError, OSError) as error:
+        print(f"refused: contamination: {error}", file=sys.stderr)
         return 2
     agent_skip = contamination.rejected_ids(args.agent_rejected)
     replay_skip = contamination.rejected_ids(args.replay_rejected)
@@ -480,7 +647,9 @@ def run_mix(args: argparse.Namespace) -> int:
         for row in read_rows(args.replay)
         if row.id not in replay_skip and kinds.get(row.id) in set(args.replay_kinds)
     ]
-    mixed, report = mixing.mix(agent, meta, replay, ratio=args.ratio)
+    mixed, report = mixing.mix(
+        agent, meta, replay, ratio=args.ratio, max_per_reply=args.max_per_reply
+    )
     args.out.mkdir(parents=True)
     from scratchcoder.data.sft import write_rows
 
@@ -492,6 +661,8 @@ def run_mix(args: argparse.Namespace) -> int:
             "replay_kinds": list(args.replay_kinds),
             "agent_rejected": len(agent_skip),
             "replay_rejected": len(replay_skip),
+            "contamination": checked,
+            "case_registries": sorted(args.case_registry_sha256),
             "mix_sha256": _sha_file(args.out / "mix.jsonl"),
         }
     )
@@ -527,6 +698,8 @@ def manifest(args: argparse.Namespace) -> int:
                 "mutation_kinds": sorted(
                     {row["mutation_kind"] for row in meta if row["mutation_kind"]}
                 ),
+                **mixing.reply_diversity(meta),
+                "controls": summary.get("controls"),
             }
         )
     document = {
@@ -553,6 +726,17 @@ def manifest(args: argparse.Namespace) -> int:
             "by_family": dict(Counter(r["family"] for r in records)),
             "templates": len({r["template_id"] for r in records}),
             "mutation_kinds_used": dict(Counter(m["kind"] for r in records for m in r["mutants"])),
+            "distinct_replies": len({r["reference_target"] for r in records}),
+            "max_instances_per_reply": max(
+                Counter(r["reference_target"] for r in records).values(), default=0
+            ),
+        },
+        "contamination_scope": {
+            "evaluation_cases": "13-gram overlap, reference AST and defined-name Jaccard "
+            "against every registered evaluation case, plus the family blocklist",
+            "development_tasks": contamination.DEV_METHOD,
+            "benchmarks": "13-gram overlap (at least three word tokens) with benchmark "
+            "prompts and reference solutions",
         },
         "builds": builds,
     }
@@ -578,6 +762,18 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--seed-base", type=int, default=0)
     g.add_argument("--mutants", type=int, default=DEFAULT_MUTANTS)
     g.add_argument("--templates", nargs="+")
+    g.add_argument(
+        "--max-per-reply",
+        type=int,
+        default=DEFAULT_MAX_PER_REPLY,
+        help="at most this many instances share one reference target (0: no cap)",
+    )
+    g.add_argument(
+        "--capacity-draws",
+        type=int,
+        default=200,
+        help="seeds per bug kind rendered to estimate each template's distinct replies",
+    )
     s = commands.add_parser("specs")
     s.add_argument("--instances", type=Path, required=True)
     s.add_argument("--out", type=Path, required=True)
@@ -602,7 +798,18 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--per-template", type=int, default=0)
     v.add_argument("--templates", nargs="+")
     v.add_argument("--exclude", type=Path, help="a contamination result whose IDs are skipped")
-    v.add_argument("--controls", action="store_true", help="negative controls once per template")
+    v.add_argument(
+        "--controls",
+        action="store_true",
+        help="negative controls once per template (templates not in --controls-from)",
+    )
+    v.add_argument(
+        "--controls-from",
+        type=Path,
+        nargs="+",
+        help="controls.jsonl of earlier builds; templates whose four controls all failed "
+        "against the oracle pinned now need not run them again",
+    )
     v.add_argument(
         "--diagnose",
         action="store_true",
@@ -624,8 +831,30 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--replay", type=Path, required=True)
     m.add_argument("--replay-index", type=Path, required=True)
     m.add_argument("--replay-kinds", nargs="+", default=["code"])
-    m.add_argument("--agent-rejected", type=Path)
-    m.add_argument("--replay-rejected", type=Path)
+    m.add_argument(
+        "--agent-rejected",
+        type=Path,
+        required=True,
+        help="the contamination result of --agent-meta (contamination --rows-meta)",
+    )
+    m.add_argument(
+        "--replay-rejected",
+        type=Path,
+        required=True,
+        help="the contamination result of --replay-index (contamination --decoded)",
+    )
+    m.add_argument(
+        "--case-registry-sha256",
+        nargs="+",
+        required=True,
+        help="registry SHA-256 of every evaluation-case set both results must cover",
+    )
+    m.add_argument(
+        "--max-per-reply",
+        type=int,
+        default=DEFAULT_MAX_PER_REPLY,
+        help="at most this many instances share one reply (0: no cap)",
+    )
     m.add_argument("--ratio", type=float, default=1.0)
     m.add_argument("--out", type=Path, required=True)
     f = commands.add_parser("manifest")
@@ -658,7 +887,7 @@ PATH_ARGS = (
     "replay_rejected",
     "specs",
 )
-PATH_LIST_ARGS = ("seed_from", "cases", "benchmarks", "build")
+PATH_LIST_ARGS = ("seed_from", "cases", "benchmarks", "build", "controls_from")
 
 
 def main(

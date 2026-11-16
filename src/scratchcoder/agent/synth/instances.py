@@ -15,7 +15,10 @@
    are the checks the original passes by construction: those of functions that do not
    depend on the target, and the target's own checks whose outcome the bug leaves unchanged.
 5. The task statement is written for the workflow type; a traceback (W5) names the frames
-   and the exception the spec function raised.
+   and the exception the spec function raised. For a failing-test task (W1, W3) the
+   statement's claim (the test it is about, and the value returned or the exception raised
+   under the bug, as modelled) is recorded as ``task_claim`` so that the row builder can
+   check it against the real observation.
 6. Wrong attempts are AST mutants of the reference target (:mod:`.mutation`), each distinct
    from the original and from the other mutants.
 
@@ -137,10 +140,15 @@ class Instance:
     original_target: str
     mutants: list[mutation.Mutant] = field(default_factory=list)
     control_constant: Any = None
+    task_claim: dict[str, str] | None = None
 
     @property
     def reference_target(self) -> str:
         return self.rendering.sources[self.template.target]
+
+    @property
+    def symmetric(self) -> list[str]:
+        return symmetric_names(self.template, self.rendering)
 
     def module_file(self, role: str) -> str:
         slot = self.template.family.func(role).module
@@ -190,6 +198,13 @@ class Instance:
     def signature(self) -> str:
         node = mutation.function_node(self.reference_target)
         return f"def {node.name}({ast.unparse(node.args)})"
+
+
+def symmetric_names(template: Template, rendering: Rendering) -> list[str]:
+    """The rendered names of the repository's functions marked symmetric."""
+    return sorted(
+        rendering.names[role] for role in template.roles() if template.family.func(role).symmetric
+    )
 
 
 def _module_text(
@@ -262,6 +277,18 @@ W5_PHRASES = (
 )
 W5_SHORT_PHRASES = ("Bug report: the test {test} fails:\n{traceback}\nFix the cause.",)
 MAX_CALL_CHARS = 70
+
+
+def _claim(instance: Instance) -> dict[str, str] | None:
+    """What a W1/W3 task statement asserts: the failing test it describes and the modelled
+    outcome under the bug (``got``, the returned value's literal, which is also the test's
+    assertion message; or ``raised``, the exception type)."""
+    if instance.template.workflow not in ("W1", "W3"):
+        return None
+    first = next(test for test in instance.tests if test.name in instance.designed_failing)
+    if first.bug.raised:
+        return {"test": first.name, "raised": first.bug.raised}
+    return {"test": first.name, "got": _literal(first.bug.value)}
 
 
 def _task(instance: Instance, rng: random.Random, encoder: TextEncoder | None) -> str:
@@ -451,9 +478,12 @@ def build(
             raise TemplateError(f"{instance.id}: a traceback case's first failing test must raise")
         instance.traceback = _traceback(instance, first)
     instance.task = _task(instance, rng, encoder)
+    instance.task_claim = _claim(instance)
     forbid = [original_target]
     for kind in mutation_kinds:
-        chosen = mutation.choose(instance.reference_target, kind, rng, forbid=forbid)
+        chosen = mutation.choose(
+            instance.reference_target, kind, rng, forbid=forbid, symmetric=instance.symmetric
+        )
         instance.mutants.append(chosen)
         forbid.append(chosen.source)
     return instance
@@ -606,6 +636,9 @@ def record(instance: Instance, static: Mapping[str, Any]) -> dict[str, Any]:
             for item in instance.mutants
         ],
         "control_constant": instance.control_constant,
+        "task_claim": instance.task_claim,
+        "reference_sha256": reply_sha256(instance.reference_target),
+        "symmetric": instance.symmetric,
         "checks": {
             "correctness": sum(1 for c in instance.checks if c.role in template.dependents()),
             "correctness_exposing": sum(
@@ -618,6 +651,29 @@ def record(instance: Instance, static: Mapping[str, Any]) -> dict[str, Any]:
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def reply_sha256(reference_target: str) -> str:
+    """The identity of an instance's reply: every row of the instance (edit and repairs) has
+    the reference target as its whole assistant turn, so instances with equal hashes train
+    on the same reply text."""
+    return _sha(reference_target)
+
+
+def reply_capacity(template: Template, draws: int, seed_base: int = 0) -> int:
+    """How many distinct reference targets (replies) ``draws`` seeds per bug kind render for
+    ``template``: an estimate of how many distinct replies an expansion can reach. Renders
+    only; nothing is executed."""
+    found: set[str] = set()
+    for bug in template.bugs:
+        for index in range(draws):
+            rng = random.Random(instance_seed(seed_base, template.id, bug, index))
+            try:
+                rendering = render(template, rng, bug)
+            except TemplateError:
+                continue
+            found.add(rendering.sources[template.target])
+    return len(found)
 
 
 def write(root: Path, instance: Instance, static: Mapping[str, Any]) -> dict[str, str]:

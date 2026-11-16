@@ -70,6 +70,9 @@ class Func:
     """Roles this function calls (imports across modules are derived from it)."""
     imports: tuple[str, ...] = ()
     """Standard-library import lines the function needs."""
+    symmetric: bool = False
+    """The function's result does not change when its first two arguments are swapped (no
+    ``swap_arguments`` mutant of a call to it is made)."""
 
     @property
     def variants(self) -> tuple[str, ...]:

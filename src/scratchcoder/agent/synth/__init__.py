@@ -24,4 +24,4 @@ Modules:
 - :mod:`.mix`: mixing agent and replay rows by assistant-loss tokens.
 """
 
-GENERATOR_VERSION = "agent-synth-v1"
+GENERATOR_VERSION = "agent-synth-v2"

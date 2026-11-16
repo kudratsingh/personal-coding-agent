@@ -300,7 +300,7 @@ def test_an_instance_writes_a_loadable_registered_case(tmp_path: Path) -> None:
     (tmp_path / cases.REGISTRY_NAME).write_text(
         json.dumps(cases.build_registry(tmp_path)), encoding="utf-8"
     )
-    (loaded,) = cases.load_cases(tmp_path)
+    (loaded,) = cases.load_cases(tmp_path, synthetic=True)
     assert loaded.id == instance.id
     assert loaded.targets == (instance.target_key,)
     assert loaded.reference_function(instance.target_key) == instance.reference_target
@@ -315,3 +315,118 @@ def test_mutation_cycle_spreads_kinds() -> None:
     assert instances.mutation_cycle(kinds, 2, 2) == ["c", "a"]
     assert instances.mutation_cycle(kinds, 0, 5) == ["a", "b", "c"]
     assert instances.mutation_cycle([], 0, 2) == []
+
+
+def _sources(source: str, kind: str, **options: object) -> set[str]:
+    return {item.source for item in mutation.mutants(source, kind, **options)}  # type: ignore[arg-type]
+
+
+def test_swap_arguments_skips_symmetric_calls() -> None:
+    assert _sources("def f(a, b):\n    return max(a, b) + min(a, b)", "swap_arguments") == set()
+    pairs = "def f(xs):\n    return sum([1 for a, b in zip(xs, xs[1:]) if a == b])"
+    assert _sources(pairs, "swap_arguments") == set()
+    products = (
+        "def f(row, vec):\n    acc = 0\n    for a, b in zip(row, vec):\n        acc += a * b\n"
+        "    return acc"
+    )
+    assert _sources(products, "swap_arguments") == set()
+    ordered = "def f(xs):\n    return sum([1 for a, b in zip(xs, xs[1:]) if a > b])"
+    assert _sources(ordered, "swap_arguments") == {
+        "def f(xs):\n    return sum([1 for a, b in zip(xs[1:], xs) if a > b])"
+    }
+    helper = "def f(p, q):\n    return dist(p, q) + 1"
+    assert _sources(helper, "swap_arguments", symmetric=["dist"]) == set()
+    assert _sources(helper, "swap_arguments") == {"def f(p, q):\n    return dist(q, p) + 1"}
+
+
+def test_off_by_one_skips_len_of_the_last_row_prefilled_defaults_and_minus_zero() -> None:
+    assert _sources("def f(m):\n    return len(m[0])", "off_by_one") == {
+        "def f(m):\n    return len(m[1])"
+    }
+    counts = (
+        "def f(g):\n    c = {k: 0 for k in g}\n    for k in g:\n        c[k] = c.get(k, 0) + 1\n"
+        "    return c"
+    )
+    found = _sources(counts, "off_by_one")
+    assert not any("c.get(k, 1)" in text or "c.get(k, -1)" in text for text in found)
+    assert any("c.get(k, 0) + 2" in text for text in found)
+    assert _sources("def f(xs):\n    return xs[-1]", "off_by_one") == {
+        "def f(xs):\n    return xs[-2]"
+    }
+
+
+def test_loops_keep_their_test_their_worklist_guard_and_their_step() -> None:
+    digits = (
+        "def f(n):\n    t = 0\n    while n > 0:\n        t += n % 10\n        n //= 10\n"
+        "    return t"
+    )
+    assert _sources(digits, "flip_comparison") == set()
+    assert _sources(digits, "negate_condition") == set()
+    operators = _sources(digits, "wrong_operator")
+    assert not any("n %= 10" in text for text in operators)
+    assert any("t -= n % 10" in text for text in operators)
+    steps = _sources(digits, "off_by_one")
+    assert any("n //= 11" in text for text in steps) and any("n //= 9" in text for text in steps)
+    assert not any("while n > 1" in text or "while n > -1" in text for text in steps)
+    assert _sources(
+        "def f(m):\n    c = 0\n    while m:\n        m >>= 1\n    return c", "off_by_one"
+    ) == {"def f(m):\n    c = 0\n    while m:\n        m >>= 2\n    return c"}
+    search = (
+        "def f(g, s):\n    seen = {s}\n    todo = [s]\n    while todo:\n        x = todo.pop()\n"
+        "        for y in g[x]:\n            if y not in seen:\n                seen.add(y)\n"
+        "                todo.append(y)\n    return len(seen)"
+    )
+    assert _sources(search, "flip_comparison") == set()
+    assert _sources(search, "negate_condition") == set()
+    assert _sources(search, "drop_branch")  # Dropping the guard still ends the loop.
+
+
+def test_a_cyclic_step_of_a_symmetric_helper_is_not_flipped() -> None:
+    walk = (
+        "def f(p):\n    t = 0\n    for i in range(len(p)):\n"
+        "        t += d(p[i], p[(i + 1) % len(p)])\n    return t"
+    )
+    assert not any("(i - 1)" in text for text in _sources(walk, "wrong_operator", symmetric=["d"]))
+    assert any("(i - 1)" in text for text in _sources(walk, "wrong_operator"))
+
+
+def test_negations_that_only_reexpress_a_comparison_are_not_new_mutants() -> None:
+    parity = "def f(n):\n    if n % 2 == 1:\n        return 1\n    return 0"
+    original = "def f(n):\n    if n % 2 == 0:\n        return 1\n    return 0"
+    assert _sources(parity, "negate_condition", forbid=[original]) == set()
+    assert not any("== 0" in text for text in _sources(parity, "off_by_one", forbid=[original]))
+    assert any("== 2" in text for text in _sources(parity, "off_by_one", forbid=[original]))
+    less = "def f(a, b):\n    if a < b:\n        return 1\n    return 0"
+    assert _sources(less, "negate_condition", forbid=[less.replace("a < b", "a >= b")]) == set()
+    assert _sources(less, "negate_condition")
+    dump = mutation.canonical_dump
+    assert dump(ast.parse("not a == b")) == dump(ast.parse("a != b"))
+    assert dump(ast.parse("x % 2 == 1")) == dump(ast.parse("x % 2 != 0"))
+    assert dump(ast.parse("not a < b")) != dump(ast.parse("a > b"))
+
+
+def test_matrix2_mutants_can_fail_its_public_tests() -> None:
+    template = catalog().template("matrix2")
+    for bug in template.bugs:
+        instance = instances.build(template, bug, 0, 0, mutation_kinds=["off_by_one"])
+        rows_name = instance.rendering.names["mt"]
+        # len(m[-1]) is never made (the same on rectangular input); len(m[1]) raises on the
+        # one-row public input of the caller.
+        assert instance.mutants[0].source.endswith(f"range(len({rows_name}[1]))]")
+        one_row = [test for test in instance.tests if test.name.endswith("_one_row")]
+        assert one_row and len(one_row[0].args[0]) == 1
+        kinds = mutation.applicable(
+            instance.reference_target,
+            forbid=[instance.original_target],
+            symmetric=instance.symmetric,
+        )
+        assert set(kinds) >= {"off_by_one", "wrong_return"}
+
+
+def test_a_failing_test_task_records_its_claim() -> None:
+    instance = instances.build(W1, "factor_up", 0, 0)
+    claim = instance.task_claim
+    assert claim is not None and claim["test"] in instance.designed_failing
+    first = next(test for test in instance.tests if test.name == claim["test"])
+    assert claim["got"] == repr(first.bug.value)
+    assert instances.build(W4, "stub_none", 0, 0).task_claim is None

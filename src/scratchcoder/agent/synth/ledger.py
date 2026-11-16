@@ -8,15 +8,23 @@ retries are executions too, so each attempt is counted. Calls made before the le
 source files and hashes (:func:`prior_from_records`).
 
 The total is the sum of ``calls`` over every entry, so the cap applies across all runs that
-share the file.
+share the file. The cap is :data:`DEFAULT_CAP`, the approved hard cap: a lower cap may be
+given for one run, a higher one is refused. A run that executes holds an exclusive lock on
+the ledger (:meth:`Ledger.locked`) for its whole duration and reads the entries only after
+taking it, so two concurrent runs cannot each spend the remainder from their own totals; it
+also refuses a ledger file that does not exist or has no prior entries
+(:meth:`Ledger.require_seeded`), so a mistyped or fresh path cannot restart the count at
+zero.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +39,10 @@ Execute = Callable[[str, str, str], Result]
 
 class CallCapReached(RuntimeError):
     """Starting another sandbox call would exceed the ledger's cap."""
+
+
+class LedgerError(ValueError):
+    """The ledger cannot be used as given (unseeded, over the cap, or held by another run)."""
 
 
 def _now() -> str:
@@ -51,6 +63,8 @@ class Ledger:
     def open(cls, path: Path, cap: int = DEFAULT_CAP) -> Ledger:
         if cap < 0:
             raise ValueError("the call cap must be non-negative")
+        if cap > DEFAULT_CAP:
+            raise LedgerError(f"the call cap may not exceed the approved {DEFAULT_CAP}")
         entries: list[dict[str, Any]] = []
         if path.exists():
             for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -63,6 +77,33 @@ class Ledger:
                     raise ValueError(f"{path}: line {number} has a negative call count")
                 entries.append(entry)
         return cls(path, cap, entries)
+
+    @classmethod
+    @contextlib.contextmanager
+    def locked(cls, path: Path, cap: int = DEFAULT_CAP) -> Iterator[Ledger]:
+        """The ledger, opened after taking an exclusive lock that is held until the block
+        ends; refused at once when another run holds it."""
+        if cap > DEFAULT_CAP:
+            raise LedgerError(f"the call cap may not exceed the approved {DEFAULT_CAP}")
+        lock_path = path.with_name(path.name + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise LedgerError(f"{path} is in use by another run") from None
+            try:
+                yield cls.open(path, cap)
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def require_seeded(self) -> None:
+        """Refuse a ledger file that does not exist or holds no prior entries: an executing
+        run must add to the shared count, never start a new one."""
+        if not self.path.is_file():
+            raise LedgerError(f"{self.path} does not exist; seed it with the ledger command")
+        if not any(entry.get("kind") == "prior" for entry in self.entries):
+            raise LedgerError(f"{self.path} has no prior entries; seed it first")
 
     @property
     def total(self) -> int:
@@ -81,12 +122,31 @@ class Ledger:
             os.fsync(stream.fileno())
         self.entries.append(row)
 
+    def _priors(self) -> list[dict[str, Any]]:
+        return [entry for entry in self.entries if entry.get("kind") == "prior"]
+
     def sources(self) -> set[str]:
-        return {str(entry.get("source")) for entry in self.entries if entry.get("kind") == "prior"}
+        return {str(entry.get("source")) for entry in self._priors()}
+
+    def known(self, path: str, sha256: str) -> str:
+        """Why a run record is already counted ("" if it is not): the same resolved path,
+        or the same bytes under another path (a copy of a counted record)."""
+        for entry in self._priors():
+            if entry.get("path") is not None and str(entry["path"]) == path:
+                return "path"
+            if entry.get("sha256") is not None and entry["sha256"] == sha256:
+                return f"copy of {entry['path']}"
+        return ""
 
     def add_prior(self, source: str, calls: int, detail: Mapping[str, Any]) -> bool:
-        """Record calls made before the ledger existed; once per source (False if present)."""
-        if source in self.sources():
+        """Record calls made before the ledger existed. A record is counted once: refused
+        (False) when ``detail`` names a path or SHA-256 already counted, or, without them,
+        when ``source`` is already present."""
+        path, sha = detail.get("path"), detail.get("sha256")
+        if path is not None and sha is not None:
+            if self.known(str(path), str(sha)):
+                return False
+        elif source in self.sources():
             return False
         if calls < 0:
             raise ValueError("prior calls must be non-negative")
@@ -169,16 +229,27 @@ def count_record(path: Path) -> int:
 RECORD_NAMES = ("validation.json", "scorecard.json", "controls.json")
 
 
-def prior_from_records(ledger: Ledger, directories: Iterable[Path]) -> list[dict[str, Any]]:
-    """Add one prior entry per run record found in ``directories`` (idempotent)."""
+def prior_from_records(
+    ledger: Ledger, directories: Iterable[Path], *, skipped: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    """Add one prior entry per run record found in ``directories`` (idempotent). A record is
+    keyed by its resolved path and its SHA-256: one already counted under either is skipped
+    and, when ``skipped`` is given, listed there with the reason."""
     added = []
     for directory in directories:
         for name in RECORD_NAMES:
             path = directory / name
             if not path.is_file():
                 continue
-            calls = count_record(path)
+            resolved = str(path.resolve())
+            sha = _file_sha(path)
+            reason = ledger.known(resolved, sha) or ledger.known(str(path), sha)
             source = f"{directory.name}/{name}"
-            if ledger.add_prior(source, calls, {"sha256": _file_sha(path), "path": str(path)}):
-                added.append({"source": source, "calls": calls})
+            if reason:
+                if skipped is not None:
+                    skipped.append({"path": resolved, "reason": reason})
+                continue
+            calls = count_record(path)
+            if ledger.add_prior(source, calls, {"sha256": sha, "path": resolved}):
+                added.append({"source": source, "path": resolved, "calls": calls})
     return added

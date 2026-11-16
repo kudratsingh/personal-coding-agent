@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 from agent_fixtures import ScriptedExecutor, write_case, write_registry
-from synth_fixtures import W1, W5, Chunks, SynthExecutor
+from synth_fixtures import W1, W3, W5, Chunks, SynthExecutor, claim_errors
 
 from scratchcoder.agent import cases, loop, workspace
 from scratchcoder.agent.policy import OraclePolicy
@@ -44,13 +44,14 @@ def _instance(
     (tmp_path / cases.REGISTRY_NAME).write_text(
         json.dumps(cases.build_registry(tmp_path)), encoding="utf-8"
     )
-    (case,) = cases.load_cases(tmp_path)
+    (case,) = cases.load_cases(tmp_path, synthetic=True)
     synth = json.loads((tmp_path / instance.id / "synth.json").read_text(encoding="utf-8"))
     return instance, case, synth, encoder
 
 
 def _executor(instance: instances.Instance, **options: object) -> SynthExecutor:
     module = instance.module_file(instance.template.target).removesuffix(".py")
+    options.setdefault("errors", claim_errors(instance.task_claim))
     return SynthExecutor(
         module,
         instance.name(instance.template.target),
@@ -149,6 +150,7 @@ def test_an_original_that_passes_correctness_rejects_the_instance(tmp_path: Path
         instance.reference_target,
         instance.designed_failing,
         test_module=instance.public_tests[0].removesuffix(".py"),
+        errors=claim_errors(instance.task_claim),
     )
     oracle = independent.check_text(ORACLE, "toy1")
     built = rows.build_instance(case, synth, oracle, encoder, encoder, execute=executor)
@@ -334,10 +336,108 @@ def test_prior_calls_are_counted_from_run_records(tmp_path: Path) -> None:
     )
     book = call_ledger.Ledger.open(tmp_path / "ledger.jsonl")
     added = call_ledger.prior_from_records(book, [run, controls])
-    assert added == [
-        {"source": "validation-run/validation.json", "calls": 4},
-        {"source": "validation-run/scorecard.json", "calls": 5},
-        {"source": "controls-run/controls.json", "calls": 6},
+    assert [(row["source"], row["calls"]) for row in added] == [
+        ("validation-run/validation.json", 4),
+        ("validation-run/scorecard.json", 5),
+        ("controls-run/controls.json", 6),
     ]
     assert call_ledger.prior_from_records(book, [run, controls]) == []
     assert book.total == 15
+    # A second record directory with the same base name under another parent is counted;
+    # a byte-for-byte copy of a counted record is skipped and reported, not counted twice.
+    other = tmp_path / "elsewhere" / "validation-run"
+    other.mkdir(parents=True)
+    (other / "validation.json").write_text(
+        json.dumps({"cases": [{"calls": [{"host_failures": 1}]}]})
+    )
+    (other / "scorecard.json").write_bytes((run / "scorecard.json").read_bytes())
+    skipped: list[dict[str, object]] = []
+    added = call_ledger.prior_from_records(book, [other], skipped=skipped)
+    assert [(row["source"], row["calls"]) for row in added] == [
+        ("validation-run/validation.json", 2)
+    ]
+    assert [row["reason"] for row in skipped] == [f"copy of {(run / 'scorecard.json').resolve()}"]
+    assert book.total == 17
+
+
+def test_an_executing_run_needs_a_seeded_ledger_the_approved_cap_and_the_lock(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ledger.jsonl"
+    with pytest.raises(call_ledger.LedgerError, match="approved"):
+        call_ledger.Ledger.open(path, cap=call_ledger.DEFAULT_CAP + 1)
+    with call_ledger.Ledger.locked(path) as book:
+        with pytest.raises(call_ledger.LedgerError, match="does not exist"):
+            book.require_seeded()
+    path.write_text("")
+    with call_ledger.Ledger.locked(path) as book:
+        with pytest.raises(call_ledger.LedgerError, match="no prior entries"):
+            book.require_seeded()
+        book.add_prior("earlier/validation.json", 3, {"sha256": "y", "path": "/p"})
+        book.require_seeded()
+        # A second run cannot take the ledger while the first holds it.
+        with pytest.raises(call_ledger.LedgerError, match="in use"):
+            with call_ledger.Ledger.locked(path):
+                pass
+    with call_ledger.Ledger.locked(path) as book:
+        assert book.total == 3
+
+
+def test_a_task_claim_that_the_observation_contradicts_rejects_the_instance(
+    tmp_path: Path,
+) -> None:
+    instance, case, synth, encoder = _instance(tmp_path)
+    oracle = independent.check_text(ORACLE, "toy1")
+    assert synth["task_claim"] == instance.task_claim and instance.task_claim
+    # The original really returns something other than the value the task statement names.
+    claim = instance.task_claim
+    wrong = _executor(instance, errors={claim["test"]: ("AssertionError", claim["got"] + "1")})
+    built = rows.build_instance(case, synth, oracle, encoder, encoder, execute=wrong)
+    assert "task_claim_not_observed" in built.reasons and built.rows == []
+    assert built.calls == 5  # F0, two mutants, the reference, G; O is not spent.
+    right = _executor(instance)
+    assert rows.build_instance(case, synth, oracle, encoder, encoder, execute=right).accepted
+    # A cross-module task is checked the same way, on the caller's test.
+    other = tmp_path / "w3"
+    other.mkdir()
+    instance, case, synth, encoder = _instance(other, W3, "factor_up")
+    assert synth["task_claim"]["test"].startswith("test_" + instance.name("scale_all"))
+    assert rows.build_instance(
+        case, synth, oracle, encoder, encoder, execute=_executor(instance)
+    ).accepted
+
+
+def test_observation_blocks_keep_each_failing_test_apart() -> None:
+    observation = "\n".join(
+        [
+            "RESULT run_tests: failed (2 of 3 tests)",
+            "FAIL test_a (test_m.py:4)",
+            "    got = f([])",
+            "IndexError: list index out of range",
+            "FAIL test_b (test_m.py:8)",
+            "    got = f([1])",
+            "KeyError: 'x'",
+            "  in m.py:3 head: return xs[1]",
+            "(+1 more failing)",
+        ]
+    )
+    blocks = rows.failure_blocks(observation)
+    assert list(blocks) == ["test_a", "test_b"]
+    traceback = {
+        "error_line": "IndexError: list index out of range",
+        "raise_file": "m.py",
+        "raise_function": "head",
+        "test": "test_a",
+    }
+    # The error comes from test_a, the frame from test_b: not one observed traceback.
+    assert not rows._traceback_seen(observation, traceback)
+    assert rows._traceback_seen(
+        observation, {**traceback, "test": "test_b", "error_line": "KeyError: 'x'"}
+    )
+    assert rows.claim_seen(observation, {"test": "test_b", "raised": "KeyError"})
+    assert not rows.claim_seen(observation, {"test": "test_a", "raised": "KeyError"})
+    assert not rows.claim_seen(observation, {"test": "test_c", "got": "1"})
+    long = "x" * 500
+    cut = f"FAIL test_a (t.py:1)\n    got = f()\nAssertionError: {long[:400]}"
+    assert rows.claim_seen(cut, {"test": "test_a", "got": long})
+    assert not rows.claim_seen(cut, {"test": "test_a", "got": "y" + long})

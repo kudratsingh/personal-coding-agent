@@ -9,6 +9,12 @@ The side with more loss tokens than its share is cut down: replay rows in a fixe
 template's instances in hash order), so the kept agent rows keep their template spread. An
 instance's rows (edit and repairs) are kept or cut together. Diversity is reported as
 distinct templates, families, workflow types and mutation kinds, not row counts.
+
+Every agent row's whole assistant turn is its instance's reference target, and a template
+renders only a limited number of distinct targets, so many instances can share one reply.
+Before balancing, at most ``max_per_reply`` instances per distinct reply are kept (in hash
+order), and the report counts distinct replies, distinct (prompt, reply) pairs and the
+largest number of rows and instances that share one reply.
 """
 
 from __future__ import annotations
@@ -37,6 +43,31 @@ def _take_until(rows: Sequence[SFTRow], budget: int) -> list[SFTRow]:
     return kept
 
 
+def reply_key(info: Mapping[str, Any]) -> str:
+    return hashlib.sha256(str(info["reply"]).encode("utf-8")).hexdigest()
+
+
+def cap_per_reply(
+    agent: Sequence[SFTRow],
+    meta: Mapping[str, Mapping[str, Any]],
+    max_per_reply: int,
+    salt: str = SALT,
+) -> tuple[list[SFTRow], list[str]]:
+    """The agent rows of at most ``max_per_reply`` instances per distinct reply (instances
+    in hash order; 0 keeps all) and the instances cut."""
+    if max_per_reply <= 0:
+        return list(agent), []
+    replies: dict[str, str] = {}
+    for row in agent:
+        replies.setdefault(str(meta[row.id]["instance"]), reply_key(meta[row.id]))
+    by_reply: dict[str, list[str]] = defaultdict(list)
+    for instance in sorted(replies, key=lambda item: _order(item, salt)):
+        by_reply[replies[instance]].append(instance)
+    kept = {instance for instances in by_reply.values() for instance in instances[:max_per_reply]}
+    cut = sorted(set(replies) - kept)
+    return [row for row in agent if str(meta[row.id]["instance"]) in kept], cut
+
+
 def mix(
     agent: Sequence[SFTRow],
     meta: Mapping[str, Mapping[str, Any]],
@@ -44,13 +75,17 @@ def mix(
     *,
     ratio: float = 1.0,
     salt: str = SALT,
+    max_per_reply: int = 0,
 ) -> tuple[list[SFTRow], dict[str, Any]]:
     """The mixed rows (agent first, then replay, each in its kept order) and the report.
-    ``ratio`` is agent loss tokens per replay loss token."""
+    ``ratio`` is agent loss tokens per replay loss token; ``max_per_reply`` caps the
+    instances that share one reply (0: no cap)."""
     if ratio <= 0:
         raise ValueError("the ratio must be positive")
     if len({row.id for row in [*agent, *replay]}) != len(agent) + len(replay):
         raise ValueError("row IDs must be unique across both sides")
+    offered = list(agent)
+    agent, cut = cap_per_reply(agent, meta, max_per_reply, salt)
     agent_tokens = sum(loss_tokens(row) for row in agent)
     replay_tokens = sum(loss_tokens(row) for row in replay)
     replay_sorted = sorted(replay, key=lambda row: _order(row.id, salt))
@@ -78,7 +113,27 @@ def mix(
         kept_agent = list(agent)
         kept_replay = _take_until(replay_sorted, int(agent_tokens / ratio))
     mixed = [*kept_agent, *kept_replay]
-    return mixed, report(kept_agent, kept_replay, meta, ratio, agent, replay)
+    found = report(kept_agent, kept_replay, meta, ratio, offered, replay)
+    found["agent"]["reply_cap_instances"] = max_per_reply
+    found["agent"]["instances_cut_by_reply_cap"] = len(cut)
+    return mixed, found
+
+
+def reply_diversity(infos: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Distinct replies and (prompt, reply) pairs of agent rows (their metadata), and the
+    most rows and instances that share one reply."""
+    replies = Counter(reply_key(info) for info in infos)
+    instances: dict[str, set[str]] = defaultdict(set)
+    for info in infos:
+        instances[reply_key(info)].add(str(info["instance"]))
+    return {
+        "distinct_replies": len(replies),
+        "distinct_prompt_reply_pairs": len(
+            {(str(info["prompt_sha256"]), reply_key(info)) for info in infos}
+        ),
+        "max_rows_per_reply": max(replies.values(), default=0),
+        "max_instances_per_reply": max((len(item) for item in instances.values()), default=0),
+    }
 
 
 def report(
@@ -110,6 +165,7 @@ def report(
                 {str(info["mutation_kind"]) for info in infos if info["mutation_kind"]}
             ),
             "instances": len({info["instance"] for info in infos}),
+            **{f"kept_{key}": value for key, value in reply_diversity(infos).items()},
         },
         "replay": {
             "rows": len(replay),

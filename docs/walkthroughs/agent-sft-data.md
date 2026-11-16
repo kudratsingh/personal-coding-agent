@@ -54,13 +54,13 @@ row and two repair rows.
 | --- | --- | --- |
 | Render | template, seed, bug kind | names, module names, constants, structural variant; canonical sources |
 | Assemble | rendered functions | modules (docstring, imports, functions), test module, hidden checks, task |
-| Mutate | reference target | mutants that parse, keep the name and signature, and differ from the reference and the original |
+| Mutate | reference target | mutants that parse, keep the name and signature, and differ (after a canonical rewrite) from the reference and the original |
 | Static check | instance | case-loader validation, sizes (20 lines, 180 tokens), the `agent_dev_run plan` fit rule, target shown, blocklist |
 | Specs | catalog, instances | `specs.json`: behaviour, signature, constants, input domain, oracle file format |
 | Loop | case, mutants, reference, oracle text | prompts of every turn, the loop's statuses |
 | Render rows | prompt, reference | chat-v1 `SFTRow` (`id`, `ids`, `source`, `spans`) plus a metadata line |
-| Contamination | rows | rejected row IDs only |
-| Mix | agent rows, replay rows | rows at a target ratio of assistant-loss tokens |
+| Contamination | rows | rejected row IDs only, the input's SHA-256 and the case registries checked |
+| Mix | agent rows, replay rows, both contamination results | rows at a target ratio of assistant-loss tokens, at most a few instances per distinct reply |
 
 Sandbox calls per instance, with `k` mutants: the original's public tests (F0), one public run
 per mutant, the reference's public run, one grading call and the original against the hidden
@@ -68,11 +68,19 @@ correctness checks. That is `k + 4` calls, six with the default two mutants. The
 test string holds the hidden correctness checks, the preservation checks and the independent
 oracle's checks, so one typed verdict decides acceptance. The loop's `grade_checks` option
 makes the loop grade with that one call; its default is unchanged. The four negative controls
-run once per template on the small batch, at one call each.
+run once per template, at one call each, before the template's first instance. A template's
+instances are built only when all four controls failed its grading script, in this run or in an
+earlier build against the same oracle (`--controls-from`). Otherwise they are recorded as
+rejected and spend no calls. `controls.all_failed` is empty (`null`), not true, when no
+control ran.
 
 Every call is counted in one ledger file before it starts. The build refuses a call that would
 take the total over the cap, and it refuses to start when the planned calls exceed what the cap
-leaves.
+leaves. It also refuses a ledger file that does not exist or has no prior entries (a mistyped
+path would restart the count at zero), a `--max-calls` above the approved cap, and a ledger
+that another run holds: the run keeps an exclusive lock on the ledger and reads its entries only
+after taking it. Earlier run records are counted once each, keyed by resolved path and file
+hash; a copy of a counted record is skipped and reported.
 
 ## Design choices and common mistakes
 
@@ -101,28 +109,56 @@ leaves.
 - **Tracebacks are modelled, then observed.** A traceback task names the frames the spec
   function's own exception passed through (each spec mirrors its function's calls). The build
   accepts the instance only if the original's real sandbox observation shows the same error
-  line and raising function.
-- **A mutant may be equivalent on the public tests.** The host cannot tell without running it.
-  When a mutant passes the public tests, the loop stops and the instance is rejected. Mutation
-  kinds that usually change outcomes are tried first.
-- **Diversity is counted by template and family, not by row.** Thousands of rows from a few
-  templates are variations, not independent problems; manifests report distinct templates,
-  families, workflow types and mutation kinds.
+  line and raising function, both in the failure block of the test the task names.
+- **Task claims are observed too.** A failing-test task (W1, W3) says which test fails and what
+  the call returns or raises under the bug; those values come from the spec model. The
+  instance records that claim, and the build accepts it only if the original's observation
+  has a block for that test showing `AssertionError: <the claimed value>` (the public tests'
+  assertion message) or the claimed exception. Otherwise the rows would pair a task statement
+  with an observation that contradicts it.
+- **A mutant may be equivalent on the public tests.** The host cannot always tell without running
+  it. When a mutant passes the public tests, the loop stops and the instance is rejected. Some
+  equivalent or never-ending mutants can be predicted from the code alone, and those sites are
+  skipped: swapping the arguments of `max`, `min`, a helper marked symmetric or a `zip` whose
+  pair is used symmetrically; `len(x[0])` to `len(x[-1])`; a default of `d.get` when `d` was
+  built by a dict comprehension; `-0`; and inside a `while` loop, its test, the `if` that
+  guards adding to its worklist, and the statements that update a name the test reads. A
+  negation that only re-expresses a comparison (`not n % 2 == 1` for `n % 2 == 0`) counts as
+  the same tree. Mutation kinds that usually change outcomes are tried first.
+- **Diversity is counted by template, family and reply, not by row.** Thousands of rows from a
+  few templates are variations, not independent problems. Every row of an instance has the
+  same reply (the reference target), and a template renders only a limited number of distinct
+  targets. So `generate` caps the instances that share one reply (`--max-per-reply`, three by
+  default) and reports, per template, the distinct replies kept and the distinct replies its
+  seeds can reach. Size an expansion by that reach, not by the call budget. `mix` applies the
+  same cap and reports distinct replies, distinct (prompt, reply) pairs and the most rows on one
+  reply, beside distinct templates, families, workflow types and mutation kinds.
+- **Contamination results are bound to their inputs.** `mix` needs both results (agent rows
+  and replay rows). Each must have been computed on exactly the file being mixed (by SHA-256)
+  and against exactly the evaluation-case registries named with `--case-registry-sha256`. The
+  development-task check on these rows is an n-gram check only, and every result and manifest
+  says so.
+- **Training instances are not evaluation cases.** Generated instances keep the case format,
+  but the case loader refuses them unless asked for them (`synthetic=True`), so they cannot be
+  scored as development cases. A path with any part starting with `heldout` is refused.
 
 ## Verification
 
 - `tests/test_agent_synth.py`: catalog breadth and uniqueness rules; every template and bug kind
   builds, parses and passes the case loader's static validation; determinism; expected values
   and designed failing tests from the spec model; cross-module, stub and traceback layouts;
-  mutant and control properties; static checks and the blocklist; spec-text edge cases.
+  mutant and control properties; the mutation skip rules and the canonical comparison; static
+  checks and the blocklist; spec-text edge cases; task claims.
 - `tests/test_agent_synth_rows.py`: rows from the real loop with a scripted executor (edit and
   repair rows, user-turn IDs equal to the harness prompt IDs, loss mask on the reply only);
-  rejection when a mutant passes, when the original passes correctness, or when a traceback is
-  not observed; negative controls; the loop's `grade_checks`; oracle text handling and the
-  `SHA256SUMS` pin; the ledger.
+  rejection when a mutant passes, when the original passes correctness, when a traceback is
+  not observed in one failure block, or when a task claim is contradicted; negative controls;
+  the loop's `grade_checks`; oracle text handling and the `SHA256SUMS` pin; the ledger's cap,
+  seeding, lock and record keys.
 - `tests/test_agent_synth_tool.py`: contamination signals and status-only output, mixing by
-  loss tokens, and the `tools/agent_sft_data.py` subcommands, including the receipt, cap and
-  oracle-pin refusals.
+  loss tokens and the reply cap, and the `tools/agent_sft_data.py` subcommands, including the
+  receipt, cap, ledger, oracle-pin, control-gate, contamination-binding, held-out and
+  synthetic-case refusals.
 
 Run them with `uv run --locked pytest tests/test_agent_synth*.py`.
 

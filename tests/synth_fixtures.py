@@ -5,7 +5,7 @@ literal (``ast.literal_eval``), never by running them."""
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -194,7 +194,8 @@ class SynthExecutor:
     - a check script: passes when the target equals ``reference``.
 
     ``public_passes`` lists target texts (such as an equivalent mutant) for which the public
-    tests pass anyway. Records every call."""
+    tests pass anyway; ``errors`` overrides ``error`` per failing test. Records every
+    call."""
 
     def __init__(
         self,
@@ -207,6 +208,7 @@ class SynthExecutor:
         frames: Sequence[list[object]] = (),
         error: tuple[str, str] = ("AssertionError", "wrong"),
         public_passes: Sequence[str] = (),
+        errors: Mapping[str, tuple[str, str]] | None = None,
     ) -> None:
         self.module, self.name, self.reference = module, name, reference
         self.failing = list(failing)
@@ -214,6 +216,7 @@ class SynthExecutor:
         self.frames = [list(frame) for frame in frames]
         self.error = error
         self.public_passes = list(public_passes)
+        self.errors = dict(errors or {})
         self.calls: list[tuple[str, str, str]] = []
 
     def __call__(self, program: str, tests: str, mode: str) -> Result:
@@ -231,9 +234,19 @@ class SynthExecutor:
                 "module": self.test_module,
                 "test": test,
                 "outcome": "fail",
-                "type": self.error[0],
-                "message": self.error[1],
+                "type": self.errors.get(test, self.error)[0],
+                "message": self.errors.get(test, self.error)[1],
                 "frames": self.frames,
             }
             lines.append(execution.REPORT_PREFIX + json.dumps(row))
         return Result("failed", "\n".join(lines) + "\n", 1, 0.1)
+
+
+def claim_errors(claim: Mapping[str, str] | None) -> dict[str, tuple[str, str]]:
+    """The failing-test error a task statement's claim describes, as the sandbox reports it:
+    the public tests assert ``got == want, repr(got)``."""
+    if not claim:
+        return {}
+    if "raised" in claim:
+        return {claim["test"]: (claim["raised"], "boom")}
+    return {claim["test"]: ("AssertionError", claim["got"])}

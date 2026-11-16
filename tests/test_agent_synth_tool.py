@@ -12,10 +12,11 @@ from pathlib import Path
 
 import pytest
 from agent_fixtures import ARITH, write_case, write_registry
-from synth_fixtures import Chunks, SynthExecutor, families_json
+from synth_fixtures import Chunks, SynthExecutor, claim_errors, families_json
 
 from scratchcoder.agent import cases, workspace
 from scratchcoder.agent.synth import contamination, mix
+from scratchcoder.agent.synth import ledger as call_ledger
 from scratchcoder.data.chat import Rendered
 from scratchcoder.data.sft import SFTRow, read_rows
 from scratchcoder.sandbox import runner
@@ -109,6 +110,8 @@ def test_mix_matches_loss_tokens_and_keeps_template_spread() -> None:
             "kind": "edit",
             "workflow_type": "W1",
             "mutation_kind": None,
+            "reply": f"def f{row.id}(): pass",
+            "prompt_sha256": row.id,
         }
         for row in agent
     }
@@ -122,6 +125,44 @@ def test_mix_matches_loss_tokens_and_keeps_template_spread() -> None:
     assert report["replay"]["rows"] == 1 and report["agent"]["rows"] == 1
     with pytest.raises(ValueError, match="unique"):
         mix.mix(small, meta, [_sft("a0-0", "replay", 3)])
+
+
+def test_mix_caps_instances_that_share_one_reply_and_reports_reply_diversity() -> None:
+    # Two templates; template a has 6 instances (2 rows each) sharing 2 replies, b has 2
+    # instances with distinct replies.
+    agent = [
+        _sft(f"{t}{i}-{k}", "agent", 5)
+        for t, count in (("a", 6), ("b", 2))
+        for i in range(count)
+        for k in ("edit", "repair")
+    ]
+    meta = {
+        row.id: {
+            "template_id": row.id[0],
+            "instance": row.id.split("-")[0],
+            "family": row.id[0],
+            "kind": row.id.split("-")[1],
+            "workflow_type": "W1",
+            "mutation_kind": None if row.id.endswith("edit") else "off_by_one",
+            "reply": f"def g{int(row.id[1]) % 2}(): pass" if row.id[0] == "a" else row.id[:2],
+            "prompt_sha256": row.id,
+        }
+        for row in agent
+    }
+    replay = [_sft(f"r{i}", "replay", 100) for i in range(3)]
+    _, uncapped = mix.mix(agent, meta, replay, ratio=1.0)
+    assert uncapped["agent"]["kept_distinct_replies"] == 4
+    assert uncapped["agent"]["kept_max_instances_per_reply"] == 3
+    assert uncapped["agent"]["kept_max_rows_per_reply"] == 6
+    assert uncapped["agent"]["kept_distinct_prompt_reply_pairs"] == 16
+    mixed, capped = mix.mix(agent, meta, replay, ratio=1.0, max_per_reply=1)
+    assert capped["agent"]["instances"] == 4 and capped["agent"]["rows"] == 8
+    assert capped["agent"]["instances_cut_by_reply_cap"] == 4
+    assert capped["agent"]["kept_max_instances_per_reply"] == 1
+    assert capped["agent"]["reply_cap_instances"] == 1
+    assert capped["agent"]["rows_available"] == 16
+    kept = {meta[row.id]["instance"] for row in mixed if row.id in meta}
+    assert len(kept) == 4 and {"b0", "b1"} <= kept
 
 
 def _receipt(path: Path, argv: Sequence[str]) -> None:
@@ -172,7 +213,7 @@ def _generate(tmp_path: Path, templates: Sequence[str]) -> Path:
 
 def test_generate_and_specs_write_registered_instances_and_text_only_specs(tmp_path: Path) -> None:
     out = _generate(tmp_path, ["stock1", "grid3"])
-    loaded = cases.load_cases(out)
+    loaded = cases.load_cases(out, synthetic=True)
     assert [case.id for case in loaded] == [
         "grid3-stub_none-000",
         "grid3-stub_raise-000",
@@ -246,10 +287,26 @@ def _independent(tmp_path: Path, files: dict[str, str] | None = None) -> str:
     return hashlib.sha256(sums.encode("utf-8")).hexdigest()
 
 
+PRIOR_CALLS = 7
+
+
+def _seed_ledger(tmp_path: Path) -> Path:
+    """The shared ledger, seeded from one earlier run record (as the ledger command does)."""
+    path = tmp_path / "ledger.jsonl"
+    if not path.exists():
+        run = tmp_path / "earlier-validation"
+        run.mkdir()
+        (run / "controls.json").write_text(json.dumps({"sandbox_calls": PRIOR_CALLS, "rows": []}))
+        argv = ["ledger", "--ledger", str(path), "--seed-from", str(run)]
+        assert agent_sft_data.main(argv) == 0
+    return path
+
+
 def _build_argv(
     tmp_path: Path, out: Path, instances: Path, receipt: Path, pin: str, *extra: str
 ) -> list[str]:
     tokenizer = tmp_path / "tokenizer.json"
+    _seed_ledger(tmp_path)
     return [
         "validate-and-build",
         "--instances",
@@ -305,6 +362,7 @@ class CaseExecutor:
                 synth["reference_target"],
                 synth["designed_failing_tests"],
                 test_module=spec["public_tests"][0].removesuffix(".py"),
+                errors=claim_errors(synth.get("task_claim")),
             )
             key = _without_target(sources, executor.module, name)
             self.routes.append((key, executor))
@@ -366,13 +424,16 @@ def test_validate_and_build_writes_rows_records_and_ledger(
         assert all(line["oracle_sha256"] == oracle_sha for line in lines), name
     assert record["totals"] == {"accepted": 2, "rows": 6}
     assert record["planned_calls"] == 2 * 6 + 4 == executor.calls
-    assert record["controls"] == {"rows": 4, "all_failed": True}
+    assert record["controls"]["rows"] == 4 and record["controls"]["all_failed"] is True
+    assert record["controls"]["templates_passed"] == ["stock1"]
+    assert record["controls"]["templates_without_controls"] == []
     built = list(read_rows(out / "rows.jsonl"))
     meta = [json.loads(line) for line in (out / "rows-meta.jsonl").read_text().splitlines()]
     assert [row.id for row in built] == [row["id"] for row in meta]
     assert {row.source for row in built} == {"agent-sft1-edit", "agent-sft1-repair"}
     lines = (tmp_path / "ledger.jsonl").read_text().splitlines()
-    assert len(lines) == executor.calls
+    assert len(lines) == 1 + executor.calls  # The prior entry, then one line per call.
+    assert record["ledger"]["total"] == PRIOR_CALLS + executor.calls
     assert hashlib.sha256((out / "rows.jsonl").read_bytes()).hexdigest()
     manifest = tmp_path / "manifest.json"
     assert (
@@ -393,7 +454,11 @@ def test_validate_and_build_writes_rows_records_and_ledger(
     )
     document = json.loads(manifest.read_text())
     assert document["builds"][0]["rows_by_kind"] == {"edit": 2, "repair": 4}
-    assert document["ledger"]["total"] == executor.calls
+    assert document["builds"][0]["distinct_prompt_reply_pairs"] == 6
+    assert document["builds"][0]["max_rows_per_reply"] <= 6
+    assert document["instances"]["distinct_replies"] >= 1
+    assert "not applied" in document["contamination_scope"]["development_tasks"]
+    assert document["ledger"]["total"] == PRIOR_CALLS + executor.calls
     assert len(document["templates"]) >= 40
 
 
@@ -422,3 +487,265 @@ def test_validate_and_build_refuses_an_unpinned_or_changed_independent_directory
     assert agent_sft_data.main(argv, execute=executor, loader=_loader) == 2
     assert "does not list stock2.py" in capsys.readouterr().err
     assert executor.calls == 0 and not out.exists()
+
+
+def test_validate_and_build_refuses_an_unseeded_ledger_and_a_raised_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    instances = _generate(tmp_path, ["stock1"])
+    pin = _independent(tmp_path)
+    receipt = tmp_path / "receipt.json"
+    executor = CaseExecutor(instances)
+    out = tmp_path / "build"
+    argv = _build_argv(tmp_path, out, instances, receipt, pin, "--controls")
+    # A mistyped ledger path would start a fresh count at zero: refused.
+    typo = [*argv]
+    typo[typo.index("--ledger") + 1] = str(tmp_path / "ledger.json")
+    _receipt(receipt, typo)
+    assert agent_sft_data.main(typo, execute=executor, loader=_loader) == 2
+    assert "does not exist" in capsys.readouterr().err
+    raised = [*argv, "--max-calls", str(call_ledger.DEFAULT_CAP + 1)]
+    _receipt(receipt, raised)
+    assert agent_sft_data.main(raised, execute=executor, loader=_loader) == 2
+    assert "approved" in capsys.readouterr().err
+    assert executor.calls == 0 and not out.exists()
+
+
+def test_a_template_whose_control_passes_gives_no_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    instances = _generate(tmp_path, ["stock1"])
+    pin = _independent(tmp_path)
+    receipt = tmp_path / "receipt.json"
+
+    class WeakChecks(CaseExecutor):
+        """The constant control (the fourth call: controls run first) passes the grading
+        script, as it would against weak checks."""
+
+        def __call__(self, program: str, tests: str, mode: str):  # type: ignore[no-untyped-def]
+            result = super().__call__(program, tests, mode)
+            if self.calls == 4:
+                return type(result)("passed")
+            return result
+
+    executor = WeakChecks(instances)
+    out = tmp_path / "build"
+    argv = _build_argv(tmp_path, out, instances, receipt, pin, "--controls")
+    _receipt(receipt, argv)
+    assert agent_sft_data.main(argv, execute=executor, loader=_loader) == 0
+    record = json.loads((out / "record.json").read_text())
+    assert record["controls"]["all_failed"] is False
+    assert record["controls"]["templates_failed"] == ["stock1"]
+    assert record["totals"] == {"controls_failed": 3}
+    assert executor.calls == 4  # The controls only; no instance was run.
+    assert (out / "rows.jsonl").read_text() == ""
+    reasons = [json.loads(line)["reasons"] for line in (out / "instances.jsonl").open()]
+    assert reasons == [["controls_not_all_failed"]] * 3
+    # Without controls (this run or an earlier one) a template gives no rows either.
+    first = out
+    out = tmp_path / "build-2"
+    argv = _build_argv(tmp_path, out, instances, receipt, pin)
+    _receipt(receipt, argv)
+    assert agent_sft_data.main(argv, execute=CaseExecutor(instances), loader=_loader) == 0
+    record = json.loads((out / "record.json").read_text())
+    assert record["controls"]["all_failed"] is None
+    assert record["controls"]["templates_without_controls"] == ["stock1"]
+    assert record["totals"] == {"no_controls": 3}
+    # Controls recorded by an earlier build against the same oracle count, and gate.
+    out = tmp_path / "build-3"
+    argv = _build_argv(
+        tmp_path, out, instances, receipt, pin, "--controls-from", str(first / "controls.jsonl")
+    )
+    _receipt(receipt, argv)
+    again = CaseExecutor(instances)
+    assert agent_sft_data.main(argv, execute=again, loader=_loader) == 0
+    assert json.loads((out / "record.json").read_text())["totals"] == {"controls_failed": 3}
+    assert again.calls == 0
+
+
+def _mix_inputs(tmp_path: Path) -> dict[str, Path]:
+    from scratchcoder.data.sft import write_rows
+
+    write_case(tmp_path / "evalcases")
+    write_registry(tmp_path / "evalcases")
+    agent = [_sft(f"agent-sft1/i{n}/edit", "agent-sft1-edit", 8) for n in range(3)]
+    write_rows(tmp_path / "rows.jsonl", agent)
+    meta = tmp_path / "rows-meta.jsonl"
+    meta.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "id": row.id,
+                    "kind": "edit",
+                    "instance": f"i{n}",
+                    "template_id": "t",
+                    "family": "f",
+                    "workflow_type": "W1",
+                    "mutation_kind": None,
+                    "prompt_sha256": row.id,
+                    "user_text": f"fix the area helper number {n}",
+                    "reply": f"def area{n}(w, h):\n    return w * h",
+                }
+            )
+            + "\n"
+            for n, row in enumerate(agent)
+        )
+    )
+    replay = [_sft(f"r{n}", "replay", 8) for n in range(3)]
+    write_rows(tmp_path / "replay.jsonl", replay)
+    index = tmp_path / "decoded-index.jsonl"
+    index.write_text(
+        "".join(
+            json.dumps(
+                {"id": row.id, "kind": "code", "user": ["q"], "assistant": [f"def v{n}(): pass"]}
+            )
+            + "\n"
+            for n, row in enumerate(replay)
+        )
+    )
+    families = families_json(tmp_path / "families.json")
+    results = {}
+    for side, flag, source in (("agent", "--rows-meta", meta), ("replay", "--decoded", index)):
+        out = tmp_path / f"contamination-{side}.json"
+        argv = [
+            "contamination",
+            "--cases",
+            str(tmp_path / "evalcases"),
+            "--families",
+            str(families),
+            flag,
+            str(source),
+            "--out",
+            str(out),
+        ]
+        assert agent_sft_data.main(argv) == 0
+        results[side] = out
+    return {"meta": meta, "index": index, **results}
+
+
+def _mix_argv(tmp_path: Path, paths: dict[str, Path], out: str, *registries: str) -> list[str]:
+    return [
+        "mix",
+        "--agent-rows",
+        str(tmp_path / "rows.jsonl"),
+        "--agent-meta",
+        str(paths["meta"]),
+        "--replay",
+        str(tmp_path / "replay.jsonl"),
+        "--replay-index",
+        str(paths["index"]),
+        "--agent-rejected",
+        str(paths["agent"]),
+        "--replay-rejected",
+        str(paths["replay"]),
+        "--case-registry-sha256",
+        *registries,
+        "--out",
+        str(tmp_path / out),
+    ]
+
+
+def test_mix_needs_both_contamination_results_for_these_inputs_and_case_sets(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    paths = _mix_inputs(tmp_path)
+    result = json.loads(paths["agent"].read_text())
+    assert result["input_kind"] == "rows_meta"
+    assert result["input_sha256"] == hashlib.sha256(paths["meta"].read_bytes()).hexdigest()
+    registry = cases.registry_sha256(tmp_path / "evalcases")
+    assert contamination.registries(result) == {registry}
+    assert agent_sft_data.main(_mix_argv(tmp_path, paths, "mix-ok", registry)) == 0
+    record = json.loads((tmp_path / "mix-ok" / "mix-record.json").read_text())
+    assert record["case_registries"] == [registry]
+    assert record["contamination"]["agent"]["input_sha256"] == result["input_sha256"]
+    # A case set the results were not checked against (e.g. the second evaluation set).
+    argv = _mix_argv(tmp_path, paths, "mix-more", registry, "e" * 64)
+    assert agent_sft_data.main(argv) == 2
+    assert "exactly the named case sets" in capsys.readouterr().err
+    # The results swapped: each was computed on the other side's input.
+    swapped = {**paths, "agent": paths["replay"], "replay": paths["agent"]}
+    assert agent_sft_data.main(_mix_argv(tmp_path, swapped, "mix-swap", registry)) == 2
+    assert "checked decoded, not rows_meta" in capsys.readouterr().err
+    # Rows metadata changed after the check (a later build): the result is stale.
+    paths["meta"].write_text(paths["meta"].read_text() + "\n")
+    assert agent_sft_data.main(_mix_argv(tmp_path, paths, "mix-stale", registry)) == 2
+    assert "not computed on" in capsys.readouterr().err
+    # Both results are required.
+    argv = _mix_argv(tmp_path, paths, "mix-none", registry)
+    del argv[argv.index("--agent-rejected") : argv.index("--agent-rejected") + 2]
+    with pytest.raises(SystemExit):
+        agent_sft_data.main(argv)
+    assert not any((tmp_path / name).exists() for name in ("mix-more", "mix-swap", "mix-stale"))
+
+
+def test_a_held_out_prefix_and_generated_instances_are_refused_as_evaluation_cases(
+    tmp_path: Path,
+) -> None:
+    for name in ("heldout-r4", "HeldOut2", "heldout"):
+        sealed = tmp_path / "runs" / "agent-cases-x" / name
+        argv = ["specs", "--instances", str(sealed), "--out", str(tmp_path / "s.json")]
+        assert agent_sft_data.main(argv) == 2
+        with pytest.raises(cases.CaseError, match="held-out"):
+            cases.load_cases(sealed)
+    assert not cases.forbidden_part("held") and cases.forbidden_part("heldout-results")
+    # Generated training instances load only when asked for; evaluation loading refuses them.
+    out = _generate(tmp_path, ["stock1"])
+    with pytest.raises(cases.CaseError, match="generated training instance"):
+        cases.load_cases(out)
+    assert cases.load_cases(out, synthetic=True)
+    write_case(tmp_path / "evalcases")
+    write_registry(tmp_path / "evalcases")
+    with pytest.raises(cases.CaseError, match="not a generated training instance"):
+        cases.load_cases(tmp_path / "evalcases", synthetic=True)
+
+
+def test_generate_caps_instances_per_reply_and_reports_reply_reach(tmp_path: Path) -> None:
+    tokenizer = tmp_path / "tokenizer.json"
+    tokenizer.write_text("{}", encoding="utf-8")
+    families = families_json(tmp_path / "families.json")
+    records = {}
+    for cap in ("0", "1"):
+        out = tmp_path / f"instances-{cap}"
+        argv = [
+            "generate",
+            "--out",
+            str(out),
+            "--tokenizer",
+            str(tokenizer),
+            "--families",
+            str(families),
+            "--templates",
+            "dice2",
+            "--per-bug",
+            "3",
+            "--max-per-reply",
+            cap,
+            "--capacity-draws",
+            "30",
+        ]
+        assert agent_sft_data.main(argv, loader=_loader) == 0
+        records[cap] = json.loads((out / "generate.json").read_text())
+    uncapped, capped = records["0"]["replies"], records["1"]["replies"]
+    reach = capped["per_template"]["dice2"]["capacity"]
+    assert reach == capped["capacity_total"] and 1 <= reach < 9
+    assert uncapped["per_template"]["dice2"]["instances"] == 9
+    assert uncapped["max_instances_per_reply"] > 1
+    # With a cap of one, every kept instance has its own reply.
+    assert capped["max_instances_per_reply"] == 1
+    assert capped["distinct"] == capped["per_template"]["dice2"]["instances"] <= reach
+    assert any("reply cap" in row["problems"][0] for row in records["1"]["dropped"])
+
+
+def test_generate_passes_over_a_kind_whose_only_mutant_an_earlier_kind_took(
+    tmp_path: Path,
+) -> None:
+    # digits1's div_ten instance: after negate_condition (not n == 0, the same tree as
+    # n != 0), flip_comparison has no mutant left; the next kind is used instead.
+    out = _generate(tmp_path, ["digits1"])
+    record = json.loads((out / "generate.json").read_text())
+    assert record["dropped"] == []
+    for row in record["kept"]:
+        assert len(row["mutation_kinds"]) == 2 == len(set(row["mutation_kinds"]))
+        assert set(row["mutation_kinds"]) <= set(row["applicable_mutation_kinds"])

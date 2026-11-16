@@ -82,7 +82,7 @@ def _sha256_file(path: Path) -> str:
 
 def _refuse_heldout(paths: Sequence[Path]) -> None:
     for path in paths:
-        if any(part.lower() in agent_cases.FORBIDDEN_PARTS for part in path.resolve().parts):
+        if any(agent_cases.forbidden_part(part) for part in path.resolve().parts):
             raise SealedPathError(f"refusing {path}: held-out agent cases are sealed")
 
 

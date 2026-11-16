@@ -17,6 +17,14 @@ holds; the output names rejected row IDs only, never the matching case, signal o
 5. **Benchmarks.** It shares a 13-gram with a benchmark prompt or reference solution
    (HumanEval, HumanEval+, MBPP+), counting only 13-grams with at least three word tokens.
 6. **Development tasks.** The same with the pool's development split (prompt and solution).
+   This is an n-gram check only (:data:`DEV_METHOD`): a row on the same concept as a
+   development task in different words is not caught, and the task-family rule used for
+   replay rows is not applied here. Every result says so in ``index.dev_method``.
+
+A result records its input file's SHA-256 and kind (``input_sha256``, ``input_kind``) and
+the registry SHA-256 of every evaluation-case root it was checked against, so that a later
+step can refuse a result that was made for other rows or against fewer cases
+(:func:`require_result`).
 
 Evaluation cases are read through :func:`scratchcoder.agent.cases.load_cases` (every file is
 checked against its registry hash; held-out locations are refused). Nothing is executed.
@@ -39,6 +47,10 @@ from scratchcoder.agent.synth.instances import Blocklist
 from scratchcoder.data.filters import ContaminationIndex
 
 SCHEMA = "agent-case-contamination-v1"
+DEV_METHOD = (
+    "13-gram overlap (at least three word tokens) with the pool development split's prompts "
+    "and solutions; the development task-family rule is not applied to these rows"
+)
 NGRAM = 13
 JACCARD = 0.25
 EXTERNAL_MIN_ALPHA = 3
@@ -213,6 +225,7 @@ def build_index(
     if dev is not None:
         index.dev = ContaminationIndex(pool_texts(dev), NGRAM, min_alpha_tokens=EXTERNAL_MIN_ALPHA)
         identity["dev_sha256"] = _sha_file(dev)
+        identity["dev_method"] = DEV_METHOD
     index.identity = identity
     return index
 
@@ -294,13 +307,37 @@ def check(index: Index, rows: Iterable[RowText]) -> dict[str, Any]:
     return {"schema": SCHEMA, "checked": checked, "rejected": sorted(rejected)}
 
 
-def rejected_ids(path: Path | None) -> set[str]:
-    if path is None:
-        return set()
+def load_result(path: Path) -> dict[str, Any]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if raw.get("schema") != SCHEMA:
         raise ValueError(f"{path}: not a contamination result")
-    return set(raw["rejected"])
+    return dict(raw)
+
+
+def rejected_ids(path: Path | None) -> set[str]:
+    if path is None:
+        return set()
+    return set(load_result(path)["rejected"])
+
+
+def registries(result: Mapping[str, Any]) -> set[str]:
+    return {str(root["registry_sha256"]) for root in result.get("index", {}).get("case_roots", [])}
+
+
+def require_result(
+    result: Mapping[str, Any], *, input_path: Path, kind: str, case_registries: Iterable[str]
+) -> None:
+    """Refuse a result unless it was computed on ``input_path`` as it is now (same SHA-256,
+    same kind of input) and against exactly the registries ``case_registries`` names."""
+    if result.get("input_kind") != kind:
+        raise ValueError(f"the contamination result checked {result.get('input_kind')}, not {kind}")
+    if result.get("input_sha256") != _sha_file(input_path):
+        raise ValueError(f"the contamination result was not computed on {input_path} as it is")
+    wanted = set(case_registries)
+    if not wanted:
+        raise ValueError("name the evaluation-case registries the result must cover")
+    if registries(result) != wanted:
+        raise ValueError("the contamination result does not cover exactly the named case sets")
 
 
 def describe(index: Index) -> Mapping[str, Any]:

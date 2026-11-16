@@ -98,7 +98,7 @@ FAMILY = Family(
             '    """Sum of each column."""\n'
             "    return [sum(col) for col in $transpose($mt)]",
             _col_sums,
-            public=[("square", (M2,)), ("wide", (W,))],
+            public=[("square", (M2,)), ("wide", (W,)), ("one_row", ([[4, 0, 5]],))],
             hidden=[([[7]],), (M3,), ([[1], [2], [3]],), ([[1, 2, 3]],), (M4,)],
             uses=("transpose",),
         ),

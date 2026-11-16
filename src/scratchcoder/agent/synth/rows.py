@@ -40,7 +40,11 @@ rows): every loop call resolved; every mutant was applied and its public run fai
 reference was applied and its public run passed; the grading call passed; the original
 failed the correctness checks; every prompt showed the target; every repair prompt holds a
 failing observation and the changes-so-far block; for a traceback task, the original's
-observation shows the exception line and the raising function the task names.
+observation shows, in the block of the test the task names, the exception line and the
+raising function the task names; for a failing-test task (W1, W3), the original's
+observation has a block for the test the task statement describes, and that block shows
+the outcome the statement claims (``AssertionError: <repr of the returned value>``, the
+public tests' assertion message, or the exception type).
 """
 
 from __future__ import annotations
@@ -147,13 +151,55 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def failure_blocks(observation: str) -> dict[str, list[str]]:
+    """The condensed observation split into its ``FAIL`` blocks, by test name: each block is
+    the ``FAIL`` line and the lines after it up to the next ``FAIL`` line or the trailing
+    ``(+N more failing)`` line."""
+    blocks: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for line in observation.split("\n"):
+        if line.startswith("FAIL "):
+            name = line[len("FAIL ") :].split(" (", 1)[0]
+            current = blocks.setdefault(name, [])
+            current.append(line)
+        elif line.startswith("(+") or line.startswith("RESULT "):
+            current = None
+        elif current is not None:
+            current.append(line)
+    return blocks
+
+
+def _error_lines(block: Sequence[str]) -> list[str]:
+    """The block's exception lines (``Type: message`` or a bare ``Type``): every line that is
+    neither the ``FAIL`` line, an indented source line, nor a frame line."""
+    return [line for line in block[1:] if line and not line.startswith(" ")]
+
+
 def _traceback_seen(observation: str, traceback: Mapping[str, str]) -> bool:
-    lines = observation.split("\n")
-    if traceback["error_line"] not in lines:
+    """The error line and the raising function's frame, both in the block of the test the
+    task names (one failing test's observation, never two blocks combined)."""
+    block = failure_blocks(observation).get(traceback.get("test", ""), [])
+    if traceback["error_line"] not in _error_lines(block):
         return False
     frame = f"  in {traceback['raise_file']}:"
     name = f" {traceback['raise_function']}: "
-    return any(line.startswith(frame) and name in line for line in lines)
+    return any(line.startswith(frame) and name in line for line in block)
+
+
+def claim_seen(observation: str, claim: Mapping[str, str]) -> bool:
+    """The task statement's claim holds in the observation: a block for its test, whose
+    exception is the claimed one (``AssertionError: <got>`` for a returned value, the
+    message possibly cut at the condensed length; the exception type for a raise)."""
+    block = failure_blocks(observation).get(claim["test"])
+    if not block:
+        return False
+    errors = _error_lines(block)
+    if "raised" in claim:
+        kind = claim["raised"]
+        return any(line == kind or line.startswith(kind + ":") for line in errors)
+    expected = f"AssertionError: {claim['got']}"
+    cut = expected[: len("AssertionError: ") + execution.MAX_MESSAGE_CHARS]
+    return any(line == expected or (line == cut and cut != expected) for line in errors)
 
 
 @dataclasses.dataclass
@@ -252,6 +298,12 @@ def build_instance(
             reasons.append(f"turn_{index + 1}_repair_context_missing")
     if synth.get("traceback") and not _traceback_seen(result.feedback_before, synth["traceback"]):
         reasons.append("traceback_not_observed")
+    if synth["workflow_type"] in ("W1", "W3"):
+        claim = synth.get("task_claim")
+        if not claim:
+            reasons.append("task_claim_missing")
+        elif not claim_seen(result.feedback_before, claim):
+            reasons.append("task_claim_not_observed")
     if diagnose and any(reason.startswith("grading:") for reason in reasons):
         files = case.reference_files()
         for label, checks in (
