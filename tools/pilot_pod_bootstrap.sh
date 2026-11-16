@@ -33,7 +33,7 @@
 # then the same revision, key and environment steps, an R2 round trip under the run's
 # posttrain-runs/ prefix, the pinned fetch and re-verification of every bound input
 # (tools.posttrain_binding), the CPU tests and the A40 preflight with its compile check:
-#   bash tools/pilot_pod_bootstrap.sh --mode posttrain --run 1|1b|2 --deadline-unix <unix> \
+#   bash tools/pilot_pod_bootstrap.sh --mode posttrain --run 1|1b|2|1c --deadline-unix <unix> \
 #        --lifetime-seconds 17820 --idle-seconds 900 --workspace /workspace/posttrain \
 #        --repo /workspace/repo --revision /workspace/revision.json \
 #        --archive /workspace/repo.tar.gz --r2-env /workspace/posttrain/r2-pod.env \
@@ -404,6 +404,13 @@ if [[ "$RUN_TESTS" == "1" ]]; then
       TESTS+=(tests/test_posttrain_run2.py tests/test_posttrain_run2_guards.py
         tests/test_posttrain_run2_integration.py tests/test_posttrain_run2_readiness.py
         tests/test_posttrain_run2_feasibility.py tests/test_rl_facts.py)
+    fi
+    if [[ "$RUN" == "1c" ]]; then
+      # Run 1c's approved specification, its bind and its worker (the final weights, the
+      # parent's dev loss, the estimate stop), its replay into the Mac side, and the frozen
+      # executed specifications.
+      TESTS+=(tests/test_run1c_posttrain.py tests/test_run1c_integration.py
+        tests/test_executed_specifications.py)
     fi
   fi
   python3 -m pytest "${TESTS[@]}" -q -p no:cacheprovider 2>&1 | tail -5

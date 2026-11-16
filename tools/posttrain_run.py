@@ -26,6 +26,14 @@
     gate record and the weights are in R2, and nothing paid follows), ``arc-sft``,
     ``eval-sft`` and ``screen``; run 1's base results stand, so no base stage runs.
 
+    Run 1c (agent SFT) runs ``probe`` (on its parent, run 1b's SFT weights), ``sft`` (one
+    pass from those weights, no special-row redraw, a fresh optimizer; the dev loss of the
+    parent before the first update and at every quarter, and the final weights kept, not the
+    lowest-loss quarter: ``KEPT_FINAL``), ``format-gate`` (as run 1b's, required) and
+    ``eval-sft`` (pool dev and the three benchmarks, greedy). Its limits stop at the lower of
+    the ceiling and 120% of its bound estimate, and before the first stage it uploads the Pod's
+    environment (``environment_record``).
+
     Run 2 (RL with the Mac in the loop, the more-SFT control and their evaluation) runs:
 
     1. ``rl``: ``run_rl`` from run 1's selected SFT weights on the withheld kept tasks, its
@@ -65,6 +73,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import math
 import os
@@ -162,6 +171,10 @@ FORMAT_GATE_RULE = (
     "strictly below 0.9) and a greedy smoke of pool dev prompts, at "
     "scratchcoder.eval.format_gate's thresholds; the benchmark smoke is recorded, not judged"
 )
+FORMAT_GATE_RULE_FINAL = FORMAT_GATE_RULE.replace(
+    "on the dev-loss-selected SFT checkpoint only", "on the kept final SFT checkpoint only"
+)
+"""Run 1c's gate rule: the same gate, on the weights it keeps (``KEPT_FINAL``)."""
 WAIT_MARGIN_STOP = "wait_margin"
 """Run 2: the next bridge wait would pass the cost stop, the wall or the finalization reserve.
 ``should_stop`` is not read during a wait, so the worker stops before one while the time and
@@ -265,6 +278,55 @@ SFT_KEYS = {
 SFT_SPECIAL_KEYS = {"special_rows_init", "special_rows_seed", "special_rows_lr_scale"}
 """Run 1b's SFT adds these (``TrainConfig.special_rows_*``); run 1's has none and trains the
 embedding as it always did."""
+RUN1C = "1c"
+RUN1C_SFT_KEYS = {"planned_updates", "kept_weights", "parent_dev_loss"}
+"""Run 1c's SFT has these too, and no other run's does: the planned update count written out
+(it must equal the one ``train_rows``, ``passes`` and the batch derive), which weights the
+stage keeps (``KEPT_WEIGHTS``) and whether it measures the parent's dev loss before the first
+update (update 0)."""
+KEPT_LOWEST = "lowest-dev-loss"
+KEPT_FINAL = "final"
+KEPT_WEIGHTS = {
+    KEPT_LOWEST: "the weights at the quarter of lowest token-weighted dev loss",
+    KEPT_FINAL: (
+        "the weights after the last update; the dev loss is still measured and reported at "
+        "every quarter"
+    ),
+}
+"""Which SFT weights a run keeps: runs 1 and 1b the lowest-dev-loss quarter (the default),
+run 1c the final weights after its one pass."""
+RUN1C_BIND_FIELDS: tuple[tuple[str, ...], ...] = (
+    ("sft", "train_rows"),
+    ("sft", "planned_updates"),
+    ("inputs", "sft-train", "size_bytes"),
+    ("inputs", "sft-train", "sha256"),
+    ("limits", "gate_estimate_usd"),
+    ("limits", "cost_limit_usd"),
+)
+"""Run 1c's values fixed when its training rows are bound, ``null`` placeholders in the
+tracked specification: the rows' count, the update count, the file's size and SHA-256, the
+estimate (the cost projection of the filled specification at its planning rates) and the cost
+limit it derives (the lower of the ceiling and 120% of it). ``python -m
+tools.posttrain_approved run1c-bind`` fills them; the worker and the readiness receipt refuse
+a placeholder."""
+RUN1C_ESTIMATE_FIELDS = ("limits.gate_estimate_usd", "limits.cost_limit_usd")
+
+
+def run1c_placeholders(raw: Mapping[str, Any]) -> list[str]:
+    """Run 1c's bind fields (``RUN1C_BIND_FIELDS``) present and still ``null``, dotted."""
+    missing = []
+    for path in RUN1C_BIND_FIELDS:
+        value: Any = raw
+        for key in path:
+            if not isinstance(value, Mapping) or key not in value:
+                break
+            value = value[key]
+        else:
+            if value is None:
+                missing.append(".".join(path))
+    return missing
+
+
 SCREENING_KEYS = {
     "samples",
     "temperature",
@@ -684,9 +746,24 @@ class Specification:
             raise ValueError("not a post-training run specification of this schema")
         if top["run"] not in posttrain_ops.RUNS:
             raise ValueError(f"unknown post-training run {top['run']!r}")
+        run1c = top["run"] == RUN1C
+        placeholders = run1c_placeholders(top) if run1c else []
+        unbound = set(placeholders) - (set(RUN1C_ESTIMATE_FIELDS) if allow_gate_nulls else set())
+        if unbound:
+            raise ValueError(
+                f"run 1c's bind values are still placeholders: {sorted(unbound)}; they are "
+                "fixed when its training rows are bound (python -m tools.posttrain_approved "
+                "run1c-bind)"
+            )
         model = ModelConfig(**_exact(top["model"], set(ModelConfig.__dataclass_fields__), "model"))
-        limits = posttrain_ops.read_limits(top["limits"])
-        posttrain_ops.specification_limits(top)  # The derived limits must exist.
+        estimate_unbound = run1c and bool(placeholders)
+        limits = posttrain_ops.read_limits(
+            top["limits"],
+            keys=posttrain_ops.limit_keys(top),
+            allow_null=("gate_estimate_usd", "cost_limit_usd") if estimate_unbound else (),
+        )
+        if not estimate_unbound:
+            posttrain_ops.specification_limits(top)  # The derived limits must exist.
         gated = any(
             isinstance(item, dict) and item.get("kind") == "format-gate" for item in top["stages"]
         )
@@ -714,7 +791,13 @@ class Specification:
         if generation["precision"] not in ("float32", "bfloat16"):
             raise ValueError("generation.precision must be float32 or bfloat16")
         special = isinstance(top["sft"], dict) and bool(SFT_SPECIAL_KEYS & set(top["sft"]))
-        sft = _exact(top["sft"], SFT_KEYS | (SFT_SPECIAL_KEYS if special else set()), "sft")
+        sft = _exact(
+            top["sft"],
+            SFT_KEYS
+            | (SFT_SPECIAL_KEYS if special else set())
+            | (RUN1C_SFT_KEYS if run1c else set()),
+            "sft",
+        )
         if special:
             # TrainConfig's rules: the initialization, a nonnegative seed, a positive scale.
             TrainConfig(**{key: sft[key] for key in SFT_SPECIAL_KEYS})
@@ -740,6 +823,18 @@ class Specification:
         _positive(sft["reference_slots_per_second"], "sft.reference_slots_per_second")
         if sft["sequence_length"] > model.context:
             raise ValueError("SFT rows must fit the model context")
+        if run1c:
+            per_update = sft["batch_size"] * sft["accumulation_steps"]
+            derived_updates = -(-sft["train_rows"] * sft["passes"] // per_update)
+            if _count(sft["planned_updates"], "sft.planned_updates") != derived_updates:
+                raise ValueError(
+                    f"sft.planned_updates ({sft['planned_updates']}) is not the "
+                    f"{derived_updates} updates train_rows, passes and the batch give"
+                )
+            if sft["kept_weights"] not in KEPT_WEIGHTS:
+                raise ValueError(f"sft.kept_weights must be one of {sorted(KEPT_WEIGHTS)}")
+            if type(sft["parent_dev_loss"]) is not bool:
+                raise ValueError("sft.parent_dev_loss must be true or false")
         screening = _exact(top["screening"], SCREENING_KEYS, "screening")
         for name in ("samples", "max_new_tokens", "planned_tasks", "chunk_tasks"):
             _count(screening[name], f"screening.{name}")
@@ -775,8 +870,10 @@ class Specification:
                 gate_seen = True
         if gated and [stage.kind for stage in stages].count("format-gate") != 1:
             raise ValueError("a specification gates its SFT weights with one format-gate stage")
-        if top["run"] == "1b" and not gated:
-            raise ValueError("run 1b's SFT weights go through the format gate before any use")
+        if top["run"] in ("1b", RUN1C) and not gated:
+            raise ValueError(
+                f"run {top['run']}'s SFT weights go through the format gate before any use"
+            )
         r2 = _exact(top["r2"], {"storage_cap_usd_per_month"}, "r2")
         _positive(r2["storage_cap_usd_per_month"], "r2.storage_cap_usd_per_month")
         return cls(
@@ -1126,12 +1223,15 @@ def stage_seconds(spec: Specification, stage: StagePlan, rates: Rates) -> float:
         return len(stage.files) * load + tokens / rates.generation_tokens_per_second
     if stage.kind == "sft":
         quarters = len(quarter_updates(spec.sft_updates)) + 1
+        # Run 1c also measures the parent before the first update, and saves its weights once.
+        dev_passes = quarters + (1 if spec.sft.get("parent_dev_loss") is True else 0)
+        saves = 1 if spec.sft.get("kept_weights") == KEPT_FINAL else quarters
         return (
             load
             + rates.compile_seconds
             + spec.sft_updates * spec.slots_per_update / rates.training_slots_per_second
-            + quarters * int(spec.sft["planned_dev_tokens"]) / rates.forward_tokens_per_second
-            + quarters * rates.weights_save_seconds
+            + dev_passes * int(spec.sft["planned_dev_tokens"]) / rates.forward_tokens_per_second
+            + saves * rates.weights_save_seconds
         )
     screening = spec.screening
     tokens = (
@@ -1214,13 +1314,13 @@ def check_policy(policy: Policy, spec: Specification) -> None:
         or policy.quoted_total_hourly < derived.quoted_total_hourly
     ):
         raise ValueError("the watchdog policy is weaker than the ceiling-derived limits")
-    if spec.run == "2" and (
+    if spec.run in posttrain_ops.ESTIMATE_STOP_RUNS and (
         policy.max_wall_seconds != derived.wall_seconds
         or policy.max_cost_usd != derived.watchdog_cost_stop_usd
     ):
         raise ValueError(
             "the watchdog policy's wall or cost stop differs from the limits derived from run "
-            "2's cost limit (posttrain_ops limits --policy-output writes them)"
+            f"{spec.run}'s cost limit (posttrain_ops limits --policy-output writes them)"
         )
     if policy.max_transfer_seconds != spec.max_transfer_seconds:
         raise ValueError("the watchdog's transfer window differs from the specification's")
@@ -2079,6 +2179,12 @@ class PosttrainWorker(Worker):
             "special_rows_lr_scale": float(settings.get("special_rows_lr_scale", 1.0)),
             "selected": None,
         }
+        kept = str(settings.get("kept_weights", KEPT_LOWEST))
+        if RUN1C_SFT_KEYS & set(settings):
+            # Run 1c: which weights are kept, and the parent's dev loss at update 0.
+            record.update(
+                kept_weights=kept, kept_weights_rule=KEPT_WEIGHTS[kept], parent_dev_loss=None
+            )
         self.report["sft"] = record
         timing: list[tuple[int, float]] = []
         best: dict[str, Any] = {}
@@ -2106,6 +2212,14 @@ class PosttrainWorker(Worker):
             if self.stopped():
                 raise PilotStop(str(self.stop_reason))
 
+        if settings.get("parent_dev_loss") is True:
+            # The parent as loaded, before the first update, on the same dev rows as every
+            # quarter: the within-run baseline of each dev set's loss.
+            record["parent_dev_loss"] = self.sft_dev_loss(stage, trainer, dev)
+            self.phase = stage.name
+            self.publish()
+            if self.stopped():
+                raise PilotStop(str(self.stop_reason))
         self.phase = stage.name
         trainer.train(on_step=on_step)
         if trainer.step != updates or not loader.exhausted:
@@ -2130,6 +2244,20 @@ class PosttrainWorker(Worker):
         record["selected"] = {
             key: best[key] for key in ("quarter", "update", "dev_loss", "sha256", "bytes")
         }
+        parent_loss = record.get("parent_dev_loss")
+        if isinstance(parent_loss, dict):
+            final = next(e for e in record["quarters"] if e["update"] == best["update"])
+            record["dev_loss_change"] = {
+                "from_update": parent_loss["update"],
+                "to_update": final["update"],
+                "dev_loss": final["dev_loss"] - parent_loss["dev_loss"],
+                "by_set": {
+                    name: final["by_set"][name]["loss"] - value["loss"]
+                    for name, value in parent_loss["by_set"].items()
+                },
+                "rule": "the kept weights' dev loss minus the parent's, set by set, same rows",
+                "kept_weights": kept,
+            }
         summary = self.write_artifact(stage, "sft.json", record)
         outputs = self.export_label(
             stage.name, [("sft.json", summary), ("updates.jsonl", updates_path)]
@@ -2176,29 +2304,15 @@ class PosttrainWorker(Worker):
         quarter: int,
         best: dict[str, Any],
     ) -> None:
-        """Assistant-token dev loss at a quarter pass; the lowest so far is saved as weights."""
-        settings = self.plan.sft
-        self.phase = f"{stage.name}-dev-loss"
-        started = synchronized_time(self.device)
-        results = {
-            name: assistant_loss(
-                trainer.model,
-                rows,
-                batch_size=int(settings["dev_batch_size"]),
-                autocast_bf16=settings["precision"] == "bfloat16",
-                on_batch=self.tick,
-            )
-            for name, rows in dev.items()
-        }
-        loss = token_weighted_loss(results.values())
-        entry: dict[str, Any] = {
-            "quarter": quarter,
-            "update": trainer.step,
-            "dev_loss": loss,
-            "by_set": results,
-            "seconds": synchronized_time(self.device) - started,
-        }
-        if not best or loss < best["dev_loss"]:
+        """Assistant-token dev loss at a quarter pass; the lowest so far is saved as weights
+        (``KEPT_LOWEST``), or with ``KEPT_FINAL`` only the last update's."""
+        entry: dict[str, Any] = {"quarter": quarter, **self.sft_dev_loss(stage, trainer, dev)}
+        loss = entry["dev_loss"]
+        if self.plan.sft.get("kept_weights") == KEPT_FINAL:
+            save = trainer.step == self.plan.sft_updates
+        else:
+            save = not best or loss < best["dev_loss"]
+        if save:
             path = self.artifact_path(stage, f"quarter-{quarter}.pt")
             digest = save_weights(
                 path,
@@ -2222,6 +2336,30 @@ class PosttrainWorker(Worker):
         record["quarters"].append(entry)
         self.phase = stage.name
         self.publish()
+
+    def sft_dev_loss(
+        self, stage: StagePlan, trainer: Trainer, dev: Mapping[str, Sequence[SFTRow]]
+    ) -> dict[str, Any]:
+        """The token-weighted assistant-token dev loss of the trainer's model now, set by set."""
+        settings = self.plan.sft
+        self.phase = f"{stage.name}-dev-loss"
+        started = synchronized_time(self.device)
+        results = {
+            name: assistant_loss(
+                trainer.model,
+                rows,
+                batch_size=int(settings["dev_batch_size"]),
+                autocast_bf16=settings["precision"] == "bfloat16",
+                on_batch=self.tick,
+            )
+            for name, rows in dev.items()
+        }
+        return {
+            "update": trainer.step,
+            "dev_loss": token_weighted_loss(results.values()),
+            "by_set": results,
+            "seconds": synchronized_time(self.device) - started,
+        }
 
     def run_format_gate(self, stage: StagePlan) -> list[dict[str, Any]]:
         """The SFT format gate on the dev-loss-selected weights (``FORMAT_GATE_RULE``).
@@ -2254,7 +2392,12 @@ class PosttrainWorker(Worker):
         self.tick()
         if record["inputs"]["checkpoint_sha256"] != file_sha256(weights):
             raise RuntimeError("the format gate measured other weights than the selected ones")
-        record["rule"] = FORMAT_GATE_RULE
+        rule = (
+            FORMAT_GATE_RULE_FINAL
+            if self.plan.sft.get("kept_weights") == KEPT_FINAL
+            else FORMAT_GATE_RULE
+        )
+        record["rule"] = rule
         path = self.write_artifact(stage, "gate.json", record)
         brief = gate_summary(record)
         self.report["format_gate"] = {
@@ -2268,7 +2411,7 @@ class PosttrainWorker(Worker):
                 for suite, entry in record["benchmark_smoke"].items()
             },
             "seconds": seconds,
-            "rule": FORMAT_GATE_RULE,
+            "rule": rule,
         }
         outputs = self.export_label(stage.name, [("gate.json", path)])
         self.rates = replace(
@@ -2412,10 +2555,23 @@ class PosttrainWorker(Worker):
             record["seconds"] = ended - started
         self.current = None
 
+    def export_environment(self) -> None:
+        """Run 1c: upload the Pod's environment record (``environment_record``, in the report
+        as ``environment``) as the ``environment`` label before the first stage; a run whose
+        report has none uploads nothing here."""
+        environment = self.report.get("environment")
+        if environment is None:
+            return
+        path = self.root / "artifacts" / "environment.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.write_json(path, environment)
+        self.export_label(ENVIRONMENT_LABEL, [("environment.json", path)])
+
     def execute(self) -> dict[str, Any]:
         try:
             self.report["timings"]["stages_started_unix"] = self.clock()
             self.check_planned_tasks()
+            self.export_environment()
             for stage in self.plan.stages:
                 self.run_stage(stage)
             self.after_stages()
@@ -2454,6 +2610,56 @@ class PosttrainWorker(Worker):
         self.report["generated_tokens"] = self.generated_tokens
         self.report["timings"].update(ended_unix=now)
         self.report["ended_at"] = utc_now()
+
+
+ENVIRONMENT_LABEL = "environment"
+"""Run 1c's label for the Pod's environment record, uploaded before the first stage."""
+IMAGE_DIGEST = re.compile(r"@sha256:[0-9a-f]{64}\Z")
+
+
+def environment_record(*, image: object) -> dict[str, Any]:
+    """The software this process runs on, for run 1c's report (a pinned environment record): the
+    container image the provider's Pod record names, its digest when that name pins one, and
+    every installed distribution with its version, with a SHA-256 of that list.
+
+    The Pod's API record names the image by tag; a tag is not a digest, so ``digest`` is
+    ``null`` then and the package list (which includes ``torch``) is the record of what ran."""
+    import importlib.metadata
+    import platform
+    import sys
+
+    found = set()
+    for distribution in importlib.metadata.distributions():
+        name = distribution.metadata["Name"]
+        if name:
+            found.add(f"{str(name).lower().replace('_', '-')}=={distribution.version}")
+    packages = sorted(found)
+    reference = image if isinstance(image, str) and image else None
+    digest = None
+    if reference is not None and IMAGE_DIGEST.search(reference):
+        digest = reference.rsplit("@", 1)[1]
+    cudnn_module: Any = torch.backends.cudnn  # Untyped in torch's stubs.
+    cudnn = cudnn_module.version() if cudnn_module.is_available() else None
+    return {
+        "schema_version": 1,
+        "kind": "posttrain-environment",
+        "image": {
+            "reference": reference,
+            "digest": digest,
+            "source": "the provider's Pod record, captured on the Mac before the receipt",
+        },
+        "python": sys.version,
+        "executable": sys.executable,
+        "platform": platform.platform(),
+        "torch": {
+            "version": torch.__version__,
+            "git_version": getattr(torch.version, "git_version", None),
+            "cuda": torch.version.cuda,
+            "cudnn": cudnn,
+        },
+        "packages": packages,
+        "packages_sha256": hashlib.sha256("\n".join(packages).encode()).hexdigest(),
+    }
 
 
 def candidate_ids(path: Path) -> list[str]:
@@ -2500,6 +2706,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     verified = posttrain_binding.verify(binding, args.root)
     inputs = {name: Path(path) for name, path in verified["paths"].items()}
     limits = RunLimits.of(spec, pod_seconds=launch.end - launch.origin)
+    extra: dict[str, Any] = {
+        "code_revision": revision,
+        "hardware": hardware,
+        "readiness_receipt": sanitize(receipt),
+        "specification_sha256": identity["specification_sha256"],
+        "binding_sha256": args.binding_sha256,
+        "preflight_sha256": identity["preflight_sha256"],
+        "launch_fit": launch.fit,
+        "pod_lifetime_end_unix": launch.end,
+    }
+    if spec.run == RUN1C:
+        image = receipt.get("pod_image")
+        if not isinstance(image, str) or not image:
+            raise ValueError("run 1c's readiness receipt names no Pod image (pod_image)")
+        extra["environment"] = environment_record(image=image)
     worker_class: type[PosttrainWorker] = PosttrainWorker
     if spec.run == "2":
         from tools.posttrain_run2 import Run2Worker
@@ -2516,16 +2737,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         limits=limits,
         device="cuda:0",
         secrets=[credentials.access_key_id, credentials.secret_access_key, *environment_secrets()],
-        extra={
-            "code_revision": revision,
-            "hardware": hardware,
-            "readiness_receipt": sanitize(receipt),
-            "specification_sha256": identity["specification_sha256"],
-            "binding_sha256": args.binding_sha256,
-            "preflight_sha256": identity["preflight_sha256"],
-            "launch_fit": launch.fit,
-            "pod_lifetime_end_unix": launch.end,
-        },
+        extra=extra,
     )
     return worker.execute()
 
@@ -2543,10 +2755,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     smoke_parser = commands.add_parser("smoke", help="run 1 or 2 end to end on tiny fixtures, CPU")
     smoke_parser.add_argument("--output", type=Path, required=True)
     smoke_parser.add_argument(
-        "--run", choices=posttrain_ops.RUNS, default="1", help="1 (default), 1b or 2"
+        "--run", choices=posttrain_ops.RUNS, default="1", help="1 (default), 1b, 2 or 1c"
     )
     args = parser.parse_args(argv)
     if args.command == "smoke":
+        if args.run == RUN1C:
+            from tools.posttrain_smoke import smoke_1c
+
+            print(json.dumps(smoke_1c(args.output), indent=1, sort_keys=True))
+            return 0
         if args.run == "1b":
             from tools.posttrain_smoke import smoke_1b
 

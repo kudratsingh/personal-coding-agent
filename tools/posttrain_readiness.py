@@ -4,10 +4,13 @@ Built on the Mac from the Pod's own evidence and the owner's confirmations, in e
 form ``tools.posttrain_run run`` accepts (its ``check_readiness`` is applied before anything
 is written). Besides the pretraining rehearsal's owner gates and termination checks it requires:
 
-- the specification to be the approved run 1, 1b or 2 (``posttrain_approved.check_run1``,
-  ``check_run1b``, ``check_run2``; for run 2 with every gate value filled, its SFT weights'
-  passing format-gate record given with ``--sft-gate`` and matching its pin) and the binding
-  to name exactly its inputs at every pinned value;
+- the specification to be the approved run 1, 1b, 2 or 1c (``posttrain_approved.check_run1``,
+  ``check_run1b``, ``check_run2``, ``check_run1c``; for run 2 with every gate value filled,
+  its SFT weights' passing format-gate record given with ``--sft-gate`` and matching its pin;
+  for run 1c with every bind value filled) and the binding to name exactly its inputs at
+  every pinned value;
+- for run 1c, the container image the provider's Pod record names (``pod_image``), which the
+  worker copies into the environment record it uploads before the first stage;
 - a watchdog policy at least as strict as the ceiling-derived limits (mode ``posttrain``,
   wall and cost stop from ``posttrain_ops.ceiling_limits``, the 900 s transfer window), with
   run 2's ``awaiting_rewards`` idle extensions exactly the derived bounds (run 1: none);
@@ -44,16 +47,21 @@ from tools.pilot_readiness_receipt import (
     round_trip_passed,
     self_destruct_live,
 )
-from tools.posttrain_approved import PARENTS, check_run1, check_run1b, check_run2
+from tools.posttrain_approved import PARENTS, check_run1, check_run1b, check_run1c, check_run2
 from tools.posttrain_run import Specification, check_policy, check_readiness, launch_fit
 from tools.rehearsal_run import lifetime_end
 from tools.runpod_watchdog import PodIdentity, Policy, parse_timestamp
 
-MAC_COPIES = {"1": PARENTS, "1b": ("b-mixed-final",), "2": ("sft-weights",)}
+MAC_COPIES = {
+    "1": PARENTS,
+    "1b": ("b-mixed-final",),
+    "2": ("sft-weights",),
+    "1c": ("sft-weights",),
+}
 """The inputs the Mac must hold its own pinned copy of before the Pod exists: run 1's three
 parent checkpoints, run 1b's one (run B's ``mixed-final``), run 2's SFT weights (the
-selected checkpoint that passed the format gate)."""
-APPROVED_CHECKS = {"1": check_run1, "1b": check_run1b, "2": check_run2}
+selected checkpoint that passed the format gate) and run 1c's parent (run 1b's SFT weights)."""
+APPROVED_CHECKS = {"1": check_run1, "1b": check_run1b, "2": check_run2, "1c": check_run1c}
 DEFAULT_HEARTBEAT = "/workspace/posttrain-run/heartbeat.json"
 """The worker's heartbeat on the Pod (its ``--output``), which the in-Pod timer must watch."""
 
@@ -135,11 +143,15 @@ def build_receipt(
         "idle_seconds": timer.get("idle_seconds"),
         "activity_files": timer.get("activity_files"),
     }
+    connection_value = _load(connection)
     cost = pod_cost_within_quote(
-        _load(connection),
+        connection_value,
         pod_id=pod_identity.pod_id,
         quoted=float(spec.limits["quoted_gpu_hourly"]),
     )
+    image = connection_value.get("image")
+    if spec.run == "1c" and (not isinstance(image, str) or not image):
+        raise ValueError("the Pod connection record names no container image (run 1c needs it)")
     code = rehearsal_ops.check_revision(_load(revision))
     owner = _load(confirmations)
     guarantee = owner.get("termination_guarantee")
@@ -234,6 +246,8 @@ def build_receipt(
         receipt["bridge_timeouts"] = asdict(bridge)  # Run 2's derived wait bounds.
     if gate_record is not None:
         receipt["sft_format_gate"] = gate_record  # Run 2's weights passed the gate.
+    if spec.run == "1c":
+        receipt["pod_image"] = image  # The image the environment record names.
     for gate in posttrain_ops.OWNER_GATES:
         receipt[gate] = owner.get(gate)
     # Exactly the worker's own acceptance check, so a written receipt is one it accepts.

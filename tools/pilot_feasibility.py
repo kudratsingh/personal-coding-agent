@@ -1372,6 +1372,30 @@ def posttrain_report(
     }
 
 
+def posttrain_estimate_usd(spec: Any, *, quoted_gpu_hourly: float | None = None) -> float:
+    """The total in dollars of ``posttrain_report``'s ``1x generation`` row for a parsed
+    specification: the setup allowance, every stage at the planning rates and the
+    finalization reserve, at the same hourly rate, summed the same way. Run 1c's estimate
+    (``posttrain_approved.run1c_estimate_usd``); it reads none of the derived limits, so it
+    can be computed before the estimate is written."""
+    from tools.posttrain_run import Rates, planned_seconds
+
+    gpu = (
+        float(spec.limits["quoted_gpu_hourly"]) if quoted_gpu_hourly is None else quoted_gpu_hourly
+    )
+    hourly = max(
+        _number(spec.limits["quoted_total_hourly"], "the quoted total hourly rate"),
+        rehearsal_total_hourly(gpu, d35.CONTAINER_DISK_GB),
+    )
+    plan = planned_seconds(spec, Rates.planning(spec))
+    stages = {
+        "setup": float(spec.limits["startup_seconds"]),
+        **plan["stages"],
+        "finalization": plan["finalization_reserve_seconds"],
+    }
+    return math.fsum(stages.values()) / 3600 * hourly
+
+
 def render_posttrain_markdown(report: Mapping[str, Any]) -> str:
     limits = report["limits"]
     lines = [

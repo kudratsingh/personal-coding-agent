@@ -1,4 +1,4 @@
-"""The owner-approved definitions of post-training runs 1, 1b and 2, in one place.
+"""The owner-approved definitions of post-training runs 1, 1b, 2 and 1c, in one place.
 
 Run 1b (after run 1's values): ``run1b_specification()`` is
 ``configs/rehearsal-a40-s-post-1b.json`` and ``check_run1b`` what the readiness receipt
@@ -25,6 +25,17 @@ budgets (``posttrain_ops.bridge_timeouts``) in place of a flat 420 s. Its second
 plans generation at the floors the standing rule derives with run 1b's host added; the first,
 ``configs/rehearsal-a40-s-post-2.json``, never ran and is kept unchanged as superseded
 (``SUPERSEDED_RUN2_TEMPLATES``).
+
+Run 1c (agent SFT, prepared for the owner's launch decision): ``run1c_specification()`` is
+the tracked ``configs/rehearsal-a40-s-post-1c.json`` with its bind values ``null`` (the
+training rows' count, size and SHA-256, the update count, the estimate and the cost limit it
+derives); ``python -m tools.posttrain_approved run1c-bind`` fills them from the frozen rows and
+writes the launch specification, and ``check_run1c`` is what the readiness receipt applies to
+it. Its protocol: the probe on run 1b's SFT weights, one SFT pass from them with run 1b's
+optimizer, schedule and batch, no special-row redraw, the final weights kept and the parent's
+dev loss measured before the first update, run 1b's format gate, and a greedy evaluation of
+pool dev and the three benchmarks; its floors are the standing rule's over the four hosts
+measured before it, and it stops at the lower of $1.50 and 120% of its own projected cost.
 
 ``run1_specification()`` is ``configs/rehearsal-a40-s-post-1.json`` (a test keeps the two
 equal), and ``check_run1`` is what the readiness receipt applies to the specification it is
@@ -981,6 +992,287 @@ def write_specification_2(path: Path = SPECIFICATION_PATH_2) -> None:
     path.write_text(json.dumps(run2_specification(), indent=2) + "\n", encoding="utf-8")
 
 
+# Run 1c -------------------------------------------------------------------------------------
+
+SPECIFICATION_PATH_1C = SPECIFICATION_PATH.with_name("rehearsal-a40-s-post-1c.json")
+"""Run 1c's tracked specification: every approved value, the bind values ``null``."""
+RUN1C_CEILING_USD = 1.5
+RUN1C_FLOOR_HOSTS = 4
+"""Run 1c's floors are the standing rule over the first four measured hosts: run 1's first
+launch, run 1, run 1b's first launch and run 1b (``MEASURED_HOST_PROBES[:4]``), the hosts
+measured before its specification was written."""
+RUN1C_FLOORS = {"128": 7_991.0, "256": 9_049.0}
+"""Run 1c's probe floors and planning generation speeds, fixed in its specification: floor(0.9
+x the mean of the four hosts' rates) at each batch (``derive_generation_floors``). A later host
+changes ``GENERATION_FLOORS`` but not this specification."""
+RUN1C_SFT_REFERENCE = 59_141.39181007806
+"""Run 1c's SFT speed reference, fixed: the mean of run 1's and run 1b's measured speed-check
+rates (``MEASURED_SFT_HOSTS[:2]``); the check's floor is 90% of it, 53,227.25 slots/s."""
+RUN1C_LIMITS: dict[str, Any] = {
+    **RUN1B_LIMITS,
+    "ceiling_usd": RUN1C_CEILING_USD,
+    "gate_estimate_usd": None,
+    "cost_limit_usd": None,
+}
+"""Run 1b's limits at the $1.50 ceiling, plus the stop at 120% of the run's estimate: the
+estimate is the cost projection of the bound specification at its planning rates
+(``run1c_estimate_usd``), and every limit derives from the lower of the ceiling and 120% of
+it (``posttrain_ops.estimate_limit_usd``). Both are ``null`` until the bind."""
+RUN1C_PLANNING = {**RUN1B_PLANNING, "generation_tokens_per_second": dict(RUN1C_FLOORS)}
+"""Run 1b's planning rates and stage seconds, the generation speeds at run 1c's floors."""
+RUN1C_PROBE = {**PROBE, "minimum_tokens_per_second": dict(RUN1C_FLOORS)}
+RUN1C_SFT: dict[str, Any] = {
+    **{key: value for key, value in RUN1B_SFT.items() if not key.startswith("special_rows_")},
+    "train_rows": None,
+    "planned_updates": None,
+    "passes": 1,
+    "reference_slots_per_second": RUN1C_SFT_REFERENCE,
+    "kept_weights": "final",
+    "parent_dev_loss": True,
+}
+"""Run 1b's optimizer, schedule, batch, sequence and dev settings with one pass, no special-row
+redraw (the ``special_rows_*`` keys are absent, so the trained rows of the parent are kept and
+train at the plain rate), a fresh optimizer (SFT always starts one), the final weights kept and
+the parent's dev loss measured before the first update. ``train_rows`` and ``planned_updates``
+are fixed at the bind."""
+RUN1C_PARENT: dict[str, Any] = {
+    "kind": "checkpoint",
+    "key": "posttrain-runs/1b/23wqovsc9gm8h4/sft-weights/checkpoint.pt",
+    "size_bytes": 541_164_677,
+    "sha256": "f9064cd0e277bf7c2158b0560879494e2b0f3480c89587f45d47c96f0a59c059",
+}
+"""Run 1b's selected SFT weights (the ``sft-weights`` label of its verified report), which
+passed the format gate: run 1c's parent and the probe's checkpoint."""
+RUN1C_INPUTS: dict[str, dict[str, Any]] = {
+    "tokenizer": dict(INPUTS["tokenizer"]),
+    "sft-weights": dict(RUN1C_PARENT),
+    "sft-train": {"kind": "sft-rows", "key": None, "size_bytes": None, "sha256": None},
+    "sft-code-dev": dict(RUN1B_INPUTS["sft-code-dev"]),
+    "sft-language-dev": dict(RUN1B_INPUTS["sft-language-dev"]),
+    "pool-dev": dict(INPUTS["pool-dev"]),
+    "humaneval": dict(INPUTS["humaneval"]),
+    "humaneval-plus": dict(INPUTS["humaneval-plus"]),
+    "mbpp-plus": dict(INPUTS["mbpp-plus"]),
+}
+"""Run 1c's inputs: the tokenizer, run 1b's SFT weights, the agent training rows (their pin
+``null`` until the bind), run 1b's two dev sets, the pool dev export and the three benchmark
+releases. No pool test export, no RL input, no ARC questions and no base checkpoint."""
+RUN1C_EVAL_FILES = (
+    "pool-dev-greedy",
+    "humaneval-greedy",
+    "humaneval-plus-greedy",
+    "mbpp-plus-greedy",
+)
+RUN1C_SCREENING = dict(SCREENING)
+"""Unused: run 1c has no screening stage, but every specification of this schema carries a
+valid ``screening`` section, so it is run 1b's, unchanged."""
+RUN1C_REFUSED_INPUT_KINDS = frozenset(
+    {"candidates-export", "candidate-list", "rl-tasks", "rl-dev-tasks", "rl-facts"}
+)
+
+
+def run1c_stages() -> list[dict[str, Any]]:
+    """Run 1c's stages in order: the probe on the parent, one SFT pass, run 1b's format gate,
+    then the four greedy files (pool dev and the three benchmarks) of the kept weights."""
+    files = [entry for entry in eval_files(False) if entry["name"] in RUN1C_EVAL_FILES]
+    return [
+        {"name": "probe", "kind": "probe", "checkpoint": "sft-weights", "prompts": "pool-dev"},
+        {
+            "name": "sft",
+            "kind": "sft",
+            "parent": "sft-weights",
+            "train": "sft-train",
+            "dev": ["sft-code-dev", "sft-language-dev"],
+        },
+        dict(RUN1B_FORMAT_GATE),
+        {"name": "eval-sft", "kind": "eval", "checkpoint": "sft", "files": files},
+    ]
+
+
+def run1c_specification() -> dict[str, Any]:
+    """Run 1c's approved specification with every bind value ``null`` (the tracked file)."""
+    return {
+        "schema_version": 1,
+        "kind": "posttrain-run-specification",
+        "run": "1c",
+        "model": dict(MODEL),
+        "limits": dict(RUN1C_LIMITS),
+        "planning": json.loads(json.dumps(RUN1C_PLANNING)),
+        "probe": json.loads(json.dumps(RUN1C_PROBE)),
+        "generation": dict(GENERATION),
+        "sft": dict(RUN1C_SFT),
+        "screening": dict(RUN1C_SCREENING),
+        "stages": run1c_stages(),
+        "inputs": json.loads(json.dumps(RUN1C_INPUTS)),
+        "r2": {"storage_cap_usd_per_month": 5.0},
+    }
+
+
+def write_specification_1c(path: Path = SPECIFICATION_PATH_1C) -> None:
+    """Write the tracked run-1c specification (``run1c_specification()``)."""
+    path.write_bytes(specification_bytes(run1c_specification()))
+
+
+def run1c_estimate_usd(raw: Mapping[str, Any]) -> float:
+    """Run 1c's estimate: the cost projection of this specification at its planning rates, the
+    total of ``pilot_feasibility.posttrain_report``'s 1x row (setup, every stage and the
+    finalization reserve at the quoted rate). It reads the bound rows (the updates) and none
+    of the limits, so it is computed before the estimate is written."""
+    from tools.pilot_feasibility import posttrain_estimate_usd
+    from tools.posttrain_run import Specification
+
+    unbound = json.loads(json.dumps(raw))
+    unbound["limits"].update(gate_estimate_usd=None, cost_limit_usd=None)
+    return posttrain_estimate_usd(Specification.from_dict(unbound, allow_gate_nulls=True))
+
+
+RUN1C_BIND_SFT = ("train_rows", "planned_updates")
+RUN1C_BIND_LIMITS = ("gate_estimate_usd", "cost_limit_usd")
+
+
+def check_run1c(raw: Mapping[str, Any]) -> None:
+    """Refuse a run-1c launch specification that is not the approved one with its bind values
+    filled. In order: a placeholder still ``null``; a pool test export, any RL or screening
+    input, a screening stage; a special-row redraw or another row learning rate; more than one
+    pass; a ceiling above $1.50; then any approved value changed (every section equal but for
+    the bind values; every input pin equal but the training rows'). The update count must be
+    the one the rows give, the estimate the projection of this specification at its planning
+    rates (``run1c_estimate_usd``), the cost limit the lower of the ceiling and 120% of it, and
+    that limit must hold the planned setup and the whole run at the planning rates."""
+    from tools.posttrain_ops import specification_limits
+    from tools.posttrain_run import Specification, run1c_placeholders
+
+    approved = run1c_specification()
+    if raw.get("run") != "1c" or raw.get("kind") != approved["kind"]:
+        raise ValueError("not a run-1c post-training specification")
+    missing = run1c_placeholders(raw)
+    if missing:
+        raise ValueError(f"run 1c's bind values are still placeholders: {missing}")
+    inputs = raw.get("inputs")
+    stages = raw.get("stages")
+    sft = raw.get("sft")
+    limits = raw.get("limits")
+    if not all(isinstance(value, Mapping) for value in (inputs, sft, limits)) or not isinstance(
+        stages, list
+    ):
+        raise ValueError("a run-1c specification has inputs, sft, limits and a stage list")
+    assert isinstance(inputs, Mapping) and isinstance(sft, Mapping) and isinstance(limits, Mapping)
+    if "pool-test" in inputs:
+        raise ValueError("run 1c reads no pool test export")
+    for name, pin in inputs.items():
+        kind = pin.get("kind") if isinstance(pin, Mapping) else None
+        if str(name).startswith("rl-") or kind in RUN1C_REFUSED_INPUT_KINDS:
+            raise ValueError(f"run 1c reads no RL or screening input ({name})")
+    for stage in stages:
+        if not isinstance(stage, Mapping):
+            raise ValueError("every run-1c stage is an object")
+        if stage.get("kind") in ("screen", "rl", "more-sft"):
+            raise ValueError(f"run 1c has no {stage.get('kind')} stage")
+        for entry in stage.get("files", []) or []:
+            if isinstance(entry, Mapping) and entry.get("split") == "test":
+                raise ValueError("run 1c generates no pool test completions")
+    if any(key.startswith("special_rows_") for key in sft):
+        if sft.get("special_rows_init", "none") != "none":
+            raise ValueError("run 1c keeps its parent's special rows: no re-initialization")
+        if sft.get("special_rows_lr_scale", 1.0) != 1.0:
+            raise ValueError("run 1c trains the special rows at the plain learning rate")
+    passes = sft.get("passes")
+    if type(passes) is not int or passes != 1:
+        raise ValueError("run 1c makes exactly one pass over its training rows")
+    ceiling = limits.get("ceiling_usd")
+    if isinstance(ceiling, bool) or not isinstance(ceiling, int | float) or ceiling > 1.5:
+        raise ValueError("run 1c's ceiling is at most $1.50")
+    differ = [
+        name
+        for name in ("model", "planning", "probe", "generation", "screening", "stages", "r2")
+        if raw.get(name) != approved[name]
+    ]
+    unbound = {key: value for key, value in sft.items() if key not in RUN1C_BIND_SFT}
+    if unbound != {k: v for k, v in approved["sft"].items() if k not in RUN1C_BIND_SFT}:
+        differ.append("sft")
+    if {k: v for k, v in limits.items() if k not in RUN1C_BIND_LIMITS} != {
+        k: v for k, v in approved["limits"].items() if k not in RUN1C_BIND_LIMITS
+    } or set(limits) != set(approved["limits"]):
+        differ.append("limits")
+    if set(inputs) != set(approved["inputs"]) or not all(
+        isinstance(pin, Mapping) for pin in inputs.values()
+    ):
+        differ.append("inputs")
+    else:
+        for name, pin in approved["inputs"].items():
+            for field, value in pin.items():
+                if value is not None and inputs[name].get(field) != value:
+                    differ.append(f"inputs.{name}.{field}")
+            if set(inputs[name]) != set(pin):
+                differ.append(f"inputs.{name}")
+    if set(raw) != set(approved):
+        differ.append("sections")
+    if differ:
+        raise ValueError(f"the specification differs from the approved run 1c in {differ}")
+    rows = inputs["sft-train"]
+    if type(rows["size_bytes"]) is not int or rows["size_bytes"] < 1:
+        raise ValueError("run 1c's training rows need a positive size")
+    _sha256_hex(rows["sha256"], "run 1c's training rows' SHA-256")
+    if type(sft["train_rows"]) is not int or sft["train_rows"] < 1:
+        raise ValueError("run 1c's train_rows must be a positive integer")
+    estimate = run1c_estimate_usd(raw)  # Parsed with the estimate unset: the update count.
+    if limits["gate_estimate_usd"] != estimate:
+        raise ValueError(
+            f"limits.gate_estimate_usd ({limits['gate_estimate_usd']}) is not the projection "
+            f"of this specification at its planning rates ({estimate})"
+        )
+    specification_limits(raw)  # The cost limit is the lower of the ceiling and 120% of it.
+    Specification.from_dict(raw)  # Every parser rule, with the limits filled.
+    fit = gate_launch_fit(raw)
+    if not fit["fits"]:
+        raise ValueError(
+            f"run 1c's cost limit of ${fit['limit_usd']:.2f} gives a "
+            f"{fit['lifetime_seconds']:,.0f} s lifetime, which does not hold the planned "
+            f"{fit['startup_seconds']:,.0f} s setup and the "
+            f"{fit['planning_seconds_needed']:,.0f} s the launch rule needs: it needs the "
+            "owner's ruling"
+        )
+
+
+def bind_run1c(train_rows: Path) -> dict[str, Any]:
+    """Run 1c's launch specification: the tracked one with its bind values filled from the
+    training rows file. The rows are read and counted (every row must fit the sequence length,
+    or the run would fail on the Pod), the file pinned by size and SHA-256, the update count
+    derived, then the estimate projected from the filled specification and the cost limit
+    derived from it. The result passes ``check_run1c``."""
+    from scratchcoder.data.sft import SFTLoader, read_rows
+    from scratchcoder.data.shards import file_sha256
+    from tools.posttrain_ops import estimate_limit_usd
+
+    raw = run1c_specification()
+    sft = raw["sft"]
+    rows = list(read_rows(train_rows))
+    loader = SFTLoader(
+        rows,
+        sequence_length=int(sft["sequence_length"]),
+        batch_size=int(sft["batch_size"]),
+        accumulation_steps=int(sft["accumulation_steps"]),
+        seed=int(sft["seed"]),
+        passes=int(sft["passes"]),
+    )
+    if loader.dropped:
+        raise ValueError(
+            f"the training rows drop {loader.dropped} at sequence length "
+            f"{sft['sequence_length']}: the worker refuses any dropped row"
+        )
+    sft.update(train_rows=len(rows), planned_updates=loader.planned_updates)
+    raw["inputs"]["sft-train"].update(
+        size_bytes=train_rows.stat().st_size, sha256=file_sha256(train_rows)
+    )
+    estimate = run1c_estimate_usd(raw)
+    raw["limits"].update(
+        gate_estimate_usd=estimate,
+        cost_limit_usd=estimate_limit_usd(RUN1C_CEILING_USD, estimate),
+    )
+    check_run1c(raw)
+    return raw
+
+
 def _sft_report(report_path: Path) -> dict[str, Any]:
     from tools.posttrain_ops import REPORT_KIND
 
@@ -1183,7 +1475,8 @@ def gate_values(
 
 def main(argv: list[str] | None = None) -> int:
     """``run2-gate``: write run 2's launch specification from the gate's values (Mac);
-    ``write-template``: rewrite the tracked run-2 template."""
+    ``write-template``: rewrite the tracked run-2 template; ``run1c-bind``: write run 1c's
+    launch specification from its training rows (Mac)."""
     import argparse
     import sys
 
@@ -1217,10 +1510,17 @@ def main(argv: list[str] | None = None) -> int:
     gate.add_argument("--output", type=Path, required=True, help="the new launch specification")
     template = commands.add_parser("write-template", help="rewrite the tracked run-2 template")
     template.add_argument("--output", type=Path, default=SPECIFICATION_PATH_2)
+    bind = commands.add_parser(
+        "run1c-bind", help="fill run 1c's bind values from its training rows (Mac, free)"
+    )
+    bind.add_argument("--sft-train", type=Path, required=True, help="the frozen training rows")
+    bind.add_argument("--output", type=Path, required=True, help="the new launch specification")
     args = parser.parse_args(argv)
     if args.command == "write-template":
         write_specification_2(args.output)
         return 0
+    if args.command == "run1c-bind":
+        return _run1c_bind(args.sft_train, args.output)
     try:
         if args.output.exists() or args.output.is_symlink():
             raise FileExistsError(f"{args.output} already exists; a launch spec is never rewritten")
@@ -1250,6 +1550,43 @@ def main(argv: list[str] | None = None) -> int:
         "specification": str(args.output),
         "sha256": hashlib.sha256(data).hexdigest(),
         **{key: limits[key] for key in ("ceiling_usd", "gate_estimate_usd", "cost_limit_usd")},
+        **{
+            key: round(fit[key])
+            for key in ("lifetime_seconds", "planning_seconds_needed", "setup_allowance_seconds")
+        },
+    }
+    print(json.dumps(printed))
+    return 0
+
+
+def _run1c_bind(train_rows: Path, output: Path) -> int:
+    import sys
+
+    try:
+        if output.exists() or output.is_symlink():
+            raise FileExistsError(f"{output} already exists; a launch spec is never rewritten")
+        filled = bind_run1c(train_rows)
+    except (OSError, ValueError, KeyError) as error:
+        print(f"posttrain-approved: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    from tools.posttrain_ops import specification_limits
+
+    data = specification_bytes(filled)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(data)
+    derived = specification_limits(filled)
+    fit = gate_launch_fit(filled)
+    printed = {
+        "specification": str(output),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "sft_train_sha256": filled["inputs"]["sft-train"]["sha256"],
+        "train_rows": filled["sft"]["train_rows"],
+        "planned_updates": filled["sft"]["planned_updates"],
+        **{key: filled["limits"][key] for key in ("ceiling_usd", "gate_estimate_usd")},
+        "cost_limit_usd": filled["limits"]["cost_limit_usd"],
+        "watchdog_cost_stop_usd": derived.watchdog_cost_stop_usd,
+        "wall_seconds": derived.wall_seconds,
+        "self_destruct_seconds": derived.self_destruct_seconds,
         **{
             key: round(fit[key])
             for key in ("lifetime_seconds", "planning_seconds_needed", "setup_allowance_seconds")
