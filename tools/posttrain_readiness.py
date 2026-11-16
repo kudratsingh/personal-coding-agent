@@ -9,8 +9,12 @@ is written). Besides the pretraining rehearsal's owner gates and termination che
   its SFT weights' passing format-gate record given with ``--sft-gate`` and matching its pin;
   for run 1c with every bind value filled) and the binding to name exactly its inputs at
   every pinned value;
-- for run 1c, the container image the provider's Pod record names (``pod_image``), which the
-  worker copies into the environment record it uploads before the first stage;
+- for run 1c, the container image the provider's Pod record names (``pod_image``), which must
+  be run 1c's tag or that tag pinned to one of its recorded digests and which the worker copies
+  into the environment record it uploads before the first stage; and the operator's launch
+  commit (``--launch-commit``, a full 40-hex SHA), which must be the shipped revision's commit
+  and which the Pod's launch check (``launch-check.json``) found the archive written from, the
+  extracted repository exactly its tree;
 - a watchdog policy at least as strict as the ceiling-derived limits (mode ``posttrain``,
   wall and cost stop from ``posttrain_ops.ceiling_limits``, the 900 s transfer window), with
   run 2's ``awaiting_rewards`` idle extensions exactly the derived bounds (run 1: none);
@@ -47,7 +51,14 @@ from tools.pilot_readiness_receipt import (
     round_trip_passed,
     self_destruct_live,
 )
-from tools.posttrain_approved import PARENTS, check_run1, check_run1b, check_run1c, check_run2
+from tools.posttrain_approved import (
+    PARENTS,
+    check_run1,
+    check_run1b,
+    check_run1c,
+    check_run2,
+    run1c_image_references,
+)
 from tools.posttrain_run import Specification, check_policy, check_readiness, launch_fit
 from tools.rehearsal_run import lifetime_end
 from tools.runpod_watchdog import PodIdentity, Policy, parse_timestamp
@@ -121,6 +132,8 @@ def build_receipt(
     heartbeat: str = DEFAULT_HEARTBEAT,
     now: float | None = None,
     sft_gate: Path | None = None,
+    launch_commit: str | None = None,
+    launch_check: Path | None = None,
 ) -> dict[str, Any]:
     created_at = time.time() if now is None else now
     spec = Specification.load(specification)
@@ -150,8 +163,18 @@ def build_receipt(
         quoted=float(spec.limits["quoted_gpu_hourly"]),
     )
     image = connection_value.get("image")
-    if spec.run == "1c" and (not isinstance(image, str) or not image):
-        raise ValueError("the Pod connection record names no container image (run 1c needs it)")
+    launch_record: dict[str, Any] | None = None
+    if spec.run == "1c":
+        if not isinstance(image, str) or not image:
+            raise ValueError("the Pod connection record names no container image (run 1c needs it)")
+        allowed = run1c_image_references(spec.raw["runtime"]["image"])
+        if image not in allowed:
+            raise ValueError(f"the Pod runs {image}, not run 1c's image ({sorted(allowed)})")
+        if launch_commit is None or launch_check is None:
+            raise ValueError("run 1c needs --launch-commit and the Pod's launch-check.json")
+        launch_record = _load(launch_check)
+    elif launch_commit is not None or launch_check is not None:
+        raise ValueError("--launch-commit and --launch-check are run 1c's")
     code = rehearsal_ops.check_revision(_load(revision))
     owner = _load(confirmations)
     guarantee = owner.get("termination_guarantee")
@@ -247,7 +270,11 @@ def build_receipt(
     if gate_record is not None:
         receipt["sft_format_gate"] = gate_record  # Run 2's weights passed the gate.
     if spec.run == "1c":
+        assert launch_check is not None
         receipt["pod_image"] = image  # The image the environment record names.
+        receipt["launch_commit"] = launch_commit  # check_readiness checks both below.
+        receipt["launch_check"] = launch_record
+        receipt["evidence_sha256"]["launch_check"] = file_sha256(launch_check)
     for gate in posttrain_ops.OWNER_GATES:
         receipt[gate] = owner.get(gate)
     # Exactly the worker's own acceptance check, so a written receipt is one it accepts.
@@ -291,6 +318,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--sft-gate", type=Path, help="run 2: its SFT weights' passing format-gate record"
     )
+    parser.add_argument("--launch-commit", help="run 1c: the full 40-hex commit it launches from")
+    parser.add_argument(
+        "--launch-check",
+        type=Path,
+        help="run 1c: the Pod's launch-check.json (default: next to --identity)",
+    )
     args = parser.parse_args(argv)
     try:
         receipt = build_receipt(
@@ -311,6 +344,12 @@ def main(argv: list[str]) -> int:
             billing_origin_unix=args.billing_origin_unix,
             heartbeat=args.heartbeat,
             sft_gate=args.sft_gate,
+            launch_commit=args.launch_commit,
+            launch_check=(
+                args.launch_check or args.identity.with_name("launch-check.json")
+                if args.launch_commit is not None
+                else args.launch_check
+            ),
         )
     except (OSError, ValueError, TypeError, KeyError) as error:
         print(f"posttrain-readiness-receipt: {type(error).__name__}: {error}", file=sys.stderr)

@@ -161,6 +161,10 @@ PROBE_STOP = "generation_below_planning_speed"
 SPEED_STOP = "sft_throughput_below_limit"
 PROJECTED_STOP = "projected_finish_after_deadline"
 FORMAT_GATE_STOP = "format_gate_failed"
+RUNTIME_STOP = "runtime_mismatch"
+"""Run 1c: the Pod's Python, torch build, CUDA version or GPU is not the one its specification
+pins (``runtime.expected``). Checked before the first stage, after the environment record is
+uploaded; nothing is trained or generated, and the run finalizes as any other early stop."""
 """Run 1b: the selected SFT weights failed the SFT format gate. The gate record and the
 weights are already in R2; the run finalizes in full and no later stage (nothing paid)
 starts from those weights."""
@@ -310,6 +314,99 @@ specification at its planning rates) and the cost limit it derives (the lower of
 and 120% of it), both ``null`` in the tracked file. ``python -m tools.posttrain_approved
 run1c-bind`` fills them; the worker and the readiness receipt refuse a placeholder."""
 RUN1C_ESTIMATE_FIELDS = ("limits.gate_estimate_usd", "limits.cost_limit_usd")
+RUNTIME_KEYS = {"expected", "image"}
+"""Run 1c's ``runtime`` section: the runtime the worker requires and the image record."""
+RUNTIME_EXPECTED_KEYS = {"python", "torch", "torch_cuda", "device_name", "device_count"}
+RUNTIME_IMAGE_KEYS = {"reference", "index_digest", "linux_amd64_digest", "resolved_on"}
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+GIT_COMMIT_HEX = re.compile(r"[0-9a-f]{40}")
+LAUNCH_CHECK_KIND = "posttrain-launch-check"
+LAUNCH_CHECK_KEYS = {
+    "kind",
+    "launch_commit",
+    "revision_commit",
+    "archive_commit",
+    "archive_sha256",
+    "files",
+    "tree_clean",
+}
+"""The record the Pod bootstrap writes for run 1c (``launch-check.json``) once it has checked
+the shipped archive against the operator's launch commit: the commit ``revision.json`` names,
+the commit the archive itself was written from (``git archive``'s header), the archive's
+SHA-256, its file count, and that the extracted repository is exactly the archive's tree."""
+
+
+def check_runtime_section(value: Any) -> dict[str, Any]:
+    """Run 1c's ``runtime`` section: the expected Python, torch, CUDA and GPU, and the image's
+    tag and digests, each of its type."""
+    section = _exact(value, RUNTIME_KEYS, "runtime")
+    expected = _exact(section["expected"], RUNTIME_EXPECTED_KEYS, "runtime.expected")
+    for name in RUNTIME_EXPECTED_KEYS - {"device_count"}:
+        if not isinstance(expected[name], str) or not expected[name]:
+            raise ValueError(f"runtime.expected.{name} must be a nonempty string")
+    _count(expected["device_count"], "runtime.expected.device_count")
+    image = _exact(section["image"], RUNTIME_IMAGE_KEYS, "runtime.image")
+    if not isinstance(image["reference"], str) or "@" in image["reference"]:
+        raise ValueError("runtime.image.reference must be the image tag")
+    for name in ("index_digest", "linux_amd64_digest"):
+        if not isinstance(image[name], str) or not DIGEST.fullmatch(image[name]):
+            raise ValueError(f"runtime.image.{name} must be sha256:<64 hex>")
+    return section
+
+
+def measure_runtime() -> dict[str, Any]:
+    """The runtime this process has: Python's version, the torch build and its CUDA version,
+    whether CUDA is available, the device count and the first device's name."""
+    import platform
+
+    available = bool(torch.cuda.is_available())
+    count = int(torch.cuda.device_count()) if available else 0
+    return {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        "cuda_available": available,
+        "device_count": count,
+        "device_name": torch.cuda.get_device_name(0) if count else None,
+    }
+
+
+def runtime_mismatches(expected: Mapping[str, Any], measured: Any) -> list[str]:
+    """The expected runtime's fields the measured runtime differs in, and ``cuda_available``
+    when CUDA is not available; every field when nothing was measured."""
+    if not isinstance(measured, Mapping):
+        return ["cuda_available", *sorted(expected)]
+    differ = [] if measured.get("cuda_available") is True else ["cuda_available"]
+    return differ + [name for name in sorted(expected) if measured.get(name) != expected[name]]
+
+
+def check_launch_commit(receipt: Mapping[str, Any]) -> str:
+    """Run 1c's receipt names its launch commit (40 lower-case hex digits), the shipped
+    revision is that commit, and the Pod's launch check found the archive written from it and
+    the extracted repository exactly its tree. Returns the commit."""
+    commit = receipt.get("launch_commit")
+    if not isinstance(commit, str) or not GIT_COMMIT_HEX.fullmatch(commit):
+        raise ValueError("run 1c's launch commit must be a full commit: 40 lower-case hex digits")
+    revision = receipt.get("revision")
+    if not isinstance(revision, Mapping) or revision.get("git_commit") != commit:
+        raise ValueError(f"the shipped code revision is not run 1c's launch commit {commit}")
+    check = receipt.get("launch_check")
+    if not isinstance(check, Mapping) or set(check) != LAUNCH_CHECK_KEYS:
+        raise ValueError(
+            f"run 1c's launch check must have exactly the keys {sorted(LAUNCH_CHECK_KEYS)}"
+        )
+    if check["kind"] != LAUNCH_CHECK_KIND:
+        raise ValueError("not a launch check record")
+    for name in ("launch_commit", "revision_commit", "archive_commit"):
+        if check[name] != commit:
+            raise ValueError(f"the launch check's {name} is not the launch commit {commit}")
+    if check["archive_sha256"] != revision.get("archive_sha256"):
+        raise ValueError("the launch check is of another archive than the shipped revision's")
+    if type(check["files"]) is not int or check["files"] < 1:
+        raise ValueError("the launch check counted no archived files")
+    if check["tree_clean"] is not True:
+        raise ValueError("the Pod's repository is not exactly the launch commit's tree")
+    return commit
 
 
 def run1c_placeholders(raw: Mapping[str, Any]) -> list[str]:
@@ -741,7 +838,8 @@ class Specification:
         ``allow_gate_nulls`` (the cost projection of the tracked template only)."""
         if isinstance(raw, dict) and raw.get("run") == "2":
             return cls._from_run2(raw, allow_gate_nulls=allow_gate_nulls)
-        top = _exact(raw, TOP_KEYS, "the specification")
+        runtime = isinstance(raw, dict) and raw.get("run") == RUN1C
+        top = _exact(raw, TOP_KEYS | ({"runtime"} if runtime else set()), "the specification")
         if top["schema_version"] != SCHEMA_VERSION or top["kind"] != SPECIFICATION_KIND:
             raise ValueError("not a post-training run specification of this schema")
         if top["run"] not in posttrain_ops.RUNS:
@@ -876,6 +974,8 @@ class Specification:
             )
         r2 = _exact(top["r2"], {"storage_cap_usd_per_month"}, "r2")
         _positive(r2["storage_cap_usd_per_month"], "r2.storage_cap_usd_per_month")
+        if run1c:
+            check_runtime_section(top["runtime"])
         return cls(
             run=top["run"],
             model=model,
@@ -1413,6 +1513,8 @@ def check_readiness(
         cost_stop_usd=derived.worker_cost_stop_usd,
         quoted_total_hourly=derived.quoted_total_hourly,
     )
+    if spec.run == RUN1C:
+        check_launch_commit(receipt)  # The operator's launch commit, checked on the Pod.
     fit = launch_fit(spec, remaining_seconds=end - now)
     require_fit(fit["remaining_seconds"], fit["planning_seconds_needed"])
     return Launch(origin, end, identity.pod_id, fit)
@@ -2567,11 +2669,40 @@ class PosttrainWorker(Worker):
         self.write_json(path, environment)
         self.export_label(ENVIRONMENT_LABEL, [("environment.json", path)])
 
+    def check_runtime(self) -> None:
+        """Run 1c: the runtime measured on this Pod (the report's ``runtime``, from
+        ``run_extra``) must be the one its specification pins (``runtime.expected``): Python,
+        the torch build, its CUDA version, CUDA available, the device count and name. The
+        comparison is recorded as ``runtime_check`` and published; any difference stops the
+        run with ``runtime_mismatch`` before the first stage. Other runs pin no runtime."""
+        section = self.plan.raw.get("runtime")
+        if not isinstance(section, Mapping):
+            return
+        expected = dict(section["expected"])
+        measured = self.report.get("runtime")
+        differ = runtime_mismatches(expected, measured)
+        self.report["runtime_check"] = {
+            "status": "failed" if differ else "passed",
+            "expected": expected,
+            "measured": measured,
+            "mismatched": differ,
+            "rule": (
+                "before the first stage the measured Python, torch build, CUDA version, device "
+                "count and device name equal the specification's and CUDA is available; any "
+                "difference stops the run"
+            ),
+        }
+        self.publish()
+        if differ:
+            self.stop_reason = RUNTIME_STOP
+            raise PilotStop(RUNTIME_STOP)
+
     def execute(self) -> dict[str, Any]:
         try:
             self.report["timings"]["stages_started_unix"] = self.clock()
             self.check_planned_tasks()
             self.export_environment()
+            self.check_runtime()
             for stage in self.plan.stages:
                 self.run_stage(stage)
             self.after_stages()
@@ -2680,18 +2811,25 @@ def _object(path: Path) -> dict[str, Any]:
 
 
 def run_extra(
-    spec: Specification, receipt: Mapping[str, Any], base: Mapping[str, Any]
+    spec: Specification,
+    receipt: Mapping[str, Any],
+    base: Mapping[str, Any],
+    *,
+    runtime: Callable[[], dict[str, Any]] = measure_runtime,
 ) -> dict[str, Any]:
     """The worker's ``extra`` report fields for this run: ``base`` unchanged for runs 1, 1b and
     2; for run 1c, ``base`` plus the environment record of the Pod image the readiness receipt
-    names (``pod_image``), which the worker uploads before its first stage. A run-1c receipt
-    without the image is refused, so the run cannot start without that record."""
+    names (``pod_image``), which the worker uploads before its first stage, and the runtime
+    measured here (``runtime``, ``measure_runtime`` on the Pod), which the worker checks
+    against its specification before that stage. A run-1c receipt without the image is
+    refused, so the run cannot start without that record."""
     extra = dict(base)
     if spec.run == RUN1C:
         image = receipt.get("pod_image")
         if not isinstance(image, str) or not image:
             raise ValueError("run 1c's readiness receipt names no Pod image (pod_image)")
         extra["environment"] = environment_record(image=image)
+        extra["runtime"] = runtime()
     return extra
 
 

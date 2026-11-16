@@ -44,6 +44,7 @@ from tools.posttrain_run import (
     Specification,
     check_policy,
     environment_record,
+    measure_runtime,
     run_extra,
     stage_seconds,
 )
@@ -137,7 +138,17 @@ def test_the_unpinned_specification_has_every_bind_value_as_a_placeholder() -> N
 def test_run_1c_is_the_prepared_protocol() -> None:
     raw = posttrain_approved.run1c_specification()
     run1b = posttrain_approved.run1b_specification()
-    assert raw["run"] == "1c" and set(raw) == set(run1b)
+    assert raw["run"] == "1c" and set(raw) == set(run1b) | {"runtime"}
+    assert raw["runtime"] == {
+        "expected": {
+            "python": "3.12.3",
+            "torch": "2.9.1+cu128",
+            "torch_cuda": "12.8",
+            "device_name": "NVIDIA A40",
+            "device_count": 1,
+        },
+        "image": posttrain_approved.RUN1C_IMAGE,
+    }
     assert [(stage["name"], stage["kind"]) for stage in raw["stages"]] == [
         ("probe", "probe"),
         ("sft", "sft"),
@@ -405,6 +416,12 @@ def _set(path: tuple[str, ...], value: Any) -> Callable[[dict[str, Any]], None]:
         (_set(("planning", "format_gate_seconds"), 1), "differs"),
         (_set(("run",), "1b"), "not a run-1c"),
         (lambda raw: raw["stages"].pop(2), "differs"),
+        (_set(("runtime", "expected", "torch"), "2.10.0+cu128"), r"\['runtime'\]"),
+        (_set(("runtime", "expected", "python"), "3.12.4"), r"\['runtime'\]"),
+        (_set(("runtime", "expected", "torch_cuda"), "12.9"), r"\['runtime'\]"),
+        (_set(("runtime", "expected", "device_name"), "NVIDIA L40S"), r"\['runtime'\]"),
+        (_set(("runtime", "image", "index_digest"), "sha256:" + "0" * 64), r"\['runtime'\]"),
+        (lambda raw: raw.pop("runtime"), "runtime"),
     ],
 )
 def test_check_run_1c_refuses(
@@ -439,6 +456,16 @@ def test_a_bound_specification_from_other_rows_is_still_checked(bound: dict[str,
         (lambda raw: raw["sft"].pop("planned_updates"), "sft must have exactly"),
         (lambda raw: raw["limits"].pop("cost_limit_usd"), "limits must have exactly"),
         (lambda raw: raw["limits"].update(cost_limit_usd=0.01), "differs from its derivation"),
+        (lambda raw: raw.pop("runtime"), "the specification must have exactly"),
+        (lambda raw: raw["runtime"].pop("image"), "runtime must have exactly"),
+        (lambda raw: raw["runtime"]["expected"].pop("torch"), "runtime.expected must have"),
+        (lambda raw: raw["runtime"]["expected"].update(torch=""), "nonempty string"),
+        (lambda raw: raw["runtime"]["expected"].update(device_count=0), "device_count"),
+        (
+            lambda raw: raw["runtime"]["image"].update(reference=IMAGE + "@sha256:" + "a" * 64),
+            "the image tag",
+        ),
+        (lambda raw: raw["runtime"]["image"].update(index_digest="sha256:ab"), "64 hex"),
     ],
 )
 def test_the_parser_holds_run_1c_to_its_rules(
@@ -672,7 +699,9 @@ def test_the_pod_run_adds_the_environment_of_the_receipts_image_for_run_1c(
     spec = Specification.from_dict(bound)
     base = {"code_revision": {"commit": "1" * 40}, "launch_fit": {"fits": True}}
     extra = run_extra(spec, {"pod_image": IMAGE}, base)
-    assert {key: value for key, value in extra.items() if key != "environment"} == base
+    added = {"environment", "runtime"}
+    assert {key: value for key, value in extra.items() if key not in added} == base
+    assert extra["runtime"] == measure_runtime()  # Measured here; checked by the worker.
     assert extra["environment"]["kind"] == "posttrain-environment"
     assert extra["environment"]["image"]["reference"] == IMAGE
     assert "environment" not in base  # The caller's fields are copied, never changed.
@@ -706,9 +735,9 @@ def test_the_smoke_worker_builds_its_extra_as_the_pod_run_does(
 
     calls: list[tuple[str, dict[str, Any]]] = []
 
-    def spy(spec: Specification, receipt: Any, base: Any) -> dict[str, Any]:
+    def spy(spec: Specification, receipt: Any, base: Any, **options: Any) -> dict[str, Any]:
         calls.append((spec.run, dict(receipt)))
-        return run_extra(spec, receipt, base)
+        return run_extra(spec, receipt, base, **options)
 
     monkeypatch.setattr(posttrain_run, "run_extra", spy)
     worker = make_worker_1c(found, tmp_path / "run", bucket=MemoryBucket())
@@ -855,6 +884,15 @@ def receipt_evidence(
         },
         "pod-connection.json": {"pod_id": POD, "cost_usd_per_hour": 0.59, "image": IMAGE},
         "revision.json": REVISION,
+        "launch-check.json": {
+            "kind": "posttrain-launch-check",
+            "launch_commit": REVISION["git_commit"],
+            "revision_commit": REVISION["git_commit"],
+            "archive_commit": REVISION["git_commit"],
+            "archive_sha256": REVISION["archive_sha256"],
+            "files": 3,
+            "tree_clean": True,
+        },
     }
     for name, change in changes.items():
         change(values[name])
@@ -882,6 +920,8 @@ def receipt_evidence(
         "revision": files["revision.json"],
         "connection": files["pod-connection.json"],
         "billing_origin_unix": float(origin),
+        "launch_commit": REVISION["git_commit"],
+        "launch_check": files["launch-check.json"],
     }
 
 
@@ -949,3 +989,275 @@ def test_the_receipt_refuses_the_tracked_template_with_its_placeholders(
     template.write_bytes(SPEC_1C.read_bytes())
     with pytest.raises(ValueError, match="placeholders"):
         build_receipt(**{**arguments, "specification": template}, now=NOW)
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        IMAGE,
+        IMAGE + "@" + posttrain_approved.RUN1C_IMAGE["index_digest"],
+        IMAGE + "@" + posttrain_approved.RUN1C_IMAGE["linux_amd64_digest"],
+    ],
+)
+def test_the_receipt_accepts_the_tag_or_the_tag_pinned_to_a_recorded_digest(
+    tmp_path: Path, bound: dict[str, Any], image: str
+) -> None:
+    from test_posttrain_readiness import NOW
+
+    from tools.posttrain_readiness import build_receipt
+
+    connection = {"pod-connection.json": lambda value: value.update(image=image)}
+    receipt = build_receipt(**receipt_evidence(tmp_path, bound, **connection), now=NOW)
+    assert receipt["pod_image"] == image
+
+
+# The launch commit -------------------------------------------------------------------------------
+
+
+def _receipt_with(
+    tmp_path: Path, bound: dict[str, Any], *, arguments: dict[str, Any], **changes: Any
+) -> dict[str, Any]:
+    from test_posttrain_readiness import NOW
+
+    from tools.posttrain_readiness import build_receipt
+
+    evidence = {**receipt_evidence(tmp_path, bound, **changes), **arguments}
+    return build_receipt(**evidence, now=NOW)
+
+
+def test_the_receipt_records_the_launch_commit_and_the_pods_launch_check(
+    tmp_path: Path, bound: dict[str, Any]
+) -> None:
+    from test_posttrain_readiness import REVISION
+
+    receipt = _receipt_with(tmp_path, bound, arguments={})
+    assert receipt["launch_commit"] == REVISION["git_commit"] == receipt["revision"]["git_commit"]
+    assert receipt["launch_check"]["tree_clean"] is True
+    assert receipt["evidence_sha256"]["launch_check"] == file_sha256(tmp_path / "launch-check.json")
+
+
+@pytest.mark.parametrize(
+    ("arguments", "changes", "match"),
+    [
+        ({"launch_commit": None}, {}, "needs --launch-commit"),
+        ({"launch_check": None}, {}, "needs --launch-commit"),
+        ({"launch_commit": "ab" * 6}, {}, "40 lower-case hex digits"),
+        ({"launch_commit": "AB" * 20}, {}, "40 lower-case hex digits"),
+        ({"launch_commit": "cd" * 20}, {}, "not run 1c's launch commit"),
+        (
+            {},
+            {"launch-check.json": lambda value: value.update(tree_clean=False)},
+            "not exactly the launch commit's tree",
+        ),
+        (
+            {},
+            {"launch-check.json": lambda value: value.update(archive_commit="cd" * 20)},
+            "archive_commit is not the launch commit",
+        ),
+        (
+            {},
+            {"launch-check.json": lambda value: value.update(archive_sha256="0" * 64)},
+            "another archive",
+        ),
+        ({}, {"launch-check.json": lambda value: value.pop("files")}, "exactly the keys"),
+        (
+            {},
+            {"pod-connection.json": lambda value: value.update(image="runpod/pytorch:other")},
+            "not run 1c's image",
+        ),
+    ],
+)
+def test_the_receipt_refuses_another_launch_commit_or_tree(
+    tmp_path: Path,
+    bound: dict[str, Any],
+    arguments: dict[str, Any],
+    changes: dict[str, Callable[[Any], None]],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _receipt_with(tmp_path, bound, arguments=arguments, **changes)
+
+
+def test_the_worker_refuses_a_receipt_without_the_launch_commit(
+    tmp_path: Path, bound: dict[str, Any]
+) -> None:
+    from test_posttrain_readiness import NOW
+
+    from tools.posttrain_readiness import DEFAULT_HEARTBEAT
+    from tools.posttrain_run import check_readiness
+
+    receipt = _receipt_with(tmp_path, bound, arguments={})
+    spec = Specification.from_dict(bound)
+    identity = {
+        "specification_sha256": receipt["specification_sha256"],
+        "binding_sha256": receipt["binding_sha256"],
+        "preflight_sha256": receipt["preflight_sha256"],
+    }
+    changes: list[Callable[[dict[str, Any]], Any]] = [
+        lambda value: value.pop("launch_commit"),
+        lambda value: value.update(launch_commit=value["launch_commit"][:12]),
+        lambda value: value["launch_check"].update(launch_commit="cd" * 20),
+        lambda value: value["revision"].update(git_commit="cd" * 20),
+    ]
+    for change in changes:
+        edited = json.loads(json.dumps(receipt))
+        change(edited)
+        with pytest.raises(ValueError, match="launch commit|launch_commit"):
+            check_readiness(edited, now=NOW, spec=spec, heartbeat=DEFAULT_HEARTBEAT, **identity)
+
+
+def test_the_other_runs_receipts_take_no_launch_commit(tmp_path: Path) -> None:
+    from test_posttrain_readiness import NOW, evidence
+
+    from tools.posttrain_readiness import build_receipt
+
+    with pytest.raises(ValueError, match="run 1c's"):
+        build_receipt(**evidence(tmp_path), launch_commit="ab" * 20, now=NOW)
+
+
+# The runtime check ----------------------------------------------------------------------------
+
+
+def test_a_matching_runtime_passes_and_is_recorded_before_the_probe(
+    smoked: tuple[dict[str, Any], Path],
+) -> None:
+    summary, output = smoked
+    assert summary["runtime_check"] == "passed"
+    report = json.loads((output / "run" / "report.json").read_text())
+    check = report["runtime_check"]
+    assert check["expected"] == posttrain_approved.RUN1C_RUNTIME
+    assert check["mismatched"] == [] and report["runtime"]["cuda_available"] is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("python", "3.12.4"),
+        ("torch", "2.9.0+cu128"),
+        ("torch_cuda", "12.6"),
+        ("device_name", "NVIDIA RTX A6000"),
+        ("device_count", 2),
+        ("cuda_available", False),
+    ],
+)
+def test_each_runtime_mismatch_stops_the_run_before_the_probe(
+    found: Fixtures, tmp_path: Path, field: str, value: Any
+) -> None:
+    from tools.posttrain_run import RUNTIME_STOP
+    from tools.posttrain_smoke import smoke_runtime_1c
+
+    bucket = MemoryBucket()
+    worker = make_worker_1c(
+        found,
+        tmp_path / "run",
+        bucket=bucket,
+        runtime=lambda: {**smoke_runtime_1c(), field: value},
+    )
+    with patched_benchmarks():
+        report = worker.execute()
+    assert report["status"] == "stopped" and report["stop_reason"] == RUNTIME_STOP
+    assert [stage["status"] for stage in report["stages"]] == ["skipped"] * 4
+    assert report["probe"] is None and report["generated_tokens"] == 0
+    assert report["runtime_check"]["status"] == "failed"
+    assert report["runtime_check"]["mismatched"] == [field]
+    labels = {row["label"] for row in report["artifacts"]}
+    assert labels == {"environment"}  # The environment record, then nothing paid for.
+    prefix = report["r2"]["prefix"]
+    assert prefix + "report.json" in bucket.objects  # Finalized like any other early stop.
+
+
+def test_this_hosts_own_runtime_is_refused_without_cuda() -> None:
+    from tools.posttrain_run import runtime_mismatches
+
+    measured = measure_runtime()
+    differ = runtime_mismatches(posttrain_approved.RUN1C_RUNTIME, measured)
+    if not torch.cuda.is_available():
+        assert "cuda_available" in differ and "device_name" in differ
+    assert runtime_mismatches(posttrain_approved.RUN1C_RUNTIME, None)[0] == "cuda_available"
+
+
+def test_runs_1_1b_and_2_pin_no_runtime_and_never_check_one() -> None:
+    for path in ("rehearsal-a40-s-post-1.json", "rehearsal-a40-s-post-1b.json"):
+        raw = json.loads((ROOT / "configs" / path).read_text())
+        assert "runtime" not in raw
+        raw["runtime"] = posttrain_approved.run1c_specification()["runtime"]
+        with pytest.raises(ValueError, match="the specification must have exactly"):
+            Specification.from_dict(raw)
+    run2 = json.loads((ROOT / "configs" / "rehearsal-a40-s-post-2-v2.json").read_text())
+    assert "runtime" not in run2
+
+
+# The SFT speed check ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("updates", "fires_at"), [(120, 50), (20, 20)])
+def test_the_speed_check_fires_at_update_50_or_at_the_last_of_fewer(
+    found: Fixtures, tmp_path: Path, updates: int, fires_at: int
+) -> None:
+    """The rule is min(50, updates): 50 or more updates check at update 50 over updates 3 to 50
+    (the two warmup updates excluded); fewer than 50 check at the last update."""
+    from scratchcoder.train.pilot import PilotStop
+
+    original = list(read_rows(found.inputs["sft-train"]))
+    per_update = 4  # The smoke's 2 rows x 2 accumulation steps.
+    rows = tmp_path / "rows" / "train.jsonl"
+    write_rows(
+        rows,
+        [
+            SFTRow(f"speed/{index}", original[index % len(original)].source, row.ids, row.mask)
+            for index in range(updates * per_update)
+            for row in [original[index % len(original)]]
+        ],
+    )
+    fixtures = Fixtures(
+        found.root, found.tokenizer, {**found.inputs, "sft-train": rows}, found.full_tasks
+    )
+    window = {"speed_check_updates": 50, "speed_check_warmup_updates": 2}
+    worker = make_worker_1c(
+        fixtures,
+        tmp_path / "run",
+        bucket=MemoryBucket(),
+        changes=lambda raw: raw["sft"].update(window),
+    )
+    assert worker.plan.sft_updates == updates
+    seen: list[dict[str, Any]] = []
+    check = worker.sft_speed_check
+
+    def observed(record: dict[str, Any], timing: Any, *, warmup: int) -> None:
+        try:
+            check(record, timing, warmup=warmup)
+        finally:
+            seen.append({"at": timing[-1][0], "timed": len(timing), **record["speed_check"]})
+            raise PilotStop("observed")
+
+    worker.sft_speed_check = observed  # type: ignore[method-assign]
+    with pytest.raises(PilotStop, match="observed"):
+        worker.run_sft(worker.plan.stage("sft"))
+    (result,) = seen
+    assert result["at"] == result["timed"] == fires_at
+    assert result["after_updates"] == 50
+    assert result["excluded_warmup_updates"] == 2 and result["counted_updates"] == fires_at - 2
+
+
+def test_the_receipt_command_reads_the_launch_check_next_to_the_identity(
+    tmp_path: Path, bound: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_posttrain_readiness import NOW
+
+    from tools import posttrain_readiness
+
+    arguments = receipt_evidence(tmp_path, bound)
+    argv = [
+        "--" + name.replace("_", "-") + "=" + str(value)
+        for name, value in arguments.items()
+        if name not in ("launch_commit", "launch_check", "billing_origin_unix")
+    ]
+    argv += [f"--billing-origin-unix={arguments['billing_origin_unix']}"]
+    argv += [f"--output={tmp_path / 'receipt.json'}"]
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    assert posttrain_readiness.main(argv) == 1  # Run 1c without its launch commit.
+    commit = arguments["launch_commit"]
+    assert posttrain_readiness.main([*argv, f"--launch-commit={commit}"]) == 0
+    receipt = json.loads((tmp_path / "receipt.json").read_text())
+    assert receipt["launch_commit"] == commit
+    assert receipt["launch_check"] == json.loads((tmp_path / "launch-check.json").read_text())

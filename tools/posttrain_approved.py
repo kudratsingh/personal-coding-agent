@@ -36,7 +36,9 @@ to it. Its protocol: the probe on run 1b's SFT weights, one SFT pass from them w
 optimizer, schedule and batch, no special-row redraw, the final weights kept and the parent's
 dev loss measured before the first update, run 1b's format gate, and a greedy evaluation of
 pool dev and the three benchmarks; its floors are the standing rule's over the four hosts
-measured before it, and it stops at the lower of $1.50 and 120% of its own projected cost.
+measured before it, and it stops at the lower of $1.50 and 120% of its own projected cost. Its
+``runtime`` section pins run 1b's recorded Python, torch build, CUDA version and GPU (the
+worker stops before its first stage on any difference) and records the image tag's digests.
 
 ``run1_specification()`` is ``configs/rehearsal-a40-s-post-1.json`` (a test keeps the two
 equal), and ``check_run1`` is what the readiness receipt applies to the specification it is
@@ -1001,7 +1003,9 @@ RUN1C_CEILING_USD = 1.5
 RUN1C_FLOOR_HOSTS = 4
 """Run 1c's floors are the standing rule over the first four measured hosts: run 1's first
 launch, run 1, run 1b's first launch and run 1b (``MEASURED_HOST_PROBES[:4]``), the hosts
-measured before its specification was written."""
+measured before its specification was written. Both first launches stopped early and both stay
+in the average. The owner ratified these floors and the SFT reference below for run 1c on
+2026-11-16, with the stopped first-launch hosts kept in the measured average."""
 RUN1C_FLOORS = {"128": 7_991.0, "256": 9_049.0}
 """Run 1c's probe floors and planning generation speeds, fixed in its specification: floor(0.9
 x the mean of the four hosts' rates) at each batch (``derive_generation_floors``). A later host
@@ -1069,6 +1073,47 @@ RUN1C_INPUTS: dict[str, dict[str, Any]] = {
 and SHA-256 ``null`` here, filled from ``RUN1C_TRAIN_ROWS`` by ``run1c_specification``), run 1b's
 two dev sets, the pool dev export and the three benchmark
 releases. No pool test export, no RL input, no ARC questions and no base checkpoint."""
+RUN1C_IMAGE: dict[str, Any] = {
+    "reference": "runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404",
+    "index_digest": "sha256:60baa36d3fb6b98fd4f4ece6b96776c83c01a8b7c540e54460ab4d496816141f",
+    "linux_amd64_digest": "sha256:3e874356857adfa3e8faa3fd913b65bd127f77a0fe2e489513e7775e1c1e16b1",
+    "resolved_on": "2026-11-16",
+}
+"""Run 1c's container image: run 1b's tag, and the digests that tag resolved to on the date
+given (one anonymous read of the registry's manifest index for the tag: the index's own
+digest and its linux/amd64 manifest's). Run 1b's own digest was never recorded (the provider's
+Pod record names the tag), so these are the tag's digests at that read, not proof of what ran
+before; the runtime check (``RUN1C_RUNTIME``) is what ties a Pod to the recorded environment.
+The Pod create body names the tag (the provider documents its image field as an image
+reference with tag examples only); the readiness receipt accepts a Pod record naming the tag
+or the tag pinned to either digest (``run1c_image_references``)."""
+RUN1C_RUNTIME: dict[str, Any] = {
+    "python": "3.12.3",
+    "torch": "2.9.1+cu128",
+    "torch_cuda": "12.8",
+    "device_name": "NVIDIA A40",
+    "device_count": 1,
+}
+"""The runtime run 1b's Pod recorded (Python, the torch build, its CUDA version and the one
+A40), which the owner accepted for run 1c: its worker measures them before the first stage
+and stops with ``runtime_mismatch`` on any difference (``posttrain_run.check_runtime``)."""
+RUN1C_LAUNCH_BRANCH = "agent/wo16-agent-sft1-run"
+"""The pushed branch run 1c launches from, at one full commit the operator names
+(``RUN1C_LAUNCH_SHA``): the code archive is written from exactly that commit, which must be
+the branch's pushed tip (``tools.posttrain_revision``), and the Pod checks the archive against
+it before anything is installed."""
+
+
+def run1c_image_references(image: Mapping[str, Any] | None = None) -> frozenset[str]:
+    """The image names a run-1c Pod record may carry: the tag, or the tag pinned to the index
+    digest or to the linux/amd64 manifest digest."""
+    image = RUN1C_IMAGE if image is None else image
+    tag = str(image["reference"])
+    return frozenset(
+        {tag, f"{tag}@{image['index_digest']}", f"{tag}@{image['linux_amd64_digest']}"}
+    )
+
+
 RUN1C_EVAL_FILES = (
     "pool-dev-greedy",
     "humaneval-greedy",
@@ -1119,6 +1164,7 @@ def run1c_specification() -> dict[str, Any]:
         "stages": run1c_stages(),
         "inputs": json.loads(json.dumps(RUN1C_INPUTS)),
         "r2": {"storage_cap_usd_per_month": 5.0},
+        "runtime": {"expected": dict(RUN1C_RUNTIME), "image": dict(RUN1C_IMAGE)},
     }
     raw["sft"].update({key: rows[key] for key in RUN1C_BIND_SFT})
     raw["inputs"]["sft-train"].update(size_bytes=rows["size_bytes"], sha256=rows["sha256"])
@@ -1168,9 +1214,9 @@ def check_run1c(raw: Mapping[str, Any]) -> None:
     filled. In order: a placeholder still ``null``; a pool test export, any RL or screening
     input, a screening stage; a special-row redraw or another row learning rate; more than one
     pass; a ceiling above $1.50; then any approved value changed (every section equal but for
-    the bind values; every input pin field equal, ``null`` included; the training rows' count,
-    update count, size and SHA-256 equal to the approved rows' when ``RUN1C_TRAIN_ROWS`` pins
-    them). The update count must be
+    the bind values, the expected runtime and the image record included; every input pin
+    field equal, ``null`` included; the training rows' count, update count, size and SHA-256
+    equal to the approved rows' when ``RUN1C_TRAIN_ROWS`` pins them). The update count must be
     the one the rows give, the estimate the projection of this specification at its planning
     rates (``run1c_estimate_usd``), the cost limit the lower of the ceiling and 120% of it, and
     that limit must hold the planned setup and the whole run at the planning rates."""
@@ -1219,7 +1265,16 @@ def check_run1c(raw: Mapping[str, Any]) -> None:
         raise ValueError("run 1c's ceiling is at most $1.50")
     differ = [
         name
-        for name in ("model", "planning", "probe", "generation", "screening", "stages", "r2")
+        for name in (
+            "model",
+            "planning",
+            "probe",
+            "generation",
+            "screening",
+            "stages",
+            "r2",
+            "runtime",
+        )
         if raw.get(name) != approved[name]
     ]
     unbound = {key: value for key, value in sft.items() if key not in RUN1C_BIND_SFT}

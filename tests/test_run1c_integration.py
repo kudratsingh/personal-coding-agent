@@ -1,4 +1,5 @@
-"""Run 1c's CPU smoke drives the real Mac-side supervisor and watchdog, gate passing or not.
+"""Run 1c's CPU smoke drives the real Mac-side supervisor and watchdog: the gate passing or
+not, and a runtime mismatch that stops the run before its first stage.
 
 The worker runs run 1c's stages on the smoke's fixtures (a weights-only parent, one pass, the
 final weights kept, the real format gate) into an in-memory bucket; each heartbeat is kept
@@ -22,7 +23,7 @@ from test_rehearsal_integration import MAC_KEY, REPOSITORY, GitHub
 
 from tools import pilot_supervisor, posttrain_ops
 from tools.pilot_supervisor import PosttrainSupervisor, archive_bundle
-from tools.posttrain_run import FORMAT_GATE_STOP, PosttrainWorker
+from tools.posttrain_run import FORMAT_GATE_STOP, RUNTIME_STOP, PosttrainWorker
 from tools.posttrain_smoke import (
     SMOKE_POD_ID_1C,
     Fixtures,
@@ -30,6 +31,7 @@ from tools.posttrain_smoke import (
     fixtures_1c,
     make_worker_1c,
     patched_benchmarks,
+    smoke_runtime_1c,
 )
 from tools.rehearsal_run import MemoryBucket
 from tools.runpod_watchdog import PodIdentity, Policy, RunpodClient, check_once
@@ -78,6 +80,15 @@ def passed(found: Fixtures, tmp_path_factory: pytest.TempPathFactory) -> Iterato
 def failed(found: Fixtures, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Recorded]:
     yield record_1c(
         found, tmp_path_factory.mktemp("posttrain-1c-fail") / "run", changes=failing_gate_1c
+    )
+
+
+@pytest.fixture(scope="module")
+def mismatched(found: Fixtures, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Recorded]:
+    yield record_1c(
+        found,
+        tmp_path_factory.mktemp("posttrain-1c-runtime") / "run",
+        runtime=lambda: {**smoke_runtime_1c(), "torch": "2.9.0+cu126", "torch_cuda": "12.6"},
     )
 
 
@@ -201,3 +212,23 @@ def test_a_failing_gate_stops_before_the_evaluation(failed: Recorded) -> None:
     keys = set(failed.bucket.objects)
     assert all(key.startswith(PREFIX) for key in keys)
     assert not any("eval-sft" in key for key in keys)
+
+
+def test_a_runtime_mismatch_stops_before_the_probe_and_the_pod_is_ended(
+    mismatched: Recorded, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    final = json.loads(mismatched.moments[-1].report)
+    assert final["status"] == "stopped" and final["stop_reason"] == RUNTIME_STOP
+    assert {stage["status"] for stage in final["stages"]} == {"skipped"}
+    assert final["runtime_check"]["mismatched"] == ["torch", "torch_cuda"]
+    assert {row["label"] for row in final["artifacts"]} == {"environment"}
+    pod, bucket = Pod(), MemoryBucket()
+    unit, _ = supervise(tmp_path / "ctrl", pod, bucket, monkeypatch)
+    for moment in mismatched.moments:
+        replay(unit, pod, bucket, moment)
+    assert unit.shutdown_ready and unit.r2_verified is not None
+    assert unit.r2_verified["report_status"] == "stopped"
+    assert watchdog_ends_the_pod(unit, mismatched) == (
+        "terminated",
+        "shutdown_ready_verified_receipts_delete_204_get_404",
+    )

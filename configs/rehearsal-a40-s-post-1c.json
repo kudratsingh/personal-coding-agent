@@ -245,5 +245,20 @@
   },
   "r2": {
     "storage_cap_usd_per_month": 5.0
+  },
+  "runtime": {
+    "expected": {
+      "python": "3.12.3",
+      "torch": "2.9.1+cu128",
+      "torch_cuda": "12.8",
+      "device_name": "NVIDIA A40",
+      "device_count": 1
+    },
+    "image": {
+      "reference": "runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404",
+      "index_digest": "sha256:60baa36d3fb6b98fd4f4ece6b96776c83c01a8b7c540e54460ab4d496816141f",
+      "linux_amd64_digest": "sha256:3e874356857adfa3e8faa3fd913b65bd127f77a0fe2e489513e7775e1c1e16b1",
+      "resolved_on": "2026-11-16"
+    }
   }
 }

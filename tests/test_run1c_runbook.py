@@ -27,6 +27,7 @@ PLACEHOLDERS = {
     "<reviewed binding sha256>": base.BINDING_SHA256,
     "<frozen training rows>": "rows/train.jsonl",
     "<approved training rows sha256>": "ab" * 32,
+    "<launch commit>": "7" * 40,
 }
 VALUES = {
     **base.VALUES,
@@ -51,6 +52,8 @@ VALUES = {
     "POD_ID": "podpost1c",
     "SELF_DESTRUCT_DEADLINE": str(ORIGIN + 3_420),
     "ART": "runs/posttrain-shared-1c/artifacts",
+    "RUN1C_BRANCH": "agent/wo16-agent-sft1-run",
+    "RUN1C_LAUNCH_SHA": "7" * 40,
 }
 
 
@@ -87,6 +90,7 @@ def test_every_tool_command_parses_with_its_real_command_line(
         "tools.runpod_pod_identity",
         "tools.mac_window_check",
         "tools.benchmark_dispatch",
+        "tools.posttrain_revision",
         "scratchcoder.cli",
     ):
         assert module in modules, module
@@ -176,7 +180,7 @@ def test_the_owner_steps_are_all_there() -> None:
     assert body.count("mac_window_check check") == 2
     assert "--specification /workspace/posttrain/specification.json" in body
     assert "eval-seal" not in body and "rl-screen" not in body and "pool-test" not in body
-    assert "no digest is guessed here" in body
+    assert "## The image and its digest" in body and "no digest is guessed here" not in body
 
 
 PUBLIC_RUN_DIRECTORIES = {
@@ -199,3 +203,36 @@ def test_the_runbook_names_no_private_identifier() -> None:
     assert not re.search(r"\bD\d\d\b|\bF\d\d\b", body)
     named = set(re.findall(r"(?<![\w-])runs/[A-Za-z0-9._-]+", body))
     assert named <= PUBLIC_RUN_DIRECTORIES, sorted(named - PUBLIC_RUN_DIRECTORIES)
+
+
+def test_run_1c_launches_from_the_pushed_branch_at_one_full_commit() -> None:
+    body = text()
+    assert "git checkout main" not in body and "pull --ff-only origin main" not in body
+    assert VALUES["RUN1C_BRANCH"] == posttrain_approved.RUN1C_LAUNCH_BRANCH
+    assert f"export RUN1C_BRANCH={posttrain_approved.RUN1C_LAUNCH_BRANCH}" in body
+    assert 'git checkout --detach "$RUN1C_LAUNCH_SHA"' in body
+    (write,) = base.by("tools.posttrain_revision", "write")
+    options = dict(zip(write[1::2], write[2::2], strict=True))
+    assert options == {
+        "--launch-commit": VALUES["RUN1C_LAUNCH_SHA"],
+        "--branch": VALUES["RUN1C_BRANCH"],
+        "--output": VALUES["CTRL"],
+    }
+    launches = [line for line in base.logical_lines() if "pilot_pod_bootstrap.sh" in line]
+    assert len(launches) == 1 and "--launch-commit $RUN1C_LAUNCH_SHA" in launches[0]
+    known = set(re.findall(r"--[a-z-]+\)", base.BOOTSTRAP.read_text(encoding="utf-8")))
+    flags = set(re.findall(r"(--[a-z-]+) ", launches[0].split("pilot_pod_bootstrap.sh", 1)[1]))
+    assert {flag + ")" for flag in flags} <= known, sorted(flags)
+    # The receipt is run 1's step 10 with the flags the prose names, the launch commit among them.
+    assert not base.by("tools.pilot_readiness_receipt")
+    assert '--launch-commit "$RUN1C_LAUNCH_SHA"' in body
+
+
+def test_the_runtime_and_the_image_are_the_specifications() -> None:
+    body = text()
+    image = posttrain_approved.RUN1C_IMAGE
+    for value in (image["reference"], image["index_digest"], image["linux_amd64_digest"]):
+        assert value in body
+    runtime = posttrain_approved.RUN1C_RUNTIME
+    assert f"Python {runtime['python']}, torch `{runtime['torch']}`" in body
+    assert "**`runtime_mismatch`**" in body and "min(50, updates)" in body

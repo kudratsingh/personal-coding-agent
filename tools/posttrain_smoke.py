@@ -605,6 +605,15 @@ SMOKE_IMAGE = "runpod/pytorch:smoke-tag"
 """The image name the smoke's environment record carries: a tag, as the provider reports."""
 
 
+def smoke_runtime_1c() -> dict[str, Any]:
+    """The runtime the smoke's worker reports: run 1c's expected runtime with CUDA available,
+    standing in for the A40 Pod the CPU smoke is not (``posttrain_run.measure_runtime`` there).
+    Run 1c's runtime check compares it with the specification's ``runtime.expected``."""
+    from tools.posttrain_approved import RUN1C_RUNTIME
+
+    return {**RUN1C_RUNTIME, "cuda_available": True}
+
+
 def fixtures_1c(root: Path) -> Fixtures:
     """Run 1c's smoke inputs: run 1b's fixtures (the public-test omission, the MBPP+ IDs), the
     parent written by ``rl.checkpoint.save_weights`` (the format of run 1b's SFT weights, with
@@ -645,7 +654,13 @@ def smoke_specification_1c(found: Fixtures) -> dict[str, Any]:
     redraw, the final weights kept, the parent's dev loss at update 0, the format gate and the
     estimate stop (the estimate projected from this specification, as the bind does)."""
     from scratchcoder.data.sft import omits_public_tests, read_rows
-    from tools.posttrain_approved import RUN1C_SFT, run1c_estimate_usd, run1c_stages
+    from tools.posttrain_approved import (
+        RUN1C_IMAGE,
+        RUN1C_RUNTIME,
+        RUN1C_SFT,
+        run1c_estimate_usd,
+        run1c_stages,
+    )
     from tools.posttrain_ops import estimate_limit_usd
 
     raw = smoke_specification(Fixtures(found.root, found.tokenizer, found.inputs, {}), KINDS_1C)
@@ -680,6 +695,7 @@ def smoke_specification_1c(found: Fixtures) -> dict[str, Any]:
         },
         planning={**raw["planning"], "format_gate_seconds": 5},
         sft=sft,
+        runtime={"expected": dict(RUN1C_RUNTIME), "image": dict(RUN1C_IMAGE)},
     )
     estimate = run1c_estimate_usd(raw)
     raw["limits"].update(
@@ -702,18 +718,20 @@ def make_worker_1c(
     changes: Callable[[dict[str, Any]], None] | None = None,
     limits: RunLimits | None = None,
     pod_created: float | None = None,
+    runtime: Callable[[], dict[str, Any]] = smoke_runtime_1c,
     **options: Any,
 ) -> Worker:
     """A CPU worker for run 1c on its smoke fixtures, its report carrying the environment
-    record the Pod run uploads, built by the Pod run's own ``run_extra`` from a receipt that
-    names the smoke image; ``changes`` edits the specification."""
+    record the Pod run uploads and the runtime it checks, built by the Pod run's own
+    ``run_extra`` from a receipt that names the smoke image (``runtime`` stands in for the
+    Pod's measurement); ``changes`` edits the specification."""
     from tools.posttrain_run import run_extra
 
     raw = smoke_specification_1c(found)
     if changes is not None:
         changes(raw)
     spec = Specification.from_dict(raw)
-    extra = run_extra(spec, {"pod_image": SMOKE_IMAGE}, options.pop("extra", {}))
+    extra = run_extra(spec, {"pod_image": SMOKE_IMAGE}, options.pop("extra", {}), runtime=runtime)
     return Worker(
         spec,
         root,
@@ -757,4 +775,5 @@ def smoke_1c(
         "environment_uploaded": any(
             key.endswith("/environment/environment.json") for key in bucket.objects
         ),
+        "runtime_check": (report.get("runtime_check") or {}).get("status"),
     }

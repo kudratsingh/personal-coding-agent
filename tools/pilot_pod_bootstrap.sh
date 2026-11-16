@@ -41,6 +41,12 @@
 #        --data-root /workspace/posttrain-inputs \
 #        --heartbeat /workspace/posttrain-run/heartbeat.json [--skip-tests]
 #
+# Run 1c also takes --launch-commit <40 hex> (and no other run does): after the revision check
+# the archive's own header (git archive records the commit it was written from) and the
+# shipped revision must both be that commit, and the extracted repository must hold exactly
+# the archive's files, byte for byte (Python bytecode caches aside), before anything is
+# installed; the result is $WORKSPACE/launch-check.json, which the readiness receipt requires.
+#
 # An existing self-destruct receipt counts as armed only while its timer lives: its pid
 # answers kill -0 and it rewrote checked_at_unix within the last 30 s (the timer rewrites
 # it every 5 s). Any other receipt is set aside and the timer is armed again.
@@ -64,6 +70,7 @@ ARCHIVE=""
 LIFETIME=""
 IDLE=""
 HEARTBEAT=""
+LAUNCH_COMMIT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode) MODE="$2"; shift 2 ;;
@@ -84,6 +91,7 @@ while [[ $# -gt 0 ]]; do
     --lifetime-seconds) LIFETIME="$2"; shift 2 ;;
     --idle-seconds) IDLE="$2"; shift 2 ;;
     --heartbeat) HEARTBEAT="$2"; shift 2 ;;
+    --launch-commit) LAUNCH_COMMIT="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -93,7 +101,7 @@ if [[ -z "$DEADLINE" || -z "$WORKSPACE" ]]; then
 fi
 REHEARSAL_ARGS="$RUN$R2_ENV$BINDING$BINDING_SHA256$DATA_ROOT$INIT_KEY$INIT_SHA256$INIT_SIZE"
 REHEARSAL_ARGS="$REHEARSAL_ARGS$REVISION$ARCHIVE"
-POSTTRAIN_ARGS="$LIFETIME$IDLE$HEARTBEAT"
+POSTTRAIN_ARGS="$LIFETIME$IDLE$HEARTBEAT$LAUNCH_COMMIT"
 case "$MODE" in
   pilot)
     if [[ -n "$REHEARSAL_ARGS$POSTTRAIN_ARGS" ]]; then
@@ -103,7 +111,7 @@ case "$MODE" in
     ;;
   rehearsal)
     if [[ -n "$POSTTRAIN_ARGS" ]]; then
-      echo "--lifetime-seconds, --idle-seconds and --heartbeat need --mode posttrain" >&2
+      echo "--lifetime-seconds, --idle-seconds, --heartbeat and --launch-commit need --mode posttrain" >&2
       exit 2
     fi
     if [[ ! "$RUN" =~ ^[AB]$ || -z "$R2_ENV" || -z "$BINDING" || -z "$DATA_ROOT" \
@@ -124,6 +132,14 @@ case "$MODE" in
       echo "posttrain mode needs --run <n>, --revision, --archive, --r2-env, --binding," \
         "--binding-sha256 <hex>, --data-root, --lifetime-seconds <s>, --idle-seconds <s>" \
         "and --heartbeat, and no initialization" >&2
+      exit 2
+    fi
+    if [[ "$RUN" == "1c" && ! "$LAUNCH_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "run 1c needs --launch-commit <40 hex>: the full commit it launches from" >&2
+      exit 2
+    fi
+    if [[ "$RUN" != "1c" && -n "$LAUNCH_COMMIT" ]]; then
+      echo "--launch-commit is run 1c's" >&2
       exit 2
     fi
     if (( LIFETIME > 60000 )); then
@@ -260,6 +276,65 @@ PY
   then
     echo "the code revision does not match the shipped archive; see the message above" >&2
     exit 6
+  fi
+  if [[ -n "$LAUNCH_COMMIT" ]]; then
+    if ! python3 - "$WORKSPACE/revision.json" "$ARCHIVE" "$REPO" "$LAUNCH_COMMIT" \
+        "$WORKSPACE/launch-check.json" <<'PY'
+import hashlib, json, os, sys, tarfile
+revision, archive, repo, commit, target = sys.argv[1:6]
+value = json.load(open(revision))
+if value.get("git_commit") != commit:
+    sys.exit(f"revision.json names {value.get('git_commit')}, not the launch commit {commit}")
+archived = {}
+with tarfile.open(archive, "r:gz") as tar:
+    header = tar.pax_headers.get("comment")
+    if header != commit:
+        sys.exit(f"the archive was written from {header}, not the launch commit {commit}")
+    for member in tar.getmembers():
+        if member.isdir():
+            continue
+        if not member.isfile():
+            sys.exit(f"the archive holds an entry that is not a regular file: {member.name}")
+        stream = tar.extractfile(member)
+        archived[os.path.normpath(member.name)] = hashlib.sha256(stream.read()).hexdigest()
+found = {}
+for root, directories, names in os.walk(repo):
+    directories[:] = [name for name in directories if name != "__pycache__"]
+    for name in names:
+        path = os.path.join(root, name)
+        relative = os.path.relpath(path, repo)
+        if os.path.islink(path) or not os.path.isfile(path):
+            sys.exit(f"{relative} is not a regular file of the launch commit's tree")
+        found[relative] = hashlib.sha256(open(path, "rb").read()).hexdigest()
+extra = sorted(set(found) - set(archived))
+missing = sorted(set(archived) - set(found))
+changed = sorted(name for name in archived if name in found and found[name] != archived[name])
+if extra or missing or changed or not archived:
+    sys.exit(
+        f"the repository is not the launch commit's tree: {len(extra)} extra, {len(missing)} "
+        f"missing, {len(changed)} changed (first: {(extra + missing + changed)[:3]})"
+    )
+record = {
+    "kind": "posttrain-launch-check",
+    "launch_commit": commit,
+    "revision_commit": value["git_commit"],
+    "archive_commit": header,
+    "archive_sha256": value["archive_sha256"],
+    "files": len(archived),
+    "tree_clean": True,
+}
+with open(target + ".part", "w") as stream:
+    json.dump(record, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+os.replace(target + ".part", target)
+print(f"launch commit {commit}: the repository is exactly its tree ({len(archived)} files)")
+PY
+    then
+      echo "the repository is not the launch commit's clean tree; see the message above" >&2
+      exit 6
+    fi
   fi
   stamp revision
 fi
