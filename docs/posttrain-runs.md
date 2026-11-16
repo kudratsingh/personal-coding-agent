@@ -309,8 +309,8 @@ Run 1c is prepared, not approved: nothing runs before the owner's final go on it
 - **Format gate:** run 1b's, required for run 1c by the parser; a failure stops the run before the evaluation.
 - **Evaluation:** `pool-dev-greedy` and the three benchmark greedy files of chat-v1, nothing else; no pool test export, no RL or screening input, no ARC.
 - **Floors:** the standing rule over the four hosts measured before it, 7,991 and 9,049 tok/s, and the SFT speed reference 59,141.39 slots/s (floor 53,227.25), fixed in the specification (`RUN1C_FLOORS`, `RUN1C_SFT_REFERENCE`).
-- **Bind values:** the training rows' count, size and SHA-256, the update count, the estimate and the cost limit are `null` in the tracked file. The bind reads the rows, refuses any the worker would drop, pins the file, derives the update count, projects the estimate from the filled specification at its planning rates (the `1x generation` row of `pilot_feasibility posttrain`, setup and finalization reserve included) and derives the cost limit: the lower of $1.50 and 120% of the estimate. Every time and cost limit then derives from the cost limit, as run 2's do (`posttrain_ops.ESTIMATE_STOP_RUNS`); the watchdog policy must carry exactly those limits.
-- **Environment:** the worker uploads an `environment` label before the first stage: the image the provider's Pod record names (a tag, so `digest: null`), the Python, platform and torch build, and every installed distribution with its version and the list's SHA-256.
+- **Bind values:** the training rows' count, size and SHA-256, the update count, the estimate and the cost limit are `null` in the tracked file. The bind (`--expected-sha256`, the hash the owner's request quotes) refuses a file of any other SHA-256, the file of another input (a dev set) and any row whose source is not an agent edit or repair row or a code replay source (`RUN1C_ROW_SOURCES`), so only the approved code-only mix binds. It reads the rows, refuses any the worker would drop, pins the file, derives the update count, projects the estimate from the filled specification at its planning rates (the `1x generation` row of `pilot_feasibility posttrain`, setup and finalization reserve included) and derives the cost limit: the lower of $1.50 and 120% of the estimate. Every time and cost limit then derives from the cost limit, as run 2's do (`posttrain_ops.ESTIMATE_STOP_RUNS`); the watchdog policy must carry exactly those limits.
+- **Environment:** the worker uploads an `environment` label before the first stage (`posttrain_run.run_extra` adds the record to the Pod run's report and refuses a receipt that names no image; the smoke builds its worker's report through the same function): the image the provider's Pod record names (a tag, so `digest: null`), the Python, platform and torch build, and every installed distribution with its version and the list's SHA-256.
 
 **After run 1c.** On the Mac, in an execution window: the CPU format gate on the fetched weights (required after every SFT run), `eval-execute` of the pool dev file and the benchmark files on GitHub Actions. The local agent evaluation of the weights is a separate step under its own approval.
 
@@ -319,11 +319,12 @@ Run 1c is prepared, not approved: nothing runs before the owner's final go on it
 | Rule | Enforced by | Tested in |
 | --- | --- | --- |
 | The approved run 1c, every value; no pool test, RL or screening input, no screening stage, no special-row redraw, one pass, a ceiling of at most $1.50 | `posttrain_approved.check_run1c`; the receipt | `test_run1c_posttrain.py` |
+| Only the approved code-only training rows bind | `posttrain_approved.bind_run1c` (`--expected-sha256`, `RUN1C_ROW_SOURCES`) | `test_run1c_posttrain.py` |
 | No placeholder reaches the Pod | `Specification.from_dict`, `check_run1c` | `test_run1c_posttrain.py` |
 | The format gate before any use of the weights | `Specification.from_dict` | `test_run1c_posttrain.py` |
 | The estimate is the bound specification's own projection; the stop at 120% of it | `run1c_estimate_usd`, `posttrain_ops.specification_limits`, `check_policy` | `test_run1c_posttrain.py` |
 | The final weights kept; the parent's dev loss at update 0 | `PosttrainWorker.run_sft`, `sft_quarter` | `test_run1c_posttrain.py` |
-| The environment record uploaded before the first stage | `PosttrainWorker.export_environment`, `environment_record` | `test_run1c_posttrain.py` |
+| The environment record uploaded before the first stage | `run_extra`, `PosttrainWorker.export_environment`, `environment_record` | `test_run1c_posttrain.py` |
 | A stopped or completed run is verified, archived and torn down by the Mac | the supervisor and the watchdog, as run 1b's | `test_run1c_integration.py` |
 | The Pod runs run 1c's tests | `tools/pilot_pod_bootstrap.sh` | `test_run1c_bootstrap.py` |
 

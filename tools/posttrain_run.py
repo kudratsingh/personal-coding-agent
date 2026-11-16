@@ -2679,6 +2679,22 @@ def _object(path: Path) -> dict[str, Any]:
     return value
 
 
+def run_extra(
+    spec: Specification, receipt: Mapping[str, Any], base: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The worker's ``extra`` report fields for this run: ``base`` unchanged for runs 1, 1b and
+    2; for run 1c, ``base`` plus the environment record of the Pod image the readiness receipt
+    names (``pod_image``), which the worker uploads before its first stage. A run-1c receipt
+    without the image is refused, so the run cannot start without that record."""
+    extra = dict(base)
+    if spec.run == RUN1C:
+        image = receipt.get("pod_image")
+        if not isinstance(image, str) or not image:
+            raise ValueError("run 1c's readiness receipt names no Pod image (pod_image)")
+        extra["environment"] = environment_record(image=image)
+    return extra
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     """Every launch gate before any GPU work, then the run's stages on ``cuda:0``."""
     spec = Specification.load(args.specification)
@@ -2716,11 +2732,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "launch_fit": launch.fit,
         "pod_lifetime_end_unix": launch.end,
     }
-    if spec.run == RUN1C:
-        image = receipt.get("pod_image")
-        if not isinstance(image, str) or not image:
-            raise ValueError("run 1c's readiness receipt names no Pod image (pod_image)")
-        extra["environment"] = environment_record(image=image)
+    extra = run_extra(spec, receipt, extra)
     worker_class: type[PosttrainWorker] = PosttrainWorker
     if spec.run == "2":
         from tools.posttrain_run2 import Run2Worker

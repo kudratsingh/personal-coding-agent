@@ -705,14 +705,15 @@ def make_worker_1c(
     **options: Any,
 ) -> Worker:
     """A CPU worker for run 1c on its smoke fixtures, its report carrying the environment
-    record the Pod run uploads; ``changes`` edits the specification."""
-    from tools.posttrain_run import environment_record
+    record the Pod run uploads, built by the Pod run's own ``run_extra`` from a receipt that
+    names the smoke image; ``changes`` edits the specification."""
+    from tools.posttrain_run import run_extra
 
     raw = smoke_specification_1c(found)
     if changes is not None:
         changes(raw)
     spec = Specification.from_dict(raw)
-    extra = options.pop("extra", {"environment": environment_record(image=SMOKE_IMAGE)})
+    extra = run_extra(spec, {"pod_image": SMOKE_IMAGE}, options.pop("extra", {}))
     return Worker(
         spec,
         root,

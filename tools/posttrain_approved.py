@@ -1128,6 +1128,22 @@ def run1c_estimate_usd(raw: Mapping[str, Any]) -> float:
 
 RUN1C_BIND_SFT = ("train_rows", "planned_updates")
 RUN1C_BIND_LIMITS = ("gate_estimate_usd", "cost_limit_usd")
+RUN1C_BIND_INPUTS = frozenset({("sft-train", "size_bytes"), ("sft-train", "sha256")})
+"""The only input pin fields the bind fills. Every other field must equal the approved value,
+``null`` included: the training rows' ``key`` stays ``null`` (the binding stages the file), so
+a spec that names an existing R2 object for them is refused."""
+RUN1C_ROW_SOURCES = frozenset(
+    {
+        "agent-sft1-edit",
+        "agent-sft1-repair",
+        "nvidia/OpenCodeInstruct",
+        "BAAI/TACO",
+        "google-research-datasets/mbpp",
+    }
+)
+"""The source labels run 1c's training rows may carry: the agent edit and repair rows and the
+code replay sources (``tools.sft_data.CODE_SOURCES``). The approved mix is code-only, so a row
+of any other source (a language row, for one) is refused at the bind."""
 
 
 def check_run1c(raw: Mapping[str, Any]) -> None:
@@ -1135,7 +1151,8 @@ def check_run1c(raw: Mapping[str, Any]) -> None:
     filled. In order: a placeholder still ``null``; a pool test export, any RL or screening
     input, a screening stage; a special-row redraw or another row learning rate; more than one
     pass; a ceiling above $1.50; then any approved value changed (every section equal but for
-    the bind values; every input pin equal but the training rows'). The update count must be
+    the bind values; every input pin field equal, ``null`` included, but the training rows' size
+    and SHA-256, ``RUN1C_BIND_INPUTS``). The update count must be
     the one the rows give, the estimate the projection of this specification at its planning
     rates (``run1c_estimate_usd``), the cost limit the lower of the ceiling and 120% of it, and
     that limit must hold the planned setup and the whole run at the planning rates."""
@@ -1201,7 +1218,8 @@ def check_run1c(raw: Mapping[str, Any]) -> None:
     else:
         for name, pin in approved["inputs"].items():
             for field, value in pin.items():
-                if value is not None and inputs[name].get(field) != value:
+                bound = (name, field) in RUN1C_BIND_INPUTS
+                if (value is not None or not bound) and inputs[name].get(field) != value:
                     differ.append(f"inputs.{name}.{field}")
             if set(inputs[name]) != set(pin):
                 differ.append(f"inputs.{name}")
@@ -1234,19 +1252,37 @@ def check_run1c(raw: Mapping[str, Any]) -> None:
         )
 
 
-def bind_run1c(train_rows: Path) -> dict[str, Any]:
+def bind_run1c(train_rows: Path, *, expected_sha256: str) -> dict[str, Any]:
     """Run 1c's launch specification: the tracked one with its bind values filled from the
-    training rows file. The rows are read and counted (every row must fit the sequence length,
-    or the run would fail on the Pod), the file pinned by size and SHA-256, the update count
-    derived, then the estimate projected from the filled specification and the cost limit
-    derived from it. The result passes ``check_run1c``."""
+    training rows file. The file must be the frozen mix the owner approved: its SHA-256 equal to
+    ``expected_sha256`` (the hash quoted in the launch request), never the file of another input
+    (a dev set), and every row of a code-only source (``RUN1C_ROW_SOURCES``). The rows are read
+    and counted (every row must fit the sequence length, or the run would fail on the Pod), the
+    file pinned by size and SHA-256, the update count derived, then the estimate projected from
+    the filled specification and the cost limit derived from it. The result passes
+    ``check_run1c``."""
     from scratchcoder.data.sft import SFTLoader, read_rows
     from scratchcoder.data.shards import file_sha256
     from tools.posttrain_ops import estimate_limit_usd
 
+    expected = _sha256_hex(expected_sha256, "the approved training rows' SHA-256")
+    digest = file_sha256(train_rows)
+    if digest != expected:
+        raise ValueError(
+            f"{train_rows} has SHA-256 {digest}, not the approved training rows' {expected}"
+        )
     raw = run1c_specification()
+    others = [name for name, pin in raw["inputs"].items() if pin.get("sha256") == digest]
+    if others:
+        raise ValueError(f"{train_rows} is the file of run 1c's {others} input, not training rows")
     sft = raw["sft"]
     rows = list(read_rows(train_rows))
+    sources = sorted({row.source for row in rows} - RUN1C_ROW_SOURCES)
+    if sources:
+        raise ValueError(
+            f"run 1c trains on code-only rows: {train_rows} holds rows of {sources}, outside "
+            f"{sorted(RUN1C_ROW_SOURCES)}"
+        )
     loader = SFTLoader(
         rows,
         sequence_length=int(sft["sequence_length"]),
@@ -1261,9 +1297,7 @@ def bind_run1c(train_rows: Path) -> dict[str, Any]:
             f"{sft['sequence_length']}: the worker refuses any dropped row"
         )
     sft.update(train_rows=len(rows), planned_updates=loader.planned_updates)
-    raw["inputs"]["sft-train"].update(
-        size_bytes=train_rows.stat().st_size, sha256=file_sha256(train_rows)
-    )
+    raw["inputs"]["sft-train"].update(size_bytes=train_rows.stat().st_size, sha256=digest)
     estimate = run1c_estimate_usd(raw)
     raw["limits"].update(
         gate_estimate_usd=estimate,
@@ -1514,13 +1548,18 @@ def main(argv: list[str] | None = None) -> int:
         "run1c-bind", help="fill run 1c's bind values from its training rows (Mac, free)"
     )
     bind.add_argument("--sft-train", type=Path, required=True, help="the frozen training rows")
+    bind.add_argument(
+        "--expected-sha256",
+        required=True,
+        help="the approved training rows' SHA-256, as the owner's launch request quotes it",
+    )
     bind.add_argument("--output", type=Path, required=True, help="the new launch specification")
     args = parser.parse_args(argv)
     if args.command == "write-template":
         write_specification_2(args.output)
         return 0
     if args.command == "run1c-bind":
-        return _run1c_bind(args.sft_train, args.output)
+        return _run1c_bind(args.sft_train, args.output, expected_sha256=args.expected_sha256)
     try:
         if args.output.exists() or args.output.is_symlink():
             raise FileExistsError(f"{args.output} already exists; a launch spec is never rewritten")
@@ -1559,13 +1598,13 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _run1c_bind(train_rows: Path, output: Path) -> int:
+def _run1c_bind(train_rows: Path, output: Path, *, expected_sha256: str) -> int:
     import sys
 
     try:
         if output.exists() or output.is_symlink():
             raise FileExistsError(f"{output} already exists; a launch spec is never rewritten")
-        filled = bind_run1c(train_rows)
+        filled = bind_run1c(train_rows, expected_sha256=expected_sha256)
     except (OSError, ValueError, KeyError) as error:
         print(f"posttrain-approved: {type(error).__name__}: {error}", file=sys.stderr)
         return 1

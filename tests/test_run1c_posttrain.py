@@ -40,9 +40,11 @@ from tools.posttrain_run import (
     Specification,
     check_policy,
     environment_record,
+    run_extra,
     stage_seconds,
 )
 from tools.posttrain_smoke import (
+    SMOKE_IMAGE,
     SMOKE_POD_ID_1C,
     Fixtures,
     failing_gate_1c,
@@ -60,30 +62,41 @@ SPEC_1C = ROOT / "configs" / "rehearsal-a40-s-post-1c.json"
 SPEC_1B = ROOT / "configs" / "rehearsal-a40-s-post-1b.json"
 
 
-def row(index: int, length: int) -> SFTRow:
-    """An authored SFT row of ``length`` token IDs, the second half assistant targets."""
+CODE_SOURCES = sorted(posttrain_approved.RUN1C_ROW_SOURCES)
+
+
+def row(index: int, length: int, *, source: str | None = None) -> SFTRow:
+    """An authored SFT row of ``length`` token IDs, the second half assistant targets, its
+    source one of the code-only labels run 1c accepts unless ``source`` names another."""
     half = length // 2
     return SFTRow(
         f"fixture/{index}",
-        "fixture",
+        CODE_SOURCES[index % len(CODE_SOURCES)] if source is None else source,
         tuple(300 + (index + offset) % 500 for offset in range(length)),
         (False,) * half + (True,) * (length - half),
     )
 
 
-def rows_file(path: Path, count: int, *, longer: int = 0) -> Path:
-    """``count`` authored rows of 40 tokens, then ``longer`` rows of 1,026 (over 1,024 pairs)."""
-    write_rows(
-        path, [row(index, 40 if index < count else 1_026) for index in range(count + longer)]
-    )
+def rows_file(path: Path, count: int, *, longer: int = 0, source: str | None = None) -> Path:
+    """``count`` authored rows of 40 tokens, then ``longer`` rows of 1,026 (over 1,024 pairs);
+    with ``source``, the last row carries that source label."""
+    total = count + longer
+    rows = [row(index, 40 if index < count else 1_026) for index in range(total)]
+    if source is not None:
+        rows[-1] = row(total - 1, len(rows[-1].ids), source=source)
+    write_rows(path, rows)
     return path
+
+
+def bind(rows: Path) -> dict[str, Any]:
+    """The bind of ``rows`` with their own SHA-256 as the approved one."""
+    return posttrain_approved.bind_run1c(rows, expected_sha256=file_sha256(rows))
 
 
 @pytest.fixture(scope="module")
 def bound(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
     """Run 1c's specification bound to 100 authored rows (4 updates of 32)."""
-    rows = rows_file(tmp_path_factory.mktemp("rows") / "train.jsonl", 100)
-    return posttrain_approved.bind_run1c(rows)
+    return bind(rows_file(tmp_path_factory.mktemp("rows") / "train.jsonl", 100))
 
 
 def fresh(bound: dict[str, Any]) -> dict[str, Any]:
@@ -231,7 +244,52 @@ def test_the_bind_fills_every_placeholder_from_the_rows(
 def test_the_bind_refuses_rows_the_worker_would_drop(tmp_path: Path) -> None:
     rows = rows_file(tmp_path / "long.jsonl", 3, longer=1)
     with pytest.raises(ValueError, match="drop"):
-        posttrain_approved.bind_run1c(rows)
+        bind(rows)
+
+
+def test_the_bind_refuses_rows_other_than_the_approved_file(tmp_path: Path) -> None:
+    rows = rows_file(tmp_path / "train.jsonl", 8)
+    other = rows_file(tmp_path / "other.jsonl", 9)
+    with pytest.raises(ValueError, match="not the approved training rows'"):
+        posttrain_approved.bind_run1c(rows, expected_sha256=file_sha256(other))
+    for malformed in ("", "AB" * 32, "ab" * 31):
+        with pytest.raises(ValueError, match="64 lowercase hex digits"):
+            posttrain_approved.bind_run1c(rows, expected_sha256=malformed)
+
+
+@pytest.mark.parametrize("source", ["OpenAssistant/oasst2", "fixture", "TIGER-Lab/AceCode-87K"])
+def test_the_bind_refuses_any_row_outside_the_code_only_sources(
+    tmp_path: Path, source: str
+) -> None:
+    rows = rows_file(tmp_path / "mixed.jsonl", 8, source=source)
+    with pytest.raises(ValueError, match="code-only rows"):
+        bind(rows)
+
+
+def test_the_code_only_sources_are_the_agent_rows_and_the_code_replay_sources() -> None:
+    from tools.sft_data import CODE_SOURCES as REPLAY_SOURCES
+
+    assert posttrain_approved.RUN1C_ROW_SOURCES == {
+        "agent-sft1-edit",
+        "agent-sft1-repair",
+        *REPLAY_SOURCES,
+    }
+
+
+def test_the_bind_refuses_the_file_of_another_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = rows_file(tmp_path / "dev.jsonl", 8)
+    approved = posttrain_approved.run1c_specification
+
+    def code_dev_is_these_rows() -> dict[str, Any]:
+        raw = approved()
+        raw["inputs"]["sft-code-dev"]["sha256"] = file_sha256(rows)
+        return raw
+
+    monkeypatch.setattr(posttrain_approved, "run1c_specification", code_dev_is_these_rows)
+    with pytest.raises(ValueError, match=r"\['sft-code-dev'\] input, not training rows"):
+        bind(rows)
 
 
 def test_the_bind_command_writes_a_new_launch_specification_only(
@@ -239,7 +297,14 @@ def test_the_bind_command_writes_a_new_launch_specification_only(
 ) -> None:
     rows = rows_file(tmp_path / "train.jsonl", 64)
     output = tmp_path / "launch.json"
-    argv = ["run1c-bind", "--sft-train", str(rows), "--output", str(output)]
+    argv: list[str] = ["run1c-bind", "--sft-train", str(rows), "--output", str(output)]
+    with pytest.raises(SystemExit):  # The approved SHA-256 is required.
+        posttrain_approved.main(argv)
+    capsys.readouterr()
+    wrong = [*argv, "--expected-sha256", "ab" * 32]
+    assert posttrain_approved.main(wrong) == 1 and not output.exists()
+    assert "not the approved training rows'" in capsys.readouterr().err
+    argv += ["--expected-sha256", file_sha256(rows)]
     assert posttrain_approved.main(argv) == 0
     printed = json.loads(capsys.readouterr().out)
     written = json.loads(output.read_text())
@@ -319,6 +384,11 @@ def _set(path: tuple[str, ...], value: Any) -> Callable[[dict[str, Any]], None]:
         (_set(("sft", "parent_dev_loss"), False), "differs"),
         (_set(("sft", "learning_rate"), 1e-4), "differs"),
         (_set(("inputs", "sft-weights", "sha256"), "0" * 64), "differs"),
+        (
+            _set(("inputs", "sft-train", "key"), "posttrain-runs/other/x.jsonl"),
+            r"inputs\.sft-train\.key",
+        ),
+        (_set(("inputs", "sft-train", "kind"), "sft-dev-rows"), r"inputs\.sft-train\.kind"),
         (_set(("probe", "minimum_tokens_per_second"), {"128": 7_731.0, "256": 8_733.0}), "differ"),
         (_set(("planning", "format_gate_seconds"), 1), "differs"),
         (_set(("run",), "1b"), "not a run-1c"),
@@ -582,6 +652,56 @@ def test_the_environment_record_lists_every_package_and_a_pinned_digest() -> Non
     assert pinned["image"]["digest"] == "sha256:" + "ab" * 32
     assert pinned["packages_sha256"] == tagged["packages_sha256"]
     assert environment_record(image=None)["image"]["reference"] is None
+
+
+def test_the_pod_run_adds_the_environment_of_the_receipts_image_for_run_1c(
+    bound: dict[str, Any],
+) -> None:
+    spec = Specification.from_dict(bound)
+    base = {"code_revision": {"commit": "1" * 40}, "launch_fit": {"fits": True}}
+    extra = run_extra(spec, {"pod_image": IMAGE}, base)
+    assert {key: value for key, value in extra.items() if key != "environment"} == base
+    assert extra["environment"]["kind"] == "posttrain-environment"
+    assert extra["environment"]["image"]["reference"] == IMAGE
+    assert "environment" not in base  # The caller's fields are copied, never changed.
+
+
+@pytest.mark.parametrize("receipt", [{}, {"pod_image": ""}, {"pod_image": None}, {"pod_image": 7}])
+def test_the_pod_run_refuses_a_run_1c_receipt_without_the_image(
+    bound: dict[str, Any], receipt: dict[str, Any]
+) -> None:
+    with pytest.raises(ValueError, match="names no Pod image"):
+        run_extra(Specification.from_dict(bound), receipt, {})
+
+
+def test_the_pod_runs_extra_is_unchanged_for_runs_1_1b_and_2() -> None:
+    run2 = json.loads((ROOT / "configs" / "rehearsal-a40-s-post-2-v2.json").read_text())
+    specs = [
+        Specification.load(ROOT / "configs" / "rehearsal-a40-s-post-1.json"),
+        Specification.load(SPEC_1B),
+        Specification.from_dict(run2, allow_gate_nulls=True),
+    ]
+    base = {"code_revision": {"commit": "1" * 40}}
+    for spec in specs:
+        for receipt in ({}, {"pod_image": IMAGE}):
+            assert run_extra(spec, receipt, base) == base, spec.run
+
+
+def test_the_smoke_worker_builds_its_extra_as_the_pod_run_does(
+    found: Fixtures, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tools import posttrain_run
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def spy(spec: Specification, receipt: Any, base: Any) -> dict[str, Any]:
+        calls.append((spec.run, dict(receipt)))
+        return run_extra(spec, receipt, base)
+
+    monkeypatch.setattr(posttrain_run, "run_extra", spy)
+    worker = make_worker_1c(found, tmp_path / "run", bucket=MemoryBucket())
+    assert calls == [("1c", {"pod_image": SMOKE_IMAGE})]
+    assert worker.report["environment"]["image"]["reference"] == SMOKE_IMAGE
 
 
 # Runs 1, 1b and 2 are unchanged -----------------------------------------------------------------

@@ -51,9 +51,10 @@ export TOKENIZER=runs/tokenizer-freeze-65536-20261020/tokenizer.json
 export EXPORTS=$RUN1_SHARED/exports
 export BINDING=$SHARED/binding.json
 export AGENT_ROWS=<frozen training rows>
+export AGENT_ROWS_SHA256=<approved training rows sha256>
 ```
 
-`SFT` is run 1b's data: run 1c's dev sets are run 1b's, byte for byte. `EXPORTS` is run 1's exports directory; run 1c reads only its pool dev export, and the sealed test split is not read.
+`AGENT_ROWS_SHA256` is the training rows' SHA-256 as the owner's request quotes it. Paste it in place of the placeholder; never derive it from the file, or the bind's check would only compare the file with itself. `SFT` is run 1b's data: run 1c's dev sets are run 1b's, byte for byte. `EXPORTS` is run 1's exports directory; run 1c reads only its pool dev export, and the sealed test split is not read.
 
 ## 3. Bind the training rows (Mac, free; the owner reviews the result)
 
@@ -61,7 +62,7 @@ Check the frozen rows against the SHA-256 in the owner's request, then write the
 
 ```sh
 shasum -a 256 "$AGENT_ROWS"
-uv run --locked python -m tools.posttrain_approved run1c-bind --sft-train "$AGENT_ROWS" --output "$SPEC"
+uv run --locked python -m tools.posttrain_approved run1c-bind --sft-train "$AGENT_ROWS" --expected-sha256 "$AGENT_ROWS_SHA256" --output "$SPEC"
 export COST_LIMIT=$(uv run --locked python -m tools.posttrain_ops limits --specification "$SPEC" --field limit_usd)
 export WALL=$(uv run --locked python -m tools.posttrain_ops limits --specification "$SPEC" --field wall_seconds)
 export WATCHDOG_COST=$(uv run --locked python -m tools.posttrain_ops limits --specification "$SPEC" --field watchdog_cost_stop_usd)
@@ -69,7 +70,7 @@ export TIMER=$(uv run --locked python -m tools.posttrain_ops limits --specificat
 echo "run $RUN: cost limit $COST_LIMIT USD, wall $WALL s, timer $TIMER s, watchdog cost stop $WATCHDOG_COST USD"
 ```
 
-The first line must print the request's SHA-256. The bind prints one JSON line: the launch specification's `sha256`, the rows' `sft_train_sha256`, `train_rows`, `planned_updates`, the `gate_estimate_usd` and `cost_limit_usd`, the watchdog stop, the wall, the timer and the launch rule's figures (`lifetime_seconds`, `planning_seconds_needed`, `setup_allowance_seconds`). It refuses rows the worker would drop (longer than the sequence length), and a cost limit whose lifetime cannot hold the planned setup plus the whole run at the planning rates. The owner's final go quotes the launch specification's SHA-256, the estimate and the cost limit; nothing below runs without it.
+The first line must print the request's SHA-256, and the bind refuses the rows unless their SHA-256 is `$AGENT_ROWS_SHA256`. It also refuses the file of another input (a dev set) and any row whose source is not an agent edit or repair row or a code replay source (`posttrain_approved.RUN1C_ROW_SOURCES`; a language row, for one), so the bound rows are a code-only mix. The bind prints one JSON line: the launch specification's `sha256`, the rows' `sft_train_sha256`, `train_rows`, `planned_updates`, the `gate_estimate_usd` and `cost_limit_usd`, the watchdog stop, the wall, the timer and the launch rule's figures (`lifetime_seconds`, `planning_seconds_needed`, `setup_allowance_seconds`). It refuses rows the worker would drop (longer than the sequence length), and a cost limit whose lifetime cannot hold the planned setup plus the whole run at the planning rates. The owner's final go quotes the launch specification's SHA-256, the estimate and the cost limit; nothing below runs without it.
 
 Check the Mac's copy of the parent against its pin (run 1b's fetched artifacts):
 

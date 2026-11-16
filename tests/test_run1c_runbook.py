@@ -26,6 +26,7 @@ ORIGIN = base.ORIGIN
 PLACEHOLDERS = {
     "<reviewed binding sha256>": base.BINDING_SHA256,
     "<frozen training rows>": "rows/train.jsonl",
+    "<approved training rows sha256>": "ab" * 32,
 }
 VALUES = {
     **base.VALUES,
@@ -41,6 +42,7 @@ VALUES = {
     "EXPORTS": "runs/posttrain-shared/exports",
     "BINDING": "runs/posttrain-shared-1c/binding.json",
     "AGENT_ROWS": "rows/train.jsonl",
+    "AGENT_ROWS_SHA256": "ab" * 32,
     "COST_LIMIT": "0.6",
     "WALL": "3600",
     "TIMER": "3420",
@@ -120,7 +122,11 @@ def test_every_block_parses_in_the_operators_shells(shell: str, tmp_path: Path) 
 def test_the_bind_and_the_binding_are_run_1cs() -> None:
     (bind,) = base.by("tools.posttrain_approved", "run1c-bind")
     options = dict(zip(bind[1::2], bind[2::2], strict=True))
-    assert options == {"--sft-train": VALUES["AGENT_ROWS"], "--output": VALUES["SPEC"]}
+    assert options == {
+        "--sft-train": VALUES["AGENT_ROWS"],
+        "--expected-sha256": VALUES["AGENT_ROWS_SHA256"],
+        "--output": VALUES["SPEC"],
+    }
     (build,) = base.by("tools.posttrain_binding", "build")
     options = dict(zip(build[1::2], build[2::2], strict=True))
     assert options["--run"] == "1c" and options["--specification"] == VALUES["SPEC"]
