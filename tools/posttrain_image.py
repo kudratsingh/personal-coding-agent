@@ -17,7 +17,8 @@ record made within ``IMAGE_CHECK_WINDOW_SECONDS`` before the create request's bi
 (bootstrap, receipt and worker) still compares what the Pod actually runs with
 ``runtime.expected``.
 
-The registry token is used for the one manifest read and is never written or printed.
+The registry token is used for the one manifest read and is never written or printed: a token
+that is not header-safe text is refused before any header is built from it, without echoing it.
 """
 
 from __future__ import annotations
@@ -62,6 +63,8 @@ REFERENCE = re.compile(
     r":(?P<tag>[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})"
 )
 """A Docker Hub ``namespace/name:tag`` reference: no registry host and no digest."""
+TOKEN = re.compile(r"[A-Za-z0-9._~+/=-]+")
+"""A bearer token that is safe in an HTTP header (the registry issues a JWT)."""
 
 Fetch = Callable[[str, Mapping[str, str]], tuple[int, dict[str, str], bytes]]
 """``fetch(url, headers) -> (status, lower-cased headers, body)``; raises ``OSError`` when no
@@ -108,7 +111,12 @@ def pinned_image(image: Any) -> dict[str, str]:
 
 def resolve(reference: str, *, fetch: Fetch | None = None) -> dict[str, Any]:
     """The digest of the manifest the tag names now, and its linux/amd64 manifest's digest
-    (``fetch`` defaults to ``http_get``)."""
+    (``fetch`` defaults to ``http_get``).
+
+    The digest is the sha256 of the manifest bytes received, whatever the registry states; a
+    ``Docker-Content-Digest`` header, when the registry sends one, must equal it. The linux/amd64
+    digest is ``None`` unless the manifest is an index or list naming exactly one such manifest.
+    """
     fetch = fetch or http_get
     repository, tag = split_reference(reference)
     scope = quote(f"repository:{repository}:pull", safe=":/")
@@ -121,6 +129,8 @@ def resolve(reference: str, *, fetch: Fetch | None = None) -> dict[str, Any]:
     )
     if not isinstance(token, str) or not token:
         raise OSError("the registry's token answer holds no token")
+    if TOKEN.fullmatch(token) is None:
+        raise OSError("the registry token is malformed")  # Never echoed: it is a credential.
     url = f"{REGISTRY_URL}/{repository}/manifests/{tag}"
     status, headers, body = fetch(url, {"Accept": ACCEPT, "Authorization": f"Bearer {token}"})
     if status != 200 or len(body) > MAX_RESPONSE_BYTES:

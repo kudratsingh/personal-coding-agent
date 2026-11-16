@@ -19,6 +19,9 @@ from tools import posttrain_approved, posttrain_image
 
 TAG = posttrain_approved.RUN1C_IMAGE["reference"]
 NOW = 1_800_000_000.0
+RECORDED_INDEX = Path(__file__).parent / "fixtures" / "run1c-image-index.json"
+"""The tag's manifest index exactly as Docker Hub served it when run 1c's image was pinned
+(public registry metadata: media types, digests, sizes and platforms)."""
 
 
 def index(amd64: str, *, extra: list[dict[str, Any]] | None = None) -> bytes:
@@ -44,17 +47,31 @@ def index(amd64: str, *, extra: list[dict[str, Any]] | None = None) -> bytes:
 class Registry:
     """Answers the token request and the manifest read; records what was asked."""
 
-    def __init__(self, body: bytes, *, stated: str | None = None, status: int = 200) -> None:
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        stated: str | None = None,
+        status: int = 200,
+        token: str = "t0ken",
+        content_type: str = posttrain_image.OCI_INDEX,
+        states_digest: bool = True,
+    ) -> None:
         self.body = body
         self.stated = "sha256:" + hashlib.sha256(body).hexdigest() if stated is None else stated
         self.status = status
+        self.token = token
+        self.content_type = content_type
+        self.states_digest = states_digest
         self.requests: list[tuple[str, dict[str, str]]] = []
 
     def __call__(self, url: str, headers: Mapping[str, str]) -> tuple[int, dict[str, str], bytes]:
         self.requests.append((url, dict(headers)))
         if url.startswith(posttrain_image.AUTH_URL):
-            return 200, {}, json.dumps({"token": "t0ken"}).encode()
-        answer = {"content-type": posttrain_image.OCI_INDEX, "docker-content-digest": self.stated}
+            return 200, {}, json.dumps({"token": self.token}).encode()
+        answer = {"content-type": self.content_type}
+        if self.states_digest:
+            answer["docker-content-digest"] = self.stated
         return self.status, answer, self.body
 
 
@@ -86,6 +103,51 @@ def test_the_tag_naming_the_pinned_digests_passes_and_the_token_is_not_recorded(
     origin = NOW + 1
     accepted = posttrain_image.check_image_record(record, image, billing_origin_unix=origin)
     assert accepted == record
+
+
+def test_the_recorded_index_is_the_pinned_one_and_passes_the_check() -> None:
+    body = RECORDED_INDEX.read_bytes()
+    pin = posttrain_approved.RUN1C_IMAGE
+    assert "sha256:" + hashlib.sha256(body).hexdigest() == pin["index_digest"]
+    assert "token" not in body.decode().lower()
+    # The content type and digest headers the registry sent with it.
+    recorded = Registry(
+        body, stated=pin["index_digest"], content_type="application/vnd.oci.image.index.v1+json"
+    )
+    record = posttrain_image.check_image(pin, fetch=recorded, now=NOW)
+    assert record["status"] == "passed" and record["mismatched"] == []
+    assert record["resolved"] == {
+        "media_type": posttrain_image.OCI_INDEX,
+        "index_digest": pin["index_digest"],
+        "linux_amd64_digest": pin["linux_amd64_digest"],
+    }
+    posttrain_image.check_image_record(record, pin, billing_origin_unix=NOW + 1)
+
+
+@pytest.mark.parametrize("token", ["t0ken\r\nX-Injected: 1", "t0ken secret", "t0ken\x00", "tök"])
+def test_a_token_that_is_not_header_safe_is_refused_without_being_echoed(token: str) -> None:
+    image, _ = pinned()
+    registry = Registry(index(image["linux_amd64_digest"]), token=token)
+    with pytest.raises(OSError, match="the registry token is malformed") as raised:
+        posttrain_image.check_image(image, fetch=registry, now=NOW)
+    assert "t0ken" not in str(raised.value) and "tök" not in str(raised.value)
+    assert len(registry.requests) == 1  # The manifest was never requested with it.
+
+
+def test_a_jwt_shaped_token_is_accepted() -> None:
+    image, _ = pinned()
+    jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIifQ.c2ln-_+/="
+    registry = Registry(index(image["linux_amd64_digest"]), token=jwt)
+    assert posttrain_image.check_image(image, fetch=registry, now=NOW)["status"] == "passed"
+    assert registry.requests[1][1]["Authorization"] == "Bearer " + jwt
+
+
+def test_the_digest_is_the_hash_of_what_was_received_when_no_digest_header_is_sent() -> None:
+    image, _ = pinned()
+    unstated = Registry(index(image["linux_amd64_digest"]), states_digest=False)
+    record = posttrain_image.check_image(image, fetch=unstated, now=NOW)
+    assert record["status"] == "passed"
+    assert record["resolved"]["index_digest"] == image["index_digest"]
 
 
 def test_a_moved_tag_fails_and_names_what_moved() -> None:
