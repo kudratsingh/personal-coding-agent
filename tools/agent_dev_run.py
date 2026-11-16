@@ -7,7 +7,8 @@ Subcommands, all with explicit paths:
 - ``plan --cases DIR --tokenizer PATH``: load and statically validate the cases, and print
   each case's turn-1 prompt size without its observation, with the three conditions of
   ``scratchcoder.agent.prompt.fit_bound``: the worst-case prompt of any turn (the snippet
-  block at its full budget, both feedback blocks at theirs, plus their separators) is within
+  block at its full budget with a separator for each further snippet a turn could show, both
+  feedback blocks at theirs, plus their separators) is within
   the 700-token prompt budget; that prompt plus 1.2 x the whole reference fix fits the 1,024
   context; and 1.2 x the largest reference function plus its two block tokens fits the
   324-token generation cap. Runs nothing.
@@ -179,6 +180,13 @@ def plan(args: argparse.Namespace) -> int:
         built = prompt.build(encoder, loop.blocks_for(case, case.files, candidates, "", case.files))
         reference = [len(encoder.encode(case.reference_function(k))) for k in case.targets]
         snippet = built.block_tokens["snippet"]
+        showable = [
+            function.key
+            for path in sorted(set(case.allowed_files) & set(case.files))
+            if not workspace.is_test_file(path)
+            for function in workspace.functions(case.files[path], path).values()
+        ]
+        headers = [len(encoder.encode(prompt.snippet_header(key))) for key in showable]
         rows.append(
             {
                 "case": case.id,
@@ -187,7 +195,13 @@ def plan(args: argparse.Namespace) -> int:
                 "shown": list(built.shown),
                 "targets_shown": all(target in built.shown for target in case.targets),
                 "reference_fix_tokens": reference,
-                **prompt.fit_bound(built.tokens, reference, snippet_tokens=snippet),
+                **prompt.fit_bound(
+                    built.tokens,
+                    reference,
+                    snippet_tokens=snippet,
+                    snippets_shown=len(built.shown),
+                    header_tokens=headers,
+                ),
             }
         )
     print(json.dumps({"registry_sha256": agent_cases.registry_sha256(args.cases), "cases": rows}))

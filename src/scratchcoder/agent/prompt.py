@@ -88,6 +88,11 @@ class Prompt:
     """Reply tokens the harness writes before generation (``--prefill-name``; empty when off).
     Not part of ``ids``, ``tokens`` or ``sha256``."""
     prefill_text: str = ""
+    sources: tuple[str, ...] = ()
+    """The source of each shown function as the prompt renders it, in ``shown`` order."""
+    prefill_skipped: str = ""
+    """With ``--prefill-name``: why this prompt got no prefill (:data:`PREFILL_SKIPS`), or
+    empty."""
 
     @property
     def tokens(self) -> int:
@@ -100,6 +105,11 @@ class Prompt:
     def generation_cap(self) -> int:
         """New tokens allowed: the planned cap, or the room the prompt and any prefill leave."""
         return min(GENERATION_CAP, CONTEXT - self.tokens - len(self.prefill))
+
+
+def snippet_header(key: str) -> str:
+    """The header line of a shown function (its rendered snippet is header + source)."""
+    return f"SNIPPET {key}\n"
 
 
 def _count(encoder: TextEncoder, text: str) -> int:
@@ -140,7 +150,7 @@ def _text(blocks: Blocks, include_map: bool, snippets: Sequence[Snippet], previo
     if include_map and blocks.map:
         parts.append("MAP\n" + "\n".join(blocks.map))
     for snippet in snippets:
-        parts.append(f"SNIPPET {snippet.key}\n{snippet.source}")
+        parts.append(snippet_header(snippet.key) + snippet.source)
     if previous and blocks.previous:
         parts.append(PREVIOUS_HEADER + "\n" + "\n".join(blocks.previous))
     if blocks.observation:
@@ -166,7 +176,7 @@ def build(encoder: TextEncoder, blocks: Blocks) -> Prompt:
         if fitted != lines:
             truncations.append(f"function:{snippet.key}")
         source = "\n".join(fitted)
-        cost = _count(encoder, f"SNIPPET {snippet.key}\n{source}")
+        cost = _count(encoder, snippet_header(snippet.key) + source)
         if index and used + cost > BUDGETS["snippet"]:
             truncations.append(f"snippet_dropped:{snippet.key}")
             continue
@@ -208,7 +218,7 @@ def build(encoder: TextEncoder, blocks: Blocks) -> Prompt:
     block_tokens = {
         "task": _count(encoder, task),
         "map": _count(encoder, "MAP\n" + "\n".join(map_lines)) if include_map and map_lines else 0,
-        "snippet": sum(_count(encoder, f"SNIPPET {s.key}\n{s.source}") for s in snippets),
+        "snippet": sum(_count(encoder, snippet_header(s.key) + s.source) for s in snippets),
         "previous": (
             _count(encoder, PREVIOUS_HEADER + "\n" + "\n".join(previous)) if keep_previous else 0
         ),
@@ -221,6 +231,7 @@ def build(encoder: TextEncoder, blocks: Blocks) -> Prompt:
         block_tokens,
         tuple(snippet.key for snippet in snippets),
         tuple(truncations),
+        sources=tuple(snippet.source for snippet in snippets),
     )
 
 
@@ -310,6 +321,7 @@ def build_training(encoder: TextEncoder, blocks: Blocks) -> Prompt:
         block_tokens,
         tuple(snippet.key for snippet in snippets),
         tuple(truncations),
+        sources=tuple(snippet.source for snippet in snippets),
     )
 
 
@@ -321,22 +333,47 @@ def build_layout(encoder: TextEncoder, blocks: Blocks, layout: str) -> Prompt:
     raise ValueError(f"unknown prompt layout {layout!r}")
 
 
-SEPARATOR_ALLOWANCE = 4
-"""Tokens allowed for the two blank-line separators that the observation and changes-so-far
-blocks add to a prompt (the plan's worst case adds both blocks)."""
+SEPARATOR_TOKENS = 2
+"""Tokens allowed for one blank-line separator (``"\\n\\n"``) that a later turn adds between
+blocks or snippets: the separator itself plus one for byte-pair drift at the joins."""
+SEPARATOR_ALLOWANCE = 2 * SEPARATOR_TOKENS
+"""Tokens allowed for the two separators that the observation and changes-so-far blocks add to
+a prompt (the plan's worst case adds both blocks)."""
+
+
+def most_snippets(header_tokens: Sequence[int]) -> int:
+    """The most snippets one prompt can show: every snippet costs at least its header, and the
+    snippets shown share :data:`BUDGETS` ``["snippet"]``, so this is the largest number of the
+    cheapest headers whose sum fits that budget (at least one: the nearest always stays)."""
+    count, used = 0, 0
+    for tokens in sorted(header_tokens):
+        if used + tokens > BUDGETS["snippet"]:
+            break
+        count, used = count + 1, used + tokens
+    return max(count, 1)
 
 
 def fit_bound(
-    prompt_tokens: int, reference_tokens: Sequence[int], *, snippet_tokens: int
+    prompt_tokens: int,
+    reference_tokens: Sequence[int],
+    *,
+    snippet_tokens: int,
+    snippets_shown: int,
+    header_tokens: Sequence[int],
 ) -> dict[str, Any]:
     """The static fit check of a case (plan section 3.5). ``prompt_tokens`` is its turn-1
     prompt without the observation and changes-so-far blocks, ``snippet_tokens`` that
-    prompt's snippet block, and ``reference_tokens`` the tokens of each target's reference
-    function.
+    prompt's snippet block (each snippet's cost, separators not included), ``snippets_shown``
+    how many snippets it shows, ``header_tokens`` the header cost (:func:`snippet_header`) of
+    every function any turn could show (the top-level functions of the case's allowed source
+    files: an edit can change a function but never add one), and ``reference_tokens`` the
+    tokens of each target's reference function.
 
     The worst-case prompt of any turn grows the snippet block to its full budget (a later turn
     can show a longer function, such as an edited one grown up to :data:`FUNCTION_BUDGET`, or
-    more located functions), adds both feedback blocks at their full budgets and allows
+    more located functions), adds one :data:`SEPARATOR_TOKENS` for each snippet beyond the
+    turn-1 count up to :func:`most_snippets` (the turn-1 separators are already in
+    ``prompt_tokens``), adds both feedback blocks at their full budgets and allows
     :data:`SEPARATOR_ALLOWANCE` tokens for their separators. The case fits when:
 
     1. that worst-case prompt is within :data:`PROMPT_BUDGET`;
@@ -347,12 +384,17 @@ def fit_bound(
 
     ``PROMPT_BUDGET + GENERATION_CAP == CONTEXT``, so a prompt within condition 1 always leaves
     the full :data:`GENERATION_CAP`; the context never shrinks the cap of a case that can fit.
-    This is planning only: at run time the budgets are enforced by truncation, drops and
-    :class:`ContextLimit`, and the cap is computed from the real prompt."""
+    Block costs are counted on each block alone, so the bound is an estimate within the
+    per-join drift allowance, not an exact count. This is planning only: at run time the
+    budgets are enforced by truncation, drops and :class:`ContextLimit`, and the cap is
+    computed from the real prompt."""
+    extra_snippets = max(0, most_snippets(header_tokens) - snippets_shown)
+    snippet_separators = extra_snippets * SEPARATOR_TOKENS
     worst = (
         prompt_tokens
         - snippet_tokens
         + max(snippet_tokens, BUDGETS["snippet"])
+        + snippet_separators
         + BUDGETS["observation"]
         + BUDGETS["previous"]
         + SEPARATOR_ALLOWANCE
@@ -362,6 +404,7 @@ def fit_bound(
     turn_bound = 1.2 * largest + 2
     return {
         "worst_prompt_tokens": worst,
+        "snippet_separator_tokens": snippet_separators,
         "generation_cap": GENERATION_CAP,
         "total_bound": total_bound,
         "largest_function_bound": turn_bound,
@@ -374,16 +417,28 @@ PREFILL_OPEN = "<|python_start|>"
 python block (``` ```python ``` plus a newline in plain markdown) is this one special token."""
 
 
+PREFILL_SKIPS = ("decorated",)
+"""Why a prompt that shows a function gets no name prefill. ``decorated``: the nearest shown
+function has decorators. The editor replaces a function's whole span, decorators included,
+with the reply's function, and a reply opened with ``def <name>(`` cannot write decorators
+before it, so a prefilled edit would silently delete them; the prefill writes only the name
+prefix, never other lines of the shown source, so it does not apply to that turn."""
+
+
 def name_prefill(prompt: Prompt, encoder: TextEncoder) -> Prompt:
     """``prompt`` with the name prefill of ``--prefill-name``: the reply is started with a
     python block and ``def <name>(``, where ``<name>`` is the function of the nearest shown
     snippet (``prompt.shown[0]``, the harness's own selection, already displayed in the
-    prompt). It reads nothing but the prompt; a prompt that shows no function gets no prefill.
+    prompt). It reads nothing but the prompt; a prompt that shows no function gets no prefill,
+    and one whose nearest shown function is decorated gets none either, with
+    ``prefill_skipped`` set (:data:`PREFILL_SKIPS`).
 
     The prefill tokens are not part of ``prompt.ids`` (whose hash is unchanged); they count
     against the context (:meth:`Prompt.generation_cap`) but are not generated tokens."""
     if not prompt.shown:
         return prompt
+    if prompt.sources and prompt.sources[0].startswith("@"):
+        return replace(prompt, prefill_skipped="decorated")
     name = prompt.shown[0].split("::", 1)[1]
     text = f"def {name}("
     return replace(

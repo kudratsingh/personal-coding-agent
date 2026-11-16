@@ -25,7 +25,8 @@ PREFILL_NOTE = (
     "Name prefill on: before each generation the harness wrote a python block opener and "
     "`def <name>(` for the nearest shown function. The one_shown_function and target_function "
     "stages and the name failures therefore count harness-supplied names, not model "
-    "task-following. Prefill tokens are counted apart from generated tokens."
+    "task-following. It is skipped for a decorated function (the editor would drop the "
+    "decorators). Prefill tokens are counted apart from generated tokens."
 )
 
 GENERATION_STAGES = (
@@ -150,6 +151,9 @@ def _cell(results: Sequence[InstanceResult]) -> dict[str, Any]:
             turn.prefill_tokens > 0 for result in results for turn in result.turns
         ),
         "prefill_tokens": sum(turn.prefill_tokens for result in results for turn in result.turns),
+        "prefill_skipped_generations": sum(
+            bool(turn.prefill_skipped) for result in results for turn in result.turns
+        ),
         "name_following": (
             HARNESS_SUPPLIED
             if any(turn.prefill_tokens for result in results for turn in result.turns)
@@ -228,6 +232,7 @@ def prefill_report(
         prefilled = [
             event["prefill_function"] for event in prompts if event.get("prefill_function")
         ]
+        skipped = [event for event in prompts if event.get("prefill_skipped")]
         hits = [key for key in prefilled if key.split("::", 1)[1] in names]
         row = report.setdefault(
             label,
@@ -238,6 +243,7 @@ def prefill_report(
                 "generations": 0,
                 "generations_prefilled": 0,
                 "generations_prefilled_target_name": 0,
+                "generations_prefill_skipped": 0,
             },
         )
         row["instances"] += 1
@@ -246,6 +252,7 @@ def prefill_report(
         row["generations"] += len(prompts)
         row["generations_prefilled"] += len(prefilled)
         row["generations_prefilled_target_name"] += len(hits)
+        row["generations_prefill_skipped"] += len(skipped)
     return dict(sorted(report.items()))
 
 
@@ -408,19 +415,21 @@ def _prefill_lines(card: Mapping[str, Any]) -> list[str]:
         (label, group["all"])
         for label, group in card["groups"].items()
         if group["all"].get("prefilled_generations")
+        or group["all"].get("prefill_skipped_generations")
     ]
     if prefilled:
         lines += [
             "",
             "## Name prefill",
             "",
-            "| Policy/condition | Prefilled generations | Prefill tokens | Generated tokens "
-            "(without prefill) |",
-            "| --- | ---: | ---: | ---: |",
+            "| Policy/condition | Prefilled generations | Skipped (decorated) | Prefill tokens | "
+            "Generated tokens (without prefill) |",
+            "| --- | ---: | ---: | ---: | ---: |",
         ]
         for label, cell in prefilled:
             lines.append(
                 f"| {label} | {_of(cell['prefilled_generations'], cell['generations'])} | "
+                f"{_of(cell.get('prefill_skipped_generations', 0), cell['generations'])} | "
                 f"{cell['prefill_tokens']} | {cell['generated_tokens']} |"
             )
     report = card.get("prefill_report")
@@ -579,6 +588,7 @@ def comparison(cards: Sequence[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
         ]
         if "prefill_name" in changed and len(changed) > 1:
             noncomparable.append("prefill_name_with_another_factor")
+        report = card.get("prefill_report") or {}
         for label, group in card["groups"].items():
             if not label.startswith("model/"):
                 continue
@@ -598,8 +608,11 @@ def comparison(cards: Sequence[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
                     "instances": everything.get("instances"),
                     "scored": everything.get("scored"),
                     "name_following": everything.get("name_following", MODEL_WRITTEN),
+                    "generations": everything.get("generations"),
                     "prefilled_generations": everything.get("prefilled_generations", 0),
+                    "prefill_skipped_generations": everything.get("prefill_skipped_generations", 0),
                     "prefill_tokens": everything.get("prefill_tokens", 0),
+                    "prefill_report": report.get(label),
                     "generated_tokens": everything.get("generated_tokens"),
                     "sampled_solved": [group["sampled"]["solved"], group["sampled"]["scored"]],
                     "greedy_solved": [group["greedy"]["solved"], group["greedy"]["scored"]],
@@ -628,12 +641,15 @@ def comparison(cards: Sequence[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
 def comparison_markdown(table: dict[str, Any]) -> str:
     head = (
         "| Run | Condition | Label | Comparable | Prompt | Sampled decoding | Recovery | "
-        "Name prefill | Name following | "
+        "Name prefill | Prefilled generations | Name following | "
         + " | ".join(COMPARE_GENERATION)
         + " | Sampled solved | Greedy solved | Failure classes | Name failures | "
         "Harness defects | Prefill tokens | Gen s | Sandbox calls | Wall s |"
     )
-    prefilled = any(row.get("prefilled_generations") for row in table["rows"])
+    prefilled = any(
+        row.get("prefilled_generations") or row.get("prefill_skipped_generations")
+        for row in table["rows"]
+    )
     lines = [
         "# Agent development comparison",
         "",
@@ -653,7 +669,7 @@ def comparison_markdown(table: dict[str, Any]) -> str:
     lines += [
         head,
         "| "
-        + " | ".join(["---"] * 9 + ["---:"] * (len(COMPARE_GENERATION) + 2))
+        + " | ".join(["---"] * 10 + ["---:"] * (len(COMPARE_GENERATION) + 2))
         + " | "
         + " | ".join(["---"] * 3 + ["---:"] * 4)
         + " |",
@@ -675,7 +691,7 @@ def comparison_markdown(table: dict[str, Any]) -> str:
             + f" | {config['prompt']} | "
             f"{decoding_text(config['sampled_temperature'], config['sampled_top_p'])} | "
             f"{config['recovery']} | {'on' if config.get('prefill_name') else 'off'} | "
-            f"{row.get('name_following', MODEL_WRITTEN)} | "
+            f"{_prefilled_of(row)} | {row.get('name_following', MODEL_WRITTEN)} | "
             + " | ".join(funnel_cells)
             + f" | {row['sampled_solved'][0]}/{row['sampled_solved'][1]}"
             f" | {row['greedy_solved'][0]}/{row['greedy_solved'][1]}"
@@ -685,4 +701,56 @@ def comparison_markdown(table: dict[str, Any]) -> str:
             f" | {row.get('prefill_tokens', 0)} | {row['generation_seconds']:.1f}"
             f" | {row['sandbox_calls']} | {row['wall_seconds']:.1f} |"
         )
+    if prefilled:
+        lines += _compare_prefill_lines(table["rows"])
     return "\n".join(lines) + "\n"
+
+
+def _prefilled_of(row: Mapping[str, Any]) -> str:
+    """``k of N generations`` prefilled, or ``n/a`` for a run without a generation count."""
+    generations = row.get("generations")
+    if generations is None:
+        return "n/a"
+    return _of(row.get("prefilled_generations", 0), generations, "generations")
+
+
+def _compare_prefill_lines(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Per row: how often the prefill applied and, read from the traces after the run, how
+    often the prefilled name was a target's, each with its denominator."""
+    lines = [
+        "",
+        "## Name prefill applicability",
+        "",
+        "How often the harness wrote a name (reporting only; the harness never consults the "
+        "targets). A prefilled target name is a name the harness supplied, not one the model "
+        "chose.",
+        "",
+        "| Run | Condition | Prefilled generations | Skipped (decorated) | Prefill tokens | "
+        "Instances with a prefilled target name | Generations with a prefilled target name |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in rows:
+        generations = row.get("generations")
+        skipped = (
+            "n/a"
+            if generations is None
+            else _of(row.get("prefill_skipped_generations", 0), generations, "generations")
+        )
+        report = row.get("prefill_report")
+        instances, named = (
+            ("n/a", "n/a")
+            if not report
+            else (
+                _of(report["instances_prefilled_target_name"], report["instances"], "instances"),
+                _of(
+                    report["generations_prefilled_target_name"],
+                    report["generations"],
+                    "generations",
+                ),
+            )
+        )
+        lines.append(
+            f"| {row['run']} | {row['condition']} | {_prefilled_of(row)} | {skipped} | "
+            f"{row.get('prefill_tokens', 0)} | {instances} | {named} |"
+        )
+    return lines

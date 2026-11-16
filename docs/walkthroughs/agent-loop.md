@@ -94,8 +94,11 @@ does not fit, the instance ends as a context failure.
 `agent_dev_run plan` checks each case statically before any run (`prompt.fit_bound`). Its
 worst-case prompt of any turn takes the turn-1 prompt, grows the snippet block to its full 250
 (a later turn can show a longer function, such as an edited one grown up to the 180-token
-function budget), adds the observation and changes-so-far blocks at their full budgets and a few
-tokens for their separators. A case fits when that prompt is within 700 tokens, that prompt plus
+function budget), adds two tokens of separator for each snippet beyond the turn-1 count that a
+turn could show (each snippet costs at least its header, the headers of the case's showable
+functions must share the 250, and an edit never adds a function), adds the observation and
+changes-so-far blocks at their full budgets and a few tokens for their separators. Blocks are
+counted alone, so this is an estimate within that per-join allowance. A case fits when that prompt is within 700 tokens, that prompt plus
 1.2 times the whole reference fix fits the 1,024 context, and 1.2 times the largest reference
 function plus its two block tokens fits the 324-token cap. Since 700 + 324 = 1,024, a prompt
 within the budget always leaves the full cap. This is planning only; at run time the budgets
@@ -152,16 +155,23 @@ changes one factor at a time.
   `def <name>(`, where `<name>` is the function of the nearest shown snippet (`prompt.shown[0]`,
   the selection the prompt already displays). It is computed from the prompt alone
   (`prompt.name_prefill`); the policy is never given the case's targets, reference or hidden
-  checks, and a test runs it on a case whose target is not the nearest shown function. The
-  reply that is parsed is prefill + generated tokens. Prefill tokens count against the 1,024
-  context (the cap is min(324, 1,024 − prompt − prefill)) but not against the generated-token
-  budget, and they are recorded apart: `prefill_function`, `prefill_text` and `prefill_tokens`
-  in the trace, the turn and the packet; generated tokens exclude them. The oracle rows never use
+  checks, and a test runs it on a case whose target is not the nearest shown function. It is
+  skipped, and the turn records `prefill_skipped: decorated`, when that function has decorators:
+  the editor replaces a function's whole span, decorators included, and a reply opened with
+  `def <name>(` cannot write them, so a prefilled edit would silently delete them. The prefill
+  never copies other lines of the shown source. The reply that is parsed is prefill + generated
+  tokens. Prefill tokens count against the 1,024 context (the cap is
+  min(324, 1,024 − prompt − prefill)) but not against the generated-token budget, and they are
+  recorded apart: `prefill_function`, `prefill_text`, `prefill_tokens` and `prefill_skipped` in
+  the trace, the turn and the packet; generated tokens exclude them. The oracle rows never use
   it. The scorecard and the comparison label name-following under the prefill as
   harness-supplied: the `one_shown_function` and `target_function` stages and the name failures
   then count names the harness wrote, never model task-following. After the run, and for
   reporting only, the tool reads the traces back and reports how many instances and generations
-  had a prefilled name equal to a target's. Without the option, prompts, generation requests and
+  had a prefilled name equal to a target's. The comparison carries the same counts per row: a
+  `Prefilled generations` column (`k of N generations`) and a name-prefill applicability table
+  with the skipped generations, prefill tokens and the instances and generations with a prefilled
+  target name, each with its denominator. Without the option, prompts, generation requests and
   traces are byte-for-byte those of earlier runs (a test pins their hash). Byte-pair merges can
   differ at the boundary between the prefilled `(` and what follows, compared with encoding the
   whole function at once.

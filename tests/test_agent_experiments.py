@@ -409,7 +409,7 @@ def test_run_records_the_configuration_and_compare_writes_one_table(
     text = md.read_text("utf-8")
     assert (
         "| A | single | baseline | yes | harness | default sampling (T 1.0, top-p 1.0) | off | off "
-        "| model |" in text
+        "| 0 of 2 generations | model |" in text
     )
     assert (
         "| E | single | combined: prompt + sampled decoding, lower temperature plus nucleus "

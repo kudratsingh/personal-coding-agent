@@ -172,10 +172,13 @@ class Turn:
     """The feedback run's status after an applied edit."""
     prefill_function: str = ""
     """With ``--prefill-name``: the shown function (``shown[0]``) whose name the harness wrote
-    before generation; empty when off or when the prompt showed nothing."""
+    before generation; empty when off, when the prompt showed nothing, or when the prefill
+    was skipped (``prefill_skipped``)."""
     prefill_text: str = ""
     prefill_tokens: int = 0
     """Tokens the harness wrote (not in ``generated_tokens``; they count against the context)."""
+    prefill_skipped: str = ""
+    """With ``--prefill-name``: why this turn got no prefill (:data:`prompt.PREFILL_SKIPS`)."""
 
 
 @dataclass
@@ -318,8 +321,9 @@ def run_instance(
 
     ``prefill_name`` (a harness aid, ``--prefill-name``) starts every reply with a python block
     and ``def <name>(`` for the nearest shown function (:func:`prompt.name_prefill`, computed
-    from the prompt alone). Its tokens count against the context, not the generated-token
-    budget, and are recorded apart from generated tokens. Off, nothing changes."""
+    from the prompt alone; not when that function is decorated, which the turn records). Its
+    tokens count against the context, not the generated-token budget, and are recorded apart
+    from generated tokens. Off, nothing changes."""
     if layout not in LAYOUTS:
         raise ValueError(f"unknown prompt layout {layout!r}")
     started = clock()
@@ -411,10 +415,12 @@ def run_instance(
                 turn.prefill_function = prompt.shown[0] if prompt.prefill else ""
                 turn.prefill_text = prompt.prefill_text
                 turn.prefill_tokens = len(prompt.prefill)
+                turn.prefill_skipped = prompt.prefill_skipped
                 prefill_fields = {
                     "prefill_function": turn.prefill_function,
                     "prefill_text": turn.prefill_text,
                     "prefill_tokens": turn.prefill_tokens,
+                    "prefill_skipped": turn.prefill_skipped,
                 }
             trace.emit(
                 "prompt",

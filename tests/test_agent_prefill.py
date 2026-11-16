@@ -8,17 +8,25 @@ import hashlib
 import itertools
 import json
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
-from agent_fixtures import FIXED_DOUBLE, ScriptedExecutor, write_case, write_registry
+from agent_fixtures import (
+    ARITH,
+    FIXED_DOUBLE,
+    REFERENCE,
+    ScriptedExecutor,
+    write_case,
+    write_registry,
+)
 from test_agent_experiments import card, config
 from test_agent_loop import receipt, tool_args
 from test_agent_workspace import Bytes
 
 from scratchcoder.agent import cases as agent_cases
-from scratchcoder.agent import loop, prompt, scorecard
+from scratchcoder.agent import loop, prompt, scorecard, workspace
 from scratchcoder.agent.cases import Case
 from scratchcoder.agent.policy import Generate, ModelPolicy, OraclePolicy
 from scratchcoder.data.chat import PYTHON_END, PYTHON_START
@@ -104,6 +112,77 @@ def test_the_prefill_is_a_block_opener_and_the_nearest_shown_name() -> None:
     assert filled.generation_cap() == min(prompt.GENERATION_CAP, 1024 - 3 - len(filled.prefill))
     nothing = prompt.Prompt((1,), "text", {}, ())
     assert prompt.name_prefill(nothing, Bytes()) == nothing
+
+
+DECORATED = "@functools.cache\ndef double(x):\n    return x + x"
+
+
+def test_a_prefilled_reply_would_drop_the_decorators_of_the_function_it_replaces() -> None:
+    # Why the prefill skips decorated functions: the editor replaces the whole span, decorators
+    # included, and a reply opened with ``def double(`` cannot write lines before it.
+    files = {"arith.py": "import functools\n\n\n" + DECORATED + "\n"}
+    candidates = list(workspace.functions(files["arith.py"], "arith.py").values())
+    edit = workspace.parse_reply(FIXED_DOUBLE, candidates, files, ["arith.py"])
+    edited = workspace.apply_function(files, edit, ["arith.py"])
+    assert "@functools.cache" not in edited["arith.py"]
+
+
+def test_the_prefill_is_skipped_for_a_decorated_nearest_function() -> None:
+    keys = ("arith.py::double", "steps.py::clamp")
+    decorated = prompt.Prompt((1, 2, 3), "text", {}, keys, sources=(DECORATED, "def clamp(v):"))
+    skipped = prompt.name_prefill(decorated, Bytes())
+    assert skipped.prefill == () and skipped.prefill_text == ""
+    assert skipped.prefill_skipped == "decorated" in prompt.PREFILL_SKIPS
+    assert skipped.generation_cap() == decorated.generation_cap()
+    # Only the nearest shown function matters, and an undecorated one is prefilled.
+    plain = replace(decorated, sources=(FIXED_DOUBLE, DECORATED))
+    assert prompt.name_prefill(plain, Bytes()).prefill == (PYTHON_START, *PREFIX)
+    assert prompt.name_prefill(plain, Bytes()).prefill_skipped == ""
+
+
+def test_built_prompts_carry_the_shown_sources_in_order() -> None:
+    first = prompt.Snippet("arith.py::double", DECORATED)
+    second = prompt.Snippet("steps.py::clamp", "def clamp(v):\n    return v")
+    blocks = prompt.Blocks("Task.", [], [first, second], "")
+    for layout in prompt.LAYOUTS:
+        built = prompt.build_layout(Bytes(), blocks, layout)
+        assert built.shown == (first.key, second.key)
+        assert built.sources == (first.source, second.source)
+
+
+def decorated_case(root: Path) -> Case:
+    """The fixture case with ``@functools.cache`` on ``double``, the nearest shown function."""
+
+    def decorate(text: str) -> str:
+        return "import functools\n" + text.replace("def double(", "@functools.cache\ndef double(")
+
+    directory = write_case(root, reference_text=decorate(REFERENCE))
+    (directory / "repo" / "arith.py").write_text(decorate(ARITH), encoding="utf-8")
+    write_registry(root)
+    return agent_cases.load_cases(root)[0]
+
+
+def test_a_decorated_nearest_function_gets_no_prefill_and_the_skip_is_recorded(
+    tmp_path: Path,
+) -> None:
+    case = decorated_case(tmp_path)
+    generate = Recorder()
+    result, trace = run(case, ModelPolicy(generate, Bytes()), prefill=True)
+    assert result.turns and all(turn.shown[0] == "arith.py::double" for turn in result.turns)
+    for turn in result.turns:
+        assert turn.prefill_skipped == "decorated"
+        assert (turn.prefill_tokens, turn.prefill_function, turn.prefill_text) == (0, "", "")
+    assert all(ids[-len(PREFIX) - 1 :] != [PYTHON_START, *PREFIX] for ids, _ in generate.requests)
+    shown = events(trace, "prompt")
+    assert shown and all(event["prefill_skipped"] == "decorated" for event in shown)
+    cell = scorecard.build([result], {})["groups"]["model/repair-3"]["all"]
+    assert cell["prefilled_generations"] == 0
+    assert cell["prefill_skipped_generations"] == cell["generations"] == len(result.turns)
+    report = scorecard.prefill_report([("model/repair-3", trace.events)], {case.id: case.targets})
+    assert report["model/repair-3"]["generations_prefill_skipped"] == len(result.turns)
+    assert report["model/repair-3"]["generations_prefilled"] == 0
+    text = scorecard.markdown(scorecard.build([result], {}, prefill=report))
+    assert f"| model/repair-3 | 0 of {len(result.turns)} | {len(result.turns)} of " in text
 
 
 def test_the_reply_is_prefill_plus_generation_and_only_generated_tokens_are_budgeted(
@@ -311,6 +390,7 @@ def test_the_tool_records_prefill_apart_and_labels_names_harness_supplied(
         "generations": 2,
         "generations_prefilled": 2,
         "generations_prefilled_target_name": 2,
+        "generations_prefill_skipped": 0,
     }
     text = (runs[1] / "scorecard.md").read_text("utf-8")
     assert scorecard.PREFILL_NOTE in text and "harness-supplied (name prefill)" in text
@@ -327,6 +407,29 @@ def test_the_tool_records_prefill_apart_and_labels_names_harness_supplied(
     compared = md.read_text("utf-8")
     assert scorecard.PREFILL_NOTE in compared
     assert "lower temperature plus nucleus sampling (T 0.6, top-p 0.95) | off | on |" in compared
+    # The comparison alone reports how often the prefill applied and named a target.
+    rows = {(row["run"], row["condition"]): row for row in table["rows"]}
+    single = rows[("P", "single")]
+    assert (single["prefilled_generations"], single["generations"]) == (2, 2)
+    assert single["prefill_skipped_generations"] == 0
+    assert single["prefill_report"] == filled["prefill_report"]["model/single"]
+    assert rows[("C", "single")]["prefill_report"] is None
+    assert "| off | on | 2 of 2 generations | harness-supplied" in compared
+    assert "| off | off | 0 of 2 generations | model |" in compared
+    tokens = 2 * (len(PREFIX) + 1)
+    assert "## Name prefill applicability" in compared
+    assert (
+        f"| P | single | 2 of 2 generations | 0 of 2 generations | {tokens} | "
+        "2 of 2 instances | 2 of 2 generations |"
+    ) in compared
+    assert "| C | single | 0 of 2 generations | 0 of 2 generations | 0 | n/a | n/a |" in compared
+
+
+def test_compare_shows_na_prefill_counts_for_a_run_without_generation_counts() -> None:
+    sampled = config(sampled_temperature=0.6, sampled_top_p=0.95)
+    text = scorecard.comparison_markdown(scorecard.comparison([("C", card(config=sampled))]))
+    assert "| off | off | n/a | model |" in text
+    assert "## Name prefill applicability" not in text
 
 
 def test_compare_accepts_prefill_only_as_the_single_differing_factor() -> None:

@@ -8,6 +8,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from agent_fixtures import (
@@ -529,30 +530,87 @@ def test_carriage_returns_in_case_files_are_refused(tmp_path: Path) -> None:
         agent_cases.load_case(directory)
 
 
+def one_function_bound(
+    prompt_tokens: int, reference: list[int], snippet_tokens: int
+) -> dict[str, Any]:
+    """The fit bound of a case with one showable function, which turn 1 already shows (so no
+    further snippet separators)."""
+    from scratchcoder.agent import prompt
+
+    return prompt.fit_bound(
+        prompt_tokens,
+        reference,
+        snippet_tokens=snippet_tokens,
+        snippets_shown=1,
+        header_tokens=[10],
+    )
+
+
 def test_the_fit_bound_counts_both_feedback_blocks_and_the_generation_cap() -> None:
     from scratchcoder.agent import prompt
 
-    ok = prompt.fit_bound(300, [100], snippet_tokens=250)
+    ok = one_function_bound(300, [100], 250)
     assert ok["worst_prompt_tokens"] == 300 + 150 + 100 + prompt.SEPARATOR_ALLOWANCE
+    assert ok["snippet_separator_tokens"] == 0
     assert ok["generation_cap"] == 324 and ok["fits"]
     # 1.2 x 270 + 2 = 326 > 324: one function too long for a turn, though the total fits.
-    too_long = prompt.fit_bound(100, [270], snippet_tokens=250)
+    too_long = one_function_bound(100, [270], 250)
     assert too_long["total_bound"] <= 1024 and not too_long["fits"]
     # 450 + 150 + 100 + 4 = 704 > 700: the worst-case prompt is over the prompt budget. (A
     # prompt within the budget always leaves the full 324-token cap, since 700 + 324 = 1,024.)
     assert prompt.PROMPT_BUDGET + prompt.GENERATION_CAP == prompt.CONTEXT
-    assert not prompt.fit_bound(450, [100], snippet_tokens=250)["fits"]
+    assert not one_function_bound(450, [100], 250)["fits"]
 
 
 def test_the_fit_bound_grows_the_snippet_block_to_its_budget() -> None:
-    from scratchcoder.agent import prompt
 
     # A later turn can show a longer function than turn 1 did (an edit can grow it up to the
     # function budget), so the worst case takes the snippet block at its full budget.
-    small = prompt.fit_bound(420, [100], snippet_tokens=100)
+    small = one_function_bound(420, [100], 100)
     assert small["worst_prompt_tokens"] == 420 - 100 + 250 + 150 + 100 + 4
     assert not small["fits"]
-    assert prompt.fit_bound(420, [100], snippet_tokens=250)["fits"]
+    assert one_function_bound(420, [100], 250)["fits"]
     # A turn-1 snippet block already over the budget is kept as it is.
-    over = prompt.fit_bound(300, [10], snippet_tokens=260)
+    over = one_function_bound(300, [10], 260)
     assert over["worst_prompt_tokens"] == 300 + 150 + 100 + 4
+
+
+def test_the_fit_bound_counts_a_separator_for_each_further_snippet() -> None:
+    from scratchcoder.agent import prompt
+
+    # Turn 1 shows one snippet; three showable functions could all be shown later, which adds
+    # two joins between snippets that the turn-1 prompt never had.
+    three = prompt.fit_bound(
+        296, [100], snippet_tokens=100, snippets_shown=1, header_tokens=[8] * 3
+    )
+    assert three["snippet_separator_tokens"] == 2 * prompt.SEPARATOR_TOKENS
+    assert three["worst_prompt_tokens"] == 296 - 100 + 250 + 2 * 2 + 150 + 100 + 4 == 704
+    assert not three["fits"]  # Without the joins it would have been 700: a fit.
+    # Joins already in the turn-1 prompt are not counted twice.
+    shown = prompt.fit_bound(
+        296, [100], snippet_tokens=100, snippets_shown=3, header_tokens=[8] * 3
+    )
+    assert shown["snippet_separator_tokens"] == 0 and shown["fits"]
+    # The headers bound the count: only so many can share the 250-token snippet budget.
+    assert prompt.most_snippets([100, 100, 100, 5]) == 3
+    assert prompt.most_snippets([240, 240]) == 1
+    assert prompt.most_snippets([]) == 1
+    wide = prompt.fit_bound(100, [10], snippet_tokens=50, snippets_shown=1, header_tokens=[10] * 40)
+    assert wide["snippet_separator_tokens"] == (25 - 1) * prompt.SEPARATOR_TOKENS
+
+
+def test_the_fit_bound_separator_count_matches_a_rendered_prompt() -> None:
+    from test_agent_workspace import Bytes
+
+    from scratchcoder.agent import prompt
+
+    # Rendered, one more snippet costs its own tokens plus the blank line before it.
+    encoder = Bytes()
+    first = prompt.Snippet("a.py::f", "def f():\n    return 1")
+    second = prompt.Snippet("a.py::g", "def g():\n    return 2")
+    one = prompt.build(encoder, prompt.Blocks("Task.", [], [first], ""))
+    two = prompt.build(encoder, prompt.Blocks("Task.", [], [first, second], ""))
+    added = two.tokens - one.tokens
+    cost = len(encoder.encode(prompt.snippet_header(second.key) + second.source))
+    assert two.block_tokens["snippet"] - one.block_tokens["snippet"] == cost
+    assert 0 < added - cost <= prompt.SEPARATOR_TOKENS
