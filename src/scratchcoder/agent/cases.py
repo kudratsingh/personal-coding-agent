@@ -40,7 +40,20 @@ does not end with a hyphen and never contains the ``--`` separator, so a file na
 into one case ID. IDs that are equal ignoring case are refused together
 (:func:`check_case_ids`): they would share a file on a case-insensitive file system."""
 FORBIDDEN_PARTS = ("heldout", "heldout-results")
-"""Held-out cases are sealed; no development tool reads them."""
+"""Held-out cases are sealed; no development tool reads them. A path is refused when any of
+its parts, lower-cased, starts with ``heldout`` (:func:`forbidden_part`), so ``heldout-r4``
+or ``heldout2`` are covered as well as these names."""
+FORBIDDEN_PREFIX = "heldout"
+SYNTHETIC_SETS = frozenset({"agent-sft1-synthetic-train"})
+"""``case.json`` ``set`` values of generated training instances. They share the case format
+(and ``split: dev``) but are training material: the loader refuses them unless the caller
+asks for synthetic instances (``synthetic=True``), so they never enter an evaluation run."""
+SYNTHETIC_MARKER = "synth.json"
+"""A case directory holding this file is a generated training instance."""
+
+
+def forbidden_part(part: str) -> bool:
+    return part.lower().startswith(FORBIDDEN_PREFIX) or part.lower() in FORBIDDEN_PARTS
 
 
 class CaseError(ValueError):
@@ -136,7 +149,7 @@ def _sha256(data: bytes) -> str:
 
 
 def _forbidden(path: Path) -> bool:
-    return any(part.lower() in FORBIDDEN_PARTS for part in path.resolve().parts)
+    return any(forbidden_part(part) for part in path.resolve().parts)
 
 
 def _case_files(directory: Path) -> list[Path]:
@@ -180,9 +193,10 @@ def registry_sha256(root: Path) -> str:
     return _sha256((root / REGISTRY_NAME).read_bytes())
 
 
-def load_cases(root: Path, *, only: set[str] | None = None) -> list[Case]:
+def load_cases(root: Path, *, only: set[str] | None = None, synthetic: bool = False) -> list[Case]:
     """Every registered case under ``root`` (or those in ``only``), hash-checked and
-    statically validated, in registry order."""
+    statically validated, in registry order. Generated training instances are refused
+    unless ``synthetic`` (and then every case must be one)."""
     if _forbidden(root):
         raise CaseError("refusing a held-out location")
     registry = json.loads((root / REGISTRY_NAME).read_text(encoding="utf-8"))
@@ -209,7 +223,7 @@ def load_cases(root: Path, *, only: set[str] | None = None) -> list[Case]:
         for name, digest in entry["files"].items():
             if _sha256(present[name].read_bytes()) != digest:
                 raise CaseError(f"{entry['id']}: {name} changed since registration")
-        case = load_case(directory, registered=entry["files"])
+        case = load_case(directory, registered=entry["files"], synthetic=synthetic)
         if case.id != entry["id"]:
             raise CaseError(f"{entry['id']}: case.json names {case.id}")
         cases.append(case)
@@ -232,9 +246,14 @@ def _inside(base: Path, relative: object, *, what: str) -> Path:
     return resolved
 
 
-def load_case(directory: Path, *, registered: Mapping[str, str] | None = None) -> Case:
+def load_case(
+    directory: Path, *, registered: Mapping[str, str] | None = None, synthetic: bool = False
+) -> Case:
     """Load one case. With ``registered`` (relative path -> SHA-256, from the registry), every
-    file read must be listed there and its bytes, as read, must match the listed hash."""
+    file read must be listed there and its bytes, as read, must match the listed hash. A
+    generated training instance (:data:`SYNTHETIC_SETS`, or a directory holding
+    :data:`SYNTHETIC_MARKER`) is refused unless ``synthetic``; with ``synthetic``, only such
+    instances are accepted."""
     root = directory.resolve()
     if _forbidden(root):
         raise CaseError("refusing a held-out location")
@@ -259,6 +278,11 @@ def load_case(directory: Path, *, registered: Mapping[str, str] | None = None) -
     spec = json.loads(raw)
     if spec.get("schema") != CASE_SCHEMA or spec.get("split") != "dev":
         raise CaseError(f"{root.name}: not an {CASE_SCHEMA} dev case")
+    generated = spec.get("set") in SYNTHETIC_SETS or (root / SYNTHETIC_MARKER).exists()
+    if generated and not synthetic:
+        raise CaseError(f"{root.name}: a generated training instance, not an evaluation case")
+    if synthetic and not generated:
+        raise CaseError(f"{root.name}: not a generated training instance")
     try:
         case_id = check_case_id(spec.get("id"))
     except CaseError as error:

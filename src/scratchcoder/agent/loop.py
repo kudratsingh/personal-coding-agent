@@ -55,6 +55,8 @@ FAILURE_CLASSES = (
     "action_selection",
     "model_capability",
 )
+GRADE_CHECKS = ("correctness", "preservation")
+"""The hidden check scripts of a case, graded in this order by default."""
 MAX_TRACE_TEXT = 65536
 """Generations are at most 324 tokens, so this keeps every completion whole in the trace."""
 
@@ -315,6 +317,7 @@ def run_instance(
     sleep: Callable[[float], None] | None = None,
     layout: str = "harness",
     prefill_name: bool = False,
+    grade_checks: tuple[str, ...] = GRADE_CHECKS,
 ) -> InstanceResult:
     """Run one instance. ``layout`` is the prompt layout (:data:`prompt.LAYOUTS`); the
     training layout shows the failing public tests and, on repair turns only, the feedback.
@@ -323,9 +326,18 @@ def run_instance(
     and ``def <name>(`` for the nearest shown function (:func:`prompt.name_prefill`, computed
     from the prompt alone; not when that function is decorated, which the turn records). Its
     tokens count against the context, not the generated-token budget, and are recorded apart
-    from generated tokens. Off, nothing changes."""
+    from generated tokens. Off, nothing changes.
+
+    ``grade_checks`` names the hidden check scripts graded, one sandbox call each, in order
+    (default: correctness, then preservation). The synthetic-data builder passes only
+    ``("correctness",)`` with a case whose correctness script already holds every check it
+    grades, so one call decides the verdict; the feedback calls are unchanged."""
     if layout not in LAYOUTS:
         raise ValueError(f"unknown prompt layout {layout!r}")
+    if not grade_checks or len(set(grade_checks)) != len(grade_checks):
+        raise ValueError("grade_checks must name distinct check scripts")
+    if any(kind not in GRADE_CHECKS for kind in grade_checks):
+        raise ValueError(f"grade_checks must be among {GRADE_CHECKS}")
     started = clock()
     budgets = case.budgets
     result = InstanceResult(case.id, policy.name, condition.name, decoding.label)
@@ -532,14 +544,14 @@ def run_instance(
             result.grade = {"public": last.status, "correctness": "not_run_null_patch"}
             result.solved = False
         else:
-            correctness = sandbox("correctness", *execution.check_call(files, case.correctness))
-            preservation = sandbox("preservation", *execution.check_call(files, case.preservation))
-            result.grade = {
-                "public": last.status,
-                "correctness": correctness.status,
-                "preservation": preservation.status,
+            scripts = {"correctness": case.correctness, "preservation": case.preservation}
+            graded = {
+                kind: sandbox(kind, *execution.check_call(files, scripts[kind]))
+                for kind in grade_checks
             }
-            result.solved = last.passed and correctness.passed and preservation.passed
+            result.grade = {"public": last.status}
+            result.grade.update({kind: run.status for kind, run in graded.items()})
+            result.solved = last.passed and all(run.passed for run in graded.values())
     except _Unresolved as error:
         result.scored = False
         result.ended = f"unresolved_{error.args[0]}"

@@ -59,7 +59,8 @@ from pathlib import Path
 from typing import Any
 
 from scratchcoder.agent import cases as agent_cases
-from scratchcoder.agent import execution, loop, prompt, scorecard, validation, workspace
+from scratchcoder.agent import execution, loop, prompt, scorecard, validation
+from scratchcoder.agent.fit import plan_case
 from scratchcoder.agent.policy import AGENT_SEED, Generate, ModelPolicy, OraclePolicy
 from scratchcoder.agent.recovery import MODES as RECOVERY_MODES
 from scratchcoder.common.records import atomic_json, git_state, utc_now
@@ -81,7 +82,7 @@ def _sha256_file(path: Path) -> str:
 
 def _refuse_heldout(paths: Sequence[Path]) -> None:
     for path in paths:
-        if any(part.lower() in agent_cases.FORBIDDEN_PARTS for part in path.resolve().parts):
+        if any(agent_cases.forbidden_part(part) for part in path.resolve().parts):
             raise SealedPathError(f"refusing {path}: held-out agent cases are sealed")
 
 
@@ -174,36 +175,7 @@ def register(args: argparse.Namespace) -> int:
 
 def plan(args: argparse.Namespace) -> int:
     encoder, _ = _tokenizer(args.tokenizer)
-    rows = []
-    for case in agent_cases.load_cases(args.cases):
-        candidates = workspace.locate(case.files, case.public_tests, None, case.allowed_files)
-        built = prompt.build(encoder, loop.blocks_for(case, case.files, candidates, "", case.files))
-        reference = [len(encoder.encode(case.reference_function(k))) for k in case.targets]
-        snippet = built.block_tokens["snippet"]
-        showable = [
-            function.key
-            for path in sorted(set(case.allowed_files) & set(case.files))
-            if not workspace.is_test_file(path)
-            for function in workspace.functions(case.files[path], path).values()
-        ]
-        headers = [len(encoder.encode(prompt.snippet_header(key))) for key in showable]
-        rows.append(
-            {
-                "case": case.id,
-                "prompt_tokens_without_observation": built.tokens,
-                "block_tokens": built.block_tokens,
-                "shown": list(built.shown),
-                "targets_shown": all(target in built.shown for target in case.targets),
-                "reference_fix_tokens": reference,
-                **prompt.fit_bound(
-                    built.tokens,
-                    reference,
-                    snippet_tokens=snippet,
-                    snippets_shown=len(built.shown),
-                    header_tokens=headers,
-                ),
-            }
-        )
+    rows = [plan_case(case, encoder) for case in agent_cases.load_cases(args.cases)]
     print(json.dumps({"registry_sha256": agent_cases.registry_sha256(args.cases), "cases": rows}))
     return 0 if all(row["fits"] and row["targets_shown"] for row in rows) else 1
 

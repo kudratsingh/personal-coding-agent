@@ -63,3 +63,5 @@ Implemented: [task-family clusters and adjudication](task-clusters.md).
 Implemented: [task admission: static gate, negative controls and reference checks](admission.md).
 
 Implemented: [the agent loop, harness v0](agent-loop.md).
+
+Implemented: [synthetic agent-training data: edit and repair rows](agent-sft-data.md).
