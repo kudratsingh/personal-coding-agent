@@ -577,3 +577,203 @@ def smoke_1b(
     with patched_benchmarks():
         report = worker.execute()
     return {**summary(report, bucket), "format_gate": report.get("format_gate")}
+
+
+# Run 1c ------------------------------------------------------------------------------------
+
+SMOKE_POD_ID_1C = "smoke-posttrain-1c"
+KINDS_1C = {
+    "tokenizer": "tokenizer",
+    "sft-weights": "checkpoint",
+    "sft-train": "sft-rows",
+    "sft-code-dev": "sft-rows",
+    "sft-language-dev": "sft-rows",
+    "pool-dev": "pool-export",
+    "humaneval": "benchmark",
+    "humaneval-plus": "benchmark",
+    "mbpp-plus": "benchmark",
+}
+"""Run 1c's inputs: no pool test export, no RL or ARC input, no base checkpoint."""
+SMOKE_COPIES_1C = 30
+"""Each fixture train row appears this many times under its own ID, so the smoke's one pass
+(run 1c's) trains its model as much as run 1b's smoke's 30 passes over the 12 rows do."""
+SMOKE_SFT_1C = {"learning_rate": 5e-3, "weight_decay": 0.0}
+"""Hard enough on the fixture rows that the real format gate passes on the final weights of
+the one pass (run 1b's smoke also had the special rows' 10x rate, which run 1c drops);
+``failing_gate_1c`` undoes it."""
+SMOKE_IMAGE = "runpod/pytorch:smoke-tag"
+"""The image name the smoke's environment record carries: a tag, as the provider reports."""
+
+
+def smoke_runtime_1c() -> dict[str, Any]:
+    """The runtime the smoke's worker reports: run 1c's expected runtime with CUDA available,
+    standing in for the A40 Pod the CPU smoke is not (``posttrain_run.measure_runtime`` there).
+    Run 1c's runtime check compares it with the specification's ``runtime.expected``."""
+    from tools.posttrain_approved import RUN1C_RUNTIME
+
+    return {**RUN1C_RUNTIME, "cuda_available": True}
+
+
+def fixtures_1c(root: Path) -> Fixtures:
+    """Run 1c's smoke inputs: run 1b's fixtures (the public-test omission, the MBPP+ IDs), the
+    parent written by ``rl.checkpoint.save_weights`` (the format of run 1b's SFT weights, with
+    its ``format``, ``step`` and ``metadata`` keys) under ``sft-weights``, and the train rows
+    repeated under their own IDs for the one pass."""
+    from scratchcoder.data.sft import read_rows
+    from scratchcoder.rl.checkpoint import save_weights
+
+    found = fixtures_1b(root)
+    config = smoke_model_1b(found.tokenizer)
+    torch.manual_seed(PARENTS["b-mixed-final"])
+    parent = root / "sft-weights" / "checkpoint.pt"
+    save_weights(
+        parent,
+        GPT(config),
+        tokenizer_hash=found.tokenizer.sha256,
+        run_id="smoke-sft-weights",
+        step=0,
+        metadata={"smoke": "the imported parent"},
+    )
+    original = list(read_rows(found.inputs["sft-train"]))
+    train = root / "sft-train-1c" / "train.jsonl"
+    write_rows(
+        train,
+        [
+            SFTRow(f"{row.id}/copy-{copy}", row.source, row.ids, row.mask)
+            for copy in range(SMOKE_COPIES_1C)
+            for row in original
+        ],
+    )
+    inputs = {name: path for name, path in found.inputs.items() if name in KINDS_1C}
+    inputs.update({"sft-weights": parent, "sft-train": train})
+    return Fixtures(found.root, found.tokenizer, inputs, found.full_tasks)
+
+
+def smoke_specification_1c(found: Fixtures) -> dict[str, Any]:
+    """Run 1c's specification at the smoke's scale: its stages, one pass, no special-row
+    redraw, the final weights kept, the parent's dev loss at update 0, the format gate and the
+    estimate stop (the estimate projected from this specification, as the bind does)."""
+    from scratchcoder.data.sft import omits_public_tests, read_rows
+    from tools.posttrain_approved import (
+        RUN1C_IMAGE,
+        RUN1C_RUNTIME,
+        RUN1C_SFT,
+        run1c_estimate_usd,
+        run1c_stages,
+    )
+    from tools.posttrain_ops import estimate_limit_usd
+
+    raw = smoke_specification(Fixtures(found.root, found.tokenizer, found.inputs, {}), KINDS_1C)
+    stages = run1c_stages()
+    with_tests = sum(
+        not omits_public_tests(row.id) for row in read_rows(found.inputs["sft-code-dev"])
+    )
+    for stage in stages:
+        for entry in stage.get("files", []):
+            entry["planned_tasks"] = SMOKE_TASKS[entry["suite"]]
+        if stage["kind"] == "format-gate":
+            stage.update(row_count=max(1, with_tests), smoke_prompts=3, benchmark_prompts=2)
+    rows = sum(1 for _ in read_rows(found.inputs["sft-train"]))
+    sft = {
+        **raw["sft"],
+        **SMOKE_SFT_1C,
+        "train_rows": rows,
+        "passes": RUN1C_SFT["passes"],
+        "kept_weights": RUN1C_SFT["kept_weights"],
+        "parent_dev_loss": RUN1C_SFT["parent_dev_loss"],
+    }
+    sft["planned_updates"] = -(-rows // (sft["batch_size"] * sft["accumulation_steps"]))
+    raw.update(
+        run="1c",
+        model=asdict(smoke_model_1b(found.tokenizer)),
+        stages=stages,
+        limits={
+            **raw["limits"],
+            "ceiling_usd": 1.5,
+            "gate_estimate_usd": None,
+            "cost_limit_usd": None,
+        },
+        planning={**raw["planning"], "format_gate_seconds": 5},
+        sft=sft,
+        runtime={"expected": dict(RUN1C_RUNTIME), "image": dict(RUN1C_IMAGE)},
+    )
+    estimate = run1c_estimate_usd(raw)
+    raw["limits"].update(
+        gate_estimate_usd=estimate, cost_limit_usd=estimate_limit_usd(1.5, estimate)
+    )
+    return raw
+
+
+def failing_gate_1c(raw: dict[str, Any]) -> None:
+    """Run 1c's smoke SFT at the real peak rate and weight decay: too little for the random
+    parent to learn the format in one pass, so the gate fails and the evaluation never runs."""
+    raw["sft"].update(learning_rate=6e-05, weight_decay=0.1)
+
+
+def make_worker_1c(
+    found: Fixtures,
+    root: Path,
+    *,
+    bucket: MemoryBucket,
+    changes: Callable[[dict[str, Any]], None] | None = None,
+    limits: RunLimits | None = None,
+    pod_created: float | None = None,
+    runtime: Callable[[], dict[str, Any]] = smoke_runtime_1c,
+    **options: Any,
+) -> Worker:
+    """A CPU worker for run 1c on its smoke fixtures, its report carrying the environment
+    record the Pod run uploads and the runtime it checks, built by the Pod run's own
+    ``run_extra`` from a receipt that names the smoke image (``runtime`` stands in for the
+    Pod's measurement); ``changes`` edits the specification."""
+    from tools.posttrain_run import run_extra
+
+    raw = smoke_specification_1c(found)
+    if changes is not None:
+        changes(raw)
+    spec = Specification.from_dict(raw)
+    extra = run_extra(spec, {"pod_image": SMOKE_IMAGE}, options.pop("extra", {}), runtime=runtime)
+    return Worker(
+        spec,
+        root,
+        inputs=found.inputs,
+        store=bucket.store(SMOKE_CREDENTIALS),
+        pod_id=SMOKE_POD_ID_1C,
+        pod_created=time.time() if pod_created is None else pod_created,
+        limits=limits,
+        extra=extra,
+        **options,
+    )
+
+
+def smoke_1c(
+    output: Path,
+    *,
+    bucket: MemoryBucket | None = None,
+    changes: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Run 1c on CPU, offline, into an in-memory bucket; return a summary."""
+    torch.set_num_threads(1)
+    if output.exists() or output.is_symlink():
+        raise FileExistsError("smoke output must be a new directory")
+    found = fixtures_1c(output / "inputs")
+    bucket = MemoryBucket() if bucket is None else bucket
+    worker = make_worker_1c(found, output / "run", bucket=bucket, changes=changes)
+    with patched_benchmarks():
+        report = worker.execute()
+    sft = report.get("sft") or {}
+    return {
+        **summary(report, bucket),
+        "format_gate": report.get("format_gate"),
+        "sft_kept_weights": sft.get("kept_weights"),
+        "sft_quarters": [entry["update"] for entry in sft.get("quarters", [])],
+        "sft_parent_dev_loss": sft.get("parent_dev_loss"),
+        "sft_dev_loss_change": sft.get("dev_loss_change"),
+        "limits": {
+            key: report["limits"][key]
+            for key in ("gate_estimate_usd", "limit_usd", "worker_cost_stop_usd", "wall_seconds")
+        },
+        "environment_uploaded": any(
+            key.endswith("/environment/environment.json") for key in bucket.objects
+        ),
+        "runtime_check": (report.get("runtime_check") or {}).get("status"),
+    }

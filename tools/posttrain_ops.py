@@ -14,7 +14,9 @@ For run 1 at $0.60/h: $3.00, $2.99, 18,000 s and 17,820 s. The worker, the readi
 receipt, the runbook's watchdog policy and the bootstrap's timer limit all take them from
 here (``limits`` prints them), and the receipt and the worker refuse anything weaker.
 
-Run 2 adds a stop at 120% of the gate's estimate (the owner's run 2 gate rulings). Its gate
+Run 2 adds a stop at 120% of the gate's estimate (the owner's run 2 gate rulings), and run
+1c the same stop at 120% of its own estimate, fixed when its training rows are bound
+(``ESTIMATE_STOP_RUNS``; the same keys and the same derivation). Run 2's gate
 writes the estimate (``limits.gate_estimate_usd``, the run 2 projection at run 1's measured
 rates and the gate's quoted price) and the limit it gives (``limits.cost_limit_usd``): the
 lower of the ceiling and 120% of the estimate, rounded down to the cent
@@ -71,11 +73,16 @@ from tools.rehearsal_binding import r2_credentials
 from tools.rehearsal_ops import ObjectStore, head_sha256
 
 RUN_ROOT = "posttrain-runs"
-RUNS = ("1", "1b", "2")
+RUNS = ("1", "1b", "2", "1c")
 """The post-training runs this code drives: run 1 (probe, ARC, evaluation, SFT, screening),
 run 1b (the SFT re-run after run 1's weights failed the format gate: probe, SFT, the format
-gate, ARC, evaluation and screening of the new SFT weights) and run 2 (RL with the Mac in the
-loop, the more-SFT control and their evaluation)."""
+gate, ARC, evaluation and screening of the new SFT weights), run 2 (RL with the Mac in the
+loop, the more-SFT control and their evaluation) and run 1c (agent SFT from run 1b's SFT
+weights: probe, one SFT pass, the format gate and a greedy evaluation of the final weights)."""
+ESTIMATE_STOP_RUNS = ("2", "1c")
+"""The runs whose limits carry an estimate and the stop at 120% of it (``RUN2_LIMIT_KEYS``):
+run 2's estimate is fixed at the owner's gate, run 1c's when its training rows are bound
+(``posttrain_approved.bind_run1c``). Runs 1 and 1b stop at their ceiling."""
 ABSOLUTE_LIFETIME_SECONDS = 60_000
 """The in-Pod timer's absolute cap (``pod_self_destruct.ABSOLUTE_DEADLINE_SECONDS``)."""
 SELF_DESTRUCT_MARGIN_SECONDS = 180
@@ -265,8 +272,9 @@ RUN2_GATE_LIMITS = ("ceiling_usd", "gate_estimate_usd", "cost_limit_usd")
 
 
 def limit_keys(specification: Mapping[str, Any]) -> frozenset[str]:
-    """The keys a specification's ``limits`` must have: run 2's include the gate estimate."""
-    return RUN2_LIMIT_KEYS if specification.get("run") == "2" else LIMIT_KEYS
+    """The keys a specification's ``limits`` must have: run 2's and run 1c's include the
+    estimate and the cost limit it derives (``ESTIMATE_STOP_RUNS``)."""
+    return RUN2_LIMIT_KEYS if specification.get("run") in ESTIMATE_STOP_RUNS else LIMIT_KEYS
 
 
 def read_limits(

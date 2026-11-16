@@ -4,10 +4,24 @@ Built on the Mac from the Pod's own evidence and the owner's confirmations, in e
 form ``tools.posttrain_run run`` accepts (its ``check_readiness`` is applied before anything
 is written). Besides the pretraining rehearsal's owner gates and termination checks it requires:
 
-- the specification to be the approved run 1, 1b or 2 (``posttrain_approved.check_run1``,
-  ``check_run1b``, ``check_run2``; for run 2 with every gate value filled, its SFT weights'
-  passing format-gate record given with ``--sft-gate`` and matching its pin) and the binding
-  to name exactly its inputs at every pinned value;
+- the specification to be the approved run 1, 1b, 2 or 1c (``posttrain_approved.check_run1``,
+  ``check_run1b``, ``check_run2``, ``check_run1c``; for run 2 with every gate value filled,
+  its SFT weights' passing format-gate record given with ``--sft-gate`` and matching its pin;
+  for run 1c with every bind value filled) and the binding to name exactly its inputs at
+  every pinned value;
+- for run 1c, the container image the provider's Pod record names (``pod_image``), which must
+  be run 1c's tag or that tag pinned to one of its recorded digests and which the worker copies
+  into the environment record it uploads before the first stage; and the operator's launch
+  commit (``--launch-commit``, a full 40-hex SHA), which must be the shipped revision's commit
+  and which the Pod's launch check (``launch-check.json``) found the archive written from, the
+  extracted repository exactly its tree; and the runtime the Pod measured before launch, both
+  the bootstrap's (``runtime-check.json``, next to the identity unless ``--runtime-check``
+  names it) and the A40 preflight's, which must be the specification's ``runtime.expected``
+  (``posttrain_run.check_runtime_preflight``), so a moved image tag stops here, before the
+  worker starts; and the Mac's image check (``image-check.json``, next to the identity unless
+  ``--image-check`` names it), which must have found the tag naming the specification's
+  pinned index and linux/amd64 digests in the 300 s before the create request
+  (``posttrain_image.check_image_record``);
 - a watchdog policy at least as strict as the ceiling-derived limits (mode ``posttrain``,
   wall and cost stop from ``posttrain_ops.ceiling_limits``, the 900 s transfer window), with
   run 2's ``awaiting_rewards`` idle extensions exactly the derived bounds (run 1: none);
@@ -44,16 +58,37 @@ from tools.pilot_readiness_receipt import (
     round_trip_passed,
     self_destruct_live,
 )
-from tools.posttrain_approved import PARENTS, check_run1, check_run1b, check_run2
-from tools.posttrain_run import Specification, check_policy, check_readiness, launch_fit
+from tools.posttrain_approved import (
+    PARENTS,
+    check_run1,
+    check_run1b,
+    check_run1c,
+    check_run2,
+    run1c_image_references,
+)
+from tools.posttrain_image import check_image_record
+from tools.posttrain_run import (
+    RUNTIME_CHECK_KIND,
+    Specification,
+    check_policy,
+    check_readiness,
+    launch_fit,
+    preflight_runtime,
+    runtime_preflight_mismatches,
+)
 from tools.rehearsal_run import lifetime_end
 from tools.runpod_watchdog import PodIdentity, Policy, parse_timestamp
 
-MAC_COPIES = {"1": PARENTS, "1b": ("b-mixed-final",), "2": ("sft-weights",)}
+MAC_COPIES = {
+    "1": PARENTS,
+    "1b": ("b-mixed-final",),
+    "2": ("sft-weights",),
+    "1c": ("sft-weights",),
+}
 """The inputs the Mac must hold its own pinned copy of before the Pod exists: run 1's three
 parent checkpoints, run 1b's one (run B's ``mixed-final``), run 2's SFT weights (the
-selected checkpoint that passed the format gate)."""
-APPROVED_CHECKS = {"1": check_run1, "1b": check_run1b, "2": check_run2}
+selected checkpoint that passed the format gate) and run 1c's parent (run 1b's SFT weights)."""
+APPROVED_CHECKS = {"1": check_run1, "1b": check_run1b, "2": check_run2, "1c": check_run1c}
 DEFAULT_HEARTBEAT = "/workspace/posttrain-run/heartbeat.json"
 """The worker's heartbeat on the Pod (its ``--output``), which the in-Pod timer must watch."""
 
@@ -113,6 +148,10 @@ def build_receipt(
     heartbeat: str = DEFAULT_HEARTBEAT,
     now: float | None = None,
     sft_gate: Path | None = None,
+    launch_commit: str | None = None,
+    launch_check: Path | None = None,
+    runtime_check: Path | None = None,
+    image_check: Path | None = None,
 ) -> dict[str, Any]:
     created_at = time.time() if now is None else now
     spec = Specification.load(specification)
@@ -135,11 +174,36 @@ def build_receipt(
         "idle_seconds": timer.get("idle_seconds"),
         "activity_files": timer.get("activity_files"),
     }
+    connection_value = _load(connection)
     cost = pod_cost_within_quote(
-        _load(connection),
+        connection_value,
         pod_id=pod_identity.pod_id,
         quoted=float(spec.limits["quoted_gpu_hourly"]),
     )
+    image = connection_value.get("image")
+    launch_record: dict[str, Any] | None = None
+    if spec.run == "1c":
+        if not isinstance(image, str) or not image:
+            raise ValueError("the Pod connection record names no container image (run 1c needs it)")
+        allowed = run1c_image_references(spec.raw["runtime"]["image"])
+        if image not in allowed:
+            raise ValueError(f"the Pod runs {image}, not run 1c's image ({sorted(allowed)})")
+        if launch_commit is None or launch_check is None:
+            raise ValueError("run 1c needs --launch-commit and the Pod's launch-check.json")
+        launch_record = _load(launch_check)
+        runtime_check = runtime_check or identity.with_name("runtime-check.json")
+        image_check = image_check or identity.with_name("image-check.json")
+        image_record = check_image_record(
+            _load(image_check),
+            spec.raw["runtime"]["image"],
+            billing_origin_unix=billing_origin_unix,
+        )
+    elif any(
+        value is not None for value in (launch_commit, launch_check, runtime_check, image_check)
+    ):
+        raise ValueError(
+            "--launch-commit, --launch-check, --runtime-check and --image-check are run 1c's"
+        )
     code = rehearsal_ops.check_revision(_load(revision))
     owner = _load(confirmations)
     guarantee = owner.get("termination_guarantee")
@@ -156,6 +220,25 @@ def build_receipt(
         or preflight_report.get("device") != "cuda:0"
     ):
         raise ValueError("the A40 preflight has not completed on cuda:0")
+    runtime_record: dict[str, Any] | None = None
+    if spec.run == "1c":
+        assert runtime_check is not None
+        measured_runtime = _load(runtime_check)
+        if measured_runtime.get("kind") != RUNTIME_CHECK_KIND:
+            raise ValueError(f"{runtime_check} is not the bootstrap's runtime check")
+        expected = dict(spec.raw["runtime"]["expected"])
+        bootstrap = measured_runtime.get("measured")
+        measured_preflight = preflight_runtime(preflight_report)
+        differ = runtime_preflight_mismatches(expected, bootstrap, measured_preflight)
+        if differ:
+            raise ValueError(f"the Pod's runtime is not run 1c's ({expected}): {differ} differ")
+        runtime_record = {
+            "status": "passed",
+            "expected": expected,
+            "bootstrap": bootstrap,
+            "preflight": measured_preflight,
+            "mismatched": [],
+        }
     posttrain_binding.check_fetch_receipt(_load(data_fetch), bound)
     check_verification(_load(data_verification), bound)
     posttrain_binding.check_fetch_receipt(_load(mac_copy), bound, names=MAC_COPIES[spec.run])
@@ -234,6 +317,18 @@ def build_receipt(
         receipt["bridge_timeouts"] = asdict(bridge)  # Run 2's derived wait bounds.
     if gate_record is not None:
         receipt["sft_format_gate"] = gate_record  # Run 2's weights passed the gate.
+    if spec.run == "1c":
+        assert launch_check is not None
+        receipt["pod_image"] = image  # The image the environment record names.
+        receipt["launch_commit"] = launch_commit  # check_readiness checks both below.
+        receipt["launch_check"] = launch_record
+        receipt["evidence_sha256"]["launch_check"] = file_sha256(launch_check)
+        assert runtime_check is not None
+        receipt["runtime_preflight"] = runtime_record  # check_readiness recomputes it.
+        receipt["evidence_sha256"]["runtime_check"] = file_sha256(runtime_check)
+        assert image_check is not None
+        receipt["image_check"] = image_record  # The tag's digests, read before the create.
+        receipt["evidence_sha256"]["image_check"] = file_sha256(image_check)
     for gate in posttrain_ops.OWNER_GATES:
         receipt[gate] = owner.get(gate)
     # Exactly the worker's own acceptance check, so a written receipt is one it accepts.
@@ -277,6 +372,22 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--sft-gate", type=Path, help="run 2: its SFT weights' passing format-gate record"
     )
+    parser.add_argument("--launch-commit", help="run 1c: the full 40-hex commit it launches from")
+    parser.add_argument(
+        "--launch-check",
+        type=Path,
+        help="run 1c: the Pod's launch-check.json (default: next to --identity)",
+    )
+    parser.add_argument(
+        "--runtime-check",
+        type=Path,
+        help="run 1c: the Pod's runtime-check.json (default: next to --identity)",
+    )
+    parser.add_argument(
+        "--image-check",
+        type=Path,
+        help="run 1c: the image check made before the create (default: next to --identity)",
+    )
     args = parser.parse_args(argv)
     try:
         receipt = build_receipt(
@@ -297,6 +408,14 @@ def main(argv: list[str]) -> int:
             billing_origin_unix=args.billing_origin_unix,
             heartbeat=args.heartbeat,
             sft_gate=args.sft_gate,
+            launch_commit=args.launch_commit,
+            launch_check=(
+                args.launch_check or args.identity.with_name("launch-check.json")
+                if args.launch_commit is not None
+                else args.launch_check
+            ),
+            runtime_check=args.runtime_check,
+            image_check=args.image_check,
         )
     except (OSError, ValueError, TypeError, KeyError) as error:
         print(f"posttrain-readiness-receipt: {type(error).__name__}: {error}", file=sys.stderr)

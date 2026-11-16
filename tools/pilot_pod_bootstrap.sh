@@ -33,13 +33,25 @@
 # then the same revision, key and environment steps, an R2 round trip under the run's
 # posttrain-runs/ prefix, the pinned fetch and re-verification of every bound input
 # (tools.posttrain_binding), the CPU tests and the A40 preflight with its compile check:
-#   bash tools/pilot_pod_bootstrap.sh --mode posttrain --run 1|1b|2 --deadline-unix <unix> \
+#   bash tools/pilot_pod_bootstrap.sh --mode posttrain --run 1|1b|2|1c --deadline-unix <unix> \
 #        --lifetime-seconds 17820 --idle-seconds 900 --workspace /workspace/posttrain \
 #        --repo /workspace/repo --revision /workspace/revision.json \
 #        --archive /workspace/repo.tar.gz --r2-env /workspace/posttrain/r2-pod.env \
 #        --binding /workspace/posttrain/binding.json --binding-sha256 <hex> \
 #        --data-root /workspace/posttrain-inputs \
 #        --heartbeat /workspace/posttrain-run/heartbeat.json [--skip-tests]
+#
+# Run 1c also takes --launch-commit <40 hex> (and no other run does): after the revision check
+# the archive's own header (git archive records the commit it was written from) and the
+# shipped revision must both be that commit, and the extracted repository must hold exactly
+# the archive's files, byte for byte, in the archive's directories and with no symbolic link
+# (a __pycache__ may hold only bytecode of a tracked module), before anything is
+# installed; the result is $WORKSPACE/launch-check.json, which the readiness receipt requires.
+# After recording the environment it also measures the runtime (Python, the torch build, its
+# CUDA version, CUDA available, the device count and name) and compares it with the
+# runtime.expected of the repository's run 1c specification (the launch check has just found
+# the repository to be the launch commit's tree), writing $WORKSPACE/runtime-check.json and
+# stopping with exit 4 on any difference, before the install and the data fetch.
 #
 # An existing self-destruct receipt counts as armed only while its timer lives: its pid
 # answers kill -0 and it rewrote checked_at_unix within the last 30 s (the timer rewrites
@@ -64,6 +76,7 @@ ARCHIVE=""
 LIFETIME=""
 IDLE=""
 HEARTBEAT=""
+LAUNCH_COMMIT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode) MODE="$2"; shift 2 ;;
@@ -84,6 +97,7 @@ while [[ $# -gt 0 ]]; do
     --lifetime-seconds) LIFETIME="$2"; shift 2 ;;
     --idle-seconds) IDLE="$2"; shift 2 ;;
     --heartbeat) HEARTBEAT="$2"; shift 2 ;;
+    --launch-commit) LAUNCH_COMMIT="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -93,7 +107,7 @@ if [[ -z "$DEADLINE" || -z "$WORKSPACE" ]]; then
 fi
 REHEARSAL_ARGS="$RUN$R2_ENV$BINDING$BINDING_SHA256$DATA_ROOT$INIT_KEY$INIT_SHA256$INIT_SIZE"
 REHEARSAL_ARGS="$REHEARSAL_ARGS$REVISION$ARCHIVE"
-POSTTRAIN_ARGS="$LIFETIME$IDLE$HEARTBEAT"
+POSTTRAIN_ARGS="$LIFETIME$IDLE$HEARTBEAT$LAUNCH_COMMIT"
 case "$MODE" in
   pilot)
     if [[ -n "$REHEARSAL_ARGS$POSTTRAIN_ARGS" ]]; then
@@ -103,7 +117,7 @@ case "$MODE" in
     ;;
   rehearsal)
     if [[ -n "$POSTTRAIN_ARGS" ]]; then
-      echo "--lifetime-seconds, --idle-seconds and --heartbeat need --mode posttrain" >&2
+      echo "--lifetime-seconds, --idle-seconds, --heartbeat and --launch-commit need --mode posttrain" >&2
       exit 2
     fi
     if [[ ! "$RUN" =~ ^[AB]$ || -z "$R2_ENV" || -z "$BINDING" || -z "$DATA_ROOT" \
@@ -124,6 +138,14 @@ case "$MODE" in
       echo "posttrain mode needs --run <n>, --revision, --archive, --r2-env, --binding," \
         "--binding-sha256 <hex>, --data-root, --lifetime-seconds <s>, --idle-seconds <s>" \
         "and --heartbeat, and no initialization" >&2
+      exit 2
+    fi
+    if [[ "$RUN" == "1c" && ! "$LAUNCH_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "run 1c needs --launch-commit <40 hex>: the full commit it launches from" >&2
+      exit 2
+    fi
+    if [[ "$RUN" != "1c" && -n "$LAUNCH_COMMIT" ]]; then
+      echo "--launch-commit is run 1c's" >&2
       exit 2
     fi
     if (( LIFETIME > 60000 )); then
@@ -261,6 +283,88 @@ PY
     echo "the code revision does not match the shipped archive; see the message above" >&2
     exit 6
   fi
+  if [[ -n "$LAUNCH_COMMIT" ]]; then
+    if ! python3 - "$WORKSPACE/revision.json" "$ARCHIVE" "$REPO" "$LAUNCH_COMMIT" \
+        "$WORKSPACE/launch-check.json" <<'PY'
+import hashlib, json, os, re, stat, sys, tarfile
+revision, archive, repo, commit, target = sys.argv[1:6]
+BYTECODE = re.compile(r"(?P<stem>[^.]+)\.cpython-[0-9]+(\.opt-[12])?\.pyc")
+value = json.load(open(revision))
+if value.get("git_commit") != commit:
+    sys.exit(f"revision.json names {value.get('git_commit')}, not the launch commit {commit}")
+archived = {}
+with tarfile.open(archive, "r:gz") as tar:
+    header = tar.pax_headers.get("comment")
+    if header != commit:
+        sys.exit(f"the archive was written from {header}, not the launch commit {commit}")
+    for member in tar.getmembers():
+        if member.isdir():
+            continue
+        if not member.isfile():
+            sys.exit(f"the archive holds an entry that is not a regular file: {member.name}")
+        stream = tar.extractfile(member)
+        archived[os.path.normpath(member.name)] = hashlib.sha256(stream.read()).hexdigest()
+folders = {"."}  # Every directory that holds a tracked file, at any depth.
+for name in archived:
+    parent = os.path.dirname(name)
+    while parent:
+        folders.add(parent)
+        parent = os.path.dirname(parent)
+found = {}
+for root, directories, names in os.walk(repo):
+    here = os.path.relpath(root, repo)
+    if here not in folders:
+        sys.exit(f"{here} is a directory the launch commit's tree does not have")
+    for name in directories:
+        path = os.path.join(root, name)
+        if os.path.islink(path):
+            sys.exit(f"{os.path.relpath(path, repo)} is a symbolic link, not the tree's directory")
+        if name != "__pycache__":
+            continue
+        # Bytecode a program wrote of a tracked module only: regular files, no directories.
+        for entry in os.listdir(path):
+            info = os.lstat(os.path.join(path, entry))
+            match = BYTECODE.fullmatch(entry)
+            source = os.path.normpath(os.path.join(here, f"{match['stem']}.py")) if match else None
+            if not stat.S_ISREG(info.st_mode) or source not in archived:
+                sys.exit(f"{os.path.relpath(path, repo)}/{entry} is not bytecode of a tracked module")
+    directories[:] = [name for name in directories if name != "__pycache__"]
+    for name in names:
+        path = os.path.join(root, name)
+        relative = os.path.relpath(path, repo)
+        if os.path.islink(path) or not os.path.isfile(path):
+            sys.exit(f"{relative} is not a regular file of the launch commit's tree")
+        found[relative] = hashlib.sha256(open(path, "rb").read()).hexdigest()
+extra = sorted(set(found) - set(archived))
+missing = sorted(set(archived) - set(found))
+changed = sorted(name for name in archived if name in found and found[name] != archived[name])
+if extra or missing or changed or not archived:
+    sys.exit(
+        f"the repository is not the launch commit's tree: {len(extra)} extra, {len(missing)} "
+        f"missing, {len(changed)} changed (first: {(extra + missing + changed)[:3]})"
+    )
+record = {
+    "kind": "posttrain-launch-check",
+    "launch_commit": commit,
+    "revision_commit": value["git_commit"],
+    "archive_commit": header,
+    "archive_sha256": value["archive_sha256"],
+    "files": len(archived),
+    "tree_clean": True,
+}
+with open(target + ".part", "w") as stream:
+    json.dump(record, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+os.replace(target + ".part", target)
+print(f"launch commit {commit}: the repository is exactly its tree ({len(archived)} files)")
+PY
+    then
+      echo "the repository is not the launch commit's clean tree; see the message above" >&2
+      exit 6
+    fi
+  fi
   stamp revision
 fi
 
@@ -326,6 +430,51 @@ if (major, minor) != (3, 12):
     sys.exit(4)
 PY
 
+# 2a. Run 1c: the runtime its specification pins (runtime.expected), measured before anything is
+#     installed or fetched, so a moved image tag stops here. The worker checks it again.
+if [[ "$RUN" == "1c" ]]; then
+  if ! python3 - "$REPO/configs/rehearsal-a40-s-post-1c.json" "$WORKSPACE/runtime-check.json" <<'PY'
+import json, os, platform, sys
+specification, target = sys.argv[1:3]
+expected = json.load(open(specification))["runtime"]["expected"]
+measured = {"python": platform.python_version()}
+try:
+    import torch
+    available = bool(torch.cuda.is_available())
+    count = int(torch.cuda.device_count()) if available else 0
+    measured.update(
+        torch=torch.__version__,
+        torch_cuda=torch.version.cuda,
+        cuda_available=available,
+        device_count=count,
+        device_name=torch.cuda.get_device_name(0) if count else None,
+    )
+except Exception as error:  # noqa: BLE001 - recorded, and every torch field then differs
+    measured["torch_error"] = type(error).__name__
+differ = [] if measured.get("cuda_available") is True else ["cuda_available"]
+differ += [name for name in sorted(expected) if measured.get(name) != expected[name]]
+record = {
+    "kind": "posttrain-runtime-check",
+    "expected": expected,
+    "measured": measured,
+    "mismatched": differ,
+    "status": "failed" if differ else "passed",
+}
+with open(target + ".part", "w") as stream:
+    json.dump(record, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+os.replace(target + ".part", target)
+if differ:
+    sys.exit(f"the runtime is not run 1c's: {differ} differ (expected {expected}, measured {measured})")
+print(f"runtime check passed: {expected}")
+PY
+  then
+    echo "the Pod's runtime is not the one run 1c's specification pins; see the message above" >&2
+    exit 4
+  fi
+fi
 stamp environment
 
 # 3. Install the project against the image's CUDA torch (never reinstall torch).
@@ -404,6 +553,13 @@ if [[ "$RUN_TESTS" == "1" ]]; then
       TESTS+=(tests/test_posttrain_run2.py tests/test_posttrain_run2_guards.py
         tests/test_posttrain_run2_integration.py tests/test_posttrain_run2_readiness.py
         tests/test_posttrain_run2_feasibility.py tests/test_rl_facts.py)
+    fi
+    if [[ "$RUN" == "1c" ]]; then
+      # Run 1c's approved specification, its bind and its worker (the final weights, the
+      # parent's dev loss, the estimate stop), the approved rows' pin, its replay into the Mac
+      # side, and the frozen executed specifications.
+      TESTS+=(tests/test_run1c_posttrain.py tests/test_run1c_train_rows.py
+        tests/test_run1c_integration.py tests/test_executed_specifications.py)
     fi
   fi
   python3 -m pytest "${TESTS[@]}" -q -p no:cacheprovider 2>&1 | tail -5
