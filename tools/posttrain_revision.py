@@ -10,7 +10,8 @@ writes ``repo.tar.gz`` and ``revision.json`` (``git_commit``, ``clean``, ``archi
 the record every post-training Pod and receipt already read) into the new output directory's
 files, refusing to replace either.
 
-Run 1c launches this way (``posttrain_approved.RUN1C_LAUNCH_BRANCH``); the Pod bootstrap's
+Run 1c launches this way, and the command refuses any branch but its own
+(``posttrain_approved.RUN1C_LAUNCH_BRANCH``); the Pod bootstrap's
 ``--launch-commit`` then checks the archive's header and the extracted repository against the
 same commit before anything is installed. Runs 1, 1b and 2 keep their runbooks' writer.
 """
@@ -26,6 +27,8 @@ import sys
 import tarfile
 from pathlib import Path
 from typing import Any
+
+from tools.posttrain_approved import RUN1C_LAUNCH_BRANCH
 
 FULL_COMMIT = re.compile(r"[0-9a-f]{40}")
 BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
@@ -116,6 +119,10 @@ def main(argv: list[str] | None = None) -> int:
     write.add_argument("--repo", type=Path, default=Path("."))
     args = parser.parse_args(argv)
     try:
+        if args.branch != RUN1C_LAUNCH_BRANCH:
+            raise ValueError(
+                f"run 1c launches from {RUN1C_LAUNCH_BRANCH} only, not from {args.branch!r}"
+            )
         record = write_revision(
             args.repo,
             args.output,

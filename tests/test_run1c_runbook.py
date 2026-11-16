@@ -223,6 +223,14 @@ def test_run_1c_launches_from_the_pushed_branch_at_one_full_commit() -> None:
     known = set(re.findall(r"--[a-z-]+\)", base.BOOTSTRAP.read_text(encoding="utf-8")))
     flags = set(re.findall(r"(--[a-z-]+) ", launches[0].split("pilot_pod_bootstrap.sh", 1)[1]))
     assert {flag + ")" for flag in flags} <= known, sorted(flags)
+    # The launch block holds only the detached launch: run 1c's records are fetched in a block of
+    # their own, after run 1's wait has found the bootstrap's exit, never alongside the launch.
+    (launch_block,) = [block for block in base.blocks() if "pilot_pod_bootstrap.sh" in block]
+    assert "podscp" not in launch_block and "launch-check.json" not in launch_block
+    (fetch,) = [block for block in base.blocks() if "launch-check.json" in block]
+    assert "runtime-check.json" in fetch and "podscp" in fetch and "setsid" not in fetch
+    body_after_launch = body.split(launch_block, 1)[1]
+    assert body_after_launch.index("BOOTSTRAP_EXIT=") < body_after_launch.index(fetch)
     # The receipt is run 1's step 10 with the flags the prose names, the launch commit among them.
     assert not base.by("tools.pilot_readiness_receipt")
     assert '--launch-commit "$RUN1C_LAUNCH_SHA"' in body

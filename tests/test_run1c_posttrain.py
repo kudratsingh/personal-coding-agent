@@ -14,6 +14,7 @@ itself and the tracked file are tested in ``test_run1c_train_rows.py``.
 
 from __future__ import annotations
 
+import ast
 import copy
 import json
 import math
@@ -854,7 +855,14 @@ def receipt_evidence(
             "status": "completed",
             "hardware_precision_and_resume_checked": True,
             "device": "cuda:0",
-            "hardware": {"device": "cuda:0", "name": "NVIDIA A40"},
+            "hardware": {
+                "device": "cuda:0",
+                "device_type": "cuda",
+                "name": "NVIDIA A40",
+                "gpu_count": 1,
+                "torch_version": "2.9.1+cu128",
+                "torch_cuda_version": "12.8",
+            },
             "fused_attention": {"status": "passed"},
             "compile_equivalence": {"status": "passed"},
         },
@@ -892,6 +900,13 @@ def receipt_evidence(
             "archive_sha256": REVISION["archive_sha256"],
             "files": 3,
             "tree_clean": True,
+        },
+        "runtime-check.json": {  # The bootstrap's record; read next to the identity.
+            "kind": "posttrain-runtime-check",
+            "expected": dict(posttrain_approved.RUN1C_RUNTIME),
+            "measured": {**posttrain_approved.RUN1C_RUNTIME, "cuda_available": True},
+            "mismatched": [],
+            "status": "passed",
         },
     }
     for name, change in changes.items():
@@ -1113,6 +1128,118 @@ def test_the_other_runs_receipts_take_no_launch_commit(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="run 1c's"):
         build_receipt(**evidence(tmp_path), launch_commit="ab" * 20, now=NOW)
+    with pytest.raises(ValueError, match="run 1c's"):
+        build_receipt(**evidence(tmp_path), runtime_check=tmp_path / "runtime.json", now=NOW)
+
+
+# The runtime before launch (the bootstrap's record and the preflight's, at the receipt) ----------
+
+
+def test_the_receipt_records_the_runtime_the_pod_measured_before_launch(
+    tmp_path: Path, bound: dict[str, Any]
+) -> None:
+    receipt = _receipt_with(tmp_path, bound, arguments={})
+    record = receipt["runtime_preflight"]
+    assert record["status"] == "passed" and record["mismatched"] == []
+    assert record["expected"] == posttrain_approved.RUN1C_RUNTIME
+    assert record["bootstrap"]["torch"] == record["preflight"]["torch"] == "2.9.1+cu128"
+    assert receipt["evidence_sha256"]["runtime_check"] == file_sha256(
+        tmp_path / "runtime-check.json"
+    )
+    # An explicit path is read in place of the one next to the identity.
+    elsewhere = tmp_path / "records" / "runtime.json"
+    elsewhere.parent.mkdir()
+    elsewhere.write_bytes((tmp_path / "runtime-check.json").read_bytes())
+    (tmp_path / "runtime-check.json").unlink()
+    receipt = _receipt_with(tmp_path, bound, arguments={"runtime_check": elsewhere})
+    assert receipt["evidence_sha256"]["runtime_check"] == file_sha256(elsewhere)
+
+
+def _measured(**change: Any) -> Callable[[dict[str, Any]], None]:
+    return lambda value: value["measured"].update(change)
+
+
+def _hardware(**change: Any) -> Callable[[dict[str, Any]], None]:
+    return lambda value: value["hardware"].update(change)
+
+
+@pytest.mark.parametrize(
+    ("name", "change", "field"),
+    [
+        ("runtime-check.json", _measured(torch="2.9.0+cu128"), "bootstrap.torch"),
+        ("runtime-check.json", _measured(python="3.12.4"), "bootstrap.python"),
+        ("runtime-check.json", _measured(torch_cuda="12.6"), "bootstrap.torch_cuda"),
+        ("runtime-check.json", _measured(device_count=2), "bootstrap.device_count"),
+        ("runtime-check.json", _measured(cuda_available=False), "bootstrap.cuda_available"),
+        ("runtime-check.json", lambda value: value.pop("measured"), "bootstrap.torch"),
+        ("preflight", _hardware(torch_version="2.9.0+cu128"), "preflight.torch"),
+        ("preflight", _hardware(torch_cuda_version="12.6"), "preflight.torch_cuda"),
+        ("preflight", _hardware(name="NVIDIA RTX A6000"), "preflight.device_name"),
+        ("preflight", _hardware(gpu_count=2), "preflight.device_count"),
+        ("preflight", _hardware(device_type="cpu"), "preflight.cuda_available"),
+    ],
+)
+def test_the_receipt_refuses_a_runtime_other_than_the_specifications(
+    tmp_path: Path,
+    bound: dict[str, Any],
+    name: str,
+    change: Callable[[dict[str, Any]], None],
+    field: str,
+) -> None:
+    # The recorded status is not trusted: the receipt recomputes the comparison.
+    with pytest.raises(ValueError, match=f"runtime is not run 1c's.*'{field}'"):
+        _receipt_with(tmp_path, bound, arguments={}, **{name: change})
+
+
+def test_the_receipt_refuses_a_missing_or_foreign_runtime_record(
+    tmp_path: Path, bound: dict[str, Any]
+) -> None:
+    foreign = {"runtime-check.json": lambda value: value.update(kind="posttrain-launch-check")}
+    with pytest.raises(ValueError, match="not the bootstrap's runtime check"):
+        _receipt_with(tmp_path, bound, arguments={}, **foreign)
+    with pytest.raises(OSError):
+        _receipt_with(tmp_path, bound, arguments={"runtime_check": tmp_path / "absent.json"})
+
+
+def test_the_worker_refuses_a_receipt_without_a_matching_runtime(
+    tmp_path: Path, bound: dict[str, Any]
+) -> None:
+    from test_posttrain_readiness import NOW
+
+    from tools.posttrain_readiness import DEFAULT_HEARTBEAT
+    from tools.posttrain_run import check_readiness
+
+    receipt = _receipt_with(tmp_path, bound, arguments={})
+    spec = Specification.from_dict(bound)
+    identity = {
+        "specification_sha256": receipt["specification_sha256"],
+        "binding_sha256": receipt["binding_sha256"],
+        "preflight_sha256": receipt["preflight_sha256"],
+    }
+    check_readiness(
+        json.loads(json.dumps(receipt)), now=NOW, spec=spec, heartbeat=DEFAULT_HEARTBEAT, **identity
+    )
+    changes: list[tuple[Callable[[dict[str, Any]], Any], str]] = [
+        (lambda value: value.pop("runtime_preflight"), "no runtime measured before launch"),
+        (
+            lambda value: value["runtime_preflight"]["bootstrap"].update(torch="2.9.0+cu128"),
+            "bootstrap.torch",
+        ),
+        (
+            lambda value: value["runtime_preflight"]["preflight"].update(device_name="other"),
+            "preflight.device_name",
+        ),
+        (
+            lambda value: value["runtime_preflight"]["expected"].update(torch="2.9.0+cu128"),
+            "expected another runtime",
+        ),
+        (lambda value: value["runtime_preflight"].update(status="failed"), "not run 1c's"),
+    ]
+    for change, match in changes:
+        edited = json.loads(json.dumps(receipt))
+        change(edited)
+        with pytest.raises(ValueError, match=match):
+            check_readiness(edited, now=NOW, spec=spec, heartbeat=DEFAULT_HEARTBEAT, **identity)
 
 
 # The runtime check ----------------------------------------------------------------------------
@@ -1261,3 +1388,19 @@ def test_the_receipt_command_reads_the_launch_check_next_to_the_identity(
     receipt = json.loads((tmp_path / "receipt.json").read_text())
     assert receipt["launch_commit"] == commit
     assert receipt["launch_check"] == json.loads((tmp_path / "launch-check.json").read_text())
+    assert receipt["runtime_preflight"]["status"] == "passed"  # runtime-check.json, alongside.
+
+
+def test_each_stop_reason_carries_its_own_docstring() -> None:
+    from tools import posttrain_run
+
+    body = ast.parse(Path(posttrain_run.__file__).read_text(encoding="utf-8")).body
+    documented = {}
+    for node, following in zip(body, body[1:], strict=False):
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            text = None
+            if isinstance(following, ast.Expr) and isinstance(following.value, ast.Constant):
+                text = following.value.value
+            documented[node.targets[0].id] = text if isinstance(text, str) else None
+    assert str(documented["FORMAT_GATE_STOP"]).startswith("Run 1b: the selected SFT weights")
+    assert str(documented["RUNTIME_STOP"]).startswith("Run 1c: the Pod's Python")

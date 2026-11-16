@@ -14,7 +14,11 @@ is written). Besides the pretraining rehearsal's owner gates and termination che
   into the environment record it uploads before the first stage; and the operator's launch
   commit (``--launch-commit``, a full 40-hex SHA), which must be the shipped revision's commit
   and which the Pod's launch check (``launch-check.json``) found the archive written from, the
-  extracted repository exactly its tree;
+  extracted repository exactly its tree; and the runtime the Pod measured before launch, both
+  the bootstrap's (``runtime-check.json``, next to the identity unless ``--runtime-check``
+  names it) and the A40 preflight's, which must be the specification's ``runtime.expected``
+  (``posttrain_run.check_runtime_preflight``), so a moved image tag stops here, before the
+  worker starts;
 - a watchdog policy at least as strict as the ceiling-derived limits (mode ``posttrain``,
   wall and cost stop from ``posttrain_ops.ceiling_limits``, the 900 s transfer window), with
   run 2's ``awaiting_rewards`` idle extensions exactly the derived bounds (run 1: none);
@@ -59,7 +63,15 @@ from tools.posttrain_approved import (
     check_run2,
     run1c_image_references,
 )
-from tools.posttrain_run import Specification, check_policy, check_readiness, launch_fit
+from tools.posttrain_run import (
+    RUNTIME_CHECK_KIND,
+    Specification,
+    check_policy,
+    check_readiness,
+    launch_fit,
+    preflight_runtime,
+    runtime_preflight_mismatches,
+)
 from tools.rehearsal_run import lifetime_end
 from tools.runpod_watchdog import PodIdentity, Policy, parse_timestamp
 
@@ -134,6 +146,7 @@ def build_receipt(
     sft_gate: Path | None = None,
     launch_commit: str | None = None,
     launch_check: Path | None = None,
+    runtime_check: Path | None = None,
 ) -> dict[str, Any]:
     created_at = time.time() if now is None else now
     spec = Specification.load(specification)
@@ -173,8 +186,9 @@ def build_receipt(
         if launch_commit is None or launch_check is None:
             raise ValueError("run 1c needs --launch-commit and the Pod's launch-check.json")
         launch_record = _load(launch_check)
-    elif launch_commit is not None or launch_check is not None:
-        raise ValueError("--launch-commit and --launch-check are run 1c's")
+        runtime_check = runtime_check or identity.with_name("runtime-check.json")
+    elif launch_commit is not None or launch_check is not None or runtime_check is not None:
+        raise ValueError("--launch-commit, --launch-check and --runtime-check are run 1c's")
     code = rehearsal_ops.check_revision(_load(revision))
     owner = _load(confirmations)
     guarantee = owner.get("termination_guarantee")
@@ -191,6 +205,25 @@ def build_receipt(
         or preflight_report.get("device") != "cuda:0"
     ):
         raise ValueError("the A40 preflight has not completed on cuda:0")
+    runtime_record: dict[str, Any] | None = None
+    if spec.run == "1c":
+        assert runtime_check is not None
+        measured_runtime = _load(runtime_check)
+        if measured_runtime.get("kind") != RUNTIME_CHECK_KIND:
+            raise ValueError(f"{runtime_check} is not the bootstrap's runtime check")
+        expected = dict(spec.raw["runtime"]["expected"])
+        bootstrap = measured_runtime.get("measured")
+        measured_preflight = preflight_runtime(preflight_report)
+        differ = runtime_preflight_mismatches(expected, bootstrap, measured_preflight)
+        if differ:
+            raise ValueError(f"the Pod's runtime is not run 1c's ({expected}): {differ} differ")
+        runtime_record = {
+            "status": "passed",
+            "expected": expected,
+            "bootstrap": bootstrap,
+            "preflight": measured_preflight,
+            "mismatched": [],
+        }
     posttrain_binding.check_fetch_receipt(_load(data_fetch), bound)
     check_verification(_load(data_verification), bound)
     posttrain_binding.check_fetch_receipt(_load(mac_copy), bound, names=MAC_COPIES[spec.run])
@@ -275,6 +308,9 @@ def build_receipt(
         receipt["launch_commit"] = launch_commit  # check_readiness checks both below.
         receipt["launch_check"] = launch_record
         receipt["evidence_sha256"]["launch_check"] = file_sha256(launch_check)
+        assert runtime_check is not None
+        receipt["runtime_preflight"] = runtime_record  # check_readiness recomputes it.
+        receipt["evidence_sha256"]["runtime_check"] = file_sha256(runtime_check)
     for gate in posttrain_ops.OWNER_GATES:
         receipt[gate] = owner.get(gate)
     # Exactly the worker's own acceptance check, so a written receipt is one it accepts.
@@ -324,6 +360,11 @@ def main(argv: list[str]) -> int:
         type=Path,
         help="run 1c: the Pod's launch-check.json (default: next to --identity)",
     )
+    parser.add_argument(
+        "--runtime-check",
+        type=Path,
+        help="run 1c: the Pod's runtime-check.json (default: next to --identity)",
+    )
     args = parser.parse_args(argv)
     try:
         receipt = build_receipt(
@@ -350,6 +391,7 @@ def main(argv: list[str]) -> int:
                 if args.launch_commit is not None
                 else args.launch_check
             ),
+            runtime_check=args.runtime_check,
         )
     except (OSError, ValueError, TypeError, KeyError) as error:
         print(f"posttrain-readiness-receipt: {type(error).__name__}: {error}", file=sys.stderr)

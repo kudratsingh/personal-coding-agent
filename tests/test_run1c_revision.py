@@ -145,3 +145,17 @@ def test_the_command_line_writes_or_refuses(
     assert posttrain_revision.main([*argv, "--launch-commit", commit]) == 0
     printed = json.loads(capsys.readouterr().out)
     assert printed["git_commit"] == commit and printed["clean"] is True
+
+
+def test_the_command_line_refuses_any_branch_but_run_1cs(
+    pushed: tuple[Path, str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo, commit = pushed
+    git(repo, "push", "-q", "origin", "HEAD:refs/heads/another")
+    git(repo, "fetch", "-q", "origin")
+    argv = ["write", "--repo", str(repo), "--output", str(tmp_path / "c")]
+    # The tip of another pushed branch, named with that branch, passes every tree check.
+    posttrain_revision.check_launch_tree(repo, commit=commit, branch="another")
+    assert posttrain_revision.main([*argv, "--branch", "another", "--launch-commit", commit]) == 1
+    assert f"launches from {BRANCH} only" in capsys.readouterr().err
+    assert not (tmp_path / "c").exists()

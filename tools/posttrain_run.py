@@ -161,13 +161,13 @@ PROBE_STOP = "generation_below_planning_speed"
 SPEED_STOP = "sft_throughput_below_limit"
 PROJECTED_STOP = "projected_finish_after_deadline"
 FORMAT_GATE_STOP = "format_gate_failed"
+"""Run 1b: the selected SFT weights failed the SFT format gate. The gate record and the
+weights are already in R2; the run finalizes in full and no later stage (nothing paid)
+starts from those weights."""
 RUNTIME_STOP = "runtime_mismatch"
 """Run 1c: the Pod's Python, torch build, CUDA version or GPU is not the one its specification
 pins (``runtime.expected``). Checked before the first stage, after the environment record is
 uploaded; nothing is trained or generated, and the run finalizes as any other early stop."""
-"""Run 1b: the selected SFT weights failed the SFT format gate. The gate record and the
-weights are already in R2; the run finalizes in full and no later stage (nothing paid)
-starts from those weights."""
 FORMAT_GATE_RULE = (
     "the format gate runs on the dev-loss-selected SFT checkpoint only, after the sft stage "
     "and before any stage that reads the SFT weights; it judges the first assistant token, "
@@ -378,6 +378,57 @@ def runtime_mismatches(expected: Mapping[str, Any], measured: Any) -> list[str]:
         return ["cuda_available", *sorted(expected)]
     differ = [] if measured.get("cuda_available") is True else ["cuda_available"]
     return differ + [name for name in sorted(expected) if measured.get(name) != expected[name]]
+
+
+RUNTIME_CHECK_KIND = "posttrain-runtime-check"
+"""The record the Pod bootstrap writes for run 1c (``runtime-check.json``) after it recorded the
+environment and before the install: the runtime measured there, the expected runtime it read
+from the repository's run 1c specification and the fields that differ (it stops on any)."""
+
+
+def preflight_runtime(preflight: Mapping[str, Any]) -> dict[str, Any]:
+    """The runtime fields the A40 preflight report records (its ``hardware``): the torch build,
+    its CUDA version, the device count and name, and whether the device is CUDA. The preflight
+    does not record Python's version."""
+    hardware = preflight.get("hardware")
+    hardware = hardware if isinstance(hardware, Mapping) else {}
+    return {
+        "torch": hardware.get("torch_version"),
+        "torch_cuda": hardware.get("torch_cuda_version"),
+        "cuda_available": hardware.get("device_type") == "cuda",
+        "device_count": hardware.get("gpu_count"),
+        "device_name": hardware.get("name"),
+    }
+
+
+def runtime_preflight_mismatches(
+    expected: Mapping[str, Any], bootstrap: Any, preflight: Mapping[str, Any]
+) -> list[str]:
+    """Run 1c before the worker: the fields the bootstrap's measured runtime
+    (``runtime-check.json``'s ``measured``) and the preflight's (``preflight_runtime``) differ
+    from the expected runtime in, prefixed ``bootstrap.`` and ``preflight.``."""
+    without_python = {name: value for name, value in expected.items() if name != "python"}
+    return [f"bootstrap.{name}" for name in runtime_mismatches(expected, bootstrap)] + [
+        f"preflight.{name}" for name in runtime_mismatches(without_python, preflight)
+    ]
+
+
+def check_runtime_preflight(receipt: Mapping[str, Any], spec: Specification) -> None:
+    """Run 1c's receipt carries the runtime the bootstrap and the preflight measured on this Pod
+    (``runtime_preflight``), and both are the specification's ``runtime.expected``, recomputed
+    here, so a moved image tag stops the launch before the worker starts."""
+    record = receipt.get("runtime_preflight")
+    if not isinstance(record, Mapping):
+        raise ValueError("run 1c's receipt carries no runtime measured before launch")
+    expected = dict(spec.raw["runtime"]["expected"])
+    if record.get("expected") != expected:
+        raise ValueError("the receipt's runtime check expected another runtime")
+    preflight = record.get("preflight")
+    differ = runtime_preflight_mismatches(
+        expected, record.get("bootstrap"), preflight if isinstance(preflight, Mapping) else {}
+    )
+    if differ or record.get("mismatched") != [] or record.get("status") != "passed":
+        raise ValueError(f"the Pod's runtime is not run 1c's: {differ or record.get('mismatched')}")
 
 
 def check_launch_commit(receipt: Mapping[str, Any]) -> str:
@@ -1515,6 +1566,7 @@ def check_readiness(
     )
     if spec.run == RUN1C:
         check_launch_commit(receipt)  # The operator's launch commit, checked on the Pod.
+        check_runtime_preflight(receipt, spec)  # The image's runtime, before the worker.
     fit = launch_fit(spec, remaining_seconds=end - now)
     require_fit(fit["remaining_seconds"], fit["planning_seconds_needed"])
     return Launch(origin, end, identity.pod_id, fit)

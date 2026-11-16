@@ -44,8 +44,14 @@
 # Run 1c also takes --launch-commit <40 hex> (and no other run does): after the revision check
 # the archive's own header (git archive records the commit it was written from) and the
 # shipped revision must both be that commit, and the extracted repository must hold exactly
-# the archive's files, byte for byte (Python bytecode caches aside), before anything is
+# the archive's files, byte for byte, in the archive's directories and with no symbolic link
+# (a __pycache__ may hold only bytecode of a tracked module), before anything is
 # installed; the result is $WORKSPACE/launch-check.json, which the readiness receipt requires.
+# After recording the environment it also measures the runtime (Python, the torch build, its
+# CUDA version, CUDA available, the device count and name) and compares it with the
+# runtime.expected of the repository's run 1c specification (the launch check has just found
+# the repository to be the launch commit's tree), writing $WORKSPACE/runtime-check.json and
+# stopping with exit 4 on any difference, before the install and the data fetch.
 #
 # An existing self-destruct receipt counts as armed only while its timer lives: its pid
 # answers kill -0 and it rewrote checked_at_unix within the last 30 s (the timer rewrites
@@ -280,8 +286,9 @@ PY
   if [[ -n "$LAUNCH_COMMIT" ]]; then
     if ! python3 - "$WORKSPACE/revision.json" "$ARCHIVE" "$REPO" "$LAUNCH_COMMIT" \
         "$WORKSPACE/launch-check.json" <<'PY'
-import hashlib, json, os, sys, tarfile
+import hashlib, json, os, re, stat, sys, tarfile
 revision, archive, repo, commit, target = sys.argv[1:6]
+BYTECODE = re.compile(r"(?P<stem>[^.]+)\.cpython-[0-9]+(\.opt-[12])?\.pyc")
 value = json.load(open(revision))
 if value.get("git_commit") != commit:
     sys.exit(f"revision.json names {value.get('git_commit')}, not the launch commit {commit}")
@@ -297,8 +304,30 @@ with tarfile.open(archive, "r:gz") as tar:
             sys.exit(f"the archive holds an entry that is not a regular file: {member.name}")
         stream = tar.extractfile(member)
         archived[os.path.normpath(member.name)] = hashlib.sha256(stream.read()).hexdigest()
+folders = {"."}  # Every directory that holds a tracked file, at any depth.
+for name in archived:
+    parent = os.path.dirname(name)
+    while parent:
+        folders.add(parent)
+        parent = os.path.dirname(parent)
 found = {}
 for root, directories, names in os.walk(repo):
+    here = os.path.relpath(root, repo)
+    if here not in folders:
+        sys.exit(f"{here} is a directory the launch commit's tree does not have")
+    for name in directories:
+        path = os.path.join(root, name)
+        if os.path.islink(path):
+            sys.exit(f"{os.path.relpath(path, repo)} is a symbolic link, not the tree's directory")
+        if name != "__pycache__":
+            continue
+        # Bytecode a program wrote of a tracked module only: regular files, no directories.
+        for entry in os.listdir(path):
+            info = os.lstat(os.path.join(path, entry))
+            match = BYTECODE.fullmatch(entry)
+            source = os.path.normpath(os.path.join(here, f"{match['stem']}.py")) if match else None
+            if not stat.S_ISREG(info.st_mode) or source not in archived:
+                sys.exit(f"{os.path.relpath(path, repo)}/{entry} is not bytecode of a tracked module")
     directories[:] = [name for name in directories if name != "__pycache__"]
     for name in names:
         path = os.path.join(root, name)
@@ -401,6 +430,51 @@ if (major, minor) != (3, 12):
     sys.exit(4)
 PY
 
+# 2a. Run 1c: the runtime its specification pins (runtime.expected), measured before anything is
+#     installed or fetched, so a moved image tag stops here. The worker checks it again.
+if [[ "$RUN" == "1c" ]]; then
+  if ! python3 - "$REPO/configs/rehearsal-a40-s-post-1c.json" "$WORKSPACE/runtime-check.json" <<'PY'
+import json, os, platform, sys
+specification, target = sys.argv[1:3]
+expected = json.load(open(specification))["runtime"]["expected"]
+measured = {"python": platform.python_version()}
+try:
+    import torch
+    available = bool(torch.cuda.is_available())
+    count = int(torch.cuda.device_count()) if available else 0
+    measured.update(
+        torch=torch.__version__,
+        torch_cuda=torch.version.cuda,
+        cuda_available=available,
+        device_count=count,
+        device_name=torch.cuda.get_device_name(0) if count else None,
+    )
+except Exception as error:  # noqa: BLE001 - recorded, and every torch field then differs
+    measured["torch_error"] = type(error).__name__
+differ = [] if measured.get("cuda_available") is True else ["cuda_available"]
+differ += [name for name in sorted(expected) if measured.get(name) != expected[name]]
+record = {
+    "kind": "posttrain-runtime-check",
+    "expected": expected,
+    "measured": measured,
+    "mismatched": differ,
+    "status": "failed" if differ else "passed",
+}
+with open(target + ".part", "w") as stream:
+    json.dump(record, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+os.replace(target + ".part", target)
+if differ:
+    sys.exit(f"the runtime is not run 1c's: {differ} differ (expected {expected}, measured {measured})")
+print(f"runtime check passed: {expected}")
+PY
+  then
+    echo "the Pod's runtime is not the one run 1c's specification pins; see the message above" >&2
+    exit 4
+  fi
+fi
 stamp environment
 
 # 3. Install the project against the image's CUDA torch (never reinstall torch).
