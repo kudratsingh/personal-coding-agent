@@ -12,25 +12,29 @@ one prompt and one solution. A synthetic instance carries two kinds of items
 (:data:`MAPPING`, :func:`instance_node`):
 
 *Family items* join families (union signals), as a pool task's prompt and solution do. They
-are what the instance's rows train the model to do: the prompts are the task statement with
-the generator's fixed phrasing removed (:func:`strip_task`), the template's specification
-text and the target function's docstring; the one solution is the reference target, the
-function every row's reply is. The node stands for every (prompt, solution) pair of these,
-joined into one family (:func:`items_of`).
+are what the instance's rows train the model to do: the prompts are the template's
+specification text and the target function's docstring, the descriptions of the task; the
+one solution is the reference target, the function every row's reply is. The node stands for
+every (prompt, solution) pair of these, joined into one family (:func:`items_of`).
 
 *Exposure items* are what the rows show without training it as the answer: the original
 (buggy or stub) target, the wrong attempts, every module of the original and the fixed
 repository and each top-level function or class of those on its own, any code inside a
-row's user text, and the user texts and the full task statement as text. They never join
+row's user text, and the user texts and the task statement as text. They never join
 families; they are checked directly (*exposure*, below), so buggy and helper code that a
 prompt shows still meets the AST and overlap checks.
 
-What the generator emits identically for more than one template is *scaffolding* and is
-never a family item: the task phrasings and traceback framing (``instances.TASK_PHRASES``,
-``TRACEBACK_HEADER``, ``FRAME_LINE``), the harness prompt's fixed blocks (map, snippet
-headers, changes-so-far block, results, instruction) and the catalog's non-target functions,
-which most templates of a family share. Only the target function is the trained unit (every
-case has one ``module::function`` target), so no whole module is a family item.
+What the generator emits for more than one template, or fills in from a template's test
+values, is *scaffolding* and is never a family item. The task statement is one of the
+generator's phrasings (``instances.TASK_PHRASES``, with the traceback framing
+``TRACEBACK_HEADER`` and ``FRAME_LINE``) filled in with a call, literal values, test,
+exception, helper file and function names: none of it describes the task, and literal
+values alone (digit runs, lists) reach the paraphrase level between unrelated templates. It
+is exposure text only; :func:`strip_task` refuses a statement the generator did not write.
+The harness prompt's fixed blocks (map, snippet headers, changes-so-far block, results,
+instruction) and the catalog's non-target functions, which most templates of a family share,
+are scaffolding too. Only the target function is the trained unit (every case has one
+``module::function`` target), so no whole module is a family item.
 
 Synthetic node IDs are ``synth:<instance>``, so their upstream identity never equals a pool
 ID. Two synthetic nodes under one instance ID (two instance sets reusing an ID) are joined,
@@ -48,9 +52,10 @@ trained on) are judged. A subject is
     when its family contains any development task (``dev_family``); when it shares a
     defined function or class name with a development task at prompt Jaccard at or above
     0.25 (``dev_named_paraphrase``); when an exposure code item has the solution AST or
-    canonical AST of a development task or of a pool task in a family with one
-    (``prompt_code_exposure``); when an exposure text reaches prompt Jaccard 0.5 with the
-    prompt of such a task (``prompt_text_exposure``); or when a name defined in its family or
+    canonical AST of a node in a family with a development task (that task, a pool task, or
+    another accepted or bridge instance; never the node itself) (``prompt_code_exposure``);
+    when an exposure text reaches prompt Jaccard 0.5 with a prompt of such a node
+    (``prompt_text_exposure``); or when a name defined in its family or
     exposure code is shared with a development task at prompt Jaccard at or above 0.25 over
     its family and exposure texts (``prompt_named_exposure``);
 ``flagged``
@@ -117,9 +122,9 @@ SCHEMA = "agent-dev-family-v2"
 RULE = RULES_VERSION
 """The identity key every result carries (``dev_family``) and ``mix`` requires."""
 MAPPING = "synthetic-items-v3"
-"""The synthetic item mapping: family items (task statement without the generator's fixed
-phrasing, specification text, target docstring; the reference target) and direct-only
-exposure items (everything else a row shows)."""
+"""The synthetic item mapping: family items (specification text, target docstring; the
+reference target) and direct-only exposure items (everything else a row shows, the task
+statement included)."""
 LEGACY_MAPPING = "synthetic-items-v2"
 """The earlier mapping, kept only to document what changed: every prompt (task statement,
 specification text, target docstring, every row's user text) and every solution (reference
@@ -146,11 +151,11 @@ METHOD = (
     "task-family rule task-clusters-v1 against the pool development split: union-signal "
     "families over pool development and training tasks and every synthetic instance "
     "(rejected and superseded instances as unjudged bridges), where a synthetic instance's "
-    "family items are its task statement without the generator's fixed phrasing, its "
-    "template's specification text, its target docstring and its reference target; every "
-    "other code and text its rows show is checked directly (solution and canonical AST "
-    "against development tasks and pool tasks in their families, prompt Jaccard 0.5 against "
-    "their prompts, shared defined names against development tasks); an accepted instance "
+    "family items are its template's specification text, its target docstring and its "
+    "reference target; every other code and text its rows show, the generated task "
+    "statement included, is checked directly (solution and canonical AST against every "
+    "other node in a family with a development task, prompt Jaccard 0.5 against their "
+    "prompts, shared defined names against development tasks); an accepted instance "
     "is dropped when its family holds a development task or any direct signal reaches the "
     "flag level, and every instance of a template with a dropped instance, a bridge with a "
     "direct signal, or an owner ruling is dropped; replay rows are dropped when synthetic "
@@ -311,27 +316,35 @@ def exposures(
     rules: ClusterRules = DEFAULT_RULES,
 ) -> list[Exposure]:
     """The direct signals of each node's exposure items: code against the solutions of
-    ``targets`` (development tasks and pool tasks in a family with one), text against their
-    prompts, and shared names against ``named_targets`` (development tasks)."""
-    keys = {key for target in targets for text in target.solutions for key in _keys(text)}
-    target_sets = {
-        found
-        for target in targets
-        for text in target.prompts
-        if (found := shingles(text, rules.width))
-    }
-    shown_sets = {
-        found
-        for node in nodes
-        for text in node.shown_text
-        if (found := shingles(text, rules.width))
-    }
-    everything = [*target_sets, *(found for found in shown_sets if found not in target_sets)]
-    is_target = [found in target_sets for found in everything]
-    hit = {found for found in shown_sets if found in target_sets}
+    ``targets`` (every node in a family with a development task: pool tasks, accepted and
+    bridge instances), text against their prompts, and shared names against
+    ``named_targets`` (development tasks). A node's items are never checked against a
+    target under its own ID (an instance's repository holds its own target)."""
+    key_owners: dict[tuple[str, str], set[str]] = defaultdict(set)
+    set_owners: dict[frozenset[tuple[str, ...]], set[str]] = defaultdict(set)
+    for target in targets:
+        for text in target.solutions:
+            for key in _keys(text):
+                key_owners[key].add(target.id)
+        for text in target.prompts:
+            if found := shingles(text, rules.width):
+                set_owners[found].add(target.id)
+    shown_sets = list(
+        dict.fromkeys(
+            found
+            for node in nodes
+            for text in node.shown_text
+            if (found := shingles(text, rules.width))
+        )
+    )
+    target_sets = list(set_owners)
+    # Shown sets after the target sets, identical ones included, so each pair is scored.
+    everything = [*target_sets, *shown_sets]
+    first_shown = len(target_sets)
+    reached: dict[frozenset[tuple[str, ...]], set[str]] = defaultdict(set)
     for i, j, _ in similar_pairs(everything, rules.paraphrase):
-        if is_target[i] != is_target[j]:
-            hit.add(everything[j] if is_target[i] else everything[i])
+        if i < first_shown <= j:  # ``i < j``: a target set, then a shown set.
+            reached[everything[j]] |= set_owners[everything[i]]
     widened = [
         Node(
             node.id,
@@ -343,9 +356,14 @@ def exposures(
     named = named_scores(named_targets, widened, rules)
     signals = []
     for node, score in zip(nodes, named, strict=True):
-        code = any(key in keys for text in node.shown_code for key in _keys(text))
-        text = any(shingles(item, rules.width) in hit for item in node.shown_text)
-        signals.append(Exposure(code, text, score))
+        own = {node.id}
+        code_hit = any(
+            key_owners.get(key, own) - own for code in node.shown_code for key in _keys(code)
+        )
+        text_hit = any(
+            reached.get(shingles(item, rules.width), own) - own for item in node.shown_text
+        )
+        signals.append(Exposure(code_hit, text_hit, score))
     return signals
 
 
@@ -427,8 +445,12 @@ def assess(
         full_dev[graph.full.find(index)].add(index)
         base_dev[graph.base.find(index)].add(index)
     first_subject = len(base)
-    # Exposure targets: development tasks and every pool task in a family with one.
-    targets = [node for index, node in enumerate(base) if graph.full.find(index) in full_dev]
+    # Exposure targets: every node in a family with a development task (development and
+    # training tasks, accepted and bridge instances), so code a prompt shows that another
+    # instance in such a family trains on is checked as a pool task's program would be.
+    in_dev = [index for index in range(len(graph.nodes)) if graph.full.find(index) in full_dev]
+    targets = [graph.nodes[index] for index in in_dev]
+    synthetic_targets = sum(1 for index in in_dev if index >= first_subject)
     synthetic = [*subjects, *bridges]
     exposure = exposures(targets, dev, synthetic, rules)
     scores = named_scores(dev, synthetic, rules)
@@ -480,7 +502,8 @@ def assess(
         "subject_families": len(roots),
         "largest_subject_family": max(roots.values(), default=0),
         "subject_families_with_dev": sum(1 for root in roots if root in full_dev),
-        "exposure_targets": len(targets),
+        "exposure_targets": len(targets) - synthetic_targets,
+        "exposure_targets_synthetic": synthetic_targets,
     }
     return Assessment(
         subjects=judged,
@@ -538,12 +561,23 @@ NOT_EQUIVALENT = "not_equivalent"
 
 def flag_edges(manifest: Mapping[str, Any]) -> list[tuple[str, str, str]]:
     """``(row, development task, review)`` for every manifest flag edge with exactly one
-    development-split endpoint."""
+    development-split endpoint. Refuses a manifest without ``flag_edges`` and an edge
+    without two endpoints and two splits: a malformed edge is never skipped silently."""
+    if not isinstance(manifest.get("flag_edges"), list):
+        raise ValueError("the flag manifest has no flag_edges list")
     found = []
-    for edge in manifest.get("flag_edges", ()):
-        splits = list(edge.get("splits", ()))
+    for number, edge in enumerate(manifest["flag_edges"], start=1):
+        splits = edge.get("splits") if isinstance(edge, Mapping) else None
+        if (
+            not isinstance(splits, list)
+            or len(splits) != 2
+            or not all(isinstance(split, str) and split for split in splits)
+            or not edge.get("a")
+            or not edge.get("b")
+        ):
+            raise ValueError(f"flag edge {number} lacks two endpoints and two splits")
         ends = [str(edge["a"]), str(edge["b"])]
-        if len(splits) != 2 or splits.count("dev") != 1:
+        if splits.count("dev") != 1:
             continue
         dev_side = splits.index("dev")
         found.append((ends[1 - dev_side], ends[dev_side], str(edge.get("review", "pending"))))
@@ -557,12 +591,18 @@ def pending_flags(
 ) -> PendingFlags:
     """Which replay ``rows`` stand on flag edges to development tasks, and which of those an
     existing record resolves: an edge is resolved only when its own review is
-    ``not_equivalent`` or a decision on exactly that (training task, development task) pair
-    is final ``not_equivalent``. A row is kept only when every one of its edges is resolved."""
-    resolving: dict[tuple[str, str], list[int]] = defaultdict(list)
+    ``not_equivalent`` or the decisions on exactly that (training task, development task)
+    pair are all final ``not_equivalent`` (one that says anything else leaves it
+    unresolved). A row is kept only when every one of its edges is resolved."""
+    finals: dict[tuple[str, str], list[tuple[int, str]]] = defaultdict(list)
     for line, decision in enumerate(decisions, start=1):
-        if str(decision.get("final")) == NOT_EQUIVALENT:
-            resolving[(str(decision.get("train")), str(decision.get("dev")))].append(line)
+        pair = (str(decision.get("train")), str(decision.get("dev")))
+        finals[pair].append((line, str(decision.get("final"))))
+    resolving = {
+        pair: [line for line, _ in lines]
+        for pair, lines in finals.items()
+        if all(final == NOT_EQUIVALENT for _, final in lines)
+    }
     by_row: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for row, dev, review in edges:
         by_row[row].append((dev, review))
@@ -767,7 +807,9 @@ def strip_task(task: str) -> str:
     """The task statement without the generator's fixed phrasing: the values it filled in
     (call, values, test, exception, function and file names, traceback frames and error
     line), one per line. Raises when no generator phrasing matches: a statement written
-    some other way is not stripped by guesswork."""
+    some other way is not stripped by guesswork. :func:`instance_node` uses it only to refuse
+    a statement the generator did not write (the statement is exposure text, never a family
+    item)."""
     for pattern, fields, _ in _phrasings():
         match = pattern.fullmatch(task)
         if match is None:
@@ -812,9 +854,10 @@ def _unique(texts: Iterable[str]) -> tuple[str, ...]:
 
 def instance_node(instance: Instance, specs: Iterable[str], user_texts: Iterable[str]) -> Node:
     """The node of one instance under :data:`MAPPING` (module docstring: family and
-    exposure items)."""
+    exposure items). Refuses a task statement the generator did not write."""
     user_texts = tuple(user_texts)
-    prompts = [strip_task(instance.task), *specs, *docstrings(instance.reference_target)]
+    strip_task(instance.task)  # Generated text, scaffolding only: refused otherwise.
+    prompts = [*specs, *docstrings(instance.reference_target)]
     shown = [instance.original_target, *instance.mutants]
     for _, text in (*instance.original_modules, *instance.modules):
         shown.append(text)
@@ -854,13 +897,12 @@ CATEGORIES = {
     "own_unit": "non_target_function",
     "unresolved_unit": "non_target_code_unresolved",
     "user_text": "harness_text",
-    "task": "task_phrase_scaffolding",
-    "task_statement": "stripped_task_statement",
+    "task": "generated_task_statement",
 }
 """Item kind -> the category of a link it alone made in one mapping and not the other.
 ``shared_unit`` is a non-target function the catalog puts in more than one template;
 ``own_unit`` one only this template has; ``unresolved_unit`` one whose role the generator's
-recorded names do not give; ``task_statement`` (this mapping only) the stripped task."""
+recorded names do not give; ``task`` the generated task statement (phrasing and values)."""
 RETAINED = frozenset(
     {"reference_target", "target_unit", "spec", "docstring", "pool_prompt", "pool_solution"}
 )
@@ -961,7 +1003,7 @@ def legacy_items(
 def current_items(instance: Instance, specs: Iterable[str]) -> Labeled:
     """The instance's family items under :data:`MAPPING`, with their kinds (the same texts
     as :func:`instance_node`'s prompts and solutions)."""
-    prompts = [("task_statement", strip_task(instance.task)), *(("spec", text) for text in specs)]
+    prompts = [("spec", text) for text in specs]
     prompts += [("docstring", text) for text in docstrings(instance.reference_target)]
     return Labeled(
         NAMESPACE + instance.id,
@@ -1170,10 +1212,13 @@ def require_result(
     dev_sha256: Iterable[str | None] = (),
     bridge_registries: Iterable[str] = (),
     dropped_templates: Iterable[str] = (),
+    flag_manifest_sha256: str | None = None,
 ) -> None:
     """Refuse a dev-family result unless it applies this rule, with its default thresholds
     and this item mapping, to exactly ``agent_meta`` and ``replay_index`` as they are now,
-    covers every replay kind mixed, applied the pending flag edges, judged against the same
+    covers every replay kind mixed, applied the pending flag edges of a manifest whose
+    in-graph count of rows on them the replay stage's record confirmed (and, when
+    ``flag_manifest_sha256`` is given, of exactly that manifest), judged against the same
     development file as any n-gram check that names one (``dev_sha256``), held every
     instance set named by ``bridge_registries`` (registry SHA-256) in its graph, as a judged
     set or a bridge set, and dropped every template in ``dropped_templates`` by owner ruling."""
@@ -1203,8 +1248,19 @@ def require_result(
     missing = set(replay_kinds) - set(result["replay"].get("kinds", ()))
     if missing:
         raise ValueError(f"the dev-family result did not judge replay kinds {sorted(missing)}")
-    if not (result["replay"].get("pending_flags") or {}).get("applied"):
+    pending = result["replay"].get("pending_flags") or {}
+    if not pending.get("applied"):
         raise ValueError("the dev-family result did not apply the pending flag edges")
+    reported = pending.get("replay_stage_reported")
+    if reported is None or reported != pending.get("candidates"):
+        raise ValueError(
+            "the dev-family result's pending flag rows were not confirmed by the replay stage's "
+            "record"
+        )
+    if not pending.get("manifest_sha256"):
+        raise ValueError("the dev-family result names no flag manifest")
+    if flag_manifest_sha256 is not None and pending["manifest_sha256"] != flag_manifest_sha256:
+        raise ValueError("the dev-family result applied another flag manifest")
     owner = set((result["agent"]["instances"].get("owner_drops") or {}).get("templates", ()))
     undropped = sorted(set(dropped_templates) - owner)
     if undropped:

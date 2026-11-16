@@ -169,25 +169,27 @@ but the model still sees it. So an instance carries two kinds of items (item map
 `synthetic-items-v3`):
 
 - **Family items** join families, as a pool task's prompt and solution do. They are what the
-  rows train: the prompts are the task statement with the generator's fixed phrasing removed,
-  the template's specification text (from every `specs.json` given) and the target
-  function's docstring; the one solution is the reference target, which is every row's whole
-  reply. Every case has one `module::function` target, so no whole module is a family item.
+  rows train: the prompts are the descriptions of the task, the template's specification
+  text (from every `specs.json` given) and the target function's docstring; the one solution
+  is the reference target, which is every row's whole reply. Every case has one `module::function` target, so no whole module is a family item.
   The instance stands for every (prompt, solution) pair of these, joined into one family.
 - **Exposure items** are everything else a row shows: the original (buggy or stub) target,
   the wrong attempts, each module of the original and the fixed repository and each of its
-  top-level functions and classes, code inside each row's user text, and the full task
-  statement and user texts as text. They never join a family. They are checked directly, so
+  top-level functions and classes, code inside each row's user text, and the task statement
+  and user texts as text. They never join a family. They are checked directly, so
   buggy and helper code still meets the AST and overlap checks (next section).
 
-**Scaffolding** is what the generator emits identically for more than one template. It is
-defined from the generator source, not from results, and it is never a family item:
+**Scaffolding** is what the generator emits for more than one template or fills in from a
+template's test values. It is defined from the generator source, not from results, and it is
+never a family item:
 
-- the task-statement phrasings (`instances.TASK_PHRASES`) and the traceback framing
-  (`TRACEBACK_HEADER`, `FRAME_LINE`). `strip_task` removes them and keeps the values the
-  generator filled in: the call, the values, test, exception, function and file names, and
-  the traceback's frames and error line. A statement that matches no phrasing is refused,
-  never stripped by guesswork;
+- the task statement. It is one of the generator's phrasings (`instances.TASK_PHRASES`, with
+  the traceback framing `TRACEBACK_HEADER` and `FRAME_LINE`) filled in with a call, literal
+  values, a test, an exception and helper file and function names. None of that describes
+  the task, and with the phrasing removed the literal values alone (runs of digits, lists)
+  reach the paraphrase level between unrelated templates. It is exposure text only.
+  `strip_task` checks that each statement is in a generator phrasing and refuses one that is
+  not, since text the generator did not write could be a real description;
 - the harness prompt's fixed blocks (map, snippet headers, changes so far, results,
   instruction), which is why row user texts are exposure text only;
 - the catalog's non-target functions. `unit_kinds` reads each template's roles from the
@@ -210,8 +212,11 @@ protection"). Excluded instances stay in the graph.
 ### Judging an accepted instance
 
 As the holdout integrity scan judges a subject, with the exposure checks added. The *exposure
-targets* are the development tasks and every pool task in a family that holds one (on the
-graph with the synthetic nodes).
+targets* are every node in a family that holds a development task, on the graph with the
+synthetic nodes: the development tasks, pool training tasks, and accepted, rejected and
+superseded instances. So code a row shows that another instance in such a family trains on
+is caught as a pool task's program would be. A node is never checked against itself (its
+fixed repository holds its own target).
 
 | Status | When | Reason class |
 | --- | --- | --- |
@@ -252,9 +257,11 @@ is kept only when an existing record resolves every one of its edges as not equi
 edge's own review, or a decision (`--flag-decisions`) that is final `not_equivalent` for
 exactly that (training task, development task) pair. Every other such row is dropped
 (`pending_flag_unresolved`). The result lists the candidates, the decision lines that keep a
-row and the manifest and decision files' SHA-256. With `--replay-record`, the replay stage's
-own count of rows on pending flag edges must equal the candidates found here, or the run is
-refused.
+row and the manifest and decision files' SHA-256. A pair with any decision other than
+`not_equivalent` stays unresolved, and a manifest edge without two endpoints and two splits
+is refused, never skipped. `--replay-record` is required: the replay stage's own count of rows
+on pending flag edges must be present and equal the candidates found here, or the run is
+refused, so a stale or wrong manifest cannot pass with no candidates.
 
 ### Evidence of the mapping change
 
@@ -273,12 +280,13 @@ items that made it:
 | `non_target_function` | a non-target function only this template has |
 | `non_target_code_unresolved` | a non-target function whose role the recorded names do not give |
 | `harness_text` | a row's user text |
-| `task_phrase_scaffolding` | the task statement with its fixed phrasing |
+| `generated_task_statement` | the task statement (generator phrasing and test values) |
 
 A link counts against the side that holds no retained item (reference target, specification,
 docstring, pool items), because a retained item on both sides would make the link in both
 mappings. A removed link with no category is a bug, and the run fails. The file also gives
-every link this mapping adds (`stripped_task_statement`), each template pair with the signals,
+every link this mapping adds (its family items are a subset of the earlier ones, so none is
+expected, and one would fail the run the same way), each template pair with the signals,
 item kinds and defined names involved, the earlier mapping's judgement and the transitions
 between the two. The result carries the summary counts and the file's SHA-256.
 
@@ -306,8 +314,12 @@ Template `C`'s buggy original target is `d0`'s program renamed. The fix differs,
 item links `C`. But every row of `C` shows that code, so `C` is excluded
 (`prompt_code_exposure`), and its sibling `C2` is dropped by template expansion. A rejected
 instance `R` that shares `A`'s helper only stays out of any family. A rejected instance whose
-task statement paraphrases `d0` and whose target is a training task's program still bridges
-that training task into `d0`'s family. A replay row `t` on a pending flag edge to `d1`, with
+specification paraphrases `d0` and whose target is a training task's program still bridges
+that training task into `d0`'s family.
+
+Template `T`'s specification paraphrases `d0`, so `T`'s instance, with target `P`, is in
+`d0`'s family. Template `S` shows `P` as a helper in every prompt while training something
+else. `P` is an exposure target, so `S` is excluded (`prompt_code_exposure`). A replay row `t` on a pending flag edge to `d1`, with
 no decision on that pair, is dropped.
 
 ### Results and binding
@@ -329,12 +341,14 @@ result whose graph did not hold each named set (judged or bridge).
 
 `mix --dev-family` refuses a result of the earlier schema or another item mapping, and one for
 another input, another rule or other thresholds. It also refuses one that did not judge every
-mixed replay kind, did not apply the pending flag edges, or used a development file other than
-the one a contamination result checked. With `--require-dropped-template` it refuses a result
+mixed replay kind, did not apply the pending flag edges with the replay stage's count
+confirming them, or used a development file other than the one a contamination result
+checked. `--require-flag-manifest-sha256` pins the flag manifest. With `--require-dropped-template` it refuses a result
 that did not drop those templates by owner ruling. The agent-case and benchmark contamination
 results are still required. The mix record states both development checks, the registry of
 every instance set the result held, and how many pending-flag candidates entered the mix.
-`manifest` describes builds, which come before the rule, so it states the rule as required
+`dev-family` refuses an `--out` or `--evidence` path inside a Git work tree that does not
+ignore it. `manifest` describes builds, which come before the rule, so it states the rule as required
 before mixing. With `--dev-family` it also records that result's SHA-256, item mapping, owner
 drops, dropped counts and survivors.
 
@@ -354,14 +368,11 @@ Limits:
 - The rule is static, so two programs that behave alike but share no signal are not linked.
 - Every instance of a template shares its specification text, so one link usually puts the
   whole template in a development family.
-- Exposure code is compared with development tasks and with pool tasks in their families, not
-  with the family items of other synthetic instances. Shown code that equals another template's
-  reference target is excluded only when that code meets a development family's pool program
-  itself.
+- Exposure code is compared with whole top-level units. A development solution nested as a
+  method inside a shown class, or a paraphrase buried in a docstring inside a long user text,
+  is not caught (the earlier mapping missed both too).
 - `clusters.py` filters no trivial programs beyond those that do not parse. A short helper that
   equals a short development solution up to renaming is therefore an exposure hit.
-- A stripped task statement is short and can link two instances that name the same call and
-  values. The evidence file lists every such added link.
 - The graph holds the pool's development and training tasks only, never a sealed split, so a
   chain that passes through a held-out task is not seen.
 
@@ -388,11 +399,14 @@ Limits:
   replay row reaching a development task through a rejected instance), a replay row joined to
   a further development task, template expansion (also through a bridge's direct signal),
   flagged instances dropped, the two mapping regressions (templates joined only by a shared
-  helper stay apart; a development solution shown in a prompt is excluded), text and
-  shared-name exposure, the task-phrasing stripper, pending flag edges and their citations,
-  the owner drop, evidence categories (on `generate` output too, and a removed link without
-  one refused), the subcommand's result and refusals (including a swapped instance set and
-  build), and the reader on `generate` output.
+  helper stay apart; a development solution shown in a prompt is excluded), task statements
+  that share only literal values staying apart, shown code that another instance in a
+  development family trains on, text and shared-name exposure, the task-phrasing check,
+  pending flag edges and their citations (conflicting decisions and malformed edges fail
+  closed, and the replay stage's count is required), the owner drop, evidence categories (on
+  `generate` output too, and a removed link without one refused), private-record paths, the
+  subcommand's result and refusals (including a swapped instance set and build), and the
+  reader on `generate` output.
 
 Run them with `uv run --locked pytest tests/test_agent_synth*.py tests/test_agent_dev_family.py`.
 

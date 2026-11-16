@@ -72,6 +72,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 import sys
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -817,17 +818,19 @@ class DevFamilyInputs:
 
 ITEM_MAPPING = {
     "version": dev_family.MAPPING,
-    "family_prompts": "the task statement without the generator's fixed phrasing, the "
-    "template's specification text and the target docstring",
+    "family_prompts": "the template's specification text and the target docstring",
     "family_solutions": "the reference target (every row's reply)",
     "exposure_code": "the original target, the wrong attempts, every module of the original "
     "and the fixed repository and each of its top-level functions and classes, and code "
-    "inside each row's user text: solution and canonical AST against development tasks and "
-    "pool tasks in their families, never a family link",
-    "exposure_text": "the full task statement and every row's user text: prompt Jaccard 0.5 "
-    "against those tasks' prompts, and shared defined names with development tasks",
-    "scaffolding": "never a family item: the generator's task phrasings and traceback "
-    "framing, the harness prompt's fixed blocks, and the catalog's non-target functions",
+    "inside each row's user text: solution and canonical AST against every other node in a "
+    "family with a development task (pool tasks, accepted and bridge instances), never a "
+    "family link",
+    "exposure_text": "the generated task statement and every row's user text: prompt "
+    "Jaccard 0.5 against those nodes' prompts, and shared defined names with development "
+    "tasks",
+    "scaffolding": "never a family item: the generated task statement (the generator's "
+    "phrasings and traceback framing filled in with test values and helper names), the "
+    "harness prompt's fixed blocks, and the catalog's non-target functions",
     "node_ids": dev_family.NAMESPACE + "<instance>",
 }
 PENDING_FLAG_KEY = "sft_rows_on_pending_dev_crossing_flag_edges_only"
@@ -923,11 +926,9 @@ def _dev_family_inputs(args: argparse.Namespace, meta: Sequence[dict[str, Any]])
     )
 
 
-def _replay_stage(path: Path | None) -> dict[str, Any] | None:
+def _replay_stage(path: Path) -> dict[str, Any]:
     """The replay stage's record, by path and SHA-256, with every count it reports as kept
     on pending (unreviewed) flag edges, so the in-graph figure can be read beside it."""
-    if path is None:
-        return None
     data = path.read_bytes()
     document = json.loads(data)
     pending = {
@@ -948,11 +949,12 @@ def _replay_stage(path: Path | None) -> dict[str, Any] | None:
 def _pending_flag_block(
     args: argparse.Namespace,
     index: Sequence[dict[str, Any]],
-    stage: dict[str, Any] | None,
+    stage: dict[str, Any],
 ) -> tuple[dev_family.PendingFlags, dict[str, Any]]:
     """The pending flag edges of the replay rows (every kind), resolved only by existing
     adjudication records, and the result block that cites them. Refuses when the replay
-    stage reports another number of rows on such edges than the manifest gives here."""
+    stage reports no number of rows on such edges, or another one than the manifest gives
+    here (a stale or wrong manifest)."""
     manifest_data = args.pending_flag_manifest.read_bytes()
     edges = dev_family.flag_edges(json.loads(manifest_data))
     decisions: list[dict[str, Any]] = []
@@ -963,10 +965,12 @@ def _pending_flag_block(
     kinds = {str(row["id"]): str(row["kind"]) for row in index}
     flags = dev_family.pending_flags(edges, decisions, kinds)
     reported = None
-    for key, value in ((stage or {}).get("pending_flag_rows_reported") or {}).items():
+    for key, value in (stage.get("pending_flag_rows_reported") or {}).items():
         if key.endswith("." + PENDING_FLAG_KEY):
             reported = int(value)
-    if reported is not None and reported != len(flags.candidates):
+    if reported is None:
+        raise ValueError(f"the replay stage's record reports no {PENDING_FLAG_KEY} count")
+    if reported != len(flags.candidates):
         raise ValueError(
             f"the replay stage reports {reported} rows on pending flag edges; the manifest "
             f"gives {len(flags.candidates)} among the replay rows"
@@ -1049,10 +1053,42 @@ def _legacy_comparison(
     }
 
 
+def _tracked_location(path: Path) -> str | None:
+    """Why ``path`` may not hold a private record: it lies in a Git work tree that does not
+    ignore it (a later ``git add`` could stage it). ``None`` when it is outside every work
+    tree or ignored there."""
+    probe = path.resolve().parent
+    while not probe.exists():
+        probe = probe.parent
+    try:
+        top = subprocess.run(
+            ["git", "-C", str(probe), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if top.returncode != 0:
+            return None
+        ignored = subprocess.run(
+            ["git", "-C", top.stdout.strip(), "check-ignore", "-q", str(path.resolve())],
+            capture_output=True,
+            check=False,
+        )
+    except OSError as error:
+        return f"cannot check {path} with git: {error}"
+    if ignored.returncode == 0:
+        return None
+    return f"{path} is inside the Git work tree {top.stdout.strip()} and not ignored"
+
+
 def run_dev_family(args: argparse.Namespace) -> int:
     for path in (args.out, args.evidence):
         if path.exists():
             print(f"refused: {path} exists", file=sys.stderr)
+            return 2
+        reason = _tracked_location(path)
+        if reason is not None:
+            print(f"refused: private record: {reason}", file=sys.stderr)
             return 2
     owner = sorted(set(args.drop_template or ()))
     if owner and args.drop_ruling is None:
@@ -1129,8 +1165,9 @@ def run_dev_family(args: argparse.Namespace) -> int:
         "categories": dev_family.CATEGORIES,
         "retained_kinds": sorted(dev_family.RETAINED),
         "scaffolding_source": {
-            "task_phrasings": "scratchcoder.agent.synth.instances.TASK_PHRASES, "
-            "TRACEBACK_HEADER, FRAME_LINE",
+            "task_statement": "generated by scratchcoder.agent.synth.instances (TASK_PHRASES, "
+            "TRACEBACK_HEADER, FRAME_LINE) from test values and helper names; exposure text "
+            "only, and refused when it matches no phrasing",
             "non_target_functions": "scratchcoder.agent.synth.catalog through "
             "dev_family.unit_kinds (template -> role -> kind)",
             "roles": comparison["scaffolding_roles"],
@@ -1309,6 +1346,7 @@ def run_mix(args: argparse.Namespace) -> int:
             dev_sha256=[side["dev_ngram_sha256"] for side in checked.values()],
             bridge_registries=args.require_instance_registry or (),
             dropped_templates=args.require_dropped_template or (),
+            flag_manifest_sha256=args.require_flag_manifest_sha256,
         )
     except (ValueError, KeyError, OSError) as error:
         print(f"refused: dev-family: {error}", file=sys.stderr)
@@ -1378,6 +1416,10 @@ def run_mix(args: argparse.Namespace) -> int:
                     "kept_resolved": pending["kept_resolved"],
                     "excluded": pending["excluded"],
                     "candidates_in_mix": len(candidates & mixed_ids),
+                    "manifest_sha256": pending["manifest_sha256"],
+                    "decisions_sha256": pending["decisions_sha256"],
+                    "replay_stage_reported": pending["replay_stage_reported"],
+                    "required_manifest_sha256": args.require_flag_manifest_sha256,
                 },
             },
             "dev_method": DEV_CHECKS,
@@ -1603,9 +1645,11 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument(
         "--replay-record",
         type=Path,
+        required=True,
         help="the replay stage's record.json: its SHA-256 and the pending flag counts it "
-        "reports are written beside the in-graph figure; a different count of rows on "
-        "pending flag edges than --pending-flag-manifest gives is refused",
+        "reports are written beside the in-graph figure; a record without that count, or a "
+        "different count of rows on pending flag edges than --pending-flag-manifest gives, "
+        "is refused",
     )
     d.add_argument(
         "--pending-flag-manifest",
@@ -1674,6 +1718,11 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         metavar="TEMPLATE",
         help="templates the dev-family result must have dropped by owner ruling",
+    )
+    m.add_argument(
+        "--require-flag-manifest-sha256",
+        metavar="SHA256",
+        help="the SHA-256 of the flag manifest the dev-family result must have applied",
     )
     m.add_argument(
         "--case-registry-sha256",

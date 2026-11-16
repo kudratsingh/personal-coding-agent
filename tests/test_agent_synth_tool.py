@@ -23,6 +23,7 @@ from dev_family_fixtures import (
     write_flag_manifest,
     write_instance,
     write_pool,
+    write_replay_record,
     write_specs,
 )
 from synth_fixtures import Chunks, SynthExecutor, claim_errors, families_json
@@ -678,9 +679,12 @@ def _mix_inputs(tmp_path: Path) -> dict[str, Path]:
     family = tmp_path / "dev-family.json"
     # Replay row r0 stands on an unresolved flag edge to the dev task.
     flags = write_flag_manifest(tmp_path / "clusters.json", [("r0", "d0", "pending")])
-    argv = dev_family_argv(dev, train, [(root, build)], [specs], meta, index, family, flags=flags)
+    stage = write_replay_record(tmp_path / "replay-record.json", 1)
+    argv = dev_family_argv(
+        dev, train, [(root, build)], [specs], meta, index, family, flags=flags, stage=stage
+    )
     assert agent_sft_data.main(argv) == 0
-    return {"meta": meta, "index": index, "family": family, **results}
+    return {"meta": meta, "index": index, "family": family, "flags": flags, **results}
 
 
 def _mix_argv(tmp_path: Path, paths: dict[str, Path], out: str, *registries: str) -> list[str]:
@@ -734,8 +738,20 @@ def test_mix_needs_both_contamination_results_for_these_inputs_and_case_sets(
         "kept_resolved": 0,
         "excluded": 1,
         "candidates_in_mix": 0,
+        "manifest_sha256": hashlib.sha256(paths["flags"].read_bytes()).hexdigest(),
+        "decisions_sha256": None,
+        "replay_stage_reported": 1,
+        "required_manifest_sha256": None,
     }
     assert record["dev_family"]["item_mapping"] == "synthetic-items-v3"
+    # The flag manifest can be pinned; the record names it and the replay stage's count.
+    pinned = hashlib.sha256(paths["flags"].read_bytes()).hexdigest()
+    argv = _mix_argv(tmp_path, paths, "mix-pinned", registry)
+    assert agent_sft_data.main([*argv, "--require-flag-manifest-sha256", pinned]) == 0
+    flags = json.loads((tmp_path / "mix-pinned" / "mix-record.json").read_text())
+    assert flags["dev_family"]["pending_flags"]["manifest_sha256"] == pinned
+    assert flags["dev_family"]["pending_flags"]["required_manifest_sha256"] == pinned
+    assert flags["dev_family"]["pending_flags"]["replay_stage_reported"] == 1
     # A case set the results were not checked against (e.g. the second evaluation set).
     argv = _mix_argv(tmp_path, paths, "mix-more", registry, "e" * 64)
     assert agent_sft_data.main(argv) == 2
@@ -971,6 +987,21 @@ def test_mix_requires_the_dev_family_result_for_these_inputs(
     unapplied = {**original["replay"], "pending_flags": {"applied": False}}
     assert variant("mix-flags", {"replay": unapplied}) == 2
     assert "did not apply the pending flag edges" in capsys.readouterr().err
+    # Pending flags applied from a manifest the replay stage's count did not confirm.
+    pending = original["replay"]["pending_flags"]
+    for name, change in (
+        ("mix-unconfirmed", {"replay_stage_reported": None}),
+        ("mix-miscounted", {"replay_stage_reported": pending["candidates"] + 1}),
+    ):
+        unconfirmed = {**original["replay"], "pending_flags": {**pending, **change}}
+        assert variant(name, {"replay": unconfirmed}) == 2
+        assert "not confirmed by the replay stage" in capsys.readouterr().err
+    nameless = {**original["replay"], "pending_flags": {**pending, "manifest_sha256": None}}
+    assert variant("mix-no-manifest", {"replay": nameless}) == 2
+    assert "names no flag manifest" in capsys.readouterr().err
+    argv = _mix_argv(tmp_path, paths, "mix-other-manifest", registry)
+    assert agent_sft_data.main([*argv, "--require-flag-manifest-sha256", "a" * 64]) == 2
+    assert "applied another flag manifest" in capsys.readouterr().err
     argv = _mix_argv(tmp_path, paths, "mix-owner", registry)
     assert agent_sft_data.main([*argv, "--require-dropped-template", "t0"]) == 2
     assert "did not drop templates ['t0']" in capsys.readouterr().err

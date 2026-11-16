@@ -19,8 +19,8 @@ def words(prefix: str, count: int) -> str:
 
 
 def phrased(text: str) -> str:
-    """``text`` as a generator task statement (a failing-test phrasing): the dev-family rule
-    strips the phrasing and keeps ``text``."""
+    """``text`` as a generator task statement (a failing-test phrasing): exposure text for
+    the dev-family rule, never a family item."""
     return f"Bug: the test {text} fails. Fix the code under test."
 
 
@@ -169,6 +169,7 @@ def dev_family_argv(
     bridges: Sequence[Path] = (),
     *,
     flags: Path,
+    stage: Path,
     evidence: Path | None = None,
 ) -> list[str]:
     argv = ["dev-family", "--dev", str(dev), "--train", str(train)]
@@ -177,9 +178,26 @@ def dev_family_argv(
     if bridges:
         argv += ["--bridge-instances", *map(str, bridges)]
     argv += ["--specs", *map(str, specs), "--rows-meta", str(meta), "--decoded", str(decoded)]
-    argv += ["--pending-flag-manifest", str(flags)]
+    argv += ["--pending-flag-manifest", str(flags), "--replay-record", str(stage)]
     argv += ["--evidence", str(evidence or out.with_name(out.stem + "-evidence.json"))]
     return [*argv, "--out", str(out)]
+
+
+PENDING_FLAG_KEY = "sft_rows_on_pending_dev_crossing_flag_edges_only"
+
+
+def write_replay_record(path: Path, pending: int | None, **others: int) -> Path:
+    """A replay stage record whose rule ``R2`` reports ``pending`` rows on pending flag edges
+    to development tasks (none when ``None``), and any other informational counts."""
+    counts: dict[str, int] = dict(others)
+    if pending is not None:
+        counts[PENDING_FLAG_KEY] = pending
+    document = {
+        "format": "replay-stage-v1",
+        "rules_applied": [{"rule": "R2", "informational_not_dropped": counts}],
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
 
 
 def write_flag_manifest(path: Path, edges: Sequence[tuple[str, str, str]] = ()) -> Path:

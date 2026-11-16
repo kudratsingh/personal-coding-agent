@@ -294,7 +294,8 @@ TASK_PHRASES = (
     *W5_SHORT_PHRASES,
 )
 """Every task-statement phrasing: the fixed text a task statement is written in, shared by
-every template of the workflow type (the dev-family rule removes it before comparing tasks)."""
+every template of the workflow type (the dev-family rule refuses a statement in no phrasing and
+never makes a statement a family item)."""
 TRACEBACK_HEADER = "Traceback (most recent call last):"
 FRAME_LINE = '  File "{file}", in {function}'
 """The fixed framing of a task's traceback: its first line and the format of each frame."""

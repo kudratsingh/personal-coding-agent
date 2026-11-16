@@ -26,6 +26,7 @@ from dev_family_fixtures import (
     write_instance,
     write_jsonl,
     write_pool,
+    write_replay_record,
     write_specs,
 )
 from dev_family_reference import dev_family_ids, scan
@@ -81,17 +82,20 @@ COPY_MODULE = "def other(n):\n    return n\n\n\n" + DEV_SOLUTION.replace(
 ).replace("total", "acc").replace("value", "item")
 
 
-def instance(identifier: str, task: str, reference: str, *, template: str, **extra: str) -> Node:
+def instance(identifier: str, text: str, reference: str, *, template: str, **extra: str) -> Node:
+    """An instance whose template's specification texts are ``text`` and, when given,
+    ``spec``; its generated task statement names nothing else."""
     item = Instance(
         id=identifier,
         template_id=template,
         family="fam",
-        task=phrased(task),
+        task=phrased(words(f"{identifier}-st", 4)),
         reference_target=reference,
         original_target=reference.replace("return", "return 1 +", 1),
         modules=(("toolbox.py", extra.get("module", reference)),),
     )
-    return dev_family.instance_node(item, [extra.get("spec", words(f"spec{template}", 12))], [])
+    specs = [text, *([extra["spec"]] if "spec" in extra else [])]
+    return dev_family.instance_node(item, specs, [])
 
 
 SUBJECTS = [
@@ -378,27 +382,29 @@ def _setup(tmp_path: Path) -> dict[str, Path]:
     write_instance(judged, "k-kept", template="ta", task=words("kept", 15), reference=HELPER)
     write_instance(judged, "k-sibling", template="ta", task=words("sib", 15),
                    reference="def sib(a):\n    return a * 5\n")  # fmt: skip
-    write_instance(judged, "k-flag", template="tf", task=prompt(6, "flag"),
+    write_instance(judged, "k-flag", template="tf", task=words("flg", 15),
                    reference="def secretfn(v):\n    return sorted(v)\n")  # fmt: skip
     write_instance(judged, "k-flag-sib", template="tf", task=words("fsib", 15),
                    reference="def fsib(a):\n    return a - 5\n")  # fmt: skip
-    write_instance(judged, "k-rejected", template="tr", task=prompt(16, "rej"), reference=HELPER)
+    write_instance(judged, "k-rejected", template="tr", task=words("rej", 15), reference=HELPER)
     register(judged)
     accepted = ("k-clear", "k-kept", "k-sibling", "k-flag", "k-flag-sib")
     build = write_build(
         tmp_path / "build-a", {**dict.fromkeys(accepted, True), "k-rejected": False}, judged
     )
     old = tmp_path / "instances-old"
-    # A superseded instance whose task paraphrases d0 and whose target is t-new's program: a
-    # valid family relationship it still bridges. Its repository also shows d1's solution
-    # (renamed): an exposure hit of the bridge, never a family link.
-    write_instance(old, "o-bridge", template="to", task=prompt(16, "ob"), reference=LONELY,
+    # A superseded instance whose specification paraphrases d0 and whose target is t-new's
+    # program: a valid family relationship it still bridges. Its repository also shows d1's
+    # solution (renamed): an exposure hit of the bridge, never a family link.
+    write_instance(old, "o-bridge", template="to", task=words("ob", 15), reference=LONELY,
                    others={"extra.py": SECOND_SOLUTION.replace("x", "y")})  # fmt: skip
     register(old)
-    specs = write_specs(
-        tmp_path / "specs.json",
-        {key: words(f"spec{key}", 12) for key in ("tc", "ta", "tf", "tr", "to")},
-    )
+    # Specification texts carry the descriptions: tr's paraphrases d0 (k-rejected joins
+    # d0's family), tf's sits at the flag level beside k-flag's dev function name, and to's
+    # paraphrases d0 (o-bridge's valid relationship).
+    texts = {key: words(f"spec{key}", 12) for key in ("tc", "ta")}
+    texts |= {"tf": prompt(6, "flag"), "tr": prompt(16, "rej"), "to": prompt(16, "ob")}
+    specs = write_specs(tmp_path / "specs.json", texts)
     rows = []
     for name, template in (("k-clear", "tc"), ("k-kept", "ta"), ("k-flag-sib", "tf")):
         for kind in ("edit", "repair-1", "repair-2"):
@@ -450,6 +456,8 @@ def _setup(tmp_path: Path) -> dict[str, Path]:
         "decoded": decoded,
         "flags": flags,
         "decisions": decisions,
+        # The replay stage counts both flag-edge rows (t-named and t-other).
+        "stage": write_replay_record(tmp_path / "replay-record.json", 2),
     }
 
 
@@ -459,6 +467,7 @@ def _argv(
     *,
     bridges: bool = True,
     more_bridges: Sequence[Path] = (),
+    stage: Path | None = None,
 ) -> list[str]:
     argv = dev_family_argv(
         paths["dev"],
@@ -470,6 +479,7 @@ def _argv(
         out,
         bridges=[*([paths["old"]] if bridges else []), *more_bridges],
         flags=paths["flags"],
+        stage=stage or paths["stage"],
     )
     return [*argv, "--flag-decisions", str(paths["decisions"])]
 
@@ -479,19 +489,8 @@ def test_the_subcommand_writes_a_bound_status_only_result(
 ) -> None:
     paths = _setup(tmp_path)
     out = tmp_path / "dev-family.json"
-    stage = tmp_path / "replay-record.json"
-    stage.write_text(
-        json.dumps(
-            {
-                "format": "replay-stage-v1",
-                "rules_applied": [
-                    {"rule": "R2", "informational_not_dropped": {"rows_on_pending_flags": 7}},
-                    {"rule": "R3", "informational_not_dropped": {"other_count": 2}},
-                ],
-            }
-        )
-    )
-    assert agent_sft_data.main([*_argv(paths, out), "--replay-record", str(stage)]) == 0
+    stage = write_replay_record(tmp_path / "stage-more.json", 2, rows_on_pending_flags=7)
+    assert agent_sft_data.main(_argv(paths, out, stage=stage)) == 0
     result = json.loads(out.read_text())
     assert result["dev_family"] == "task-clusters-v1"
     assert result["rules"] == {
@@ -546,7 +545,10 @@ def test_the_subcommand_writes_a_bound_status_only_result(
         "record": str(stage),
         "record_sha256": dev_family.sha_file(stage),
         "format": "replay-stage-v1",
-        "pending_flag_rows_reported": {"R2.rows_on_pending_flags": 7},
+        "pending_flag_rows_reported": {
+            "R2.rows_on_pending_flags": 7,
+            f"R2.{PENDING_KEY}": 2,
+        },
     }
     # k-kept is excluded only through the rejected instance; k-sibling joins it by template
     # text, so both are reached only through bridges.
@@ -555,10 +557,13 @@ def test_the_subcommand_writes_a_bound_status_only_result(
         "dropped": ["k-kept", "k-sibling"],
     }
     # The superseded instance shows a dev solution: its (subject-less) template is dropped.
+    # The rejected instance's repository shows HELPER, which k-kept (in d0's family) trains;
+    # never its own target alone.
     assert agent["instances"]["bridges_with_direct_hit"] == {
-        "synth:o-bridge": "prompt_code_exposure"
+        "synth:k-rejected": "prompt_code_exposure",
+        "synth:o-bridge": "prompt_code_exposure",
     }
-    assert agent["instances"]["templates_dropped_through_bridge_hits"] == ["to"]
+    assert agent["instances"]["templates_dropped_through_bridge_hits"] == ["to", "tr"]
     assert result["synthetic"]["item_mapping"]["version"] == dev_family.MAPPING
     assert agent["instances"]["owner_drops"]["templates"] == []
     # The earlier mapping made links this one does not; every one has a category.
@@ -585,7 +590,6 @@ def test_the_subcommand_writes_a_bound_status_only_result(
     assert agent_sft_data.main(_argv(paths, again, bridges=False)) == 0
     assert json.loads(again.read_text())["replay"]["rejected"] == ["t-named"]
     assert "warning: no --bridge-instances" in capsys.readouterr().err
-    assert json.loads(again.read_text())["replay"]["replay_stage"] is None
     assert agent_sft_data.main(_argv(paths, out)) == 2  # The output exists.
 
 
@@ -594,14 +598,15 @@ def test_a_bridge_named_edge_drops_its_template_in_the_subcommand(tmp_path: Path
     named-paraphrase level; k-clear has no signal of its own and is dropped (``template``)."""
     paths = _setup(tmp_path)
     extra = tmp_path / "instances-named"
-    write_instance(extra, "n-bridge", template="tc", task=prompt(10, "nb"),
-                   reference="def secretfn(v):\n    return min(v)\n")  # fmt: skip
+    # Its target's docstring (a family prompt) sits at the named-paraphrase level.
+    documented = f'def secretfn(v):\n    """{prompt(10, "nb")}"""\n    return min(v)\n'
+    write_instance(extra, "n-bridge", template="tc", task=words("nb", 15), reference=documented)
     register(extra)
     out = tmp_path / "dev-family.json"
     assert agent_sft_data.main(_argv(paths, out, more_bridges=[extra])) == 0
     instances = json.loads(out.read_text())["agent"]["instances"]
     assert instances["bridges_with_direct_hit"]["synth:n-bridge"] == "dev_named_paraphrase"
-    assert instances["templates_dropped_through_bridge_hits"] == ["tc", "to"]
+    assert instances["templates_dropped_through_bridge_hits"] == ["tc", "to", "tr"]
     assert instances["dropped"]["k-clear"] == "template"
     assert "k-clear" in instances["only_through_bridges"]["dropped"]
     assert "k-clear" not in instances["only_through_bridges"]["judged_not_clear"]
@@ -694,9 +699,11 @@ def test_the_reader_takes_generator_output_as_text(tmp_path: Path) -> None:
     first = next(item for item in found if item.template_id == "stock1")
     assert any(first.reference_target.split("(")[0] in text for _, text in first.modules)
     node = dev_family.instance_node(first, ["a spec text here"], [])
-    # Family items: the stripped statement, the spec and the reference target alone.
+    # Family items: the spec, the target's docstrings and the reference target alone; the
+    # generated task statement is exposure text.
     assert node.solutions == (first.reference_target,)
-    assert dev_family.strip_task(first.task) in node.prompts and first.task in node.shown_text
+    assert node.prompts == ("a spec text here", *dev_family.docstrings(first.reference_target))
+    assert first.task in node.shown_text
     # Exposure items: the original target, every wrong attempt, both repositories' modules.
     assert first.original_target in node.shown_code and first.mutants
     assert set(first.mutants) <= set(node.shown_code)
@@ -725,8 +732,9 @@ def test_the_reader_takes_generator_output_as_text(tmp_path: Path) -> None:
     decoded = write_jsonl(tmp_path / "index.jsonl", [{"id": "t-other", "kind": "code"}])
     result_path = tmp_path / "dev-family.json"
     flags = write_flag_manifest(tmp_path / "clusters.json")
+    stage = write_replay_record(tmp_path / "replay-record.json", 0)
     argv = dev_family_argv(
-        dev, train, [(out, build)], [specs], meta, decoded, result_path, flags=flags
+        dev, train, [(out, build)], [specs], meta, decoded, result_path, flags=flags, stage=stage
     )
     assert agent_sft_data.main(argv) == 0
     dropped = json.loads(result_path.read_text())["agent"]["instances"]["dropped"]
@@ -1046,16 +1054,181 @@ def test_the_subcommand_applies_an_owner_drop_with_its_ruling(
 def test_the_subcommand_refuses_a_pending_count_the_replay_stage_disagrees_with(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """The replay stage's own count binds the flag manifest: a record reporting another
+    count (a stale or wrong manifest) or none at all is refused, and the record is
+    required."""
     paths = _setup(tmp_path)
     for count, code in ((5, 2), (2, 0)):
-        stage = tmp_path / f"stage-{count}.json"
-        rules = [{"rule": "R2", "informational_not_dropped": {PENDING_KEY: count}}]
-        stage.write_text(json.dumps({"format": "x", "rules_applied": rules}))
+        stage = write_replay_record(tmp_path / f"stage-{count}.json", count)
         out = tmp_path / f"family-{count}.json"
-        assert agent_sft_data.main([*_argv(paths, out), "--replay-record", str(stage)]) == code
+        assert agent_sft_data.main(_argv(paths, out, stage=stage)) == code
     assert "the replay stage reports 5 rows on pending flag edges" in capsys.readouterr().err
     block = json.loads((tmp_path / "family-2.json").read_text())["replay"]["pending_flags"]
     assert block["replay_stage_reported"] == 2
+    # A manifest without these rows' edges: the record's count no longer matches.
+    empty = write_flag_manifest(tmp_path / "empty-clusters.json")
+    out = tmp_path / "family-empty.json"
+    assert agent_sft_data.main(_argv({**paths, "flags": empty}, out)) == 2
+    assert "gives 0 among the replay rows" in capsys.readouterr().err
+    silent = write_replay_record(tmp_path / "stage-none.json", None, other_count=3)
+    assert agent_sft_data.main(_argv(paths, tmp_path / "family-none.json", stage=silent)) == 2
+    assert f"reports no {PENDING_KEY} count" in capsys.readouterr().err
+    argv = _argv(paths, tmp_path / "family-unset.json")
+    del argv[argv.index("--replay-record") : argv.index("--replay-record") + 2]
+    with pytest.raises(SystemExit):
+        agent_sft_data.main(argv)
+    assert not any((tmp_path / f"family-{n}.json").exists() for n in ("empty", "none", "unset"))
 
 
 PENDING_KEY = agent_sft_data.PENDING_FLAG_KEY
+
+
+def _w1(call: str, got: str, want: str) -> str:
+    return instances.W1_PHRASES[0].format(call=call, got=got, want=want)
+
+
+def test_shared_literal_values_in_task_statements_are_not_a_family_link() -> None:
+    """The generated task statement is scaffolding (a phrasing filled in with test values),
+    not a description: two templates whose statements share only digit runs stay apart.
+    With the phrasing removed those values alone reach the paraphrase level, so a statement
+    that were a family item would join tb to ta's development family."""
+    first = replace(
+        _repo_instance("a", "ta", RENAMED_DEV),
+        task=_w1("widest([[1, 1, 1], [0, 0, 0], [0, 1, 1]])", "4", "6"),
+    )
+    second = replace(
+        _repo_instance("b", "tb", "def flip(s):\n    return s[::-1]\n"),
+        task=_w1("bits_of(9)", "[1, 0, 0, 0]", "[1, 1, 1, 0]"),
+    )
+    stripped = [shingles(dev_family.strip_task(item.task), 3) for item in (first, second)]
+    assert len(stripped[0] & stripped[1]) / len(stripped[0] | stripped[1]) >= 0.5
+    dev = [task_node(t) for t in DEV]
+    nodes = [
+        dev_family.instance_node(item, _spec(item.template_id), []) for item in (first, second)
+    ]
+    assert all(
+        item.task in node.shown_text for item, node in zip((first, second), nodes, strict=True)
+    )
+    assert not any(
+        item.task in node.prompts for item, node in zip((first, second), nodes, strict=True)
+    )
+    found = {j.id: j.reason for j in assess(dev, [], nodes).subjects}
+    assert found == {"synth:a": "dev_family", "synth:b": None}
+    as_family = [
+        replace(node, prompts=(*node.prompts, dev_family.strip_task(item.task)))
+        for item, node in zip((first, second), nodes, strict=True)
+    ]
+    linked = {j.id: j.reason for j in assess(dev, [], as_family).subjects}
+    assert linked == {"synth:a": "dev_family", "synth:b": "dev_family"}
+
+
+def test_code_another_dev_family_instance_trains_is_exposure_when_shown() -> None:
+    """Template tc's specification paraphrases d0, so tc's instance (target R) is in d0's
+    family, and so is ta's instance, which also trains R. tb's rows show R as a helper while
+    training an unrelated target: tb is excluded (``prompt_code_exposure``) as it would be if
+    R were a pool task's program, and its sibling with it. A rejected instance of tb is a
+    bridge with a direct hit; an instance in a dev family showing only its own target is
+    not."""
+    program = "def top_up(level, need):\n    return max(need - level, 0)\n"
+    paraphrase = _repo_instance("c", "tc", program)
+    trains = _repo_instance("a", "ta", program)
+    shows = _repo_instance("b", "tb", "def flip(s):\n    return s[::-1]\n", helper=program)
+    sibling = _repo_instance("b2", "tb", "def upper_fn(s):\n    return s.upper()\n")
+    specs = {"tc": [prompt(16, "tcspec")], "ta": _spec("ta"), "tb": _spec("tb")}
+    node = {
+        item.id: dev_family.instance_node(item, specs[item.template_id], [])
+        for item in (paraphrase, trains, shows, sibling)
+    }
+    dev = [task_node(t) for t in DEV]
+    found = assess(dev, [], [node["c"], node["a"], node["b"], node["b2"]])
+    reasons = {j.id: j.reason for j in found.subjects}
+    assert reasons == {
+        "synth:c": "dev_family",
+        "synth:a": "dev_family",
+        "synth:b": "prompt_code_exposure",
+        "synth:b2": None,
+    }
+    assert found.families["exposure_targets_synthetic"] == 2
+    judged = [dev_family.Judgement(j.id[6:], j.status, j.reason) for j in found.subjects]
+    templates = {"c": "tc", "a": "ta", "b": "tb", "b2": "tb"}
+    assert dev_family.expand_templates(judged, templates)["b2"] == "template"
+    as_bridges = assess(dev, [], [node["b2"]], [node["c"], node["b"]])
+    assert as_bridges.bridges_hit == {"synth:b": "prompt_code_exposure"}
+    alone = assess(dev, [], [], [node["c"]])
+    assert alone.families["exposure_targets_synthetic"] == 1 and alone.bridges_hit == {}
+
+
+def test_pending_flags_fail_closed_on_conflicting_or_malformed_records() -> None:
+    """A pair with any decision other than not equivalent stays unresolved, whatever the
+    order of its lines; an edge without two endpoints and two splits is refused."""
+    edges = [("t1", "d0", "pending"), ("t2", "d0", "pending")]
+    decisions = [
+        {"train": "t1", "dev": "d0", "final": "not_equivalent"},
+        {"train": "t1", "dev": "d0", "final": "confirmed_equivalent"},
+        {"train": "t2", "dev": "d0", "final": "unclear"},
+        {"train": "t2", "dev": "d0", "final": "not_equivalent"},
+    ]
+    found = dev_family.pending_flags(edges, decisions, ["t1", "t2"])
+    assert found.kept == {} and found.excluded == ["t1", "t2"]
+    agreed = dev_family.pending_flags(edges, [decisions[0], decisions[0]], ["t1"])
+    assert agreed.kept == {"t1": [1, 2]}
+    for edge in (
+        {"a": "t1", "b": "d0", "review": "pending"},
+        {"a": "t1", "b": "d0", "splits": ["dev"]},
+        {"a": "t1", "splits": ["train", "dev"]},
+        {"a": "t1", "b": "d0", "splits": ["train", None]},
+    ):
+        with pytest.raises(ValueError, match="two endpoints and two splits"):
+            dev_family.flag_edges({"flag_edges": [edge]})
+    with pytest.raises(ValueError, match="no flag_edges"):
+        dev_family.flag_edges({})
+
+
+def test_private_records_are_refused_in_a_work_tree_that_does_not_ignore_them(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The evidence file names defined names from development solutions; it and the
+    result may sit only outside every Git work tree or where Git ignores them."""
+    import subprocess
+
+    paths = _setup(tmp_path)
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / ".gitignore").write_text("runs/\n")
+    out = tmp_path / "family.json"
+    for place in (repo / "docs" / "evidence.json", repo / "evidence.json"):
+        argv = dev_family_argv(
+            paths["dev"],
+            paths["train"],
+            [(paths["judged"], paths["build"])],
+            [paths["specs"]],
+            paths["meta"],
+            paths["decoded"],
+            out,
+            flags=paths["flags"],
+            stage=paths["stage"],
+            evidence=place,
+        )
+        assert agent_sft_data.main(argv) == 2
+        assert "and not ignored" in capsys.readouterr().err
+        assert not place.exists() and not out.exists()
+    tracked_out = repo / "family.json"
+    argv = _argv(paths, tmp_path / "unused.json")
+    argv[argv.index("--out") + 1] = str(tracked_out)
+    assert agent_sft_data.main(argv) == 2
+    assert "and not ignored" in capsys.readouterr().err
+    ignored = repo / "runs" / "v3" / "evidence.json"
+    argv = dev_family_argv(
+        paths["dev"],
+        paths["train"],
+        [(paths["judged"], paths["build"])],
+        [paths["specs"]],
+        paths["meta"],
+        paths["decoded"],
+        repo / "runs" / "v3" / "family.json",
+        flags=paths["flags"],
+        stage=paths["stage"],
+        evidence=ignored,
+    )
+    assert agent_sft_data.main(argv) == 0 and ignored.exists()
