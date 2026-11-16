@@ -195,16 +195,24 @@ a rejected one is still caught ("bridge protection"). Excluded instances stay in
 Excluded and flagged instances are both dropped: a flag cannot be adjudicated without
 behaviour runs, so it is treated as unresolved and kept out. Then every instance of a template
 that holds a dropped instance is dropped too (`template`), since a template is one task family
-with renamed variants. A dropped instance loses all its rows (the edit row and both repair
-rows). The result reports instance-level and template-expanded counts; the expanded set is the
-one `mix` uses.
+with renamed variants. Bridges are not judged, but their own shared-name edges to development
+tasks are scored: a template that holds a bridge at the flag level or above is dropped the
+same way (`templates_dropped_through_bridge_named_edges`). A dropped instance loses all its
+rows (the edit row and both repair rows). The result reports instance-level and
+template-expanded counts, and which drops only bridges reach (`only_through_bridges`: the same
+judging with no rejected or superseded instance in the graph); the expanded set is the one
+`mix` uses.
 
 **Replay rows** are pool training tasks, judged by the family rule when the replay set was
-built. A replay row is dropped only when synthetic nodes create a new chain: its family holds
-a development task with them and did not without them. Rows whose family held a development
-task without synthetic nodes keep their adjudicated outcome and are counted; so are rows with
-a direct shared-name edge to a development task (pending flag edges stay as the replay stage
-reported them).
+built. A replay row is dropped when synthetic nodes add a development task to its family:
+either its family held none without them (`rejected_new_chain`), or it held some and the
+synthetic nodes join it to one more (`rejected_new_dev_link`; that link was never
+adjudicated). Rows whose family held a development task without synthetic nodes and gains none
+keep their adjudicated outcome and are counted. So are rows with a direct shared-name edge to
+a development task: pending flag edges stay as the replay stage reported them. With
+`--replay-record`, the replay stage's record path, its SHA-256 and the pending-flag counts it
+reports are written beside the in-graph figure, so a reader can see that those rows were kept
+as reported, not re-judged.
 
 **Why the efficient form is the same rule.** The cross product of an instance's prompts and
 solutions can hold hundreds of items, and pairwise edges among identical keys are quadratic.
@@ -234,22 +242,37 @@ classes, counts): `dev_family: "task-clusters-v1"`, the thresholds, the pool dev
 training files' SHA-256, every instance set's registry SHA-256 and build file SHA-256, the
 specification files' SHA-256, and per side `input_kind` and `input_sha256` (the rows metadata
 and the decoded replay index). It never writes a prompt, solution, signal or development
-task ID. `mix --dev-family` refuses a result for another input, another rule or other
-thresholds, one that did not judge every mixed replay kind, or one whose development file
-differs from the file a contamination result checked; the agent-case and benchmark
-contamination results are still required. The mix record states both development checks.
+task ID.
+
+Each `--judged INSTANCES BUILD` pair must belong together. The build's `record.json` must name
+the instance set's registry (`instances_registry_sha256`), and every row's `spec_sha256` must
+equal the registered `case.json` hash of its instance. A superseded set that reuses the
+instance IDs therefore cannot be judged in place of the set the rows came from. Leaving out
+`--bridge-instances` prints a warning, and `mix --require-instance-registry SHA...` refuses a
+result whose graph did not hold each named set (judged or bridge).
+
+`mix --dev-family` refuses a result for another input, another rule or other thresholds, one
+that did not judge every mixed replay kind, or one whose development file differs from the
+file a contamination result checked; the agent-case and benchmark contamination results are
+still required. The mix record states both development checks and the registry of every
+instance set the result held. `manifest` describes builds, which come before the rule, so it
+states the rule as required before mixing; with `--dev-family` it also records that result's
+SHA-256, dropped counts and survivors.
 
 ```bash
 uv run --locked python -m tools.agent_sft_data dev-family \
   --dev POOL/dev.jsonl --train POOL/train.jsonl \
   --judged INSTANCES_A BUILD_A --judged INSTANCES_B BUILD_B \
   --bridge-instances SUPERSEDED --specs SPECS_1 SPECS_2 \
-  --rows-meta ROWS_META --decoded REPLAY_INDEX --out DEV_FAMILY.json
+  --rows-meta ROWS_META --decoded REPLAY_INDEX --replay-record REPLAY_RECORD \
+  --out DEV_FAMILY.json
 ```
 
 Limits: the rule is static, so two programs that behave alike but share no signal are not
-linked; and because every instance of a template shares its specification text, one link
-usually puts the whole template in a development family.
+linked. Because every instance of a template shares its specification text, one link usually
+puts the whole template in a development family. The graph holds the pool's development and
+training tasks only, never a sealed split, so a chain that passes through a held-out task is
+not seen.
 
 ## Verification
 
@@ -271,9 +294,10 @@ usually puts the whole template in a development family.
 - `tests/test_agent_dev_family.py`: the reference tests against copies of `dev_family_ids` and
   `scan` (`tests/dev_family_reference.py`) on cross-product items, the link construction
   against `find_edges` components, each status and reason, the bridge regressions (kept
-  instance and replay row reaching a development task through a rejected instance), template
-  expansion, flagged instances dropped, the subcommand's result and refusals, and the reader
-  on `generate` output.
+  instance and replay row reaching a development task through a rejected instance), a replay
+  row joined to a further development task, template expansion (also through a bridge's
+  shared-name edge), flagged instances dropped, the subcommand's result and refusals (including
+  a swapped instance set and build), and the reader on `generate` output.
 
 Run them with `uv run --locked pytest tests/test_agent_synth*.py tests/test_agent_dev_family.py`.
 

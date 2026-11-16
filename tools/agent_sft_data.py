@@ -41,10 +41,12 @@ anything is opened:
 - ``dev-family``: the development task-family rule (``task-clusters-v1``,
   ``scratchcoder.agent.synth.dev_family``) on the accepted instances of every ``--judged``
   build, with pool development and training tasks, the builds' rejected instances and any
-  ``--bridge-instances`` set in the family graph, and on the replay index's rows (new chains
-  through synthetic nodes only). Drops every row of an excluded or flagged instance and of
-  every instance of its template; writes one status-only result bound to the rows metadata
-  and the replay index. Runs nothing.
+  ``--bridge-instances`` set in the family graph, and on the replay index's rows (dropped
+  when synthetic nodes add a development task to a row's family). Each judged build must name
+  its instance set's registry and each row its instance's registered ``case.json``. Drops
+  every row of an excluded or flagged instance and of every instance of its template (or of a
+  template holding a bridge with a shared-name edge to a development task); writes one
+  status-only result bound to the rows metadata and the replay index. Runs nothing.
 - ``mix``: agent rows plus replay rows at a target ratio of assistant-loss tokens. It needs
   both contamination results, computed on exactly these inputs and against exactly the case
   registries named by ``--case-registry-sha256``, and the dev-family result for both sides,
@@ -113,6 +115,12 @@ DEV_CHECKS = (
     "result), and 13-gram overlap with development prompts and solutions where a "
     "contamination result names a development file (dev_ngram_sha256)"
 )
+DEV_SCOPE = (
+    f"development tasks: required before mixing; the build counts here come before it. mix "
+    f"refuses without a {dev_family.RULE} dev-family result for both sides and records it "
+    "with the 13-gram checks (see the mix record; dev_family below when one is given)"
+)
+"""The manifest's statement: it describes builds, which come before the family rule."""
 
 
 def _tokenizer(path: Path) -> tuple[TextEncoder, TextDecoder]:
@@ -786,10 +794,22 @@ def _pool_tasks(path: Path, split: str) -> list[Task]:
     return tasks
 
 
-def _dev_family_inputs(
-    args: argparse.Namespace, meta: Sequence[dict[str, Any]]
-) -> tuple[dict[str, Any], list[dev_family.Node], list[dev_family.Node], dict[str, str]]:
-    """Subject and bridge nodes, each subject's template, and the record of every source."""
+DevFamilyInputs = tuple[
+    dict[str, Any],
+    list[dev_family.Node],
+    list[dev_family.Node],
+    dict[str, str],
+    dict[str, set[str]],
+]
+
+
+def _dev_family_inputs(args: argparse.Namespace, meta: Sequence[dict[str, Any]]) -> DevFamilyInputs:
+    """Subject and bridge nodes, each subject's template, the templates under each bridge
+    node ID, and the record of every source.
+
+    Each ``--judged`` pair must belong together: the build's record names the instance set's
+    registry, and every row names the registered ``case.json`` of the instance it came from,
+    so a superseded set that reuses the instance IDs cannot stand in for the real one."""
     spec_texts = dev_family.load_specs(args.spec_files)
     rows_by_instance: dict[str, list[dict[str, Any]]] = {}
     if len({str(row["id"]) for row in meta}) != len(meta):
@@ -801,6 +821,12 @@ def _dev_family_inputs(
     record: dict[str, Any] = {"judged": [], "bridges": []}
     for directory, build in args.judged:
         found, registry = dev_family.read_instances(directory)
+        build_record = build / "record.json"
+        named = json.loads(build_record.read_text(encoding="utf-8")).get(
+            "instances_registry_sha256"
+        )
+        if named != registry:
+            raise ValueError(f"{build} was not built from {directory} as it is (registry)")
         outcome = {}
         for line in _jsonl(build / "instances.jsonl"):
             if str(line["instance"]) in outcome:
@@ -817,6 +843,7 @@ def _dev_family_inputs(
                 "instances": str(directory),
                 "registry_sha256": registry,
                 "build": str(build),
+                "build_record_sha256": _sha_file(build_record),
                 "build_instances_sha256": _sha_file(build / "instances.jsonl"),
                 "accepted": len(accepted),
                 "rejected": sum(1 for item in found if outcome.get(item.id) is False),
@@ -836,11 +863,19 @@ def _dev_family_inputs(
     template_of = {item.id: item.template_id for item in subjects}
     if len(template_of) != len(subjects):
         raise ValueError("an accepted instance ID appears in two builds")
+    spec_of = {item.id: item.spec_sha256 for item in subjects}
     for identifier, rows_of in rows_by_instance.items():
         if identifier not in template_of:
             raise ValueError(f"rows of {identifier}, which no build accepted")
         if any(str(row["template_id"]) != template_of[identifier] for row in rows_of):
             raise ValueError(f"rows of {identifier} name another template")
+        if any(row.get("spec_sha256") != spec_of[identifier] for row in rows_of):
+            raise ValueError(
+                f"rows of {identifier} were not built from the judged instance (case.json)"
+            )
+    bridge_templates: dict[str, set[str]] = {}
+    for item in bridges:
+        bridge_templates.setdefault(dev_family.NAMESPACE + item.id, set()).add(item.template_id)
     missing = sorted({item.template_id for item in [*subjects, *bridges]} - set(spec_texts))
     if missing:
         raise ValueError(f"no specification text for templates {missing}")
@@ -864,19 +899,48 @@ def _dev_family_inputs(
         "each of its top-level functions and classes",
         "node_ids": dev_family.NAMESPACE + "<instance>",
     }
-    return record, nodes, bridge_nodes, template_of
+    return record, nodes, bridge_nodes, template_of, bridge_templates
+
+
+def _replay_stage(path: Path | None) -> dict[str, Any] | None:
+    """The replay stage's record, by path and SHA-256, with every count it reports as kept
+    on pending (unreviewed) flag edges, so the in-graph figure can be read beside it."""
+    if path is None:
+        return None
+    data = path.read_bytes()
+    document = json.loads(data)
+    pending = {
+        f"{rule.get('rule', '?')}.{key}": value
+        for rule in document.get("rules_applied", ())
+        if isinstance(rule, dict)
+        for key, value in (rule.get("informational_not_dropped") or {}).items()
+        if "pending" in key
+    }
+    return {
+        "record": str(path),
+        "record_sha256": hashlib.sha256(data).hexdigest(),
+        "format": document.get("format"),
+        "pending_flag_rows_reported": pending,
+    }
 
 
 def run_dev_family(args: argparse.Namespace) -> int:
     if args.out.exists():
         print(f"refused: {args.out} exists", file=sys.stderr)
         return 2
+    if not args.bridge_instances:
+        print(
+            "warning: no --bridge-instances: chains through superseded instance sets are not "
+            "in the graph",
+            file=sys.stderr,
+        )
     try:
         dev = _pool_tasks(args.dev, "dev")
         train = _pool_tasks(args.train, "train")
         meta, meta_sha256 = _hashed_jsonl(args.rows_meta)
         index, index_sha256 = _hashed_jsonl(args.decoded)
-        synthetic, subjects, bridges, template_of = _dev_family_inputs(args, meta)
+        stage = _replay_stage(args.replay_record)
+        synthetic, subjects, bridges, template_of, bridge_templates = _dev_family_inputs(args, meta)
         if len({str(row["id"]) for row in index}) != len(index):
             raise ValueError("the replay index repeats a row ID")
         replay = [str(row["id"]) for row in index if str(row["kind"]) in set(args.replay_kinds)]
@@ -887,14 +951,27 @@ def run_dev_family(args: argparse.Namespace) -> int:
             bridges,
             replay=replay,
         )
+        # The same judging without any bridge, to count what only bridges reach.
+        unbridged = dev_family.assess(
+            [dev_family.task_node(task) for task in dev],
+            [dev_family.task_node(task) for task in train],
+            subjects,
+        )
     except (ValueError, KeyError, TypeError, OSError) as error:
         print(f"refused: dev-family: {error}", file=sys.stderr)
         return 2
     prefix = len(dev_family.NAMESPACE)
-    judged = [
-        dev_family.Judgement(item.id[prefix:], item.status, item.reason) for item in found.subjects
-    ]
-    dropped = dev_family.expand_templates(judged, template_of)
+
+    def strip(judgements: Sequence[dev_family.Judgement]) -> list[dev_family.Judgement]:
+        return [dev_family.Judgement(j.id[prefix:], j.status, j.reason) for j in judgements]
+
+    judged = strip(found.subjects)
+    bridge_template_hits = sorted(
+        {template for node in found.bridges_named for template in bridge_templates[node]}
+    )
+    dropped = dev_family.expand_templates(judged, template_of, bridge_template_hits)
+    dropped_unbridged = dev_family.expand_templates(strip(unbridged.subjects), template_of)
+    clear_unbridged = {j.id for j in strip(unbridged.subjects) if j.status == "clear"}
     rejected = sorted(str(row["id"]) for row in meta if str(row["instance"]) in dropped)
     kept = [row for row in meta if str(row["instance"]) not in dropped]
     rows_dropped = {
@@ -942,6 +1019,14 @@ def run_dev_family(args: argparse.Namespace) -> int:
                     for reason in dev_family.REASONS
                 },
                 "templates_dropped": sorted({template_of[i] for i in dropped}),
+                "bridges_with_named_edge": found.bridges_named,
+                "templates_dropped_through_bridge_named_edges": bridge_template_hits,
+                "only_through_bridges": {
+                    "judged_not_clear": sorted(
+                        j.id for j in judged if j.status != "clear" and j.id in clear_unbridged
+                    ),
+                    "dropped": sorted(set(dropped) - set(dropped_unbridged)),
+                },
             },
             "rows_dropped_by_reason": rows_dropped,
             "rows_dropped_instance_level": sum(
@@ -953,6 +1038,10 @@ def run_dev_family(args: argparse.Namespace) -> int:
                 "templates": len({row["template_id"] for row in kept}),
                 "families": len({row["family"] for row in kept}),
                 "workflow_types": sorted({str(row["workflow_type"]) for row in kept}),
+                "rows_by_kind": dict(sorted(Counter(str(row["kind"]) for row in kept).items())),
+                "mutation_kinds": sorted(
+                    {str(row["mutation_kind"]) for row in kept if row.get("mutation_kind")}
+                ),
                 "loss_tokens": sum(int(row.get("loss_tokens", 0)) for row in kept),
                 **mixing.reply_diversity(kept),
             },
@@ -964,8 +1053,13 @@ def run_dev_family(args: argparse.Namespace) -> int:
             "kinds": sorted(set(args.replay_kinds)),
             "checked": len(replay),
             "rejected": found.replay_excluded,
+            "rejected_new_chain": len(found.replay_new_chain),
+            "rejected_new_dev_link": len(found.replay_new_dev_link),
             "kept_in_dev_family_without_synthetic": len(found.replay_in_dev_family),
+            # An in-graph stand-in for the replay stage's pending flag edges, which it
+            # does not overturn: read it beside ``replay_stage``.
             "kept_direct_named_edge_without_synthetic": len(found.replay_named),
+            "replay_stage": stage,
             "not_judged_other_kinds": len(index) - len(replay),
         },
     }
@@ -1016,6 +1110,7 @@ def run_mix(args: argparse.Namespace) -> int:
             replay_index=args.replay_index,
             replay_kinds=args.replay_kinds,
             dev_sha256=[side["dev_ngram_sha256"] for side in checked.values()],
+            bridge_registries=args.require_instance_registry or (),
         )
     except (ValueError, KeyError, OSError) as error:
         print(f"refused: dev-family: {error}", file=sys.stderr)
@@ -1066,6 +1161,14 @@ def run_mix(args: argparse.Namespace) -> int:
                 "pool_train_sha256": family["pool"]["train_sha256"],
                 "agent_rejected": len(family_agent),
                 "replay_rejected": len(family_replay),
+                "instance_registries": sorted(
+                    str(part["registry_sha256"])
+                    for part in [
+                        *family["synthetic"].get("judged", ()),
+                        *family["synthetic"].get("bridges", ()),
+                    ]
+                ),
+                "required_instance_registries": sorted(args.require_instance_registry or ()),
             },
             "dev_method": DEV_CHECKS,
             "case_registries": sorted(args.case_registry_sha256),
@@ -1140,12 +1243,24 @@ def manifest(args: argparse.Namespace) -> int:
         "contamination_scope": {
             "evaluation_cases": "13-gram overlap, reference AST and defined-name Jaccard "
             "against every registered evaluation case, plus the family blocklist",
-            "development_tasks": DEV_CHECKS,
+            "development_tasks": DEV_SCOPE,
             "benchmarks": "13-gram overlap (at least three word tokens) with benchmark "
             "prompts and reference solutions",
         },
         "builds": builds,
     }
+    if args.dev_family is not None:
+        family = dev_family.load_result(args.dev_family)
+        document["dev_family"] = {
+            "result": str(args.dev_family),
+            "result_sha256": _sha_file(args.dev_family),
+            "rule": family["dev_family"],
+            "agent_rows_dropped": len(family["agent"]["rejected"]),
+            "instances_dropped": len(family["agent"]["instances"]["dropped"]),
+            "dropped_by_reason": family["agent"]["instances"]["dropped_by_reason"],
+            "replay_rows_dropped": len(family["replay"]["rejected"]),
+            "surviving": family["agent"]["surviving"],
+        }
     if args.specs is not None:
         document["specs_sha256"] = _sha_file(args.specs)
     if args.ledger is not None:
@@ -1273,6 +1388,12 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--rows-meta", type=Path, required=True)
     d.add_argument("--decoded", type=Path, required=True, help="the decoded replay index")
     d.add_argument("--replay-kinds", nargs="+", default=["code"])
+    d.add_argument(
+        "--replay-record",
+        type=Path,
+        help="the replay stage's record.json: its SHA-256 and the pending flag counts it "
+        "reports are written beside the in-graph figure",
+    )
     d.add_argument("--out", type=Path, required=True)
     m = commands.add_parser("mix")
     m.add_argument("--agent-rows", type=Path, required=True)
@@ -1299,6 +1420,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="the dev-family result of --agent-meta and --replay-index (dev-family)",
     )
     m.add_argument(
+        "--require-instance-registry",
+        nargs="+",
+        metavar="SHA256",
+        help="registry SHA-256 of instance sets (judged or bridge) the dev-family result "
+        "must have held in its graph, such as a superseded set",
+    )
+    m.add_argument(
         "--case-registry-sha256",
         nargs="+",
         required=True,
@@ -1318,6 +1446,11 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--specs", type=Path)
     f.add_argument("--ledger", type=Path)
     f.add_argument("--max-calls", type=int, default=call_ledger.DEFAULT_CAP)
+    f.add_argument(
+        "--dev-family",
+        type=Path,
+        help="a dev-family result to record (its SHA-256, dropped counts and survivors)",
+    )
     f.add_argument("--out", type=Path, required=True)
     return parser
 
@@ -1343,6 +1476,7 @@ PATH_ARGS = (
     "specs",
     "train",
     "dev_family",
+    "replay_record",
 )
 PATH_LIST_ARGS = (
     "seed_from",

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 from dev_family_fixtures import (
+    case_sha,
     dev_family_argv,
     meta_line,
     pool_task,
@@ -179,6 +180,38 @@ def test_a_replay_row_reaching_dev_through_a_rejected_instance_is_newly_excluded
     assert _assess(bridges=()).replay_excluded == []
 
 
+def test_a_replay_row_joined_to_a_further_dev_task_is_newly_excluded() -> None:
+    """A replay row already in d0's family (kept by the replay stage) is joined to d1 through
+    a synthetic node: that link was never adjudicated, so the row is dropped."""
+    program = "def rprog(w):\n    return w % 7 + 3\n"
+    row = pool_task("r", prompt(16, "rp"), program, "train")
+    joiner = Node("synth:j", (words("jn", 15),), (program, SECOND_SOLUTION.replace("x", "y")))
+    found = assess(
+        [task_node(t) for t in DEV], [task_node(row)], [], [joiner], replay=["r"]
+    )  # fmt: skip
+    assert found.replay_excluded == ["r"] and found.replay_new_dev_link == ["r"]
+    assert found.replay_new_chain == [] and found.replay_in_dev_family == []
+    alone = assess([task_node(t) for t in DEV], [task_node(row)], [], [], replay=["r"])
+    assert alone.replay_excluded == [] and alone.replay_in_dev_family == ["r"]
+    # The regression (b) row is a new chain, not a new link.
+    assert _assess().replay_new_chain == ["t-new"] and _assess().replay_new_dev_link == []
+
+
+def test_a_bridge_with_a_named_edge_to_dev_drops_its_template() -> None:
+    """A rejected instance that defines a dev task's function name at the named-paraphrase
+    level, while its accepted sibling has neither signal: the bridge is not judged, but its
+    template is dropped."""
+    sibling = Node("synth:a", (words("sa", 15),), ("def sib(a):\n    return a * 5\n",))
+    bridge = Node("synth:b", (prompt(10, "br"),), ("def secretfn(v):\n    return min(v)\n",))
+    weak = Node("synth:w", (prompt(6, "wk"),), ("def secretfn(v):\n    return max(v)\n",))
+    found = assess([task_node(t) for t in DEV], [], [sibling], [bridge, weak])
+    assert [(j.id, j.status) for j in found.subjects] == [("synth:a", "clear")]
+    assert found.bridges_named == {"synth:b": "dev_named_paraphrase", "synth:w": "dev_named_flag"}
+    judged = [dev_family.Judgement("a", "clear", None)]
+    assert dev_family.expand_templates(judged, {"a": "T"}) == {}
+    assert dev_family.expand_templates(judged, {"a": "T"}, ["T"]) == {"a": "template"}
+
+
 def test_template_expansion_drops_every_instance_of_a_dropped_template() -> None:
     """Regression (c): s-sibling is clear, but its template holds an excluded instance."""
     prefix = len(dev_family.NAMESPACE)
@@ -341,22 +374,36 @@ def _setup(tmp_path: Path) -> dict[str, Path]:
     register(judged)
     accepted = ("k-clear", "k-kept", "k-sibling", "k-flag", "k-flag-sib")
     build = write_build(
-        tmp_path / "build-a", {**dict.fromkeys(accepted, True), "k-rejected": False}
+        tmp_path / "build-a", {**dict.fromkeys(accepted, True), "k-rejected": False}, judged
     )
     old = tmp_path / "instances-old"
-    write_instance(old, "o-bridge", template="tr", task=words("rtwo", 15), reference=LONELY,
+    write_instance(old, "o-bridge", template="to", task=words("rtwo", 15), reference=LONELY,
                    others={"extra.py": SECOND_SOLUTION.replace("x", "y")})  # fmt: skip
     register(old)
     specs = write_specs(
         tmp_path / "specs.json",
-        {key: words(f"spec{key}", 12) for key in ("tc", "ta", "tf", "tr")},
+        {key: words(f"spec{key}", 12) for key in ("tc", "ta", "tf", "tr", "to")},
     )
     rows = []
     for name, template in (("k-clear", "tc"), ("k-kept", "ta"), ("k-flag-sib", "tf")):
         for kind in ("edit", "repair-1", "repair-2"):
-            rows.append(meta_line(name, template, kind, words(f"{name}{kind}", 12), "x = 1"))
-    rows.append(meta_line("k-flag", "tf", "edit", words("flagrow", 12), "x = 2"))
-    rows.append(meta_line("k-sibling", "ta", "edit", words("sibrow", 12), "x = 3"))
+            rows.append(
+                meta_line(
+                    name,
+                    template,
+                    kind,
+                    words(f"{name}{kind}", 12),
+                    "x = 1",
+                    spec_sha256=case_sha(judged, name),
+                )
+            )
+    for name, template, text, reply in (
+        ("k-flag", "tf", words("flagrow", 12), "x = 2"),
+        ("k-sibling", "ta", words("sibrow", 12), "x = 3"),
+    ):
+        rows.append(
+            meta_line(name, template, "edit", text, reply, spec_sha256=case_sha(judged, name))
+        )
     meta = write_jsonl(tmp_path / "rows-meta.jsonl", rows)
     decoded = write_jsonl(
         tmp_path / "decoded-index.jsonl",
@@ -375,7 +422,13 @@ def _setup(tmp_path: Path) -> dict[str, Path]:
     }
 
 
-def _argv(paths: dict[str, Path], out: Path, *, bridges: bool = True) -> list[str]:
+def _argv(
+    paths: dict[str, Path],
+    out: Path,
+    *,
+    bridges: bool = True,
+    more_bridges: Sequence[Path] = (),
+) -> list[str]:
     return dev_family_argv(
         paths["dev"],
         paths["train"],
@@ -384,14 +437,28 @@ def _argv(paths: dict[str, Path], out: Path, *, bridges: bool = True) -> list[st
         paths["meta"],
         paths["decoded"],
         out,
-        bridges=[paths["old"]] if bridges else [],
+        bridges=[*([paths["old"]] if bridges else []), *more_bridges],
     )
 
 
-def test_the_subcommand_writes_a_bound_status_only_result(tmp_path: Path) -> None:
+def test_the_subcommand_writes_a_bound_status_only_result(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     paths = _setup(tmp_path)
     out = tmp_path / "dev-family.json"
-    assert agent_sft_data.main(_argv(paths, out)) == 0
+    stage = tmp_path / "replay-record.json"
+    stage.write_text(
+        json.dumps(
+            {
+                "format": "replay-stage-v1",
+                "rules_applied": [
+                    {"rule": "R2", "informational_not_dropped": {"rows_on_pending_flags": 7}},
+                    {"rule": "R3", "informational_not_dropped": {"other_count": 2}},
+                ],
+            }
+        )
+    )
+    assert agent_sft_data.main([*_argv(paths, out), "--replay-record", str(stage)]) == 0
     result = json.loads(out.read_text())
     assert result["dev_family"] == "task-clusters-v1"
     assert result["rules"] == {
@@ -424,9 +491,28 @@ def test_the_subcommand_writes_a_bound_status_only_result(tmp_path: Path) -> Non
     replay = result["replay"]
     assert replay["input_kind"] == "decoded" and replay["kinds"] == ["code"]
     assert replay["rejected"] == ["t-new"]  # Through the superseded set's instance.
+    assert replay["rejected_new_chain"] == 1 and replay["rejected_new_dev_link"] == 0
     assert replay["kept_in_dev_family_without_synthetic"] == 1
     assert replay["kept_direct_named_edge_without_synthetic"] == 1
     assert replay["not_judged_other_kinds"] == 1
+    # The replay stage's own pending-flag figure, with its record's hash, sits beside it.
+    assert replay["replay_stage"] == {
+        "record": str(stage),
+        "record_sha256": dev_family.sha_file(stage),
+        "format": "replay-stage-v1",
+        "pending_flag_rows_reported": {"R2.rows_on_pending_flags": 7},
+    }
+    # k-kept is excluded only through the rejected instance; k-sibling joins it by template
+    # text, so both are reached only through bridges.
+    assert agent["instances"]["only_through_bridges"] == {
+        "judged_not_clear": ["k-kept", "k-sibling"],
+        "dropped": ["k-kept", "k-sibling"],
+    }
+    assert agent["instances"]["bridges_with_named_edge"] == {}
+    assert agent["surviving"]["rows_by_kind"] == {"edit": 1, "repair": 2}
+    assert result["synthetic"]["judged"][0]["build_record_sha256"] == dev_family.sha_file(
+        paths["build"] / "record.json"
+    )
     assert result["pool"]["dev_sha256"] == dev_family.sha_file(paths["dev"])
     assert result["synthetic"]["judged"][0]["rejected"] == 1
     assert result["synthetic"]["bridges"][0]["count"] == 1
@@ -434,10 +520,66 @@ def test_the_subcommand_writes_a_bound_status_only_result(tmp_path: Path) -> Non
     text = out.read_text()
     assert "alpha0" not in text and "secretfn" not in text and '"d0"' not in text
     # Without the superseded set, the replay row has no chain to dev.
+    capsys.readouterr()
     again = tmp_path / "without.json"
     assert agent_sft_data.main(_argv(paths, again, bridges=False)) == 0
     assert json.loads(again.read_text())["replay"]["rejected"] == []
+    assert "warning: no --bridge-instances" in capsys.readouterr().err
+    assert json.loads(again.read_text())["replay"]["replay_stage"] is None
     assert agent_sft_data.main(_argv(paths, out)) == 2  # The output exists.
+
+
+def test_a_bridge_named_edge_drops_its_template_in_the_subcommand(tmp_path: Path) -> None:
+    """A superseded instance of k-clear's template defines a dev function name at the
+    named-paraphrase level; k-clear has no signal of its own and is dropped (``template``)."""
+    paths = _setup(tmp_path)
+    extra = tmp_path / "instances-named"
+    write_instance(extra, "n-bridge", template="tc", task=prompt(10, "nb"),
+                   reference="def secretfn(v):\n    return min(v)\n")  # fmt: skip
+    register(extra)
+    out = tmp_path / "dev-family.json"
+    assert agent_sft_data.main(_argv(paths, out, more_bridges=[extra])) == 0
+    instances = json.loads(out.read_text())["agent"]["instances"]
+    assert instances["bridges_with_named_edge"] == {"synth:n-bridge": "dev_named_paraphrase"}
+    assert instances["templates_dropped_through_bridge_named_edges"] == ["tc"]
+    assert instances["dropped"]["k-clear"] == "template"
+    assert "k-clear" in instances["only_through_bridges"]["dropped"]
+    assert "k-clear" not in instances["only_through_bridges"]["judged_not_clear"]
+
+
+def test_a_judged_pair_must_belong_together(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A superseded set that reuses the instance IDs cannot stand in for the set the rows
+    were built from: the build record names the registry, and each row names its instance's
+    registered case.json."""
+    paths = _setup(tmp_path)
+    superseded = tmp_path / "instances-superseded"
+    templates = {"k-clear": "tc", "k-kept": "ta", "k-sibling": "ta", "k-flag": "tf"}
+    templates |= {"k-flag-sib": "tf", "k-rejected": "tr"}
+    for name, template in templates.items():
+        write_instance(superseded, name, template=template, task=words(f"old{name}", 15),
+                       reference="def fine(s):\n    return s.lower()\n")  # fmt: skip
+    register(superseded)
+    swapped = {**paths, "judged": superseded}
+    assert agent_sft_data.main(_argv(swapped, tmp_path / "a.json")) == 2
+    assert "was not built from" in capsys.readouterr().err
+    # A build record that names the superseded registry: the rows still name other instances.
+    built = (paths["build"] / "instances.jsonl").read_text().splitlines()
+    outcomes = {line["instance"]: line["accepted"] for line in map(json.loads, built)}
+    relabelled = write_build(tmp_path / "build-relabelled", outcomes, superseded)
+    swapped = {**swapped, "build": relabelled}
+    assert agent_sft_data.main(_argv(swapped, tmp_path / "b.json")) == 2
+    assert "were not built from the judged instance" in capsys.readouterr().err
+    # A row without the instance's case.json hash.
+    lines = paths["meta"].read_text().splitlines()
+    first = json.loads(lines[0])
+    del first["spec_sha256"]
+    bare = tmp_path / "bare-meta.jsonl"
+    bare.write_text("\n".join([json.dumps(first), *lines[1:]]) + "\n")
+    assert agent_sft_data.main(_argv({**paths, "meta": bare}, tmp_path / "c.json")) == 2
+    assert "were not built from the judged instance" in capsys.readouterr().err
+    assert not any((tmp_path / f"{name}.json").exists() for name in "abc")
 
 
 def test_the_subcommand_refuses_unresolved_inputs(
@@ -498,10 +640,20 @@ def test_the_reader_takes_generator_output_as_text(tmp_path: Path) -> None:
         [pool_task("d0", words("unrelated", 20), first.reference_target, "dev")],
     )
     train = write_pool(tmp_path / "pool" / "train.jsonl", TRAIN)
-    build = write_build(tmp_path / "build", {item.id: True for item in found})
+    build = write_build(tmp_path / "build", {item.id: True for item in found}, out)
     meta = write_jsonl(
         tmp_path / "rows-meta.jsonl",
-        [meta_line(item.id, item.template_id, "edit", words("row", 12), "x") for item in found],
+        [
+            meta_line(
+                item.id,
+                item.template_id,
+                "edit",
+                words("row", 12),
+                "x",
+                spec_sha256=item.spec_sha256,
+            )
+            for item in found
+        ],
     )
     decoded = write_jsonl(tmp_path / "index.jsonl", [{"id": "t-other", "kind": "code"}])
     result_path = tmp_path / "dev-family.json"

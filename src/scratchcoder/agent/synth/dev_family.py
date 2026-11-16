@@ -39,13 +39,15 @@ trained on) are judged. A subject is
 
 *Bridges* (rejected and superseded instances) and pool training tasks are never judged, but
 they carry links, so a subject joined to a development task only through a rejected row is
-still excluded. Excluded and flagged subjects stay in the graph as nodes.
+still excluded. Excluded and flagged subjects stay in the graph as nodes. A bridge's own
+direct shared-name edges to development tasks are scored too (``bridges_named``): the caller
+drops every subject of a template that holds such a bridge.
 
 **Replay rows** are pool training tasks. One is newly excluded when its family, with the
-synthetic nodes added, contains a development task while its family without them did not:
-a new chain through synthetic nodes. Families that already held a development task were
-judged when the replay set was built; this check reports them and does not overturn that
-outcome.
+synthetic nodes added, holds a development task that its family without them did not: a new
+chain through synthetic nodes, either into a first development task or into one more. Rows
+whose family already held a development task and gains none were judged when the replay set
+was built; this check reports them and does not overturn that outcome.
 """
 
 from __future__ import annotations
@@ -83,15 +85,17 @@ NAMESPACE = "synth:"
 STATUSES = ("excluded", "flagged", "clear")
 REASONS = ("dev_family", "dev_named_paraphrase", "dev_named_flag", "template")
 """Reason classes: the first three judge an instance; ``template`` drops every instance of a
-template that holds an excluded or flagged instance."""
+template that holds an excluded or flagged instance, or a bridge with a direct shared-name
+edge to a development task at the flag level or above."""
 METHOD = (
     "task-family rule task-clusters-v1 against the pool development split: union-signal "
     "families over pool development and training tasks and every synthetic instance "
     "(rejected and superseded instances as unjudged bridges); an accepted instance is "
     "dropped when its family holds a development task or it shares a defined name with one "
     "(prompt Jaccard at least 0.10, flagged ones included), and every instance of a template "
-    "with a dropped instance is dropped; replay rows are dropped on a new chain through "
-    "synthetic nodes"
+    "with a dropped instance, or with a bridge sharing a defined name with a development "
+    "task at that level, is dropped; replay rows are dropped when synthetic nodes add a "
+    "development task to their family"
 )
 
 
@@ -230,13 +234,24 @@ class Judgement:
 class Assessment:
     subjects: list[Judgement]
     replay_excluded: list[str]
-    """Replay rows newly in a development family through synthetic nodes."""
+    """Replay rows whose family gains a development task through synthetic nodes (dropped):
+    both kinds below."""
+    replay_new_chain: list[str]
+    """Of those, rows whose family held no development task without synthetic nodes."""
+    replay_new_dev_link: list[str]
+    """Of those, rows whose family already held a development task without synthetic nodes
+    and is joined to a further one through them (that link was never adjudicated)."""
     replay_in_dev_family: list[str]
-    """Replay rows whose family held a development task without synthetic nodes (kept)."""
+    """Replay rows whose family held a development task without synthetic nodes and gains
+    none through them (kept: the replay stage's outcome stands)."""
     replay_named: list[str]
     """Replay rows outside every development family, with or without synthetic nodes, that
     have a direct shared-name edge to a development task at the flag level or above (kept:
     pending flag edges stay as the replay stage reported them)."""
+    bridges_named: dict[str, str]
+    """Bridges with a direct shared-name edge to a development task at the flag level or
+    above, and its level (``dev_named_paraphrase`` or ``dev_named_flag``). Bridges are not
+    judged; the caller drops every subject of their templates."""
     families: dict[str, int]
 
 
@@ -264,8 +279,12 @@ def assess(
     if len({node.id for node in base}) != len(base):
         raise ValueError("development and training task IDs must be unique")
     graph = FamilyGraph(base, [*subjects, *bridges], rules)
-    full_dev = {graph.full.find(index) for index in range(len(dev))}
-    base_dev = {graph.base.find(index) for index in range(len(dev))}
+    # Development tasks per family, with and without the synthetic nodes.
+    full_dev: dict[int, set[int]] = defaultdict(set)
+    base_dev: dict[int, set[int]] = defaultdict(set)
+    for index in range(len(dev)):
+        full_dev[graph.full.find(index)].add(index)
+        base_dev[graph.base.find(index)].add(index)
     first_subject = len(base)
     scores = named_scores(dev, subjects, rules)
     judged = []
@@ -275,18 +294,29 @@ def assess(
         roots[root] += 1
         status, reason = _status(root in full_dev, score, rules)
         judged.append(Judgement(node.id, status, reason))
+    bridges_named: dict[str, str] = {}
+    for node, score in zip(bridges, named_scores(dev, bridges, rules), strict=True):
+        _, reason = _status(False, score, rules)
+        if reason is not None:
+            # A bridge under the ID of another bridge or subject keeps its strongest level.
+            if bridges_named.get(node.id) != "dev_named_paraphrase":
+                bridges_named[node.id] = reason
     position = {node.id: index for index, node in enumerate(train, start=len(dev))}
     unknown = [identifier for identifier in replay if identifier not in position]
     if unknown:
         raise ValueError(f"{len(unknown)} replay rows are not pool training tasks")
-    newly, already = [], []
+    new_chain: list[str] = []
+    new_link: list[str] = []
+    already: list[str] = []
     for identifier in replay:
         index = position[identifier]
-        if graph.base.find(index) in base_dev:
+        before = base_dev.get(graph.base.find(index), set())
+        after = full_dev.get(graph.full.find(index), set())
+        if len(after) > len(before):  # ``after`` always contains ``before``.
+            (new_link if before else new_chain).append(identifier)
+        elif before:
             already.append(identifier)
-        elif graph.full.find(index) in full_dev:
-            newly.append(identifier)
-    judged_already = {*already, *newly}
+    judged_already = {*already, *new_chain, *new_link}
     outside = [identifier for identifier in replay if identifier not in judged_already]
     named = named_scores(dev, [base[position[i]] for i in outside], rules)
     replay_named = [
@@ -299,14 +329,28 @@ def assess(
         "largest_subject_family": max(roots.values(), default=0),
         "subject_families_with_dev": sum(1 for root in roots if root in full_dev),
     }
-    return Assessment(judged, sorted(newly), sorted(already), sorted(replay_named), families)
+    return Assessment(
+        subjects=judged,
+        replay_excluded=sorted([*new_chain, *new_link]),
+        replay_new_chain=sorted(new_chain),
+        replay_new_dev_link=sorted(new_link),
+        replay_in_dev_family=sorted(already),
+        replay_named=sorted(replay_named),
+        bridges_named=dict(sorted(bridges_named.items())),
+        families=families,
+    )
 
 
-def expand_templates(judged: Sequence[Judgement], template_of: Mapping[str, str]) -> dict[str, str]:
+def expand_templates(
+    judged: Sequence[Judgement],
+    template_of: Mapping[str, str],
+    also_templates: Iterable[str] = (),
+) -> dict[str, str]:
     """Every dropped subject and its reason class: each excluded or flagged subject, and
-    every other subject of a template that holds one (``template``)."""
+    every other subject of a template that holds one or is in ``also_templates`` (the
+    templates of bridges with a shared-name edge to a development task): ``template``."""
     dropped = {item.id: str(item.reason) for item in judged if item.status != "clear"}
-    templates = {template_of[identifier] for identifier in dropped}
+    templates = {template_of[identifier] for identifier in dropped} | set(also_templates)
     for item in judged:
         if item.id not in dropped and template_of[item.id] in templates:
             dropped[item.id] = "template"
@@ -326,6 +370,8 @@ class Instance:
     original_target: str
     modules: tuple[tuple[str, str], ...]
     """The fixed repository's source modules (tests left out): name and text."""
+    spec_sha256: str = ""
+    """The registered SHA-256 of its ``case.json`` (what each row's ``spec_sha256`` names)."""
 
 
 def _sha(data: bytes) -> str:
@@ -397,6 +443,7 @@ def read_instances(root: Path) -> tuple[list[Instance], str]:
                 reference_target=str(synth["reference_target"]),
                 original_target=str(synth["original_target"]),
                 modules=tuple(sorted(modules.items())),
+                spec_sha256=str(entry["files"]["case.json"]),
             )
         )
     return found, _sha(raw)
@@ -477,11 +524,21 @@ def require_result(
     replay_index: Path,
     replay_kinds: Iterable[str],
     dev_sha256: Iterable[str | None] = (),
+    bridge_registries: Iterable[str] = (),
 ) -> None:
     """Refuse a dev-family result unless it applies this rule, with its default thresholds,
     to exactly ``agent_meta`` and ``replay_index`` as they are now, covers every replay kind
-    mixed, and judged against the same development file as any n-gram check that names one
-    (``dev_sha256``)."""
+    mixed, judged against the same development file as any n-gram check that names one
+    (``dev_sha256``), and held every instance set named by ``bridge_registries`` (registry
+    SHA-256) in its graph, as a judged set or a bridge set."""
+    synthetic = result.get("synthetic") or {}
+    held = {
+        str(part.get("registry_sha256"))
+        for part in [*synthetic.get("judged", ()), *synthetic.get("bridges", ())]
+    }
+    absent = sorted(set(bridge_registries) - held)
+    if absent:
+        raise ValueError(f"the dev-family result did not hold instance sets {absent}")
     if result.get("schema") != SCHEMA or result.get("dev_family") != RULE:
         raise ValueError(f"not a {RULE} dev-family result")
     if result.get("rules") != rules_record():

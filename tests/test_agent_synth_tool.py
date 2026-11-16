@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from agent_fixtures import ARITH, write_case, write_registry
 from dev_family_fixtures import (
+    case_sha,
     dev_family_argv,
     pool_task,
     register,
@@ -468,10 +469,26 @@ def test_validate_and_build_writes_rows_records_and_ledger(
     assert document["builds"][0]["distinct_prompt_reply_pairs"] == 6
     assert document["builds"][0]["max_rows_per_reply"] <= 6
     assert document["instances"]["distinct_replies"] >= 1
-    assert "task-clusters-v1" in document["contamination_scope"]["development_tasks"]
-    assert "not applied" not in document["contamination_scope"]["development_tasks"]
+    scope = document["contamination_scope"]["development_tasks"]
+    assert "task-clusters-v1" in scope and "not applied" not in scope
+    # The manifest describes builds, which come before the family rule: it states the rule
+    # as required before mixing, not as applied, and records no result unless given one.
+    assert "required before mixing" in scope and "dev_family" not in document
     assert document["ledger"]["total"] == PRIOR_CALLS + executor.calls
     assert len(document["templates"]) >= 40
+
+
+def test_the_manifest_records_a_dev_family_result_when_given(tmp_path: Path) -> None:
+    paths = _mix_inputs(tmp_path)
+    manifest = tmp_path / "manifest.json"
+    argv = ["manifest", "--instances", str(tmp_path / "synth-instances")]
+    argv += ["--dev-family", str(paths["family"]), "--out", str(manifest)]
+    assert agent_sft_data.main(argv) == 0
+    recorded = json.loads(manifest.read_text())["dev_family"]
+    assert recorded["result_sha256"] == hashlib.sha256(paths["family"].read_bytes()).hexdigest()
+    assert recorded["rule"] == "task-clusters-v1"
+    assert recorded["agent_rows_dropped"] == 1 and recorded["instances_dropped"] == 1
+    assert recorded["surviving"]["rows"] == 2
 
 
 def test_validate_and_build_refuses_an_unpinned_or_changed_independent_directory(
@@ -584,6 +601,17 @@ def _mix_inputs(tmp_path: Path) -> dict[str, Path]:
     write_registry(tmp_path / "evalcases")
     agent = [_sft(f"agent-sft1/i{n}/edit", "agent-sft1-edit", 8) for n in range(3)]
     write_rows(tmp_path / "rows.jsonl", agent)
+    # The synthetic instances the rows came from (read as text by dev-family).
+    root = tmp_path / "synth-instances"
+    for n in range(3):
+        write_instance(
+            root,
+            f"i{n}",
+            template=f"t{n}",
+            task=words(f"task{n}", 12),
+            reference=f"def area{n}(w, h):\n    return w * h + {n}\n",
+        )
+    register(root)
     meta = tmp_path / "rows-meta.jsonl"
     meta.write_text(
         "".join(
@@ -597,6 +625,7 @@ def _mix_inputs(tmp_path: Path) -> dict[str, Path]:
                     "workflow_type": "W1",
                     "mutation_kind": None,
                     "prompt_sha256": row.id,
+                    "spec_sha256": case_sha(root, f"i{n}"),
                     "user_text": words(f"fix{n}area", 8),
                     "reply": f"def area{n}(w, h):\n    return w * h",
                 }
@@ -635,16 +664,6 @@ def _mix_inputs(tmp_path: Path) -> dict[str, Path]:
         assert agent_sft_data.main(argv) == 0
         results[side] = out
     # The dev-family result: instance i2 shares its target program with a dev task.
-    root = tmp_path / "synth-instances"
-    for n in range(3):
-        write_instance(
-            root,
-            f"i{n}",
-            template=f"t{n}",
-            task=words(f"task{n}", 12),
-            reference=f"def area{n}(w, h):\n    return w * h + {n}\n",
-        )
-    register(root)
     dev = write_pool(
         tmp_path / "pool" / "dev.jsonl",
         [pool_task("d0", words("devp", 20), "def other(w, h):\n    return w * h + 2\n", "dev")],
@@ -653,7 +672,7 @@ def _mix_inputs(tmp_path: Path) -> dict[str, Path]:
         tmp_path / "pool" / "train.jsonl",
         [pool_task(f"r{n}", words(f"trainp{n}", 20), None, "train") for n in range(3)],
     )
-    build = write_build(tmp_path / "synth-build", {f"i{n}": True for n in range(3)})
+    build = write_build(tmp_path / "synth-build", {f"i{n}": True for n in range(3)}, root)
     specs = write_specs(tmp_path / "specs.json", {f"t{n}": words(f"spec{n}", 12) for n in range(3)})
     family = tmp_path / "dev-family.json"
     argv = dev_family_argv(dev, train, [(root, build)], [specs], meta, index, family)
@@ -943,3 +962,22 @@ def test_mix_requires_the_dev_family_result_for_these_inputs(
     paths["meta"].write_text(paths["meta"].read_text() + "\n")
     assert agent_sft_data.main(_mix_argv(tmp_path, paths, "mix-stale", registry)) == 2
     assert not any(path.name.startswith("mix-") and path.is_dir() for path in tmp_path.iterdir())
+
+
+def test_mix_can_require_instance_sets_in_the_dev_family_graph(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A result computed without a required set (say a superseded one left out of
+    ``--bridge-instances``) is refused; one that held it is accepted and recorded."""
+    paths = _mix_inputs(tmp_path)
+    registry = cases.registry_sha256(tmp_path / "evalcases")
+    held = cases.registry_sha256(tmp_path / "synth-instances")
+    argv = _mix_argv(tmp_path, paths, "mix-missing", registry)
+    assert agent_sft_data.main([*argv, "--require-instance-registry", held, "f" * 64]) == 2
+    assert "did not hold instance sets" in capsys.readouterr().err
+    argv = _mix_argv(tmp_path, paths, "mix-held", registry)
+    assert agent_sft_data.main([*argv, "--require-instance-registry", held]) == 0
+    record = json.loads((tmp_path / "mix-held" / "mix-record.json").read_text())
+    assert record["dev_family"]["required_instance_registries"] == [held]
+    assert held in record["dev_family"]["instance_registries"]
+    assert not (tmp_path / "mix-missing").exists()

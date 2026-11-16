@@ -3,13 +3,14 @@ Everything is text written to disk; nothing here runs the code it writes."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from scratchcoder.agent.cases import REGISTRY_NAME, build_registry
+from scratchcoder.agent.cases import REGISTRY_NAME, build_registry, registry_sha256
 from scratchcoder.eval.tasks import Task
 
 
@@ -76,6 +77,8 @@ def write_instance(
         "id": identifier,
         "template_id": template,
         "family": family,
+        "workflow_type": "W1",
+        "mutants": [],
         "reference_target": reference,
         "original_target": original,
     }
@@ -88,8 +91,16 @@ def register(root: Path) -> Path:
     return root
 
 
-def write_build(path: Path, outcomes: Mapping[str, bool]) -> Path:
+def case_sha(root: Path, identifier: str) -> str:
+    """The SHA-256 of an instance's ``case.json`` (what a row's ``spec_sha256`` names)."""
+    return hashlib.sha256((root / identifier / "case.json").read_bytes()).hexdigest()
+
+
+def write_build(path: Path, outcomes: Mapping[str, bool], instances: Path) -> Path:
+    """A build of the registered set ``instances``: its record names that registry."""
     path.mkdir(parents=True, exist_ok=True)
+    record = {"instances_registry_sha256": registry_sha256(instances)}
+    (path / "record.json").write_text(json.dumps(record), encoding="utf-8")
     (path / "instances.jsonl").write_text(
         "".join(
             json.dumps({"instance": name, "accepted": accepted}) + "\n"
@@ -107,7 +118,14 @@ def write_specs(path: Path, specs: Mapping[str, str]) -> Path:
 
 
 def meta_line(
-    instance: str, template: str, kind: str, user_text: str, reply: str, family: str = "fam"
+    instance: str,
+    template: str,
+    kind: str,
+    user_text: str,
+    reply: str,
+    family: str = "fam",
+    *,
+    spec_sha256: str,
 ) -> dict[str, Any]:
     return {
         "id": f"agent-sft1/{instance}/{kind}",
@@ -118,6 +136,7 @@ def meta_line(
         "workflow_type": "W1",
         "mutation_kind": None,
         "prompt_sha256": f"{instance}/{kind}",
+        "spec_sha256": spec_sha256,
         "user_text": user_text,
         "reply": reply,
         "loss_tokens": 8,
