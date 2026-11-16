@@ -35,7 +35,15 @@ from typing import Any, Protocol, TextIO
 from scratchcoder.agent import execution, workspace
 from scratchcoder.agent.audit import audit_refusal, name_failure, reply_facts
 from scratchcoder.agent.cases import Case
-from scratchcoder.agent.prompt import LAYOUTS, Blocks, ContextLimit, Prompt, Snippet, build_layout
+from scratchcoder.agent.prompt import (
+    LAYOUTS,
+    Blocks,
+    ContextLimit,
+    Prompt,
+    Snippet,
+    build_layout,
+    name_prefill,
+)
 from scratchcoder.data.chat import TextEncoder
 from scratchcoder.sandbox.reward import audit_attempt
 
@@ -93,6 +101,10 @@ class Proposal:
     """Whether the reply had a closed python block; None means ``code is not None``."""
     recovery: dict[str, Any] | None = None
     """When ``code`` was recovered from an unclosed block: the rule and span kept."""
+    prefill_tokens: int = 0
+    """Reply tokens the harness wrote before generation (the name prefill); not counted in
+    ``generated_tokens``, but part of ``tokens`` and ``text``."""
+    prefill_text: str = ""
 
 
 class Policy(Protocol):
@@ -158,6 +170,12 @@ class Turn:
     function: str = ""
     feedback: str = ""
     """The feedback run's status after an applied edit."""
+    prefill_function: str = ""
+    """With ``--prefill-name``: the shown function (``shown[0]``) whose name the harness wrote
+    before generation; empty when off or when the prompt showed nothing."""
+    prefill_text: str = ""
+    prefill_tokens: int = 0
+    """Tokens the harness wrote (not in ``generated_tokens``; they count against the context)."""
 
 
 @dataclass
@@ -293,9 +311,15 @@ def run_instance(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] | None = None,
     layout: str = "harness",
+    prefill_name: bool = False,
 ) -> InstanceResult:
     """Run one instance. ``layout`` is the prompt layout (:data:`prompt.LAYOUTS`); the
-    training layout shows the failing public tests and, on repair turns only, the feedback."""
+    training layout shows the failing public tests and, on repair turns only, the feedback.
+
+    ``prefill_name`` (a harness aid, ``--prefill-name``) starts every reply with a python block
+    and ``def <name>(`` for the nearest shown function (:func:`prompt.name_prefill`, computed
+    from the prompt alone). Its tokens count against the context, not the generated-token
+    budget, and are recorded apart from generated tokens. Off, nothing changes."""
     if layout not in LAYOUTS:
         raise ValueError(f"unknown prompt layout {layout!r}")
     started = clock()
@@ -370,6 +394,8 @@ def run_instance(
                 break
             if all(target in prompt.shown for target in case.targets):
                 result.target_located = True
+            if prefill_name:
+                prompt = name_prefill(prompt, encoder)
             cap = min(prompt.generation_cap(), remaining)
             turn = Turn(
                 number,
@@ -380,6 +406,16 @@ def run_instance(
                 cap,
             )
             result.turns.append(turn)
+            prefill_fields: dict[str, Any] = {}
+            if prefill_name:
+                turn.prefill_function = prompt.shown[0] if prompt.prefill else ""
+                turn.prefill_text = prompt.prefill_text
+                turn.prefill_tokens = len(prompt.prefill)
+                prefill_fields = {
+                    "prefill_function": turn.prefill_function,
+                    "prefill_text": turn.prefill_text,
+                    "prefill_tokens": turn.prefill_tokens,
+                }
             trace.emit(
                 "prompt",
                 turn=number,
@@ -390,8 +426,11 @@ def run_instance(
                 truncations=list(prompt.truncations),
                 generation_cap=cap,
                 text=prompt.text,
+                **prefill_fields,
             )
             proposal = policy.propose(case, number, prompt, cap, decoding, files)
+            if proposal.prefill_tokens != turn.prefill_tokens:
+                raise ValueError("the policy did not start its reply with the prompt's prefill")
             turn.generated_tokens = proposal.generated_tokens
             turn.finish_reason = proposal.finish_reason
             turn.generation_seconds = proposal.seconds
@@ -419,6 +458,7 @@ def run_instance(
                 recovered=turn.recovered,
                 recovery=proposal.recovery,
                 text=proposal.text[:MAX_TRACE_TEXT],
+                **({"prefill_tokens": proposal.prefill_tokens} if prefill_name else {}),
             )
             shown = [item.function for item in candidates if item.function.key in prompt.shown]
             facts = reply_facts(proposal.code, shown)

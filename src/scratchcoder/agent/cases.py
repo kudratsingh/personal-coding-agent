@@ -20,7 +20,7 @@ import ast
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,8 +31,14 @@ CASE_SCHEMA = "agent-case-v1"
 REGISTRY_SCHEMA = "agent-case-registry-v1"
 REGISTRY_NAME = "registry.json"
 MAX_FILE_BYTES = 16384
-CASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
-"""Case IDs name output files, so they are restricted to a safe file-name alphabet."""
+MAX_CASE_ID = 32
+CASE_ID = re.compile(r"(?!.*--)[A-Za-z0-9](?:[A-Za-z0-9_-]{0,30}[A-Za-z0-9_])?\Z")
+"""A case ID is the identity of a case in every output: file names
+(``{case}--{policy}--{condition}--{decoding}``), scorecard cells and comparisons. It is 1 to
+:data:`MAX_CASE_ID` characters of a safe file-name alphabet, starts with a letter or digit,
+does not end with a hyphen and never contains the ``--`` separator, so a file name splits back
+into one case ID. IDs that are equal ignoring case are refused together
+(:func:`check_case_ids`): they would share a file on a case-insensitive file system."""
 FORBIDDEN_PARTS = ("heldout", "heldout-results")
 """Held-out cases are sealed; no development tool reads them."""
 
@@ -96,6 +102,35 @@ class Case:
         return workspace.function_source(text, workspace.functions(text, path)[name])
 
 
+def check_case_id(case_id: object) -> str:
+    """``case_id`` if it is a well-formed case ID (:data:`CASE_ID`); raises :class:`CaseError`."""
+    if not isinstance(case_id, str) or not CASE_ID.match(case_id):
+        raise CaseError(
+            f"case id {case_id!r} must be 1-{MAX_CASE_ID} letters, digits, '_' or '-', start "
+            "with a letter or digit, not end with '-' and not contain '--'"
+        )
+    return case_id
+
+
+def check_case_ids(case_ids: Iterable[object], *, what: str = "case IDs") -> list[str]:
+    """Every ID well formed and distinct, also ignoring case; raises :class:`CaseError`.
+
+    Results are keyed by case ID, so two distinct cases under one ID (or under IDs that differ
+    only in case) would merge in a scorecard or overwrite each other's files."""
+    seen: dict[str, str] = {}
+    found = []
+    for case_id in case_ids:
+        checked = check_case_id(case_id)
+        folded = checked.casefold()
+        if folded in seen:
+            other = seen[folded]
+            kind = "repeated" if other == checked else f"equal ignoring case to {other!r}"
+            raise CaseError(f"{what}: {checked!r} is {kind}")
+        seen[folded] = checked
+        found.append(checked)
+    return found
+
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -137,6 +172,7 @@ def build_registry(root: Path) -> dict[str, Any]:
         )
     if not cases:
         raise CaseError("no case directories")
+    check_case_ids((case["id"] for case in cases), what="registry")
     return {"schema": REGISTRY_SCHEMA, "cases": cases}
 
 
@@ -152,6 +188,12 @@ def load_cases(root: Path, *, only: set[str] | None = None) -> list[Case]:
     registry = json.loads((root / REGISTRY_NAME).read_text(encoding="utf-8"))
     if registry.get("schema") != REGISTRY_SCHEMA:
         raise CaseError("unknown registry schema")
+    # Every registered ID, not only the requested ones: a run's outputs must never be able to
+    # mix two cases, whichever subset it loads.
+    check_case_ids((entry.get("id") for entry in registry["cases"]), what="registry")
+    directories = [str(entry.get("directory", "")).casefold() for entry in registry["cases"]]
+    if len(set(directories)) != len(directories):
+        raise CaseError("registry: two cases share a directory (ignoring case)")
     cases = []
     for entry in registry["cases"]:
         if only is not None and entry["id"] not in only:
@@ -217,9 +259,10 @@ def load_case(directory: Path, *, registered: Mapping[str, str] | None = None) -
     spec = json.loads(raw)
     if spec.get("schema") != CASE_SCHEMA or spec.get("split") != "dev":
         raise CaseError(f"{root.name}: not an {CASE_SCHEMA} dev case")
-    case_id = spec.get("id")
-    if not isinstance(case_id, str) or not CASE_ID.match(case_id):
-        raise CaseError(f"{root.name}: case id must match {CASE_ID.pattern}")
+    try:
+        case_id = check_case_id(spec.get("id"))
+    except CaseError as error:
+        raise CaseError(f"{root.name}: {error}") from None
     repo = _inside(root, spec["repo"], what="repo")
     files = {
         path.name: text(str(path.relative_to(root)), "repo file")

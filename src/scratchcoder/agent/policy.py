@@ -87,29 +87,41 @@ class ModelPolicy:
         decoding: Decoding,
         files: Mapping[str, str],
     ) -> Proposal:
+        """One generation for ``prompt``. Only ``case.id`` is read (for the seed): never the
+        targets, reference or hidden checks. A prompt prefill (``prompt.prefill``, the name
+        prefill) is appended to the prompt IDs and starts the reply: the reply that is parsed is
+        prefill + generated tokens, while ``generated_tokens`` counts the generated ones only."""
         seed = None if decoding.temperature == 0 else turn_seed(case.id, turn, decoding.index)
-        key = (prompt.ids, max_new_tokens, decoding.temperature, decoding.top_p, seed)
+        prefill = prompt.prefill
+        key = (prompt.ids, prefill, max_new_tokens, decoding.temperature, decoding.top_p, seed)
         if key in self.cache:
             hit = self.cache[key]
             return replace(hit, seconds=0.0, cached=True, cached_seconds=hit.seconds)
         started = self.clock()
         tokens, finish = self.generate(
-            prompt.ids, max_new_tokens, decoding.temperature, decoding.top_p, seed
+            (*prompt.ids, *prefill) if prefill else prompt.ids,
+            max_new_tokens,
+            decoding.temperature,
+            decoding.top_p,
+            seed,
         )
         seconds = self.clock() - started
-        code = extract_program(tokens, self.decoder)
+        reply = [*prefill, *tokens]
+        code = extract_program(reply, self.decoder)
         recovered = None
         if code is None and self.recovery == "intact-function":
-            recovered = recover(tokens, self.decoder, finish)
+            recovered = recover(reply, self.decoder, finish)
         proposal = Proposal(
             code if recovered is None else recovered.code,
-            self.decoder.decode(tokens),
+            self.decoder.decode(reply),
             len(tokens),
             finish,
             seconds,
-            tokens=tuple(tokens),
+            tokens=tuple(reply),
             closed_block=code is not None,
             recovery=None if recovered is None else recovered.record(),
+            prefill_tokens=len(prefill),
+            prefill_text=prompt.prefill_text,
         )
         self.cache[key] = proposal
         return proposal

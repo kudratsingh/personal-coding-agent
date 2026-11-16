@@ -5,8 +5,12 @@ Subcommands, all with explicit paths:
 - ``register --cases DIR``: write ``DIR/registry.json`` (every case file with its SHA-256).
   Refuses to replace an existing registry. Runs nothing.
 - ``plan --cases DIR --tokenizer PATH``: load and statically validate the cases, and print
-  each case's turn-1 prompt size without its observation, with the bound
-  ``prompt + observation budget + 1.2 x reference-fix tokens <= 1,024``. Runs nothing.
+  each case's turn-1 prompt size without its observation, with the three conditions of
+  ``scratchcoder.agent.prompt.fit_bound``: the worst-case prompt of any turn (the snippet
+  block at its full budget, both feedback blocks at theirs, plus their separators) is within
+  the 700-token prompt budget; that prompt plus 1.2 x the whole reference fix fits the 1,024
+  context; and 1.2 x the largest reference function plus its two block tokens fits the
+  324-token generation cap. Runs nothing.
 - ``run``: everything that executes. It refuses to start without ``--receipt``, a passing
   execution-window receipt written by ``tools.mac_window_check exec`` for this very command
   in the last 30 minutes (``tools.admission_check``'s receipt rule), and without a new
@@ -21,6 +25,18 @@ Subcommands, all with explicit paths:
      ``--seeds`` sampled seeds, at batch 1, in canonical order (case, decoding, condition);
   4. writes one JSONL trace per instance (``traces/``), one review packet and diff per
      instance (``packets/``), ``validation.json``, ``scorecard.json`` and ``scorecard.md``.
+
+  ``--prefill-name`` (a harness aid, off by default) starts every model reply with a python
+  block and ``def <name>(`` for the prompt's nearest shown function; the oracle rows never
+  use it. After the run, the traces are read back to report how often the prefilled name was
+  a target's (reporting only).
+
+- ``compare --runs DIR ... --out-md PATH --out-json PATH``: one table across runs that share
+  everything but their configuration (``scratchcoder.agent.scorecard.comparison``).
+
+Case IDs are the identity of every output: they are checked at registry load
+(``scratchcoder.agent.cases.check_case_ids``), and a scorecard or comparison refuses
+results that would merge two cases.
 
   Model-written code runs only inside the sandbox, through
   ``scratchcoder.eval.harness.isolated_execution``; the host only parses it.
@@ -111,6 +127,7 @@ def config_of(args: argparse.Namespace) -> dict[str, Any]:
         "sampled_temperature": args.sampled_temperature,
         "sampled_top_p": args.sampled_top_p,
         "recovery": args.recovery,
+        "prefill_name": args.prefill_name,
     }
 
 
@@ -123,13 +140,17 @@ def compare(args: argparse.Namespace) -> int:
     for run_dir in args.runs:
         card = json.loads((run_dir / "scorecard.json").read_text(encoding="utf-8"))
         cards.append((run_dir.name, card))
-    table = scorecard.comparison(cards)
+    try:
+        table = scorecard.comparison(cards)
+    except agent_cases.CaseError as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 2
     if not table["comparable"] and not args.allow_noncomparable:
         for row in table["rows"]:
             if not row["comparable"]:
                 print(
-                    f"refused: {row['run']} differs from the baseline outside its "
-                    f"configuration: {', '.join(row['noncomparable_fields'])}",
+                    f"refused: {row['run']} is not comparable with the baseline: "
+                    f"{', '.join(row['noncomparable_fields'])}",
                     file=sys.stderr,
                 )
         return 2
@@ -157,6 +178,7 @@ def plan(args: argparse.Namespace) -> int:
         candidates = workspace.locate(case.files, case.public_tests, None, case.allowed_files)
         built = prompt.build(encoder, loop.blocks_for(case, case.files, candidates, "", case.files))
         reference = [len(encoder.encode(case.reference_function(k))) for k in case.targets]
+        snippet = built.block_tokens["snippet"]
         rows.append(
             {
                 "case": case.id,
@@ -165,7 +187,7 @@ def plan(args: argparse.Namespace) -> int:
                 "shown": list(built.shown),
                 "targets_shown": all(target in built.shown for target in case.targets),
                 "reference_fix_tokens": reference,
-                **prompt.fit_bound(built.tokens, reference),
+                **prompt.fit_bound(built.tokens, reference, snippet_tokens=snippet),
             }
         )
     print(json.dumps({"registry_sha256": agent_cases.registry_sha256(args.cases), "cases": rows}))
@@ -214,6 +236,8 @@ def run(
     atomic_json(out / "validation.json", {"cases": reports})
     valid = [case for case, report in zip(cases, reports, strict=True) if report["valid"]]
     results: list[loop.InstanceResult] = []
+    names: set[str] = set()
+    traced: list[tuple[str, Path]] = []
 
     def instance(
         case: agent_cases.Case,
@@ -221,8 +245,12 @@ def run(
         condition: loop.Condition,
         decoding: loop.Decoding,
         encoder: TextEncoder,
+        prefill_name: bool = False,
     ) -> None:
         name = f"{case.id}--{policy.name}--{condition.name}--{decoding.label}"
+        if name.casefold() in names:  # Registry load already refuses colliding case IDs.
+            raise agent_cases.CaseError(f"two instances would share the output name {name}")
+        names.add(name.casefold())
         trace_path = _under(out / "traces", f"{name}.jsonl")
         _under(out / "packets", name)
         with trace_path.open("x", encoding="utf-8") as stream:
@@ -236,9 +264,11 @@ def run(
                 trace=loop.Trace(stream),
                 clock=clock,
                 layout=args.prompt,
+                prefill_name=prefill_name,
             )
         loop.write_instance(out / "packets" / name, result, case, str(trace_path.relative_to(out)))
         results.append(result)
+        traced.append((f"{result.policy}/{result.condition}", trace_path))
         print(
             json.dumps(
                 {
@@ -265,7 +295,7 @@ def run(
     for case in valid:
         for decoding in decodings:
             for condition in conditions:
-                instance(case, model, condition, decoding, encoder)
+                instance(case, model, condition, decoding, encoder, args.prefill_name)
     commit, dirty = git_state()
     identity = {
         "started_at": started,
@@ -299,7 +329,17 @@ def run(
         },
         "generation_cache_hits": sum(turn.cached for r in results for turn in r.turns),
     }
-    card = scorecard.build(results, identity)
+    report = None
+    if args.prefill_name:  # Reporting only: read back from the traces once every instance ran.
+        report = scorecard.prefill_report(
+            (
+                (label, [json.loads(line) for line in path.read_text("utf-8").splitlines()])
+                for label, path in traced
+                if label.startswith("model/")
+            ),
+            {case.id: case.targets for case in valid},
+        )
+    card = scorecard.build(results, identity, prefill=report)
     atomic_json(out / "scorecard.json", card)
     (out / "scorecard.md").write_text(scorecard.markdown(card), encoding="utf-8")
     print(json.dumps({"scorecard": str(out / "scorecard.json")}))
@@ -338,6 +378,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--prompt", choices=prompt.LAYOUTS, default="harness")
     run_parser.add_argument("--recovery", choices=RECOVERY_MODES, default="off")
+    run_parser.add_argument(
+        "--prefill-name",
+        action="store_true",
+        help="harness aid: start each model reply with `def <name>(` of the nearest shown "
+        "function (recorded apart from generated tokens; never credited as task-following)",
+    )
     compare_parser = commands.add_parser("compare")
     compare_parser.add_argument("--runs", type=Path, nargs="+", required=True)
     compare_parser.add_argument("--out-md", type=Path, required=True)

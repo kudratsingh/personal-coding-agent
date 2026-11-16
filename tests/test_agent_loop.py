@@ -313,7 +313,9 @@ def test_the_scorecard_counts_with_denominators_and_keeps_unscored_apart(case: C
     assert cell["sampled"] == {**cell["sampled"], "scored": 1, "solved": 0, "unscored": 1}
     assert cell["sampled"]["failure_classes"] == {"formatting": 1}
     text = scorecard.markdown(card)
-    assert "| model/repair-3 | X01 | 0/1 | 1/1 | formatting 1 (unscored 1) |" in text
+    assert (
+        "| model/repair-3 | X01 | 0/1 | 1/1 | formatting 1 of 2 scored (unscored 1 of 3) |" in text
+    )
 
 
 # ----------------------------------------------------------------------------- the tool
@@ -530,11 +532,27 @@ def test_carriage_returns_in_case_files_are_refused(tmp_path: Path) -> None:
 def test_the_fit_bound_counts_both_feedback_blocks_and_the_generation_cap() -> None:
     from scratchcoder.agent import prompt
 
-    ok = prompt.fit_bound(300, [100])
-    assert ok["worst_prompt_tokens"] == 300 + 150 + 100 and ok["generation_cap"] == 324
-    assert ok["fits"]
+    ok = prompt.fit_bound(300, [100], snippet_tokens=250)
+    assert ok["worst_prompt_tokens"] == 300 + 150 + 100 + prompt.SEPARATOR_ALLOWANCE
+    assert ok["generation_cap"] == 324 and ok["fits"]
     # 1.2 x 270 + 2 = 326 > 324: one function too long for a turn, though the total fits.
-    too_long = prompt.fit_bound(100, [270])
+    too_long = prompt.fit_bound(100, [270], snippet_tokens=250)
     assert too_long["total_bound"] <= 1024 and not too_long["fits"]
-    # A long prompt shrinks the cap below the function's need.
-    assert not prompt.fit_bound(470, [230])["fits"]
+    # 450 + 150 + 100 + 4 = 704 > 700: the worst-case prompt is over the prompt budget. (A
+    # prompt within the budget always leaves the full 324-token cap, since 700 + 324 = 1,024.)
+    assert prompt.PROMPT_BUDGET + prompt.GENERATION_CAP == prompt.CONTEXT
+    assert not prompt.fit_bound(450, [100], snippet_tokens=250)["fits"]
+
+
+def test_the_fit_bound_grows_the_snippet_block_to_its_budget() -> None:
+    from scratchcoder.agent import prompt
+
+    # A later turn can show a longer function than turn 1 did (an edit can grow it up to the
+    # function budget), so the worst case takes the snippet block at its full budget.
+    small = prompt.fit_bound(420, [100], snippet_tokens=100)
+    assert small["worst_prompt_tokens"] == 420 - 100 + 250 + 150 + 100 + 4
+    assert not small["fits"]
+    assert prompt.fit_bound(420, [100], snippet_tokens=250)["fits"]
+    # A turn-1 snippet block already over the budget is kept as it is.
+    over = prompt.fit_bound(300, [10], snippet_tokens=260)
+    assert over["worst_prompt_tokens"] == 300 + 150 + 100 + 4

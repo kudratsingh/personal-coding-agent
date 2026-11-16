@@ -81,7 +81,7 @@ def test_double():
 | Feedback call | (packed workspace, public driver), mode `function` | `Result` -> `SandboxRun(status, resolved, stdout)` |
 | Condense | driver rows (untrusted, bounded) + host copy of the files | observation text |
 | Locate | parsed tests and modules, failing test names | functions, nearest first, allowed files only |
-| Budget | task, map, snippets, changes so far, observation | prompt token IDs; generation cap = min(324, 1,024 − prompt) |
+| Budget | task, map, snippets, changes so far, observation | prompt token IDs; generation cap = min(324, 1,024 − prompt − prefill) |
 | Policy | prompt IDs, cap, decoding | first closed python block (or none) |
 | Edit | reply code, shown functions | new file text, or a refusal reason |
 | Grade call | (packed source modules, hidden check script) | supervisor status per check set |
@@ -90,6 +90,26 @@ Block budgets (tokens): task 120, map 80, snippets 250 (one function at most 180
 so far 100, observation 150; prompt at most 700. Over budget a block is truncated; then the
 changes-so-far block, the map and the farthest snippets are dropped, in that order. If the prompt still
 does not fit, the instance ends as a context failure.
+
+`agent_dev_run plan` checks each case statically before any run (`prompt.fit_bound`). Its
+worst-case prompt of any turn takes the turn-1 prompt, grows the snippet block to its full 250
+(a later turn can show a longer function, such as an edited one grown up to the 180-token
+function budget), adds the observation and changes-so-far blocks at their full budgets and a few
+tokens for their separators. A case fits when that prompt is within 700 tokens, that prompt plus
+1.2 times the whole reference fix fits the 1,024 context, and 1.2 times the largest reference
+function plus its two block tokens fits the 324-token cap. Since 700 + 324 = 1,024, a prompt
+within the budget always leaves the full cap. This is planning only; at run time the budgets
+are enforced by truncation, drops and the context failure.
+
+**Case IDs are identities.** Every output is keyed by case ID: trace and packet names
+(`{case}--{policy}--{condition}--{decoding}`), scorecard cells and comparison rows. An ID is 1 to
+32 letters, digits, `_` or `-`, starts with a letter or digit, does not end with `-` and never
+contains `--`, so a file name splits back into one ID. Loading a registry refuses any malformed
+ID and any two IDs that are equal ignoring case (they would share a file on a case-insensitive
+file system), whichever cases a run selects. A scorecard refuses two results for the same
+instance and case IDs that collide; a comparison refuses two runs with the same name and any
+run whose case IDs collide. So two distinct cases can never merge into one count or overwrite
+each other's files.
 
 Failure classes for an unsolved, scored instance: `context` (the prompt did not fit, or the
 target was never shown), `formatting` (no usable code), `tool_interface` (code the host refused:
@@ -126,6 +146,25 @@ changes one factor at a time.
   re-indented, and test outcomes are never consulted. The prefix then meets the same reply rules
   and editor as any reply. The turn records `recovered`, the rule and the kept span; the trace
   keeps the full original completion.
+- `--prefill-name` (off by default) is a **harness aid**, not a model capability. Before each
+  model generation the harness writes the start of the reply: a python block opener (in chat-v1
+  the `<|python_start|>` token, the counterpart of a markdown `` ```python `` line) and
+  `def <name>(`, where `<name>` is the function of the nearest shown snippet (`prompt.shown[0]`,
+  the selection the prompt already displays). It is computed from the prompt alone
+  (`prompt.name_prefill`); the policy is never given the case's targets, reference or hidden
+  checks, and a test runs it on a case whose target is not the nearest shown function. The
+  reply that is parsed is prefill + generated tokens. Prefill tokens count against the 1,024
+  context (the cap is min(324, 1,024 − prompt − prefill)) but not against the generated-token
+  budget, and they are recorded apart: `prefill_function`, `prefill_text` and `prefill_tokens`
+  in the trace, the turn and the packet; generated tokens exclude them. The oracle rows never use
+  it. The scorecard and the comparison label name-following under the prefill as
+  harness-supplied: the `one_shown_function` and `target_function` stages and the name failures
+  then count names the harness wrote, never model task-following. After the run, and for
+  reporting only, the tool reads the traces back and reports how many instances and generations
+  had a prefilled name equal to a target's. Without the option, prompts, generation requests and
+  traces are byte-for-byte those of earlier runs (a test pins their hash). Byte-pair merges can
+  differ at the boundary between the prefilled `(` and what follows, compared with encoding the
+  whole function at once.
 
 The scorecard's **funnel** counts nested stages, per generation and per instance: closed or
 recovered block, parseable, exactly one shown function, that function is a target, an applied
@@ -141,8 +180,14 @@ already has) is flagged as a harness defect. `agent_dev_run compare --runs DIR..
 its code commit (clean tree), cases, case registry, checkpoint, tokenizer, seeds, decoding rows, conditions, budgets,
 threads, batch size, supervisor and runtime image, or the comparison is refused (unless
 `--allow-noncomparable`, which marks those rows). Each row names the configuration fields that
-differ and is labelled baseline, single factor (prompt, sampled decoding as one factor, or
-recovery) or combined.
+differ and is labelled baseline, single factor (prompt, sampled decoding as one factor,
+recovery, or the name prefill) or combined. Sampled decoding is named by what changed from the
+default T 1.0, top-p 1.0: T 0.6 with top-p 0.95 is "lower temperature plus nucleus sampling
+(T 0.6, top-p 0.95)", never just a lower temperature. The name prefill may differ from the
+baseline only as the one differing factor; combined with another factor the row is marked
+non-comparable. In both markdown tables every count carries its denominator: funnel stages out
+of the row's generations or instances, failure classes out of scored instances, name failures
+out of generations and harness defects out of instances.
 
 ## Design choices and common mistakes
 
@@ -177,8 +222,11 @@ recovery) or combined.
 
 - Implementation: [`src/scratchcoder/agent/`](../../src/scratchcoder/agent/) and
   [`tools/agent_dev_run.py`](../../tools/agent_dev_run.py).
-- Tests: [`tests/test_agent_workspace.py`](../../tests/test_agent_workspace.py) and
-  [`tests/test_agent_loop.py`](../../tests/test_agent_loop.py), run by `make test`. They use
+- Tests: [`tests/test_agent_workspace.py`](../../tests/test_agent_workspace.py),
+  [`tests/test_agent_loop.py`](../../tests/test_agent_loop.py),
+  [`tests/test_agent_experiments.py`](../../tests/test_agent_experiments.py),
+  [`tests/test_agent_prefill.py`](../../tests/test_agent_prefill.py) and
+  [`tests/test_agent_case_ids.py`](../../tests/test_agent_case_ids.py), run by `make test`. They use
   scripted executors and fake policies only; a reference-fix oracle solves the fixture through the
   full loop, and one test checks that `isolated_execution` receives exactly the packed program and
   check text.
@@ -208,3 +256,5 @@ negative controls fail), runs the oracle, then the model rows.
    block, then the map, then the farthest snippets.
 5. *What does the oracle prove?* That locate, prompt, edit, feedback and grading fit together:
    writing the reference function through the same editor must solve every valid case.
+6. *Does a solve under `--prefill-name` show that the model follows the task?* No. The harness
+   supplied the function name; only what the model generated after `def <name>(` is its own.

@@ -25,17 +25,18 @@ budget, a block is truncated (and the truncation logged); if the whole prompt is
 :data:`PROMPT_BUDGET`, the changes-so-far block is dropped, then the map, then the farthest
 snippets (the nearest one always stays). If even that does not fit, :class:`ContextLimit` is
 raised and the instance ends as a context failure. The generation cap is
-``min(GENERATION_CAP, CONTEXT - prompt tokens)``.
+``min(GENERATION_CAP, CONTEXT - prompt tokens - prefill tokens)``; the prefill (``--prefill-name``,
+:func:`name_prefill`) is empty unless that option is on.
 """
 
 from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
-from scratchcoder.data.chat import Message, TextEncoder, generation_prompt
+from scratchcoder.data.chat import PYTHON_START, Message, TextEncoder, generation_prompt
 from scratchcoder.eval.harness import ContextLimitError
 
 CONTEXT = 1024
@@ -83,6 +84,10 @@ class Prompt:
     shown: tuple[str, ...]
     """The function keys the prompt shows, nearest first."""
     truncations: tuple[str, ...] = field(default_factory=tuple)
+    prefill: tuple[int, ...] = ()
+    """Reply tokens the harness writes before generation (``--prefill-name``; empty when off).
+    Not part of ``ids``, ``tokens`` or ``sha256``."""
+    prefill_text: str = ""
 
     @property
     def tokens(self) -> int:
@@ -93,7 +98,8 @@ class Prompt:
         return hashlib.sha256(",".join(map(str, self.ids)).encode()).hexdigest()
 
     def generation_cap(self) -> int:
-        return min(GENERATION_CAP, CONTEXT - self.tokens)
+        """New tokens allowed: the planned cap, or the room the prompt and any prefill leave."""
+        return min(GENERATION_CAP, CONTEXT - self.tokens - len(self.prefill))
 
 
 def _count(encoder: TextEncoder, text: str) -> int:
@@ -315,23 +321,71 @@ def build_layout(encoder: TextEncoder, blocks: Blocks, layout: str) -> Prompt:
     raise ValueError(f"unknown prompt layout {layout!r}")
 
 
-def fit_bound(prompt_tokens: int, reference_tokens: Sequence[int]) -> dict[str, Any]:
-    """The static fit check of a case (plan section 3.5), from its turn-1 prompt without the
-    observation and changes-so-far blocks and the tokens of each target's reference function.
+SEPARATOR_ALLOWANCE = 4
+"""Tokens allowed for the two blank-line separators that the observation and changes-so-far
+blocks add to a prompt (the plan's worst case adds both blocks)."""
 
-    The worst-case prompt adds both blocks' full budgets. The whole fix, with a 20% margin,
-    must fit the context after that prompt, and the largest single function (one per turn), with
-    the margin and its two block tokens (python start and end), must fit the generation cap
-    that prompt leaves."""
-    worst = prompt_tokens + BUDGETS["observation"] + BUDGETS["previous"]
-    cap = min(GENERATION_CAP, CONTEXT - worst)
+
+def fit_bound(
+    prompt_tokens: int, reference_tokens: Sequence[int], *, snippet_tokens: int
+) -> dict[str, Any]:
+    """The static fit check of a case (plan section 3.5). ``prompt_tokens`` is its turn-1
+    prompt without the observation and changes-so-far blocks, ``snippet_tokens`` that
+    prompt's snippet block, and ``reference_tokens`` the tokens of each target's reference
+    function.
+
+    The worst-case prompt of any turn grows the snippet block to its full budget (a later turn
+    can show a longer function, such as an edited one grown up to :data:`FUNCTION_BUDGET`, or
+    more located functions), adds both feedback blocks at their full budgets and allows
+    :data:`SEPARATOR_ALLOWANCE` tokens for their separators. The case fits when:
+
+    1. that worst-case prompt is within :data:`PROMPT_BUDGET`;
+    2. the whole fix, with a 20% margin, fits the context after it:
+       ``worst + 1.2 x sum(reference) <= CONTEXT``;
+    3. the largest single function (one per turn), with the margin and its two block tokens
+       (python start and end), fits the generation cap: ``1.2 x largest + 2 <= GENERATION_CAP``.
+
+    ``PROMPT_BUDGET + GENERATION_CAP == CONTEXT``, so a prompt within condition 1 always leaves
+    the full :data:`GENERATION_CAP`; the context never shrinks the cap of a case that can fit.
+    This is planning only: at run time the budgets are enforced by truncation, drops and
+    :class:`ContextLimit`, and the cap is computed from the real prompt."""
+    worst = (
+        prompt_tokens
+        - snippet_tokens
+        + max(snippet_tokens, BUDGETS["snippet"])
+        + BUDGETS["observation"]
+        + BUDGETS["previous"]
+        + SEPARATOR_ALLOWANCE
+    )
     largest = max(reference_tokens, default=0)
     total_bound = worst + 1.2 * sum(reference_tokens)
     turn_bound = 1.2 * largest + 2
     return {
         "worst_prompt_tokens": worst,
-        "generation_cap": cap,
+        "generation_cap": GENERATION_CAP,
         "total_bound": total_bound,
         "largest_function_bound": turn_bound,
-        "fits": total_bound <= CONTEXT and turn_bound <= cap and worst <= PROMPT_BUDGET,
+        "fits": worst <= PROMPT_BUDGET and total_bound <= CONTEXT and turn_bound <= GENERATION_CAP,
     }
+
+
+PREFILL_OPEN = "<|python_start|>"
+"""How a prefill's block opener is written in ``prefill_text``: in chat-v1 the opening of a
+python block (``` ```python ``` plus a newline in plain markdown) is this one special token."""
+
+
+def name_prefill(prompt: Prompt, encoder: TextEncoder) -> Prompt:
+    """``prompt`` with the name prefill of ``--prefill-name``: the reply is started with a
+    python block and ``def <name>(``, where ``<name>`` is the function of the nearest shown
+    snippet (``prompt.shown[0]``, the harness's own selection, already displayed in the
+    prompt). It reads nothing but the prompt; a prompt that shows no function gets no prefill.
+
+    The prefill tokens are not part of ``prompt.ids`` (whose hash is unchanged); they count
+    against the context (:meth:`Prompt.generation_cap`) but are not generated tokens."""
+    if not prompt.shown:
+        return prompt
+    name = prompt.shown[0].split("::", 1)[1]
+    text = f"def {name}("
+    return replace(
+        prompt, prefill=(PYTHON_START, *encoder.encode(text)), prefill_text=PREFILL_OPEN + text
+    )

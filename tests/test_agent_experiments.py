@@ -387,6 +387,7 @@ def test_run_records_the_configuration_and_compare_writes_one_table(
         "sampled_temperature": 1.0,
         "sampled_top_p": 1.0,
         "recovery": "off",
+        "prefill_name": False,
     }
     assert second["identity"]["config"]["recovery"] == "intact-function"
     assert [d["temperature"] for d in second["identity"]["decodings"]] == [0.0, 0.6]
@@ -406,8 +407,14 @@ def test_run_records_the_configuration_and_compare_writes_one_table(
         1,
     ]
     text = md.read_text("utf-8")
-    assert "| A | single | baseline | yes | harness | 1.0 / 1.0 | off |" in text
-    assert "| E | single | combined: prompt + sampled_decoding + recovery | yes |" in text
+    assert (
+        "| A | single | baseline | yes | harness | default sampling (T 1.0, top-p 1.0) | off | off "
+        "| model |" in text
+    )
+    assert (
+        "| E | single | combined: prompt + sampled decoding, lower temperature plus nucleus "
+        "sampling (T 0.6, top-p 0.95) + recovery | yes |" in text
+    )
     assert table["comparable"] and table["rows"][2]["differs_from_baseline"] == [
         "prompt",
         "sampled_temperature",
@@ -549,7 +556,8 @@ def test_compare_labels_factors_and_flags_runs_that_differ_outside_the_config() 
     assert labels == [
         "baseline",
         "single factor: prompt",
-        "single factor: sampled_decoding",
+        "single factor: sampled decoding, lower temperature plus nucleus sampling "
+        "(T 0.6, top-p 0.95)",
         "single factor: recovery",
         "combined: prompt + recovery",
         "same configuration as baseline",
