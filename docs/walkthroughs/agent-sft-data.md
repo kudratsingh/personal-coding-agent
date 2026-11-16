@@ -188,8 +188,12 @@ never a family item:
   values, a test, an exception and helper file and function names. None of that describes
   the task, and with the phrasing removed the literal values alone (runs of digits, lists)
   reach the paraphrase level between unrelated templates. It is exposure text only.
-  `strip_task` checks that each statement is in a generator phrasing and refuses one that is
-  not, since text the generator did not write could be a real description;
+  `strip_task` checks that each statement is in a generator phrasing and that each field
+  holds what the generator fills in: the call is a name called with literal arguments, the
+  values are literals, the test, function and exception are identifiers, the file is a
+  `*.py` name, and the traceback is the header, frame lines and one error line. It refuses
+  any other statement, prose inside a field included, since text the generator did not
+  write could be a real description;
 - the harness prompt's fixed blocks (map, snippet headers, changes so far, results,
   instruction), which is why row user texts are exposure text only;
 - the catalog's non-target functions. `unit_kinds` reads each template's roles from the

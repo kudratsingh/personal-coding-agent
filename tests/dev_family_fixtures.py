@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -19,9 +20,11 @@ def words(prefix: str, count: int) -> str:
 
 
 def phrased(text: str) -> str:
-    """``text`` as a generator task statement (a failing-test phrasing): exposure text for
-    the dev-family rule, never a family item."""
-    return f"Bug: the test {text} fails. Fix the code under test."
+    """``text`` as a generator task statement (a failing-test phrasing, ``text`` made into
+    the test's identifier as the generator's test names are): exposure text for the
+    dev-family rule, never a family item."""
+    name = "test_" + re.sub(r"\W", "_", text)
+    return f"Bug: the test {name} fails. Fix the code under test."
 
 
 def pool_task(identifier: str, prompt: str, solution: str | None, split: str) -> Task:

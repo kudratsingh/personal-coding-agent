@@ -30,7 +30,8 @@ generator's phrasings (``instances.TASK_PHRASES``, with the traceback framing
 ``TRACEBACK_HEADER`` and ``FRAME_LINE``) filled in with a call, literal values, test,
 exception, helper file and function names: none of it describes the task, and literal
 values alone (digit runs, lists) reach the paraphrase level between unrelated templates. It
-is exposure text only; :func:`strip_task` refuses a statement the generator did not write.
+is exposure text only; :func:`strip_task` refuses a statement the generator did not write:
+one in no phrasing, or one whose fields hold anything but what the generator fills in.
 The harness prompt's fixed blocks (map, snippet headers, changes-so-far block, results,
 instruction) and the catalog's non-target functions, which most templates of a family share,
 are scaffolding too. Only the target function is the trained unit (every case has one
@@ -88,9 +89,12 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import json
+import keyword
 import re
 import string
+import tokenize
 from collections import Counter, defaultdict
 from collections.abc import Hashable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -767,21 +771,69 @@ def _defines(text: str) -> bool:
 
 
 @cache
-def _phrasings() -> tuple[tuple[re.Pattern[str], tuple[str, ...], int], ...]:
-    """Each generator phrasing as a pattern, its field names and its fixed-text length,
-    longest fixed text first (the most specific phrasing wins)."""
+def _phrasings() -> tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]:
+    """Each generator phrasing as its fixed text pieces (one more than its fields: the text
+    before, between and after them) and its field names, longest fixed text first (the most
+    specific phrasing wins)."""
     found = []
     for order, phrase in enumerate(generator.TASK_PHRASES):
-        pattern, fields, fixed = "", [], 0
+        pieces, fields = [""], []
         for literal, name, _, _ in string.Formatter().parse(phrase):
-            pattern += re.escape(literal)
-            fixed += len(literal)
+            pieces[-1] += literal
             if name is not None:
-                pattern += "(.+?)"
                 fields.append(name)
-        found.append((order, re.compile(pattern, re.DOTALL), tuple(fields), fixed))
-    found.sort(key=lambda item: (-item[3], item[0]))
-    return tuple((pattern, fields, fixed) for _, pattern, fields, fixed in found)
+                pieces.append("")
+        found.append((-sum(map(len, pieces)), order, tuple(pieces), tuple(fields)))
+    found.sort()
+    return tuple((pieces, fields) for _, _, pieces, fields in found)
+
+
+def _expression(text: str) -> ast.expr | None:
+    """``text`` parsed as one expression on one line with no comment, else ``None``. A
+    generator literal is a ``repr``: one line, never a comment outside a string."""
+    if not text or text != text.strip() or "\n" in text or "\r" in text:
+        return None
+    try:
+        tree = ast.parse(text, mode="eval")
+        tokens = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (SyntaxError, ValueError, MemoryError, RecursionError, tokenize.TokenError):
+        return None
+    if any(token.type == tokenize.COMMENT for token in tokens):
+        return None
+    return tree.body
+
+
+def _is_literal(node: ast.expr) -> bool:
+    try:
+        ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return False
+    return True
+
+
+def _is_name(text: str) -> bool:
+    return text.isascii() and text.isidentifier() and not keyword.iskeyword(text)
+
+
+def _is_file(text: str) -> bool:
+    return text.endswith(".py") and _is_name(text.removesuffix(".py"))
+
+
+def _is_call(text: str) -> bool:
+    """``name(literal, ...)``, as the generator's ``_call`` renders a test's call."""
+    node = _expression(text)
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and _is_name(node.func.id)
+        and not node.keywords
+        and all(not isinstance(arg, ast.Starred) and _is_literal(arg) for arg in node.args)
+    )
+
+
+def _is_value(text: str) -> bool:
+    node = _expression(text)
+    return node is not None and _is_literal(node)
 
 
 _FRAME = re.compile(
@@ -791,6 +843,36 @@ _FRAME = re.compile(
     .replace(re.escape("{function}"), "(.*)")
     + "$"
 )
+_ERROR_LINE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:: (.+))?")
+
+
+def _is_traceback(text: str) -> bool:
+    """The generator's ``_traceback``: the header, one or more frames (each a ``*.py``
+    file and a function name), then one error line (an exception name, optionally ``: `` and
+    its message)."""
+    lines = text.split("\n")
+    if len(lines) < 3 or lines[0] != generator.TRACEBACK_HEADER:
+        return False
+    for line in lines[1:-1]:
+        frame = _FRAME.match(line)
+        if frame is None or not (_is_file(frame[1]) and _is_name(frame[2])):
+            return False
+    error = _ERROR_LINE.fullmatch(lines[-1])
+    return error is not None and _is_name(error[1])
+
+
+_FIELD_CHECKS = {
+    "call": _is_call,
+    "want": _is_value,
+    "got": _is_value,
+    "test": _is_name,
+    "name": _is_name,
+    "exc": _is_name,
+    "file": _is_file,
+    "traceback": _is_traceback,
+}
+"""What each field of a phrasing holds, as ``instances._task`` fills it in: a call of a name
+with literal arguments, literal values, identifiers, a ``*.py`` file and a traceback."""
 
 
 def _strip_traceback(text: str) -> str:
@@ -803,21 +885,53 @@ def _strip_traceback(text: str) -> str:
     return "\n".join(lines)
 
 
+def _fill(
+    task: str, pieces: tuple[str, ...], fields: tuple[str, ...], start: int
+) -> list[str] | None:
+    """The first way ``task[start:]`` fills ``fields`` between ``pieces`` (each field
+    nonempty, shortest first, as a lazy pattern would match) whose every value passes its
+    field's check; ``None`` when there is none."""
+    if not fields:
+        return [] if task[start:] == pieces[0] else None
+    if not task.startswith(pieces[0], start):
+        return None
+    begin = start + len(pieces[0])
+    following = pieces[1]
+    if len(fields) == 1 and not following:
+        ends = [len(task)] if len(task) > begin else []
+    else:
+        ends = []
+        at = task.find(following, begin + 1)
+        while at != -1:
+            ends.append(at)
+            at = task.find(following, at + 1)
+    check = _FIELD_CHECKS[fields[0]]
+    for end in ends:
+        value = task[begin:end]
+        if not check(value):
+            continue
+        rest = _fill(task, pieces[1:], fields[1:], end)
+        if rest is not None:
+            return [value, *rest]
+    return None
+
+
 def strip_task(task: str) -> str:
     """The task statement without the generator's fixed phrasing: the values it filled in
     (call, values, test, exception, function and file names, traceback frames and error
-    line), one per line. Raises when no generator phrasing matches: a statement written
-    some other way is not stripped by guesswork. :func:`instance_node` uses it only to refuse
-    a statement the generator did not write (the statement is exposure text, never a family
-    item)."""
-    for pattern, fields, _ in _phrasings():
-        match = pattern.fullmatch(task)
-        if match is None:
+    line), one per line. Raises unless the statement is a generator phrasing whose every
+    field holds what ``instances._task`` puts there (:data:`_FIELD_CHECKS`): a statement
+    written some other way, or prose inside a phrasing's field, is not stripped by
+    guesswork. :func:`instance_node` uses it only to refuse a statement the generator did not
+    write (the statement is exposure text, never a family item)."""
+    for pieces, fields in _phrasings():
+        values = _fill(task, pieces, fields, 0)
+        if values is None:
             continue
-        values = []
-        for name, value in zip(fields, match.groups(), strict=True):
-            values.append(_strip_traceback(value) if name == "traceback" else value)
-        return "\n".join(values)
+        return "\n".join(
+            _strip_traceback(value) if name == "traceback" else value
+            for name, value in zip(fields, values, strict=True)
+        )
     raise ValueError("a task statement matches no generator phrasing")
 
 

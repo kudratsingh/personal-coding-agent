@@ -7,6 +7,7 @@ cross product of each node's prompts and solutions. Nothing generated is execute
 from __future__ import annotations
 
 import json
+import re
 import string
 from collections.abc import Sequence
 from dataclasses import replace
@@ -34,6 +35,7 @@ from dev_family_reference import dev_family_ids, scan
 from scratchcoder.agent import cases
 from scratchcoder.agent import prompt as harness_prompt
 from scratchcoder.agent.synth import dev_family, instances
+from scratchcoder.agent.synth.catalog import catalog
 from scratchcoder.agent.synth.dev_family import Instance, Node, assess, task_node
 from scratchcoder.data.clusters import (
     DEFAULT_RULES,
@@ -926,6 +928,126 @@ def test_strip_task_removes_every_generator_phrasing() -> None:
             assert "test_lib.py test_run_one\nlib.py run\nIndexError" in stripped
     with pytest.raises(ValueError, match="no generator phrasing"):
         dev_family.strip_task("Please rewrite this function.")
+
+
+class _Options:
+    """A test encoder that records each task statement the generator offers it and counts
+    every one too long, so the generator offers every phrasing it fills in."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def encode(self, text: str) -> list[int]:
+        self.seen.append(text)
+        return [0] * (instances.MAX_TASK_TOKENS + 1)
+
+
+def test_strip_task_accepts_every_statement_the_generator_writes() -> None:
+    """Every phrasing the generator fills in, for every catalog template and bug kind, has
+    fields that pass their checks. Together they use every phrasing but the W3 raise one,
+    which no catalog template writes (the field tests below fill it in)."""
+    options = _Options()
+    for template in catalog().templates:
+        for bug in template.bugs:
+            for index in range(2):
+                instances.build(template, bug, index, 0, encoder=options)
+    used: set[str] = set()
+    for text in options.seen:
+        dev_family.strip_task(text)
+        used.update(
+            phrase
+            for phrase in instances.TASK_PHRASES
+            if re.fullmatch(
+                "(.+?)".join(re.escape(piece) for piece in re.split(r"\{\w+\}", phrase)),
+                text,
+                re.DOTALL,
+            )
+        )
+    assert used == set(instances.TASK_PHRASES) - set(instances.W3_RAISE_PHRASES)
+
+
+def _filled(phrase: str, **changes: str) -> str:
+    values = {
+        "call": "run([1, 2], 'a')",
+        "got": "3",
+        "want": "(4, None)",
+        "test": "test_run_one",
+        "exc": "IndexError",
+        "name": "run",
+        "file": "lib.py",
+        "traceback": "\n".join(
+            [
+                instances.TRACEBACK_HEADER,
+                instances.FRAME_LINE.format(file="test_lib.py", function="test_run_one"),
+                instances.FRAME_LINE.format(file="lib.py", function="run"),
+                "IndexError: list index out of range",
+            ]
+        ),
+    }
+    return phrase.format(**{**values, **changes})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "prose"),
+    [
+        ("name", "a function that returns the longest strictly increasing subsequence"),
+        ("file", "the module that sorts a list of intervals by start.py"),
+        ("test", "test_run when given an empty list of words"),
+        ("exc", "an error because the list of intervals is empty"),
+        ("call", "run([1, 2])  # merge the overlapping intervals of a list"),
+        ("call", "run(sorted(words))"),
+        ("call", "the function that merges overlapping intervals([1, 2])"),
+        ("want", "4  # the number of distinct words in a sentence"),
+        ("want", "the length of the longest run of equal values"),
+        ("got", "sum(values)"),
+        (
+            "traceback",
+            "\n".join(
+                [
+                    instances.TRACEBACK_HEADER,
+                    "  The function merges overlapping intervals of a sorted list.",
+                    "IndexError: list index out of range",
+                ]
+            ),
+        ),
+        (
+            "traceback",
+            "\n".join(
+                [
+                    instances.TRACEBACK_HEADER,
+                    instances.FRAME_LINE.format(file="lib.py", function="run"),
+                    "It returns the longest strictly increasing subsequence.",
+                ]
+            ),
+        ),
+    ],
+)
+def test_strip_task_refuses_prose_inside_a_phrasing_field(field_name: str, prose: str) -> None:
+    """A field holds only what the generator puts there (a call of a name with literal
+    arguments, a literal, an identifier, a ``*.py`` file, a traceback): a real description
+    written inside a phrasing's fixed frame is refused."""
+    phrases = [p for p in instances.TASK_PHRASES if "{" + field_name + "}" in p]
+    assert phrases
+    for phrase in phrases:
+        assert dev_family.strip_task(_filled(phrase))
+        with pytest.raises(ValueError, match="no generator phrasing"):
+            dev_family.strip_task(_filled(phrase, **{field_name: prose}))
+
+
+def test_strip_task_refuses_the_reviewed_stub_description() -> None:
+    task = (
+        "Implement the stub a function that returns the longest strictly increasing "
+        "subsequence of a list in lis.py following its docstring."
+    )
+    with pytest.raises(ValueError, match="no generator phrasing"):
+        dev_family.strip_task(task)
+
+
+def test_strip_task_splits_a_literal_holding_a_phrasing_separator() -> None:
+    """A literal value may contain a phrasing's fixed text; the split whose fields all pass
+    their checks is taken."""
+    text = _filled(instances.W1_PHRASES[0], got="' instead of '", want="'x'")
+    assert dev_family.strip_task(text) == "run([1, 2], 'a')\n' instead of '\n'x'"
 
 
 def test_pending_flag_rows_are_kept_only_on_a_record_that_resolves_each_edge() -> None:
