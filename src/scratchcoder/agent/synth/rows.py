@@ -368,6 +368,9 @@ def build_instance(
     return InstanceBuild(case.id, not reasons, reasons, counted[0], steps, rows, meta)
 
 
+CONTROL_CHECKS = ("full", "independent")
+
+
 def run_controls(
     case: Case,
     synth: Mapping[str, Any],
@@ -375,16 +378,42 @@ def run_controls(
     *,
     execute: execution.Execute,
     sleep: Callable[[float], None] | None = None,
+    checks: str = "full",
 ) -> list[dict[str, Any]]:
     """The negative controls of one instance's template: each replaces the reference target
-    with a trivial body and runs the full grading script once; each must not pass."""
+    with a trivial body and runs the full grading script once; each must not pass.
+
+    ``checks="independent"`` runs the independent oracle's checks alone instead, to measure
+    whether they reject the controls without the generator's tests; it first runs the
+    reference against them (control ``reference``, ok when it passes). Such rows never gate."""
+    if checks not in CONTROL_CHECKS:
+        raise ValueError(f"unknown control checks {checks!r}")
     path, _, name = case.targets[0].partition("::")
     reference = case.reference_function(case.targets[0])
     block = independent.block(
         oracle, path.removesuffix(".py"), name, synth["oracle_params"], int(synth["seed"]) % 2**31
     )
-    grading = independent.grading_script(case.correctness, case.preservation, block)
     rows = []
+    if checks == "independent":
+        grading = block
+        # Positive control first: the oracle's checks alone must pass the reference, or a
+        # script that fails for every candidate (a broken oracle) would read as "rejected".
+        run = execution.run_call(
+            *execution.check_call(case.reference_files(), grading), execute=execute, sleep=sleep
+        )
+        rows.append(
+            {
+                "instance": case.id,
+                "template_id": synth["template_id"],
+                "control": "reference",
+                "checks": checks,
+                "status": run.status,
+                "resolved": run.resolved,
+                "ok": run.resolved and run.passed,
+            }
+        )
+    else:
+        grading = independent.grading_script(case.correctness, case.preservation, block)
     for kind in mutation.CONTROL_KINDS:
         source = mutation.control(reference, kind, synth.get("control_constant"))
         files = workspace.apply_function(
@@ -398,6 +427,7 @@ def run_controls(
                 "instance": case.id,
                 "template_id": synth["template_id"],
                 "control": kind,
+                "checks": checks,
                 "status": run.status,
                 "resolved": run.resolved,
                 "ok": run.resolved and not run.passed,

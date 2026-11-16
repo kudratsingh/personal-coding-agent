@@ -15,7 +15,7 @@ from agent_fixtures import ARITH, write_case, write_registry
 from synth_fixtures import Chunks, SynthExecutor, claim_errors, families_json
 
 from scratchcoder.agent import cases, workspace
-from scratchcoder.agent.synth import contamination, instances, mix
+from scratchcoder.agent.synth import contamination, independent, instances, mix, mutation
 from scratchcoder.agent.synth import ledger as call_ledger
 from scratchcoder.data.chat import Rendered
 from scratchcoder.data.sft import SFTRow, read_rows
@@ -797,3 +797,60 @@ def test_generate_with_another_seed_base_gets_new_ids_and_counts_prior_replies(
 def test_instance_ids_name_a_non_zero_seed_base() -> None:
     assert instances.instance_id("dice2", "ascending", 4) == "dice2-ascending-004"
     assert instances.instance_id("dice2", "ascending", 4, 7) == "dice2-ascending-s7-004"
+
+
+def test_oracle_only_controls_measure_the_oracle_and_never_gate_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    instances = _generate(tmp_path, ["stock1"])
+    pin = _independent(tmp_path, {"stock1.py": STOCK1_ORACLE, "README.md": "notes\n"})
+    receipt = tmp_path / "receipt.json"
+    executor = CaseExecutor(instances)
+    out = tmp_path / "oracle-controls"
+    argv = _build_argv(tmp_path, out, instances, receipt, pin, "--oracle-controls-only")
+    _receipt(receipt, argv)
+    assert agent_sft_data.main(argv, execute=executor, loader=_loader) == 0
+    # One template: the reference, then its four controls, against the oracle's checks alone.
+    assert executor.calls == 5
+    found = [json.loads(line) for line in (out / "oracle-controls.jsonl").read_text().splitlines()]
+    assert len(found) == 5 and {row["checks"] for row in found} == {"independent"}
+    assert found[0]["control"] == "reference" and found[0]["ok"]
+    assert not (out / "rows.jsonl").exists() and not (out / "controls.jsonl").exists()
+    record = json.loads((out / "record.json").read_text())
+    assert record["rows"] == 5 and record["planned_calls"] == 5 and record["controls"] == 4
+    assert record["reference_passed"] == ["stock1"] and record["reference_not_passed"] == []
+    assert record["rejected_by_oracle_alone"] == sum(row["ok"] for row in found[1:])
+    # These rows never stand in for the full-grading controls that gate rows.
+    later = tmp_path / "build"
+    argv = _build_argv(
+        tmp_path,
+        later,
+        instances,
+        receipt,
+        pin,
+        "--controls-from",
+        str(out / "oracle-controls.jsonl"),
+    )
+    _receipt(receipt, argv)
+    assert agent_sft_data.main(argv, execute=executor, loader=_loader) == 0
+    built = json.loads((later / "record.json").read_text())
+    assert built["controls"]["templates_without_controls"] == ["stock1"]
+    assert built["totals"].get("accepted", 0) == 0
+    assert (later / "rows.jsonl").read_text() == ""
+
+
+def test_older_control_rows_without_a_checks_key_still_gate(tmp_path: Path) -> None:
+    from tools.agent_sft_data import _prior_controls
+
+    oracle = independent.Oracle("t", "", "abc", True)
+    rows = [
+        {"template_id": "t", "control": kind, "ok": True, "oracle_sha256": "abc"}
+        for kind in mutation.CONTROL_KINDS
+    ]
+    target = tmp_path / "controls.jsonl"
+    target.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    assert _prior_controls([target], {"t": oracle}) == {"t": True}
+    marked = [{**row, "checks": "independent"} for row in rows]
+    target.write_text("".join(json.dumps(row) + "\n" for row in marked))
+    assert _prior_controls([target], {"t": oracle}) == {}

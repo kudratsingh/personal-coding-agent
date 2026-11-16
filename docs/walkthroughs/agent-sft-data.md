@@ -133,7 +133,13 @@ hash; a copy of a counted record is skipped and reported.
   seeds can reach. Size an expansion by that reach, not by the call budget. An expansion uses
   a new `--seed-base`, which becomes part of each instance ID (`<template>-<bug>-s<base>-<n>`),
   and names the earlier sets with `--prior-instances`: their replies count toward the cap, and
-  an ID they already hold is refused. `mix` applies the
+  an ID they already hold is refused. A passing grading call does not show that the
+  independent checks have any power of their own, so `--oracle-controls-only` runs the four
+  negative controls against the independent oracle alone, once per template, and builds
+  nothing. It first runs the reference against the same checks: a template's rejections count
+  only when that positive control passed, since a script that fails for every candidate would
+  otherwise read as a perfect rejection. Its rows go to `oracle-controls.jsonl` and never stand in for the gating
+  controls. `mix` applies the
   same cap and reports distinct replies, distinct (prompt, reply) pairs and the most rows on one
   reply, beside distinct templates, families, workflow types and mutation kinds.
 - **Contamination results are bound to their inputs.** `mix` needs both results (agent rows

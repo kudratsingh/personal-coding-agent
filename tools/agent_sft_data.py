@@ -373,6 +373,104 @@ def ledger(args: argparse.Namespace) -> int:
     return 0
 
 
+def _oracle_controls(
+    args: argparse.Namespace,
+    book: call_ledger.Ledger,
+    chosen: Sequence[agent_cases.Case],
+    records: dict[str, dict[str, Any]],
+    oracles: dict[str, Any],
+    pinned: independent.Pin,
+    image_id: str,
+    execute: execution.Execute,
+) -> int:
+    """Run the reference (a positive control) and the four negative controls against the
+    independent oracle's checks alone, once per template (its first selected instance).
+    Writes ``oracle-controls.jsonl`` (never read as gating controls) and ``record.json``;
+    builds no instance and no row."""
+    out: Path = args.out
+    usable = [
+        c for c in chosen if isinstance(oracles[records[c.id]["template_id"]], independent.Oracle)
+    ]
+    planned = (len(mutation.CONTROL_KINDS) + 1) * len(usable)
+    if planned > book.remaining:
+        print(
+            f"refused: {planned} planned sandbox calls exceed the {book.remaining} the ledger "
+            f"cap leaves ({book.total} of {book.cap} used)",
+            file=sys.stderr,
+        )
+        return 2
+    out.mkdir(parents=True)
+    target = out / "oracle-controls.jsonl"
+    target.touch(exist_ok=False)
+    started = utc_now()
+    context = {"value": ""}
+    counted = book.execute(execute, run=out.name, context=lambda: context["value"])
+    stopped = ""
+    found: list[dict[str, Any]] = []
+    for case in usable:
+        record = records[case.id]
+        oracle = oracles[record["template_id"]]
+        context["value"] = f"{case.id}/oracle-controls"
+        try:
+            got = rows.run_controls(case, record, oracle, execute=counted, checks="independent")
+        except call_ledger.CallCapReached as error:
+            stopped = str(error)
+            break
+        got = [
+            {**row, "independent_sums_sha256": pinned.sums_sha256, "oracle_sha256": oracle.sha256}
+            for row in got
+        ]
+        rows.append_jsonl(target, got)
+        found.extend(got)
+    commit, dirty = git_state()
+    # A template's controls count as rejected by the oracle only when the oracle passed its
+    # reference (the positive control) and all four controls came back.
+    rows_by: dict[str, list[dict[str, Any]]] = {}
+    for row in found:
+        rows_by.setdefault(row["template_id"], []).append(row)
+    reference_ok = {
+        t: any(r["control"] == "reference" and r["ok"] for r in got) for t, got in rows_by.items()
+    }
+    by_template = {
+        t: reference_ok[t]
+        and {r["control"] for r in got} >= set(mutation.CONTROL_KINDS)
+        and all(r["ok"] for r in got)
+        for t, got in rows_by.items()
+    }
+    controls_found = [row for row in found if row["control"] != "reference"]
+    summary = {
+        "schema": "agent-synth-oracle-controls-v1",
+        "generator_version": GENERATOR_VERSION,
+        "started_at": started,
+        "finished_at": utc_now(),
+        "git_commit": commit,
+        "dirty": dirty,
+        "runtime_image_id": image_id,
+        "instances_registry_sha256": agent_cases.registry_sha256(args.instances),
+        "independent": {"directory": str(args.independent), **pinned.record()},
+        "planned_calls": planned,
+        "rows": len(found),
+        "reference_passed": sorted(t for t, ok in reference_ok.items() if ok),
+        "reference_not_passed": sorted(t for t, ok in reference_ok.items() if not ok),
+        "controls": len(controls_found),
+        # Counted only for templates whose reference the oracle passed.
+        "rejected_by_oracle_alone": sum(
+            row["ok"] for row in controls_found if reference_ok[row["template_id"]]
+        ),
+        "templates_all_rejected": sorted(t for t, ok in by_template.items() if ok),
+        "templates_not_all_rejected": sorted(t for t, ok in by_template.items() if not ok),
+        "templates_without_oracle": sorted(
+            records[c.id]["template_id"] for c in chosen if c not in usable
+        ),
+        "stopped": stopped,
+        "ledger": book.summary(),
+    }
+    atomic_json(out / "record.json", summary)
+    keys = ("rows", "controls", "rejected_by_oracle_alone", "reference_not_passed", "stopped")
+    print(json.dumps({k: summary[k] for k in keys}))
+    return 0 if not stopped else 3
+
+
 def _prior_controls(paths: Sequence[Path], oracles: dict[str, Any]) -> dict[str, bool]:
     """Templates whose negative controls an earlier build already ran against the oracle
     pinned now: template -> whether every control failed (all four kinds present)."""
@@ -387,7 +485,12 @@ def _prior_controls(paths: Sequence[Path], oracles: dict[str, Any]) -> dict[str,
         oracle = oracles.get(template_id)
         if not isinstance(oracle, independent.Oracle):
             continue
-        current = [row for row in found_rows if row.get("oracle_sha256") == oracle.sha256]
+        # Only full-grading controls gate rows; oracle-only measurements never do.
+        current = [
+            row
+            for row in found_rows
+            if row.get("oracle_sha256") == oracle.sha256 and row.get("checks", "full") == "full"
+        ]
         kinds = {str(row["control"]) for row in current}
         if not current:
             continue
@@ -457,6 +560,11 @@ def _build(
         chosen.append(case)
         if args.limit and len(chosen) >= args.limit:
             break
+    if args.oracle_controls_only:
+        first: dict[str, agent_cases.Case] = {}
+        for case in chosen:
+            first.setdefault(records[case.id]["template_id"], case)
+        chosen = list(first.values())
     templates = {records[case.id]["template_id"] for case in chosen}
     # Every oracle is read and checked against the pin once, before any call; later edits to
     # the directory cannot reach this run.
@@ -471,6 +579,8 @@ def _build(
     # controls failed its grading script, in this run (--controls) or in an earlier build
     # against the same oracle (--controls-from).
     passed = _prior_controls(args.controls_from or [], oracles)
+    if args.oracle_controls_only:
+        return _oracle_controls(args, book, chosen, records, oracles, pinned, image_id, execute)
     to_control = sorted(t for t in templates if t not in passed) if args.controls else []
     planned = sum(rows.calls_per_instance(len(records[c.id]["mutants"])) for c in chosen)
     planned += len(mutation.CONTROL_KINDS) * len(to_control)
@@ -855,6 +965,12 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         help="controls.jsonl of earlier builds; templates whose four controls all failed "
         "against the oracle pinned now need not run them again",
+    )
+    v.add_argument(
+        "--oracle-controls-only",
+        action="store_true",
+        help="run the four negative controls against the independent oracle's checks alone, "
+        "once per template, and build nothing (a measurement; these rows never gate)",
     )
     v.add_argument(
         "--diagnose",
