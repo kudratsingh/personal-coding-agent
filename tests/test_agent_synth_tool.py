@@ -20,6 +20,7 @@ from dev_family_fixtures import (
     register,
     words,
     write_build,
+    write_flag_manifest,
     write_instance,
     write_pool,
     write_specs,
@@ -675,7 +676,9 @@ def _mix_inputs(tmp_path: Path) -> dict[str, Path]:
     build = write_build(tmp_path / "synth-build", {f"i{n}": True for n in range(3)}, root)
     specs = write_specs(tmp_path / "specs.json", {f"t{n}": words(f"spec{n}", 12) for n in range(3)})
     family = tmp_path / "dev-family.json"
-    argv = dev_family_argv(dev, train, [(root, build)], [specs], meta, index, family)
+    # Replay row r0 stands on an unresolved flag edge to the dev task.
+    flags = write_flag_manifest(tmp_path / "clusters.json", [("r0", "d0", "pending")])
+    argv = dev_family_argv(dev, train, [(root, build)], [specs], meta, index, family, flags=flags)
     assert agent_sft_data.main(argv) == 0
     return {"meta": meta, "index": index, "family": family, **results}
 
@@ -724,6 +727,15 @@ def test_mix_needs_both_contamination_results_for_these_inputs_and_case_sets(
     assert "not applied" not in json.dumps(record)
     mixed = {row.id for row in read_rows(tmp_path / "mix-ok" / "mix.jsonl")}
     assert "agent-sft1/i2/edit" not in mixed
+    # The replay row on an unresolved flag edge stays out; the record counts the candidates.
+    assert "r0" not in mixed
+    assert record["dev_family"]["pending_flags"] == {
+        "candidates": 1,
+        "kept_resolved": 0,
+        "excluded": 1,
+        "candidates_in_mix": 0,
+    }
+    assert record["dev_family"]["item_mapping"] == "synthetic-items-v3"
     # A case set the results were not checked against (e.g. the second evaluation set).
     argv = _mix_argv(tmp_path, paths, "mix-more", registry, "e" * 64)
     assert agent_sft_data.main(argv) == 2
@@ -924,7 +936,8 @@ def test_mix_requires_the_dev_family_result_for_these_inputs(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Regression (e): mix refuses without the dev-family result, or with one for another
-    input, another rule or thresholds, or fewer replay kinds."""
+    input, another rule, schema, item mapping or thresholds, fewer replay kinds, without the
+    pending flag edges applied, or without a template it must have dropped."""
     paths = _mix_inputs(tmp_path)
     registry = cases.registry_sha256(tmp_path / "evalcases")
     argv = _mix_argv(tmp_path, paths, "mix-none", registry)
@@ -934,7 +947,7 @@ def test_mix_requires_the_dev_family_result_for_these_inputs(
     # A contamination result where the dev-family result belongs.
     wrong = {**paths, "family": paths["agent"]}
     assert agent_sft_data.main(_mix_argv(tmp_path, wrong, "mix-wrong", registry)) == 2
-    assert "not a dev-family result" in capsys.readouterr().err
+    assert "not a dev-family result of schema" in capsys.readouterr().err
     original = json.loads(paths["family"].read_text())
 
     def variant(name: str, change: dict[str, Any]) -> int:
@@ -949,6 +962,18 @@ def test_mix_requires_the_dev_family_result_for_these_inputs(
     assert variant("mix-swapped", swapped) == 2
     assert "another kind of input" in capsys.readouterr().err
     assert variant("mix-rule", {"dev_family": "task-clusters-v0"}) == 2
+    # A result of the earlier schema (its synthetic items were the earlier mapping).
+    assert variant("mix-schema", {"schema": "agent-dev-family-v1"}) == 2
+    assert "not a dev-family result of schema" in capsys.readouterr().err
+    synthetic = {**original["synthetic"], "item_mapping": {"version": "synthetic-items-v2"}}
+    assert variant("mix-mapping", {"synthetic": synthetic}) == 2
+    assert "did not use the item mapping" in capsys.readouterr().err
+    unapplied = {**original["replay"], "pending_flags": {"applied": False}}
+    assert variant("mix-flags", {"replay": unapplied}) == 2
+    assert "did not apply the pending flag edges" in capsys.readouterr().err
+    argv = _mix_argv(tmp_path, paths, "mix-owner", registry)
+    assert agent_sft_data.main([*argv, "--require-dropped-template", "t0"]) == 2
+    assert "did not drop templates ['t0']" in capsys.readouterr().err
     assert variant("mix-rules", {"rules": {**original["rules"], "named_flag": 0.2}}) == 2
     assert variant("mix-kinds", {"replay": {**original["replay"], "kinds": []}}) == 2
     assert "did not judge replay kinds" in capsys.readouterr().err

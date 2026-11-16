@@ -18,6 +18,12 @@ def words(prefix: str, count: int) -> str:
     return " ".join(f"{prefix}{index}" for index in range(count))
 
 
+def phrased(text: str) -> str:
+    """``text`` as a generator task statement (a failing-test phrasing): the dev-family rule
+    strips the phrasing and keeps ``text``."""
+    return f"Bug: the test {text} fails. Fix the code under test."
+
+
 def pool_task(identifier: str, prompt: str, solution: str | None, split: str) -> Task:
     return Task(
         id=identifier,
@@ -49,9 +55,12 @@ def write_instance(
     family: str = "fam",
     module: str = "toolbox.py",
     others: Mapping[str, str] | None = None,
+    names: Mapping[str, str] | None = None,
+    mutants: Sequence[str] = (),
 ) -> None:
     """One instance directory: ``module`` holds the target alone (original in the
-    repository, ``reference`` in the fix); ``others`` are further repository modules."""
+    repository, ``reference`` in the fix); ``others`` are further repository modules. The
+    task statement is ``task`` in a generator phrasing (:func:`phrased`)."""
     original = original or reference.replace("return", "return 1 +", 1)
     directory = root / identifier
     (directory / "repo").mkdir(parents=True)
@@ -69,7 +78,7 @@ def write_instance(
         "split": "dev",
         "category": "debugging",
         "workflow_type": "W1",
-        "task": task,
+        "task": phrased(task),
         "repo": "repo",
         "reference": {module: f"reference/{module}"},
     }
@@ -78,7 +87,8 @@ def write_instance(
         "template_id": template,
         "family": family,
         "workflow_type": "W1",
-        "mutants": [],
+        "mutants": [{"source": source} for source in mutants],
+        "names": dict(names or {}),
         "reference_target": reference,
         "original_target": original,
     }
@@ -157,6 +167,9 @@ def dev_family_argv(
     decoded: Path,
     out: Path,
     bridges: Sequence[Path] = (),
+    *,
+    flags: Path,
+    evidence: Path | None = None,
 ) -> list[str]:
     argv = ["dev-family", "--dev", str(dev), "--train", str(train)]
     for instances, build in judged:
@@ -164,4 +177,18 @@ def dev_family_argv(
     if bridges:
         argv += ["--bridge-instances", *map(str, bridges)]
     argv += ["--specs", *map(str, specs), "--rows-meta", str(meta), "--decoded", str(decoded)]
+    argv += ["--pending-flag-manifest", str(flags)]
+    argv += ["--evidence", str(evidence or out.with_name(out.stem + "-evidence.json"))]
     return [*argv, "--out", str(out)]
+
+
+def write_flag_manifest(path: Path, edges: Sequence[tuple[str, str, str]] = ()) -> Path:
+    """A cluster manifest with ``flag_edges`` only: (training task, dev task, review)."""
+    document = {
+        "flag_edges": [
+            {"a": train, "b": dev, "splits": ["train", "dev"], "review": review}
+            for train, dev, review in edges
+        ]
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path

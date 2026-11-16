@@ -8,12 +8,29 @@ code, and tests are never a signal.
 
 **Nodes.** The family graph holds every pool development task (the targets), every pool
 training task, and every synthetic instance (:class:`Node`). A pool task is one node with
-one prompt and one solution. A synthetic instance is one node with several prompts (task
-statement, the template's specification text, the target function's docstring, every
-training row's user text) and several solutions (the reference target, the original target,
-every module of the fixed repository and every top-level function or class of those modules
-on its own). The node stands for every (prompt, solution) pair of these, joined into one
-family, so any link of any pair marks the whole instance (:func:`items_of`).
+one prompt and one solution. A synthetic instance carries two kinds of items
+(:data:`MAPPING`, :func:`instance_node`):
+
+*Family items* join families (union signals), as a pool task's prompt and solution do. They
+are what the instance's rows train the model to do: the prompts are the task statement with
+the generator's fixed phrasing removed (:func:`strip_task`), the template's specification
+text and the target function's docstring; the one solution is the reference target, the
+function every row's reply is. The node stands for every (prompt, solution) pair of these,
+joined into one family (:func:`items_of`).
+
+*Exposure items* are what the rows show without training it as the answer: the original
+(buggy or stub) target, the wrong attempts, every module of the original and the fixed
+repository and each top-level function or class of those on its own, any code inside a
+row's user text, and the user texts and the full task statement as text. They never join
+families; they are checked directly (*exposure*, below), so buggy and helper code that a
+prompt shows still meets the AST and overlap checks.
+
+What the generator emits identically for more than one template is *scaffolding* and is
+never a family item: the task phrasings and traceback framing (``instances.TASK_PHRASES``,
+``TRACEBACK_HEADER``, ``FRAME_LINE``), the harness prompt's fixed blocks (map, snippet
+headers, changes-so-far block, results, instruction) and the catalog's non-target functions,
+which most templates of a family share. Only the target function is the trained unit (every
+case has one ``module::function`` target), so no whole module is a family item.
 
 Synthetic node IDs are ``synth:<instance>``, so their upstream identity never equals a pool
 ID. Two synthetic nodes under one instance ID (two instance sets reusing an ID) are joined,
@@ -28,26 +45,38 @@ links two nodes.
 trained on) are judged. A subject is
 
 ``excluded``
-    when its family contains any development task (``dev_family``), or when it shares a
+    when its family contains any development task (``dev_family``); when it shares a
     defined function or class name with a development task at prompt Jaccard at or above
-    0.25 (``dev_named_paraphrase``);
+    0.25 (``dev_named_paraphrase``); when an exposure code item has the solution AST or
+    canonical AST of a development task or of a pool task in a family with one
+    (``prompt_code_exposure``); when an exposure text reaches prompt Jaccard 0.5 with the
+    prompt of such a task (``prompt_text_exposure``); or when a name defined in its family or
+    exposure code is shared with a development task at prompt Jaccard at or above 0.25 over
+    its family and exposure texts (``prompt_named_exposure``);
 ``flagged``
-    when it is not excluded but shares a defined name with a development task at prompt
-    Jaccard at or above 0.10 (``dev_named_flag``);
+    when it is not excluded but one of the two shared-name signals reaches 0.10
+    (``dev_named_flag``, then ``prompt_named_exposure``);
 ``clear``
     otherwise.
 
 *Bridges* (rejected and superseded instances) and pool training tasks are never judged, but
-they carry links, so a subject joined to a development task only through a rejected row is
-still excluded. Excluded and flagged subjects stay in the graph as nodes. A bridge's own
-direct shared-name edges to development tasks are scored too (``bridges_named``): the caller
-drops every subject of a template that holds such a bridge.
+they carry links under the same mapping, so a subject joined to a development task only
+through a rejected row is still excluded. A bridge's own direct signals (shared-name edges
+and every exposure check) are scored (``bridges_hit``): the caller drops every subject of a
+template that holds such a bridge.
 
 **Replay rows** are pool training tasks. One is newly excluded when its family, with the
 synthetic nodes added, holds a development task that its family without them did not: a new
 chain through synthetic nodes, either into a first development task or into one more. Rows
 whose family already held a development task and gains none were judged when the replay set
-was built; this check reports them and does not overturn that outcome.
+was built; this check reports them and does not overturn that outcome. Rows on pending
+(unreviewed) shared-name flag edges to development tasks are dropped unless an existing
+adjudication record resolves every such edge as not equivalent (:func:`pending_flags`).
+
+**Evidence** (:func:`link_changes`): every direct link of the earlier mapping
+(:data:`LEGACY_MAPPING`, :func:`legacy_items`) that this mapping no longer makes, with the
+category of the item that made it (:data:`CATEGORIES`), and every link this mapping adds. A
+removed link that only retained items made is a bug and raises.
 """
 
 from __future__ import annotations
@@ -55,13 +84,19 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
-from collections import defaultdict
-from collections.abc import Hashable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+import re
+import string
+from collections import Counter, defaultdict
+from collections.abc import Hashable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import asdict, dataclass, field
+from functools import cache
 from pathlib import Path
 from typing import Any
 
 from scratchcoder.agent import cases, workspace
+from scratchcoder.agent import prompt as harness_prompt
+from scratchcoder.agent.synth import instances as generator
+from scratchcoder.agent.synth.template import Catalog
 from scratchcoder.data.adapters import canonical_id
 from scratchcoder.data.clusters import (
     DEFAULT_RULES,
@@ -78,34 +113,62 @@ from scratchcoder.data.clusters import (
 from scratchcoder.data.pool import shingles
 from scratchcoder.eval.tasks import Task
 
-SCHEMA = "agent-dev-family-v1"
+SCHEMA = "agent-dev-family-v2"
 RULE = RULES_VERSION
 """The identity key every result carries (``dev_family``) and ``mix`` requires."""
+MAPPING = "synthetic-items-v3"
+"""The synthetic item mapping: family items (task statement without the generator's fixed
+phrasing, specification text, target docstring; the reference target) and direct-only
+exposure items (everything else a row shows)."""
+LEGACY_MAPPING = "synthetic-items-v2"
+"""The earlier mapping, kept only to document what changed: every prompt (task statement,
+specification text, target docstring, every row's user text) and every solution (reference
+and original target, every fixed-repository module and each of its top-level functions and
+classes) was a family item."""
 NAMESPACE = "synth:"
 STATUSES = ("excluded", "flagged", "clear")
-REASONS = ("dev_family", "dev_named_paraphrase", "dev_named_flag", "template")
-"""Reason classes: the first three judge an instance; ``template`` drops every instance of a
-template that holds an excluded or flagged instance, or a bridge with a direct shared-name
-edge to a development task at the flag level or above."""
+JUDGED_REASONS = (
+    "dev_family",
+    "dev_named_paraphrase",
+    "prompt_code_exposure",
+    "prompt_text_exposure",
+    "prompt_named_exposure",
+    "dev_named_flag",
+)
+"""Reasons that judge one instance, in precedence order."""
+REASONS = (*JUDGED_REASONS, "template", "owner_ruling")
+"""Reason classes of a dropped instance: the judged ones; ``template`` drops every instance
+of a template that holds a judged (excluded or flagged) instance, or a bridge with a direct
+signal; ``owner_ruling`` drops every instance of a template the owner named."""
+REPLAY_REASONS = ("dev_family_new_chain", "dev_family_new_link", "pending_flag_unresolved")
+EXPOSURE_REASONS = ("prompt_code_exposure", "prompt_text_exposure", "prompt_named_exposure")
 METHOD = (
     "task-family rule task-clusters-v1 against the pool development split: union-signal "
     "families over pool development and training tasks and every synthetic instance "
-    "(rejected and superseded instances as unjudged bridges); an accepted instance is "
-    "dropped when its family holds a development task or it shares a defined name with one "
-    "(prompt Jaccard at least 0.10, flagged ones included), and every instance of a template "
-    "with a dropped instance, or with a bridge sharing a defined name with a development "
-    "task at that level, is dropped; replay rows are dropped when synthetic nodes add a "
-    "development task to their family"
+    "(rejected and superseded instances as unjudged bridges), where a synthetic instance's "
+    "family items are its task statement without the generator's fixed phrasing, its "
+    "template's specification text, its target docstring and its reference target; every "
+    "other code and text its rows show is checked directly (solution and canonical AST "
+    "against development tasks and pool tasks in their families, prompt Jaccard 0.5 against "
+    "their prompts, shared defined names against development tasks); an accepted instance "
+    "is dropped when its family holds a development task or any direct signal reaches the "
+    "flag level, and every instance of a template with a dropped instance, a bridge with a "
+    "direct signal, or an owner ruling is dropped; replay rows are dropped when synthetic "
+    "nodes add a development task to their family or a pending shared-name flag edge to a "
+    "development task is not resolved as not equivalent by an adjudication record"
 )
 
 
 @dataclass(frozen=True)
 class Node:
-    """One graph node: every (prompt, solution) pair of it is one task, all joined."""
+    """One graph node: every (prompt, solution) pair of it is one task, all joined. The
+    ``shown`` items are exposure items: checked directly, never a family link."""
 
     id: str
     prompts: tuple[str, ...] = ()
     solutions: tuple[str, ...] = ()
+    shown_code: tuple[str, ...] = ()
+    shown_text: tuple[str, ...] = ()
 
 
 def task_node(task: Task) -> Node:
@@ -115,7 +178,7 @@ def task_node(task: Task) -> Node:
 def items_of(node: Node, split: str) -> list[Item]:
     """The task items a node stands for: the cross product of its prompts and solutions
     (a node without solutions stands for its prompts alone). IDs after the first carry a
-    ``#n`` suffix; callers join them to the first."""
+    ``#n`` suffix; callers join them to the first. Exposure items are not task items."""
     prompts = node.prompts or ("",)
     solutions: Sequence[str | None] = node.solutions or (None,)
     found = []
@@ -223,6 +286,69 @@ def named_scores(
     return found
 
 
+def _keys(text: str) -> Iterator[tuple[str, str]]:
+    for kind, key in (("solution_ast", solution_key(text)), ("canonical_ast", canonical_key(text))):
+        if key is not None:
+            yield kind, key
+
+
+@dataclass(frozen=True)
+class Exposure:
+    """The direct signals of one node's exposure items."""
+
+    code: bool = False
+    """An exposure code item has the solution or canonical AST of an exposure target."""
+    text: bool = False
+    """An exposure text reaches the paraphrase level with an exposure target's prompt."""
+    named: float | None = None
+    """The strongest shared-name score over family and exposure items (``named_scores``)."""
+
+
+def exposures(
+    targets: Sequence[Node],
+    named_targets: Sequence[Node],
+    nodes: Sequence[Node],
+    rules: ClusterRules = DEFAULT_RULES,
+) -> list[Exposure]:
+    """The direct signals of each node's exposure items: code against the solutions of
+    ``targets`` (development tasks and pool tasks in a family with one), text against their
+    prompts, and shared names against ``named_targets`` (development tasks)."""
+    keys = {key for target in targets for text in target.solutions for key in _keys(text)}
+    target_sets = {
+        found
+        for target in targets
+        for text in target.prompts
+        if (found := shingles(text, rules.width))
+    }
+    shown_sets = {
+        found
+        for node in nodes
+        for text in node.shown_text
+        if (found := shingles(text, rules.width))
+    }
+    everything = [*target_sets, *(found for found in shown_sets if found not in target_sets)]
+    is_target = [found in target_sets for found in everything]
+    hit = {found for found in shown_sets if found in target_sets}
+    for i, j, _ in similar_pairs(everything, rules.paraphrase):
+        if is_target[i] != is_target[j]:
+            hit.add(everything[j] if is_target[i] else everything[i])
+    widened = [
+        Node(
+            node.id,
+            (*node.prompts, *node.shown_text),
+            (*node.solutions, *node.shown_code),
+        )
+        for node in nodes
+    ]
+    named = named_scores(named_targets, widened, rules)
+    signals = []
+    for node, score in zip(nodes, named, strict=True):
+        code = any(key in keys for text in node.shown_code for key in _keys(text))
+        text = any(shingles(item, rules.width) in hit for item in node.shown_text)
+        signals.append(Exposure(code, text, score))
+    return signals
+
+
 @dataclass(frozen=True)
 class Judgement:
     id: str
@@ -246,22 +372,37 @@ class Assessment:
     none through them (kept: the replay stage's outcome stands)."""
     replay_named: list[str]
     """Replay rows outside every development family, with or without synthetic nodes, that
-    have a direct shared-name edge to a development task at the flag level or above (kept:
-    pending flag edges stay as the replay stage reported them)."""
-    bridges_named: dict[str, str]
-    """Bridges with a direct shared-name edge to a development task at the flag level or
-    above, and its level (``dev_named_paraphrase`` or ``dev_named_flag``). Bridges are not
-    judged; the caller drops every subject of their templates."""
+    have a direct shared-name edge to a development task at the flag level or above (an
+    in-graph stand-in for the pending flag edges, which :func:`pending_flags` applies)."""
+    bridges_hit: dict[str, str]
+    """Bridges with a direct signal (a shared-name edge to a development task at the flag
+    level or above, or an exposure hit) and its reason. Bridges are not judged; the caller
+    drops every subject of their templates."""
     families: dict[str, int]
+    exposure_hits: dict[str, int] = field(default_factory=dict)
+    """Subjects with each direct exposure signal, whatever their judged reason."""
 
 
-def _status(in_family: bool, score: float | None, rules: ClusterRules) -> tuple[str, str | None]:
+_RANK = {reason: rank for rank, reason in enumerate(JUDGED_REASONS)}
+
+
+def _status(
+    in_family: bool, score: float | None, exposure: Exposure, rules: ClusterRules
+) -> tuple[str, str | None]:
     if in_family:
         return "excluded", "dev_family"
     if score is not None and score >= rules.named_paraphrase:
         return "excluded", "dev_named_paraphrase"
+    if exposure.code:
+        return "excluded", "prompt_code_exposure"
+    if exposure.text:
+        return "excluded", "prompt_text_exposure"
+    if exposure.named is not None and exposure.named >= rules.named_paraphrase:
+        return "excluded", "prompt_named_exposure"
     if score is not None and score >= rules.named_flag:
         return "flagged", "dev_named_flag"
+    if exposure.named is not None and exposure.named >= rules.named_flag:
+        return "flagged", "prompt_named_exposure"
     return "clear", None
 
 
@@ -286,21 +427,32 @@ def assess(
         full_dev[graph.full.find(index)].add(index)
         base_dev[graph.base.find(index)].add(index)
     first_subject = len(base)
-    scores = named_scores(dev, subjects, rules)
+    # Exposure targets: development tasks and every pool task in a family with one.
+    targets = [node for index, node in enumerate(base) if graph.full.find(index) in full_dev]
+    synthetic = [*subjects, *bridges]
+    exposure = exposures(targets, dev, synthetic, rules)
+    scores = named_scores(dev, synthetic, rules)
     judged = []
     roots: dict[int, int] = defaultdict(int)
-    for offset, (node, score) in enumerate(zip(subjects, scores, strict=True)):
+    hits: Counter[str] = Counter()
+    for offset, node in enumerate(subjects):
         root = graph.full.find(first_subject + offset)
         roots[root] += 1
-        status, reason = _status(root in full_dev, score, rules)
+        found = exposure[offset]
+        status, reason = _status(root in full_dev, scores[offset], found, rules)
         judged.append(Judgement(node.id, status, reason))
-    bridges_named: dict[str, str] = {}
-    for node, score in zip(bridges, named_scores(dev, bridges, rules), strict=True):
-        _, reason = _status(False, score, rules)
+        hits["prompt_code_exposure"] += found.code
+        hits["prompt_text_exposure"] += found.text
+        if found.named is not None and found.named >= rules.named_flag:
+            hits["prompt_named_exposure"] += 1
+    bridges_hit: dict[str, str] = {}
+    for offset, node in enumerate(bridges, start=len(subjects)):
+        _, reason = _status(False, scores[offset], exposure[offset], rules)
         if reason is not None:
-            # A bridge under the ID of another bridge or subject keeps its strongest level.
-            if bridges_named.get(node.id) != "dev_named_paraphrase":
-                bridges_named[node.id] = reason
+            # A bridge under the ID of another bridge keeps its strongest reason.
+            held = bridges_hit.get(node.id)
+            if held is None or _RANK[reason] < _RANK[held]:
+                bridges_hit[node.id] = reason
     position = {node.id: index for index, node in enumerate(train, start=len(dev))}
     unknown = [identifier for identifier in replay if identifier not in position]
     if unknown:
@@ -328,6 +480,7 @@ def assess(
         "subject_families": len(roots),
         "largest_subject_family": max(roots.values(), default=0),
         "subject_families_with_dev": sum(1 for root in roots if root in full_dev),
+        "exposure_targets": len(targets),
     }
     return Assessment(
         subjects=judged,
@@ -336,8 +489,9 @@ def assess(
         replay_new_dev_link=sorted(new_link),
         replay_in_dev_family=sorted(already),
         replay_named=sorted(replay_named),
-        bridges_named=dict(sorted(bridges_named.items())),
+        bridges_hit=dict(sorted(bridges_hit.items())),
         families=families,
+        exposure_hits={reason: hits[reason] for reason in EXPOSURE_REASONS},
     )
 
 
@@ -345,16 +499,92 @@ def expand_templates(
     judged: Sequence[Judgement],
     template_of: Mapping[str, str],
     also_templates: Iterable[str] = (),
+    owner_templates: Iterable[str] = (),
 ) -> dict[str, str]:
-    """Every dropped subject and its reason class: each excluded or flagged subject, and
-    every other subject of a template that holds one or is in ``also_templates`` (the
-    templates of bridges with a shared-name edge to a development task): ``template``."""
-    dropped = {item.id: str(item.reason) for item in judged if item.status != "clear"}
+    """Every dropped subject and its reason class: each subject of a template in
+    ``owner_templates`` (``owner_ruling``, whatever its judgement); each other excluded or
+    flagged subject; and every other subject of a template that holds one or is in
+    ``also_templates`` (the templates of bridges with a direct signal): ``template``."""
+    owner = set(owner_templates)
+    dropped = {item.id: "owner_ruling" for item in judged if template_of[item.id] in owner}
+    for item in judged:
+        if item.id not in dropped and item.status != "clear":
+            dropped[item.id] = str(item.reason)
     templates = {template_of[identifier] for identifier in dropped} | set(also_templates)
     for item in judged:
         if item.id not in dropped and template_of[item.id] in templates:
             dropped[item.id] = "template"
     return dropped
+
+
+# -- Pending flag edges of replay rows ------------------------------------------------------
+
+
+@dataclass
+class PendingFlags:
+    candidates: list[str]
+    """Replay rows that are an endpoint of a flag edge to a development task."""
+    kept: dict[str, list[int]]
+    """Candidates every one of whose edges an adjudication record resolves as not
+    equivalent, with the decision lines (1-based) that resolve them."""
+    excluded: list[str]
+    """Every other candidate (``pending_flag_unresolved``)."""
+    edges: int
+    """Flag edges to development tasks in the manifest."""
+
+
+NOT_EQUIVALENT = "not_equivalent"
+
+
+def flag_edges(manifest: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+    """``(row, development task, review)`` for every manifest flag edge with exactly one
+    development-split endpoint."""
+    found = []
+    for edge in manifest.get("flag_edges", ()):
+        splits = list(edge.get("splits", ()))
+        ends = [str(edge["a"]), str(edge["b"])]
+        if len(splits) != 2 or splits.count("dev") != 1:
+            continue
+        dev_side = splits.index("dev")
+        found.append((ends[1 - dev_side], ends[dev_side], str(edge.get("review", "pending"))))
+    return found
+
+
+def pending_flags(
+    edges: Sequence[tuple[str, str, str]],
+    decisions: Sequence[Mapping[str, Any]],
+    rows: Iterable[str],
+) -> PendingFlags:
+    """Which replay ``rows`` stand on flag edges to development tasks, and which of those an
+    existing record resolves: an edge is resolved only when its own review is
+    ``not_equivalent`` or a decision on exactly that (training task, development task) pair
+    is final ``not_equivalent``. A row is kept only when every one of its edges is resolved."""
+    resolving: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for line, decision in enumerate(decisions, start=1):
+        if str(decision.get("final")) == NOT_EQUIVALENT:
+            resolving[(str(decision.get("train")), str(decision.get("dev")))].append(line)
+    by_row: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for row, dev, review in edges:
+        by_row[row].append((dev, review))
+    candidates = sorted({row for row in rows if row in by_row})
+    kept: dict[str, list[int]] = {}
+    excluded = []
+    for row in candidates:
+        lines: list[int] = []
+        resolved = True
+        for dev, review in by_row[row]:
+            if review == NOT_EQUIVALENT:
+                continue
+            cited = resolving.get((row, dev))
+            if not cited:
+                resolved = False
+                break
+            lines.extend(cited)
+        if resolved:
+            kept[row] = sorted(set(lines))
+        else:
+            excluded.append(row)
+    return PendingFlags(candidates, kept, excluded, len(edges))
 
 
 # -- Synthetic instances on disk (read as text, never imported or run) -------------------
@@ -372,6 +602,12 @@ class Instance:
     """The fixed repository's source modules (tests left out): name and text."""
     spec_sha256: str = ""
     """The registered SHA-256 of its ``case.json`` (what each row's ``spec_sha256`` names)."""
+    original_modules: tuple[tuple[str, str], ...] = ()
+    """The original repository's source modules (tests left out), as the rows show them."""
+    mutants: tuple[str, ...] = ()
+    """The wrong attempts' sources (each a version of the target)."""
+    names: tuple[tuple[str, str], ...] = ()
+    """The generator's rendered names: placeholder (function role) and identifier."""
 
 
 def _sha(data: bytes) -> str:
@@ -425,13 +661,14 @@ def read_instances(root: Path) -> tuple[list[Instance], str]:
         if spec["id"] != entry["id"] or synth["id"] != entry["id"]:
             raise ValueError(f"{entry['id']}: case.json or synth.json names another instance")
         repo = str(spec["repo"])
-        modules = {
+        original = {
             Path(name).name: texts[name].decode("utf-8")
             for name in texts
             if Path(name).parent == Path(repo)
             and name.endswith(".py")
             and not workspace.is_test_file(Path(name).name)
         }
+        modules = dict(original)
         for module, relative in spec["reference"].items():
             modules[str(module)] = texts[str(relative)].decode("utf-8")
         found.append(
@@ -444,6 +681,9 @@ def read_instances(root: Path) -> tuple[list[Instance], str]:
                 original_target=str(synth["original_target"]),
                 modules=tuple(sorted(modules.items())),
                 spec_sha256=str(entry["files"]["case.json"]),
+                original_modules=tuple(sorted(original.items())),
+                mutants=tuple(str(item["source"]) for item in synth.get("mutants", ())),
+                names=tuple(sorted((str(k), str(v)) for k, v in synth.get("names", {}).items())),
             )
         )
     return found, _sha(raw)
@@ -470,34 +710,125 @@ def docstrings(source: str) -> list[str]:
     return found
 
 
+_UNITS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
 def top_level_units(source: str) -> list[str]:
     """Each module-level function and class of ``source`` on its own, as source text."""
     tree = _parse(source)
     if tree is None:
         return []
-    return [
-        ast.unparse(node)
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    ]
+    return [ast.unparse(node) for node in tree.body if isinstance(node, _UNITS)]
+
+
+def _defines(text: str) -> bool:
+    tree = _parse(text)
+    return tree is not None and any(isinstance(node, _UNITS) for node in tree.body)
+
+
+@cache
+def _phrasings() -> tuple[tuple[re.Pattern[str], tuple[str, ...], int], ...]:
+    """Each generator phrasing as a pattern, its field names and its fixed-text length,
+    longest fixed text first (the most specific phrasing wins)."""
+    found = []
+    for order, phrase in enumerate(generator.TASK_PHRASES):
+        pattern, fields, fixed = "", [], 0
+        for literal, name, _, _ in string.Formatter().parse(phrase):
+            pattern += re.escape(literal)
+            fixed += len(literal)
+            if name is not None:
+                pattern += "(.+?)"
+                fields.append(name)
+        found.append((order, re.compile(pattern, re.DOTALL), tuple(fields), fixed))
+    found.sort(key=lambda item: (-item[3], item[0]))
+    return tuple((pattern, fields, fixed) for _, pattern, fields, fixed in found)
+
+
+_FRAME = re.compile(
+    "^"
+    + re.escape(generator.FRAME_LINE)
+    .replace(re.escape("{file}"), "(.*)")
+    .replace(re.escape("{function}"), "(.*)")
+    + "$"
+)
+
+
+def _strip_traceback(text: str) -> str:
+    lines = []
+    for line in text.split("\n"):
+        if line == generator.TRACEBACK_HEADER:
+            continue
+        frame = _FRAME.match(line)
+        lines.append(" ".join(frame.groups()) if frame else line)
+    return "\n".join(lines)
+
+
+def strip_task(task: str) -> str:
+    """The task statement without the generator's fixed phrasing: the values it filled in
+    (call, values, test, exception, function and file names, traceback frames and error
+    line), one per line. Raises when no generator phrasing matches: a statement written
+    some other way is not stripped by guesswork."""
+    for pattern, fields, _ in _phrasings():
+        match = pattern.fullmatch(task)
+        if match is None:
+            continue
+        values = []
+        for name, value in zip(fields, match.groups(), strict=True):
+            values.append(_strip_traceback(value) if name == "traceback" else value)
+        return "\n".join(values)
+    raise ValueError("a task statement matches no generator phrasing")
+
+
+_HEADERS = ("SNIPPET ", harness_prompt.PREVIOUS_HEADER, "RESULT ", "MAP\n")
+
+
+def code_blocks(user_text: str) -> list[str]:
+    """The Python sources a row's user text shows: each snippet block's function (its
+    header line removed; a snippet runs to the next block header or the instruction), and
+    any other blank-line-separated block that parses and defines a top-level function or
+    class. Text is parsed, never run."""
+    found: list[str] = []
+    current: list[str] | None = None
+    for part in user_text.split("\n\n"):
+        boundary = part.startswith(_HEADERS) or part.strip() == harness_prompt.INSTRUCTION
+        if current is not None and not boundary:
+            current.append(part)
+            continue
+        if current is not None:
+            found.append("\n\n".join(current))
+            current = None
+        if part.startswith("SNIPPET "):
+            current = [part.partition("\n")[2]]
+        elif _defines(part):
+            found.append(part)
+    if current is not None:
+        found.append("\n\n".join(current))
+    return [code for code in found if _defines(code)]
+
+
+def _unique(texts: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(text for text in texts if text.strip()))
 
 
 def instance_node(instance: Instance, specs: Iterable[str], user_texts: Iterable[str]) -> Node:
-    """The node of one instance (module docstring: prompts and solutions)."""
-    prompts = [
-        instance.task,
-        *specs,
-        *docstrings(instance.reference_target),
-        *user_texts,
-    ]
-    solutions = [instance.reference_target, instance.original_target]
-    for _, text in instance.modules:
-        solutions.append(text)
-        solutions.extend(top_level_units(text))
+    """The node of one instance under :data:`MAPPING` (module docstring: family and
+    exposure items)."""
+    user_texts = tuple(user_texts)
+    prompts = [strip_task(instance.task), *specs, *docstrings(instance.reference_target)]
+    shown = [instance.original_target, *instance.mutants]
+    for _, text in (*instance.original_modules, *instance.modules):
+        shown.append(text)
+        shown.extend(top_level_units(text))
+    for text in user_texts:
+        for code in code_blocks(text):
+            shown.append(code)
+            shown.extend(top_level_units(code))
     return Node(
         NAMESPACE + instance.id,
-        tuple(dict.fromkeys(text for text in prompts if text.strip())),
-        tuple(dict.fromkeys(text for text in solutions if text.strip())),
+        _unique(prompts),
+        _unique([instance.reference_target]),
+        _unique(shown),
+        _unique([instance.task, *user_texts]),
     )
 
 
@@ -513,6 +844,319 @@ def load_specs(paths: Sequence[Path]) -> dict[str, list[str]]:
     return dict(found)
 
 
+# -- Evidence: the links the earlier mapping made and this one does not ---------------------
+
+
+CATEGORIES = {
+    "original_target": "original_target_as_solution",
+    "repo_module": "repo_module_as_solution",
+    "shared_unit": "shared_scaffolding_code",
+    "own_unit": "non_target_function",
+    "unresolved_unit": "non_target_code_unresolved",
+    "user_text": "harness_text",
+    "task": "task_phrase_scaffolding",
+    "task_statement": "stripped_task_statement",
+}
+"""Item kind -> the category of a link it alone made in one mapping and not the other.
+``shared_unit`` is a non-target function the catalog puts in more than one template;
+``own_unit`` one only this template has; ``unresolved_unit`` one whose role the generator's
+recorded names do not give; ``task_statement`` (this mapping only) the stripped task."""
+RETAINED = frozenset(
+    {"reference_target", "target_unit", "spec", "docstring", "pool_prompt", "pool_solution"}
+)
+"""Item kinds both mappings hold as the same family item (a ``target_unit`` is the reference
+target as the fixed module prints it, the same program)."""
+
+
+@dataclass(frozen=True)
+class Labeled:
+    """A node's family items with their kinds, for comparing two mappings."""
+
+    id: str
+    group: str
+    """``template:<id>`` for a synthetic node, ``pool:<split>`` for a pool task."""
+    prompts: tuple[tuple[str, str], ...] = ()
+    solutions: tuple[tuple[str, str], ...] = ()
+
+    def node(self) -> Node:
+        return Node(
+            self.id,
+            _unique(text for _, text in self.prompts),
+            _unique(text for _, text in self.solutions),
+        )
+
+
+def pool_labeled(task: Task) -> Labeled:
+    return Labeled(
+        task.id,
+        f"pool:{task.split}",
+        (("pool_prompt", task.prompt),),
+        (("pool_solution", task.solution),) if task.solution else (),
+    )
+
+
+def unit_kinds(catalog: Catalog) -> dict[str, dict[str, str]]:
+    """Template ID -> function role -> ``target_unit``, ``shared_unit`` (a non-target role
+    another template of the catalog also holds) or ``own_unit``: the generator source's
+    definition of scaffolding code."""
+    holders: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for template in catalog.templates:
+        for role in template.roles():
+            holders[(template.family.id, role)].add(template.id)
+    found: dict[str, dict[str, str]] = {}
+    for template in catalog.templates:
+        kinds = {}
+        for role in template.roles():
+            if role == template.target:
+                kinds[role] = "target_unit"
+            elif holders[(template.family.id, role)] - {template.id}:
+                kinds[role] = "shared_unit"
+            else:
+                kinds[role] = "own_unit"
+        found[template.id] = kinds
+    return found
+
+
+def _first_name(source: str) -> str | None:
+    tree = _parse(source)
+    if tree is None or not tree.body or not isinstance(tree.body[0], _UNITS):
+        return None
+    return tree.body[0].name
+
+
+def _unit_kind(instance: Instance, unit: str, roles: Mapping[str, Mapping[str, str]]) -> str:
+    """A fixed-module unit's kind: the target, or the kind :func:`unit_kinds` gives its role
+    (found through the instance's recorded names), else ``unresolved_unit``."""
+    name = _first_name(unit)
+    if name is not None and name == _first_name(instance.reference_target):
+        return "target_unit"
+    role_of = {identifier: role for role, identifier in instance.names}
+    role = role_of.get(name or "")
+    return roles.get(instance.template_id, {}).get(role or "", "unresolved_unit")
+
+
+def legacy_items(
+    instance: Instance,
+    specs: Iterable[str],
+    user_texts: Iterable[str],
+    roles: Mapping[str, Mapping[str, str]],
+) -> Labeled:
+    """The instance's family items under :data:`LEGACY_MAPPING`, with their kinds."""
+    prompts = [("task", instance.task), *(("spec", text) for text in specs)]
+    prompts += [("docstring", text) for text in docstrings(instance.reference_target)]
+    prompts += [("user_text", text) for text in user_texts]
+    solutions = [("reference_target", instance.reference_target)]
+    solutions.append(("original_target", instance.original_target))
+    for _, text in instance.modules:
+        solutions.append(("repo_module", text))
+        solutions += [(_unit_kind(instance, unit, roles), unit) for unit in top_level_units(text)]
+    return Labeled(
+        NAMESPACE + instance.id,
+        f"template:{instance.template_id}",
+        _labeled_unique(prompts),
+        _labeled_unique(solutions),
+    )
+
+
+def current_items(instance: Instance, specs: Iterable[str]) -> Labeled:
+    """The instance's family items under :data:`MAPPING`, with their kinds (the same texts
+    as :func:`instance_node`'s prompts and solutions)."""
+    prompts = [("task_statement", strip_task(instance.task)), *(("spec", text) for text in specs)]
+    prompts += [("docstring", text) for text in docstrings(instance.reference_target)]
+    return Labeled(
+        NAMESPACE + instance.id,
+        f"template:{instance.template_id}",
+        _labeled_unique(prompts),
+        _labeled_unique([("reference_target", instance.reference_target)]),
+    )
+
+
+def _labeled_unique(items: Iterable[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
+    """Items with nonblank, distinct texts; a repeated text keeps its first kind."""
+    seen: dict[str, str] = {}
+    for kind, text in items:
+        if text.strip() and text not in seen:
+            seen[text] = kind
+    return tuple((kind, text) for text, kind in seen.items())
+
+
+class _Direct:
+    """The direct links of a labeled node list: key groups, prompt sets and similar pairs."""
+
+    def __init__(self, nodes: Sequence[Labeled], rules: ClusterRules) -> None:
+        self.size = len(nodes)
+        self.groups: dict[tuple[str, str], dict[int, set[str]]] = defaultdict(
+            lambda: defaultdict(set)
+        )
+        self.group_names: dict[tuple[str, str], set[str]] = defaultdict(set)
+        self.keys: list[set[tuple[str, str]]] = [set() for _ in nodes]
+        self.upstream = [canonical_id(node.id) for node in nodes]
+        index: dict[frozenset[tuple[str, ...]], int] = {}
+        self.sets: list[frozenset[tuple[str, ...]]] = []
+        self.holders: list[dict[int, set[str]]] = []
+        self.node_sets: list[set[int]] = [set() for _ in nodes]
+        for position, node in enumerate(nodes):
+            for kind, text in node.solutions:
+                names = defined_names(text)
+                for key in _keys(text):
+                    self.groups[key][position].add(kind)
+                    self.group_names[key] |= names
+                    self.keys[position].add(key)
+            for kind, text in node.prompts:
+                found = shingles(text, rules.width)
+                if not found:
+                    continue
+                if found not in index:
+                    index[found] = len(self.sets)
+                    self.sets.append(found)
+                    self.holders.append(defaultdict(set))
+                number = index[found]
+                self.holders[number][position].add(kind)
+                self.node_sets[position].add(number)
+        self.similar = [(i, j) for i, j, _ in similar_pairs(self.sets, rules.paraphrase)]
+        self.similar_to: dict[int, set[int]] = defaultdict(set)
+        for i, j in self.similar:
+            self.similar_to[i].add(j)
+            self.similar_to[j].add(i)
+
+    def linked(self, a: int, b: int) -> bool:
+        if self.upstream[a] == self.upstream[b] or self.keys[a] & self.keys[b]:
+            return True
+        own, other = self.node_sets[a], self.node_sets[b]
+        if own & other:
+            return True
+        return any(self.similar_to.get(number, set()) & other for number in own)
+
+    def pairs(self) -> Iterator[tuple[str, int, int, set[str], set[str], frozenset[str]]]:
+        """Every directly linked node pair once per signal group: (signal, a, b, the kinds
+        of ``a``'s and of ``b``'s items that made it, the defined names involved)."""
+        for key, holders in self.groups.items():
+            members = sorted(holders)
+            names = frozenset(self.group_names[key])
+            for x, a in enumerate(members):
+                for b in members[x + 1 :]:
+                    yield key[0], a, b, holders[a], holders[b], names
+        for holders in self.holders:
+            members = sorted(holders)
+            for x, a in enumerate(members):
+                for b in members[x + 1 :]:
+                    yield "prompt_paraphrase", a, b, holders[a], holders[b], frozenset()
+        empty: set[str] = set()
+        for i, j in self.similar:
+            first, second = self.holders[i], self.holders[j]
+            for a in first:
+                for b in second:
+                    if a == b:
+                        continue
+                    kinds_a = first[a] | second.get(a, empty)
+                    kinds_b = second[b] | first.get(b, empty)
+                    if a > b:
+                        a, b, kinds_a, kinds_b = b, a, kinds_b, kinds_a
+                    yield "prompt_paraphrase", a, b, kinds_a, kinds_b, frozenset()
+
+
+def _pair(first: str, second: str) -> tuple[str, str]:
+    return (first, second) if first <= second else (second, first)
+
+
+def _cause(kinds_a: set[str], kinds_b: set[str]) -> set[str]:
+    """The categories of a link one mapping makes and the other does not: the kinds on each
+    side that holds no retained item (a side with one would make the link in both)."""
+    found: set[str] = set()
+    for kinds in (kinds_a, kinds_b):
+        if not kinds & RETAINED:
+            found |= {CATEGORIES[kind] for kind in kinds}
+    return found
+
+
+def _changes(
+    made: _Direct,
+    other: _Direct,
+    groups: Sequence[str],
+    base_size: int,
+    direction: str,
+) -> dict[str, Any]:
+    pairs: dict[int, set[str]] = {}
+    detail: dict[tuple[str, str], dict[str, set[str]]] = {}
+    size = made.size
+    for signal, a, b, kinds_a, kinds_b, names in made.pairs():
+        if b < base_size or other.linked(a, b):
+            continue
+        categories = _cause(kinds_a, kinds_b)
+        if not categories:
+            raise ValueError(
+                f"a {direction} link between {groups[a]} and {groups[b]} rests only on items "
+                "both mappings hold"
+            )
+        pairs.setdefault(a * size + b, set()).update(categories)
+        row = detail.setdefault(
+            _pair(groups[a], groups[b]), {"signals": set(), "kinds": set(), "names": set()}
+        )
+        row["signals"].add(signal)
+        row["kinds"].update(kinds_a | kinds_b)
+        row["names"].update(names)
+    by_category: Counter[str] = Counter()
+    by_set: Counter[str] = Counter()
+    by_groups: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
+    kinds_of_pair: Counter[str] = Counter()
+    for code, categories in pairs.items():
+        a, b = divmod(code, size)
+        label = "+".join(sorted(categories))
+        by_category.update(categories)
+        by_set[label] += 1
+        by_groups[_pair(groups[a], groups[b])][label] += 1
+        if groups[a].startswith("pool:") or groups[b].startswith("pool:"):
+            kinds_of_pair["synthetic_pool"] += 1
+        elif groups[a] == groups[b]:
+            kinds_of_pair["same_template"] += 1
+        else:
+            kinds_of_pair["cross_template"] += 1
+    rows = [
+        {
+            "groups": list(pair),
+            "pairs_by_category": dict(sorted(by_groups[pair].items())),
+            "signals": sorted(detail[pair]["signals"]),
+            "item_kinds": sorted(detail[pair]["kinds"]),
+            "defined_names": sorted(detail[pair]["names"]),
+        }
+        for pair in sorted(by_groups)
+    ]
+    summary = {
+        "links": len(pairs),
+        "by_category": dict(sorted(by_category.items())),
+        "by_category_set": dict(sorted(by_set.items())),
+        "by_pair_kind": {
+            kind: kinds_of_pair[kind]
+            for kind in ("synthetic_pool", "same_template", "cross_template")
+        },
+    }
+    return {"summary": summary, "rows": rows}
+
+
+def link_changes(
+    old: Sequence[Labeled],
+    new: Sequence[Labeled],
+    base_size: int,
+    rules: ClusterRules = DEFAULT_RULES,
+) -> dict[str, Any]:
+    """Every direct node link (pairwise, any union signal) of ``old`` that ``new`` lacks
+    (``removed``) and of ``new`` that ``old`` lacks (``added``), node lists aligned by index,
+    pool-only pairs (the first ``base_size`` nodes) left out. Each link carries the
+    categories of the items that made it (:data:`CATEGORIES`); one that only items both
+    mappings hold (:data:`RETAINED`) made is a bug and raises ``ValueError``."""
+    if [node.id for node in old] != [node.id for node in new]:
+        raise ValueError("the two mappings must hold the same nodes in the same order")
+    groups = [node.group for node in old]
+    before, after = _Direct(old, rules), _Direct(new, rules)
+    return {
+        "removed": _changes(before, after, groups, base_size, "removed"),
+        "added": _changes(after, before, groups, base_size, "added"),
+    }
+
+
+# -- Results ---------------------------------------------------------------------------------
+
+
 def rules_record(rules: ClusterRules = DEFAULT_RULES) -> dict[str, Any]:
     return asdict(rules)
 
@@ -525,13 +1169,19 @@ def require_result(
     replay_kinds: Iterable[str],
     dev_sha256: Iterable[str | None] = (),
     bridge_registries: Iterable[str] = (),
+    dropped_templates: Iterable[str] = (),
 ) -> None:
-    """Refuse a dev-family result unless it applies this rule, with its default thresholds,
-    to exactly ``agent_meta`` and ``replay_index`` as they are now, covers every replay kind
-    mixed, judged against the same development file as any n-gram check that names one
-    (``dev_sha256``), and held every instance set named by ``bridge_registries`` (registry
-    SHA-256) in its graph, as a judged set or a bridge set."""
+    """Refuse a dev-family result unless it applies this rule, with its default thresholds
+    and this item mapping, to exactly ``agent_meta`` and ``replay_index`` as they are now,
+    covers every replay kind mixed, applied the pending flag edges, judged against the same
+    development file as any n-gram check that names one (``dev_sha256``), held every
+    instance set named by ``bridge_registries`` (registry SHA-256) in its graph, as a judged
+    set or a bridge set, and dropped every template in ``dropped_templates`` by owner ruling."""
+    if result.get("schema") != SCHEMA or result.get("dev_family") != RULE:
+        raise ValueError(f"not a {SCHEMA} result of {RULE}")
     synthetic = result.get("synthetic") or {}
+    if (synthetic.get("item_mapping") or {}).get("version") != MAPPING:
+        raise ValueError(f"the dev-family result did not use the item mapping {MAPPING}")
     held = {
         str(part.get("registry_sha256"))
         for part in [*synthetic.get("judged", ()), *synthetic.get("bridges", ())]
@@ -539,8 +1189,6 @@ def require_result(
     absent = sorted(set(bridge_registries) - held)
     if absent:
         raise ValueError(f"the dev-family result did not hold instance sets {absent}")
-    if result.get("schema") != SCHEMA or result.get("dev_family") != RULE:
-        raise ValueError(f"not a {RULE} dev-family result")
     if result.get("rules") != rules_record():
         raise ValueError("the dev-family result used other thresholds")
     for side, path, kind in (
@@ -555,6 +1203,12 @@ def require_result(
     missing = set(replay_kinds) - set(result["replay"].get("kinds", ()))
     if missing:
         raise ValueError(f"the dev-family result did not judge replay kinds {sorted(missing)}")
+    if not (result["replay"].get("pending_flags") or {}).get("applied"):
+        raise ValueError("the dev-family result did not apply the pending flag edges")
+    owner = set((result["agent"]["instances"].get("owner_drops") or {}).get("templates", ()))
+    undropped = sorted(set(dropped_templates) - owner)
+    if undropped:
+        raise ValueError(f"the dev-family result did not drop templates {undropped}")
     pool_dev = result.get("pool", {}).get("dev_sha256")
     if not pool_dev:
         raise ValueError("the dev-family result names no development file")
@@ -565,5 +1219,5 @@ def require_result(
 def load_result(path: Path) -> dict[str, Any]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if raw.get("schema") != SCHEMA:
-        raise ValueError(f"{path}: not a dev-family result")
+        raise ValueError(f"{path}: not a dev-family result of schema {SCHEMA}")
     return dict(raw)

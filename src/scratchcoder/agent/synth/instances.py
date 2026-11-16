@@ -282,6 +282,22 @@ W5_PHRASES = (
     "Crash report for {call}:\n{traceback}\nFind the cause and fix it.",
 )
 W5_SHORT_PHRASES = ("Bug report: the test {test} fails:\n{traceback}\nFix the cause.",)
+TASK_PHRASES = (
+    *W1_PHRASES,
+    *W1_RAISE_PHRASES,
+    *W1_SHORT_PHRASES,
+    *W3_PHRASES,
+    *W3_RAISE_PHRASES,
+    *W3_SHORT_PHRASES,
+    *W4_PHRASES,
+    *W5_PHRASES,
+    *W5_SHORT_PHRASES,
+)
+"""Every task-statement phrasing: the fixed text a task statement is written in, shared by
+every template of the workflow type (the dev-family rule removes it before comparing tasks)."""
+TRACEBACK_HEADER = "Traceback (most recent call last):"
+FRAME_LINE = '  File "{file}", in {function}'
+"""The fixed framing of a task's traceback: its first line and the format of each frame."""
 MAX_CALL_CHARS = 70
 
 
@@ -341,10 +357,13 @@ def _traceback(instance: Instance, test: PublicTest) -> dict[str, str]:
     if not chain:
         raise TemplateError(f"{instance.id}: the spec raised outside every spec function")
     test_file = instance.public_tests[0]
-    frames = [f'  File "{test_file}", in {test.name}']
-    frames += [f'  File "{instance.module_file(role)}", in {instance.name(role)}' for role in chain]
+    frames = [FRAME_LINE.format(file=test_file, function=test.name)]
+    frames += [
+        FRAME_LINE.format(file=instance.module_file(role), function=instance.name(role))
+        for role in chain
+    ]
     error = f"{test.bug.raised}: {test.bug.message}" if test.bug.message else test.bug.raised
-    text = "\n".join(["Traceback (most recent call last):", *frames, error])
+    text = "\n".join([TRACEBACK_HEADER, *frames, error])
     return {
         "text": text,
         "error_line": error,

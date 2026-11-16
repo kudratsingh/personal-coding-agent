@@ -42,15 +42,24 @@ anything is opened:
   ``scratchcoder.agent.synth.dev_family``) on the accepted instances of every ``--judged``
   build, with pool development and training tasks, the builds' rejected instances and any
   ``--bridge-instances`` set in the family graph, and on the replay index's rows (dropped
-  when synthetic nodes add a development task to a row's family). Each judged build must name
-  its instance set's registry and each row its instance's registered ``case.json``. Drops
-  every row of an excluded or flagged instance and of every instance of its template (or of a
-  template holding a bridge with a shared-name edge to a development task); writes one
-  status-only result bound to the rows metadata and the replay index. Runs nothing.
+  when synthetic nodes add a development task to a row's family). An instance joins families
+  only through its family items (task statement without the generator's fixed phrasing,
+  specification text, target docstring, reference target); everything else its rows show is
+  checked directly against development tasks and the pool tasks in their families (solution
+  and canonical AST, prompt Jaccard, shared names). Each judged build must name its instance
+  set's registry and each row its instance's registered ``case.json``. Drops every row of an
+  excluded or flagged instance and of every instance of its template (or of a template
+  holding a bridge with a direct signal, or named by ``--drop-template`` with its
+  ``--drop-ruling``), and every replay row on a flag edge to a development task in
+  ``--pending-flag-manifest`` unless an adjudication record (``--flag-decisions``) resolves
+  each such edge as not equivalent. Writes one status-only result bound to the rows metadata
+  and the replay index, and a private ``--evidence`` file with every link the earlier item
+  mapping made and this one does not, by category. Runs nothing.
 - ``mix``: agent rows plus replay rows at a target ratio of assistant-loss tokens. It needs
   both contamination results, computed on exactly these inputs and against exactly the case
-  registries named by ``--case-registry-sha256``, and the dev-family result for both sides,
-  and caps instances per distinct reply.
+  registries named by ``--case-registry-sha256``, and a dev-family result of this item
+  mapping for both sides (with any ``--require-dropped-template`` dropped), caps instances
+  per distinct reply, and reports how many pending-flag candidates enter the mix.
 - ``manifest``: families, templates, bug and mutation kinds, workflow types, counts, file
   hashes and ledger totals.
 
@@ -66,6 +75,7 @@ import json
 import sys
 from collections import Counter
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -794,18 +804,40 @@ def _pool_tasks(path: Path, split: str) -> list[Task]:
     return tasks
 
 
-DevFamilyInputs = tuple[
-    dict[str, Any],
-    list[dev_family.Node],
-    list[dev_family.Node],
-    dict[str, str],
-    dict[str, set[str]],
-]
+@dataclass
+class DevFamilyInputs:
+    record: dict[str, Any]
+    subjects: list[dev_family.Instance]
+    bridges: list[dev_family.Instance]
+    spec_texts: dict[str, list[str]]
+    user_texts: dict[str, list[str]]
+    template_of: dict[str, str]
+    bridge_templates: dict[str, set[str]]
+
+
+ITEM_MAPPING = {
+    "version": dev_family.MAPPING,
+    "family_prompts": "the task statement without the generator's fixed phrasing, the "
+    "template's specification text and the target docstring",
+    "family_solutions": "the reference target (every row's reply)",
+    "exposure_code": "the original target, the wrong attempts, every module of the original "
+    "and the fixed repository and each of its top-level functions and classes, and code "
+    "inside each row's user text: solution and canonical AST against development tasks and "
+    "pool tasks in their families, never a family link",
+    "exposure_text": "the full task statement and every row's user text: prompt Jaccard 0.5 "
+    "against those tasks' prompts, and shared defined names with development tasks",
+    "scaffolding": "never a family item: the generator's task phrasings and traceback "
+    "framing, the harness prompt's fixed blocks, and the catalog's non-target functions",
+    "node_ids": dev_family.NAMESPACE + "<instance>",
+}
+PENDING_FLAG_KEY = "sft_rows_on_pending_dev_crossing_flag_edges_only"
+"""The replay stage's count of rows on pending flag edges to development tasks."""
 
 
 def _dev_family_inputs(args: argparse.Namespace, meta: Sequence[dict[str, Any]]) -> DevFamilyInputs:
-    """Subject and bridge nodes, each subject's template, the templates under each bridge
-    node ID, and the record of every source.
+    """Subject and bridge instances, their specification texts and row user texts, each
+    subject's template, the templates under each bridge node ID, and the record of every
+    source.
 
     Each ``--judged`` pair must belong together: the build's record names the instance set's
     registry, and every row names the registered ``case.json`` of the instance it came from,
@@ -881,25 +913,14 @@ def _dev_family_inputs(args: argparse.Namespace, meta: Sequence[dict[str, Any]])
         raise ValueError(f"no specification text for templates {missing}")
     record["specs"] = [{"path": str(path), "sha256": _sha_file(path)} for path in args.spec_files]
     record["subjects_without_rows"] = sum(1 for item in subjects if item.id not in rows_by_instance)
-    nodes = [
-        dev_family.instance_node(
-            item,
-            spec_texts[item.template_id],
-            (str(row["user_text"]) for row in rows_by_instance.get(item.id, [])),
-        )
-        for item in subjects
-    ]
-    bridge_nodes = [
-        dev_family.instance_node(item, spec_texts[item.template_id], ()) for item in bridges
-    ]
-    record["item_mapping"] = {
-        "prompts": "task statement, template specification text, target docstring, every "
-        "row's user text",
-        "solutions": "reference target, original target, every fixed-repository module and "
-        "each of its top-level functions and classes",
-        "node_ids": dev_family.NAMESPACE + "<instance>",
+    record["item_mapping"] = ITEM_MAPPING
+    user_texts = {
+        identifier: [str(row["user_text"]) for row in rows_of]
+        for identifier, rows_of in rows_by_instance.items()
     }
-    return record, nodes, bridge_nodes, template_of, bridge_templates
+    return DevFamilyInputs(
+        record, subjects, bridges, spec_texts, user_texts, template_of, bridge_templates
+    )
 
 
 def _replay_stage(path: Path | None) -> dict[str, Any] | None:
@@ -924,9 +945,118 @@ def _replay_stage(path: Path | None) -> dict[str, Any] | None:
     }
 
 
+def _pending_flag_block(
+    args: argparse.Namespace,
+    index: Sequence[dict[str, Any]],
+    stage: dict[str, Any] | None,
+) -> tuple[dev_family.PendingFlags, dict[str, Any]]:
+    """The pending flag edges of the replay rows (every kind), resolved only by existing
+    adjudication records, and the result block that cites them. Refuses when the replay
+    stage reports another number of rows on such edges than the manifest gives here."""
+    manifest_data = args.pending_flag_manifest.read_bytes()
+    edges = dev_family.flag_edges(json.loads(manifest_data))
+    decisions: list[dict[str, Any]] = []
+    record: dict[str, Any] = {"decisions": None, "decisions_sha256": None}
+    if args.flag_decisions is not None:
+        decisions, digest = _hashed_jsonl(args.flag_decisions)
+        record = {"decisions": str(args.flag_decisions), "decisions_sha256": digest}
+    kinds = {str(row["id"]): str(row["kind"]) for row in index}
+    flags = dev_family.pending_flags(edges, decisions, kinds)
+    reported = None
+    for key, value in ((stage or {}).get("pending_flag_rows_reported") or {}).items():
+        if key.endswith("." + PENDING_FLAG_KEY):
+            reported = int(value)
+    if reported is not None and reported != len(flags.candidates):
+        raise ValueError(
+            f"the replay stage reports {reported} rows on pending flag edges; the manifest "
+            f"gives {len(flags.candidates)} among the replay rows"
+        )
+    block = {
+        "applied": True,
+        "rule": "a replay row on a flag edge to a development task is dropped "
+        "(pending_flag_unresolved) unless every such edge is resolved not equivalent by its "
+        "own review or by a decision on exactly that pair",
+        "manifest": str(args.pending_flag_manifest),
+        "manifest_sha256": hashlib.sha256(manifest_data).hexdigest(),
+        **record,
+        "edges_to_dev": flags.edges,
+        "candidates": len(flags.candidates),
+        "candidates_by_kind": dict(sorted(Counter(kinds[row] for row in flags.candidates).items())),
+        "candidate_ids": flags.candidates,
+        "kept_resolved": len(flags.kept),
+        "kept_resolved_decision_lines": flags.kept,
+        "excluded": len(flags.excluded),
+        "replay_stage_reported": reported,
+    }
+    return flags, block
+
+
+def _legacy_comparison(
+    dev: Sequence[Task],
+    train: Sequence[Task],
+    inputs: DevFamilyInputs,
+    current: Sequence[dev_family.Node],
+    current_bridges: Sequence[dev_family.Node],
+    replay: Sequence[str],
+    found: dev_family.Assessment,
+) -> dict[str, Any]:
+    """The links the earlier item mapping made and this one does not (and the reverse),
+    each with its category, and the earlier mapping's judgement beside this one's."""
+    roles = dev_family.unit_kinds(catalog())
+    base = [dev_family.pool_labeled(task) for task in [*dev, *train]]
+    specs = inputs.spec_texts
+    old = [
+        dev_family.legacy_items(
+            item, specs[item.template_id], inputs.user_texts.get(item.id, ()), roles
+        )
+        for item in inputs.subjects
+    ] + [
+        dev_family.legacy_items(item, specs[item.template_id], (), roles) for item in inputs.bridges
+    ]
+    new = [
+        dev_family.current_items(item, specs[item.template_id])
+        for item in [*inputs.subjects, *inputs.bridges]
+    ]
+    for labeled, node in zip(new, [*current, *current_bridges], strict=True):
+        if labeled.node().prompts != node.prompts or labeled.node().solutions != node.solutions:
+            raise ValueError(f"{node.id}: the evidence items differ from the judged items")
+    changes = dev_family.link_changes([*base, *old], [*base, *new], len(base))
+    legacy = dev_family.assess(
+        [dev_family.task_node(task) for task in dev],
+        [dev_family.task_node(task) for task in train],
+        [labeled.node() for labeled in old[: len(inputs.subjects)]],
+        [labeled.node() for labeled in old[len(inputs.subjects) :]],
+        replay=replay,
+    )
+    prefix = len(dev_family.NAMESPACE)
+    legacy_reason = {j.id[prefix:]: j.reason for j in legacy.subjects}
+    transitions = Counter(
+        f"{legacy_reason[j.id[prefix:]] or 'clear'} -> {j.reason or 'clear'}"
+        for j in found.subjects
+    )
+    return {
+        "changes": changes,
+        "legacy": {
+            "mapping": dev_family.LEGACY_MAPPING,
+            "by_reason": dict(
+                sorted(Counter(j.reason or "clear" for j in legacy.subjects).items())
+            ),
+            "replay_rejected": len(legacy.replay_excluded),
+            "families": legacy.families,
+        },
+        "transitions": dict(sorted(transitions.items())),
+        "scaffolding_roles": roles,
+    }
+
+
 def run_dev_family(args: argparse.Namespace) -> int:
-    if args.out.exists():
-        print(f"refused: {args.out} exists", file=sys.stderr)
+    for path in (args.out, args.evidence):
+        if path.exists():
+            print(f"refused: {path} exists", file=sys.stderr)
+            return 2
+    owner = sorted(set(args.drop_template or ()))
+    if owner and args.drop_ruling is None:
+        print("refused: --drop-template needs --drop-ruling (the ruling's record)", file=sys.stderr)
         return 2
     if not args.bridge_instances:
         print(
@@ -940,37 +1070,48 @@ def run_dev_family(args: argparse.Namespace) -> int:
         meta, meta_sha256 = _hashed_jsonl(args.rows_meta)
         index, index_sha256 = _hashed_jsonl(args.decoded)
         stage = _replay_stage(args.replay_record)
-        synthetic, subjects, bridges, template_of, bridge_templates = _dev_family_inputs(args, meta)
+        inputs = _dev_family_inputs(args, meta)
         if len({str(row["id"]) for row in index}) != len(index):
             raise ValueError("the replay index repeats a row ID")
+        present = {item.template_id for item in [*inputs.subjects, *inputs.bridges]}
+        absent = sorted(set(owner) - present)
+        if absent:
+            raise ValueError(f"--drop-template names templates no instance has: {absent}")
+        specs = inputs.spec_texts
+        subjects = [
+            dev_family.instance_node(
+                item, specs[item.template_id], inputs.user_texts.get(item.id, ())
+            )
+            for item in inputs.subjects
+        ]
+        bridges = [
+            dev_family.instance_node(item, specs[item.template_id], ()) for item in inputs.bridges
+        ]
         replay = [str(row["id"]) for row in index if str(row["kind"]) in set(args.replay_kinds)]
-        found = dev_family.assess(
-            [dev_family.task_node(task) for task in dev],
-            [dev_family.task_node(task) for task in train],
-            subjects,
-            bridges,
-            replay=replay,
-        )
+        dev_nodes = [dev_family.task_node(task) for task in dev]
+        train_nodes = [dev_family.task_node(task) for task in train]
+        found = dev_family.assess(dev_nodes, train_nodes, subjects, bridges, replay=replay)
         # The same judging without any bridge, to count what only bridges reach.
-        unbridged = dev_family.assess(
-            [dev_family.task_node(task) for task in dev],
-            [dev_family.task_node(task) for task in train],
-            subjects,
-        )
+        unbridged = dev_family.assess(dev_nodes, train_nodes, subjects)
+        flags, flag_block = _pending_flag_block(args, index, stage)
+        comparison = _legacy_comparison(dev, train, inputs, subjects, bridges, replay, found)
     except (ValueError, KeyError, TypeError, OSError) as error:
         print(f"refused: dev-family: {error}", file=sys.stderr)
         return 2
     prefix = len(dev_family.NAMESPACE)
+    template_of = inputs.template_of
 
     def strip(judgements: Sequence[dev_family.Judgement]) -> list[dev_family.Judgement]:
         return [dev_family.Judgement(j.id[prefix:], j.status, j.reason) for j in judgements]
 
     judged = strip(found.subjects)
     bridge_template_hits = sorted(
-        {template for node in found.bridges_named for template in bridge_templates[node]}
+        {template for node in found.bridges_hit for template in inputs.bridge_templates[node]}
     )
-    dropped = dev_family.expand_templates(judged, template_of, bridge_template_hits)
-    dropped_unbridged = dev_family.expand_templates(strip(unbridged.subjects), template_of)
+    dropped = dev_family.expand_templates(judged, template_of, bridge_template_hits, owner)
+    dropped_unbridged = dev_family.expand_templates(
+        strip(unbridged.subjects), template_of, (), owner
+    )
     clear_unbridged = {j.id for j in strip(unbridged.subjects) if j.status == "clear"}
     rejected = sorted(str(row["id"]) for row in meta if str(row["instance"]) in dropped)
     kept = [row for row in meta if str(row["instance"]) not in dropped]
@@ -978,7 +1119,31 @@ def run_dev_family(args: argparse.Namespace) -> int:
         reason: sum(1 for row in meta if dropped.get(str(row["instance"])) == reason)
         for reason in dev_family.REASONS
     }
+    replay_rejected = sorted(set(found.replay_excluded) | set(flags.excluded))
+    changes = comparison["changes"]
+    evidence = {
+        "schema": "agent-dev-family-evidence-v1",
+        "mapping": dev_family.MAPPING,
+        "legacy_mapping": dev_family.LEGACY_MAPPING,
+        "result": str(args.out),
+        "categories": dev_family.CATEGORIES,
+        "retained_kinds": sorted(dev_family.RETAINED),
+        "scaffolding_source": {
+            "task_phrasings": "scratchcoder.agent.synth.instances.TASK_PHRASES, "
+            "TRACEBACK_HEADER, FRAME_LINE",
+            "non_target_functions": "scratchcoder.agent.synth.catalog through "
+            "dev_family.unit_kinds (template -> role -> kind)",
+            "roles": comparison["scaffolding_roles"],
+        },
+        "removed_links": changes["removed"],
+        "added_links": changes["added"],
+        "legacy_judgement": comparison["legacy"],
+        "judgement_transitions": comparison["transitions"],
+    }
+    args.evidence.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json(args.evidence, evidence)
     commit, dirty = git_state()
+    owner_rows = rows_dropped["owner_ruling"]
     result: dict[str, Any] = {
         "schema": dev_family.SCHEMA,
         "dev_family": dev_family.RULE,
@@ -995,8 +1160,16 @@ def run_dev_family(args: argparse.Namespace) -> int:
             "train_sha256": _sha_file(args.train),
             "train_tasks": len(train),
         },
-        "synthetic": synthetic,
+        "synthetic": inputs.record,
         "families": found.families,
+        "link_changes": {
+            "evidence": str(args.evidence),
+            "evidence_sha256": _sha_file(args.evidence),
+            "removed": changes["removed"]["summary"],
+            "added": changes["added"]["summary"],
+            "legacy_by_reason": comparison["legacy"]["by_reason"],
+            "legacy_replay_rejected": comparison["legacy"]["replay_rejected"],
+        },
         "agent": {
             "input": str(args.rows_meta),
             "input_kind": "rows_meta",
@@ -1013,14 +1186,28 @@ def run_dev_family(args: argparse.Namespace) -> int:
                     status: sum(1 for item in judged if item.status == status)
                     for status in dev_family.STATUSES
                 },
+                "by_judged_reason": {
+                    reason: sum(1 for item in judged if item.reason == reason)
+                    for reason in dev_family.JUDGED_REASONS
+                },
+                "exposure_hits": found.exposure_hits,
                 "dropped": dict(sorted(dropped.items())),
                 "dropped_by_reason": {
                     reason: sum(1 for value in dropped.values() if value == reason)
                     for reason in dev_family.REASONS
                 },
                 "templates_dropped": sorted({template_of[i] for i in dropped}),
-                "bridges_with_named_edge": found.bridges_named,
-                "templates_dropped_through_bridge_named_edges": bridge_template_hits,
+                "owner_drops": {
+                    "templates": owner,
+                    "ruling": None if args.drop_ruling is None else str(args.drop_ruling),
+                    "ruling_sha256": None
+                    if args.drop_ruling is None
+                    else _sha_file(args.drop_ruling),
+                    "instances": sum(1 for value in dropped.values() if value == "owner_ruling"),
+                    "rows": owner_rows,
+                },
+                "bridges_with_direct_hit": found.bridges_hit,
+                "templates_dropped_through_bridge_hits": bridge_template_hits,
                 "only_through_bridges": {
                     "judged_not_clear": sorted(
                         j.id for j in judged if j.status != "clear" and j.id in clear_unbridged
@@ -1030,7 +1217,9 @@ def run_dev_family(args: argparse.Namespace) -> int:
             },
             "rows_dropped_by_reason": rows_dropped,
             "rows_dropped_instance_level": sum(
-                count for reason, count in rows_dropped.items() if reason != "template"
+                count
+                for reason, count in rows_dropped.items()
+                if reason not in ("template", "owner_ruling")
             ),
             "surviving": {
                 "rows": len(kept),
@@ -1052,13 +1241,19 @@ def run_dev_family(args: argparse.Namespace) -> int:
             "input_sha256": index_sha256,
             "kinds": sorted(set(args.replay_kinds)),
             "checked": len(replay),
-            "rejected": found.replay_excluded,
+            "rejected": replay_rejected,
+            "rejected_by_reason": {
+                "dev_family_new_chain": len(found.replay_new_chain),
+                "dev_family_new_link": len(found.replay_new_dev_link),
+                "pending_flag_unresolved": len(flags.excluded),
+            },
             "rejected_new_chain": len(found.replay_new_chain),
             "rejected_new_dev_link": len(found.replay_new_dev_link),
             "kept_in_dev_family_without_synthetic": len(found.replay_in_dev_family),
-            # An in-graph stand-in for the replay stage's pending flag edges, which it
-            # does not overturn: read it beside ``replay_stage``.
+            # The in-graph shared-name edges of rows outside every dev family, beside the
+            # manifest's pending flag edges that ``pending_flags`` applies.
             "kept_direct_named_edge_without_synthetic": len(found.replay_named),
+            "pending_flags": flag_block,
             "replay_stage": stage,
             "not_judged_other_kinds": len(index) - len(replay),
         },
@@ -1069,7 +1264,9 @@ def run_dev_family(args: argparse.Namespace) -> int:
             {
                 "agent_rejected": len(rejected),
                 "instances_dropped": len(dropped),
-                "replay_rejected": len(found.replay_excluded),
+                "replay_rejected": len(replay_rejected),
+                "pending_flag_candidates": len(flags.candidates),
+                "links_removed": changes["removed"]["summary"]["links"],
             }
         )
     )
@@ -1111,6 +1308,7 @@ def run_mix(args: argparse.Namespace) -> int:
             replay_kinds=args.replay_kinds,
             dev_sha256=[side["dev_ngram_sha256"] for side in checked.values()],
             bridge_registries=args.require_instance_registry or (),
+            dropped_templates=args.require_dropped_template or (),
         )
     except (ValueError, KeyError, OSError) as error:
         print(f"refused: dev-family: {error}", file=sys.stderr)
@@ -1145,6 +1343,9 @@ def run_mix(args: argparse.Namespace) -> int:
     from scratchcoder.data.sft import write_rows
 
     write_rows(args.out / "mix.jsonl", mixed)
+    pending = family["replay"]["pending_flags"]
+    candidates = set(pending["candidate_ids"])
+    mixed_ids = {row.id for row in mixed}
     report.update(
         {
             "agent_rows_sha256": _sha_file(args.agent_rows),
@@ -1169,6 +1370,15 @@ def run_mix(args: argparse.Namespace) -> int:
                     ]
                 ),
                 "required_instance_registries": sorted(args.require_instance_registry or ()),
+                "item_mapping": family["synthetic"]["item_mapping"]["version"],
+                "owner_drops": family["agent"]["instances"]["owner_drops"],
+                "required_dropped_templates": sorted(args.require_dropped_template or ()),
+                "pending_flags": {
+                    "candidates": len(candidates),
+                    "kept_resolved": pending["kept_resolved"],
+                    "excluded": pending["excluded"],
+                    "candidates_in_mix": len(candidates & mixed_ids),
+                },
             },
             "dev_method": DEV_CHECKS,
             "case_registries": sorted(args.case_registry_sha256),
@@ -1255,6 +1465,8 @@ def manifest(args: argparse.Namespace) -> int:
             "result": str(args.dev_family),
             "result_sha256": _sha_file(args.dev_family),
             "rule": family["dev_family"],
+            "item_mapping": family["synthetic"]["item_mapping"]["version"],
+            "owner_drops": family["agent"]["instances"]["owner_drops"],
             "agent_rows_dropped": len(family["agent"]["rejected"]),
             "instances_dropped": len(family["agent"]["instances"]["dropped"]),
             "dropped_by_reason": family["agent"]["instances"]["dropped_by_reason"],
@@ -1392,7 +1604,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--replay-record",
         type=Path,
         help="the replay stage's record.json: its SHA-256 and the pending flag counts it "
-        "reports are written beside the in-graph figure",
+        "reports are written beside the in-graph figure; a different count of rows on "
+        "pending flag edges than --pending-flag-manifest gives is refused",
+    )
+    d.add_argument(
+        "--pending-flag-manifest",
+        type=Path,
+        required=True,
+        help="the cluster manifest whose flag_edges hold the replay rows' shared-name flag "
+        "edges to development tasks: a row on one is dropped unless every such edge is "
+        "resolved not equivalent",
+    )
+    d.add_argument(
+        "--flag-decisions",
+        type=Path,
+        help="adjudication decisions (JSONL with train, dev and final): a decision final "
+        "not_equivalent on exactly a flag edge's pair resolves that edge",
+    )
+    d.add_argument(
+        "--drop-template",
+        nargs="+",
+        metavar="TEMPLATE",
+        help="templates the owner ruled out: every instance is dropped (owner_ruling)",
+    )
+    d.add_argument(
+        "--drop-ruling", type=Path, help="the record of the ruling --drop-template cites"
+    )
+    d.add_argument(
+        "--evidence",
+        type=Path,
+        required=True,
+        help="where to write the private evidence file: every link the earlier item mapping "
+        "made and this one does not, with its category",
     )
     d.add_argument("--out", type=Path, required=True)
     m = commands.add_parser("mix")
@@ -1425,6 +1668,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SHA256",
         help="registry SHA-256 of instance sets (judged or bridge) the dev-family result "
         "must have held in its graph, such as a superseded set",
+    )
+    m.add_argument(
+        "--require-dropped-template",
+        nargs="+",
+        metavar="TEMPLATE",
+        help="templates the dev-family result must have dropped by owner ruling",
     )
     m.add_argument(
         "--case-registry-sha256",
@@ -1477,6 +1726,10 @@ PATH_ARGS = (
     "train",
     "dev_family",
     "replay_record",
+    "pending_flag_manifest",
+    "flag_decisions",
+    "drop_ruling",
+    "evidence",
 )
 PATH_LIST_ARGS = (
     "seed_from",

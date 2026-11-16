@@ -160,89 +160,165 @@ words. The pool's development split is protected by a task-family rule, `task-cl
 synthetic rows and to the replay rows (`scratchcoder.agent.synth.dev_family`). It runs
 nothing: it reads text and parses it with `ast`.
 
-**Nodes.** The rule needs a prompt and a solution per task. A pool task has one of each. A
-synthetic instance gets several, so that no reading of "its prompt" or "its solution" is
-missed:
+### Family items and exposure items
 
-- prompts: the task statement, the template's specification text (from every `specs.json`
-  given), the target function's docstring and the user text of each of its rows;
-- solutions: the reference target (every row's reply), the original buggy or stub target,
-  each module of the fixed repository, and each top-level function or class of those modules
-  on its own (test modules are left out; tests are never a signal).
+The rule needs a prompt and a solution per task. A pool task has one of each. A synthetic
+instance's rows show much more than the task they train: buggy code, wrong attempts, helper
+functions, harness boilerplate. Buggy input code is not a correct solution of the repair task,
+but the model still sees it. So an instance carries two kinds of items (item mapping
+`synthetic-items-v3`):
 
-The instance stands for every (prompt, solution) pair of these, joined into one family, so a
-link through any pair marks the whole instance. Its node ID is `synth:<instance>`, which can
-never equal a pool task's upstream ID. Two nodes under one instance ID (two instance sets that
-reuse an ID) are joined, as the pilot intake joins repeated IDs.
+- **Family items** join families, as a pool task's prompt and solution do. They are what the
+  rows train: the prompts are the task statement with the generator's fixed phrasing removed,
+  the template's specification text (from every `specs.json` given) and the target
+  function's docstring; the one solution is the reference target, which is every row's whole
+  reply. Every case has one `module::function` target, so no whole module is a family item.
+  The instance stands for every (prompt, solution) pair of these, joined into one family.
+- **Exposure items** are everything else a row shows: the original (buggy or stub) target,
+  the wrong attempts, each module of the original and the fixed repository and each of its
+  top-level functions and classes, code inside each row's user text, and the full task
+  statement and user texts as text. They never join a family. They are checked directly, so
+  buggy and helper code still meets the AST and overlap checks (next section).
 
-**Links and families.** Two nodes are linked by a union signal: equal docstring-stripped
-solution AST, equal AST up to renaming, equal upstream ID, or 3-word prompt shingle Jaccard at
-least 0.5. A family is a connected component. The graph holds every pool development task,
-every pool training task and every synthetic instance: accepted ones, the builds' rejected
-ones, and superseded sets (`--bridge-instances`). Rejected and superseded instances are never
-judged, but their links count, so a kept instance that reaches a development task only through
-a rejected one is still caught ("bridge protection"). Excluded instances stay in the graph.
+**Scaffolding** is what the generator emits identically for more than one template. It is
+defined from the generator source, not from results, and it is never a family item:
 
-**Judging an accepted instance**, as the holdout integrity scan judges a subject:
+- the task-statement phrasings (`instances.TASK_PHRASES`) and the traceback framing
+  (`TRACEBACK_HEADER`, `FRAME_LINE`). `strip_task` removes them and keeps the values the
+  generator filled in: the call, the values, test, exception, function and file names, and
+  the traceback's frames and error line. A statement that matches no phrasing is refused,
+  never stripped by guesswork;
+- the harness prompt's fixed blocks (map, snippet headers, changes so far, results,
+  instruction), which is why row user texts are exposure text only;
+- the catalog's non-target functions. `unit_kinds` reads each template's roles from the
+  catalog: the target, a *shared* role that another template also holds, or one only this
+  template holds. Most templates of a family share their helpers.
+
+Synthetic node IDs are `synth:<instance>`, which can never equal a pool task's upstream ID.
+Two nodes under one instance ID (two instance sets that reuse an ID) are joined, as the pilot
+intake joins repeated IDs.
+
+**Links and families.** Two nodes are linked by a union signal on their family items: equal
+docstring-stripped solution AST, equal AST up to renaming, equal upstream ID, or 3-word prompt
+shingle Jaccard at least 0.5. A family is a connected component. The graph holds every pool
+development task, every pool training task and every synthetic instance: accepted ones, the
+builds' rejected ones, and superseded sets (`--bridge-instances`). Rejected and superseded
+instances use the same mapping and are never judged, but their links count. A kept instance
+that reaches a development task only through a rejected one is still caught ("bridge
+protection"). Excluded instances stay in the graph.
+
+### Judging an accepted instance
+
+As the holdout integrity scan judges a subject, with the exposure checks added. The *exposure
+targets* are the development tasks and every pool task in a family that holds one (on the
+graph with the synthetic nodes).
 
 | Status | When | Reason class |
 | --- | --- | --- |
 | excluded | its family holds any development task | `dev_family` |
-| excluded | it shares a defined function or class name with a development task at prompt Jaccard ≥ 0.25 | `dev_named_paraphrase` |
-| flagged | otherwise, a shared name at prompt Jaccard ≥ 0.10 | `dev_named_flag` |
+| excluded | a defined name of its reference target is shared with a development task at prompt Jaccard ≥ 0.25 | `dev_named_paraphrase` |
+| excluded | an exposure code item has the solution AST or renamed AST of an exposure target | `prompt_code_exposure` |
+| excluded | an exposure text has prompt Jaccard ≥ 0.5 with an exposure target's prompt | `prompt_text_exposure` |
+| excluded | a name defined in its family or exposure code is shared with a development task at Jaccard ≥ 0.25 over its family and exposure texts | `prompt_named_exposure` |
+| flagged | otherwise, the first shared-name signal at ≥ 0.10 | `dev_named_flag` |
+| flagged | otherwise, the second shared-name signal at ≥ 0.10 | `prompt_named_exposure` |
 | clear | otherwise | |
 
 Excluded and flagged instances are both dropped: a flag cannot be adjudicated without
 behaviour runs, so it is treated as unresolved and kept out. Then every instance of a template
 that holds a dropped instance is dropped too (`template`), since a template is one task family
-with renamed variants. Bridges are not judged, but their own shared-name edges to development
-tasks are scored: a template that holds a bridge at the flag level or above is dropped the
-same way (`templates_dropped_through_bridge_named_edges`). A dropped instance loses all its
-rows (the edit row and both repair rows). The result reports instance-level and
-template-expanded counts, and which drops only bridges reach (`only_through_bridges`: the same
-judging with no rejected or superseded instance in the graph); the expanded set is the one
-`mix` uses.
+with renamed variants. Bridges are not judged, but their own direct signals (shared-name edges
+and every exposure check) are scored. A template that holds a bridge with one is dropped the
+same way (`templates_dropped_through_bridge_hits`). `--drop-template` drops every instance of
+the named templates whatever their judgement (`owner_ruling`); it needs `--drop-ruling`, the
+record of the ruling, whose path and SHA-256 the result keeps. A dropped instance loses all
+its rows (the edit row and both repair rows). The result reports instance-level and
+template-expanded counts, each exposure signal's subject count, and which drops only bridges
+reach (`only_through_bridges`: the same judging with no rejected or superseded instance in the
+graph). The expanded set is the one `mix` uses.
 
-**Replay rows** are pool training tasks, judged by the family rule when the replay set was
-built. A replay row is dropped when synthetic nodes add a development task to its family:
-either its family held none without them (`rejected_new_chain`), or it held some and the
-synthetic nodes join it to one more (`rejected_new_dev_link`; that link was never
-adjudicated). Rows whose family held a development task without synthetic nodes and gains none
-keep their adjudicated outcome and are counted. So are rows with a direct shared-name edge to
-a development task: pending flag edges stay as the replay stage reported them. With
-`--replay-record`, the replay stage's record path, its SHA-256 and the pending-flag counts it
-reports are written beside the in-graph figure, so a reader can see that those rows were kept
-as reported, not re-judged.
+### Replay rows
 
-**Why the efficient form is the same rule.** The cross product of an instance's prompts and
-solutions can hold hundreds of items, and pairwise edges among identical keys are quadratic.
-The port keeps only what decides the outcome: nodes sharing a key are chained instead of
-linked pairwise (same components); identical shingle sets are chained and every other prompt
-pair is found once by the exact prefix-filtered search; and an instance's strongest
-shared-name edge to a development task is its highest prompt Jaccard over the targets that
-define one of its names. The reference tests run copies of the original `dev_family_ids` and
-`scan` on the cross-product items of small fixtures and check that the port decides the same.
+Replay rows are pool training tasks, judged by the family rule when the replay set was built.
+A replay row is dropped when synthetic nodes add a development task to its family. Either its
+family held none without them (`dev_family_new_chain`), or it held some and the synthetic
+nodes join it to one more (`dev_family_new_link`; that link was never adjudicated). Rows whose
+family held a development task without synthetic nodes and gains none keep their adjudicated
+outcome and are counted.
+
+A shared-name flag edge to a development task in the cluster manifest
+(`--pending-flag-manifest`) is pending until someone reviews it. A replay row on such an edge
+is kept only when an existing record resolves every one of its edges as not equivalent: the
+edge's own review, or a decision (`--flag-decisions`) that is final `not_equivalent` for
+exactly that (training task, development task) pair. Every other such row is dropped
+(`pending_flag_unresolved`). The result lists the candidates, the decision lines that keep a
+row and the manifest and decision files' SHA-256. With `--replay-record`, the replay stage's
+own count of rows on pending flag edges must equal the candidates found here, or the run is
+refused.
+
+### Evidence of the mapping change
+
+The earlier mapping, `synthetic-items-v2`, made every prompt and every solution a family item.
+A buggy target, a helper that many templates share, or a formulaic harness text then joined
+unrelated templates into one family. Every link that mapping made and this one does not must
+be explained. `dev-family --evidence PATH` writes a private file with every such link
+(pairwise, any union signal, pool-only pairs left out). Each link carries the category of the
+items that made it:
+
+| Category | The item that made the link |
+| --- | --- |
+| `original_target_as_solution` | the original (buggy or stub) target |
+| `repo_module_as_solution` | a whole module of the fixed repository |
+| `shared_scaffolding_code` | a non-target function that the catalog gives more than one template |
+| `non_target_function` | a non-target function only this template has |
+| `non_target_code_unresolved` | a non-target function whose role the recorded names do not give |
+| `harness_text` | a row's user text |
+| `task_phrase_scaffolding` | the task statement with its fixed phrasing |
+
+A link counts against the side that holds no retained item (reference target, specification,
+docstring, pool items), because a retained item on both sides would make the link in both
+mappings. A removed link with no category is a bug, and the run fails. The file also gives
+every link this mapping adds (`stripped_task_statement`), each template pair with the signals,
+item kinds and defined names involved, the earlier mapping's judgement and the transitions
+between the two. The result carries the summary counts and the file's SHA-256.
+
+### Why the efficient form is the same rule
+
+The cross product of an instance's prompts and solutions can hold many items, and pairwise
+edges among identical keys are quadratic. The port keeps only what decides the outcome. Nodes
+sharing a key are chained instead of linked pairwise, which gives the same components.
+Identical shingle sets are chained, and every other prompt pair is found once by the exact
+prefix-filtered search. An instance's strongest shared-name edge to a development task is its
+highest prompt Jaccard over the targets that define one of its names. The reference tests run
+copies of the original `dev_family_ids` and `scan` on the family items of small fixtures and
+check that the port decides the same.
 
 ### Worked example
 
-Development task `d0` sums `values` times three. Accepted instance `A` ships a helper
-`shared_helper(z)`. Rejected instance `R` ships the same helper, and its task statement
-paraphrases `d0`'s prompt (Jaccard ≥ 0.5). Without `R`, `A` is clear. With `R` in the graph,
-`A`—`R` share a solution AST and `R`—`d0` share a paraphrase, so `A` is in `d0`'s family and
-is excluded. Instance `F` defines a function with `d0`'s name and its task shares a few
-3-word shingles with `d0`'s prompt (Jaccard 0.13): it is flagged and dropped. `F`'s template
-sibling `G` is clear on its own; it is dropped by template expansion. A pool training task
-`t` shares only its program with a superseded instance whose module also holds `d1`'s
-program renamed: `t` is a replay row newly excluded.
+Development task `d0` sums `values` times three. Template `A`'s target is that program with
+other names, so `A`'s instances are in `d0`'s family (`dev_family`). Template `B`'s target
+reverses a string, but its repository holds the same generic `bounded` helper as `A`'s. Under
+the earlier mapping the helper was a family item and joined `B` to `A`, so `B` was excluded.
+Now the helper is shown code: it is no development solution, so `B` is clear. The evidence
+records the removed `A`–`B` link as `shared_scaffolding_code`, naming `bounded`.
+
+Template `C`'s buggy original target is `d0`'s program renamed. The fix differs, so no family
+item links `C`. But every row of `C` shows that code, so `C` is excluded
+(`prompt_code_exposure`), and its sibling `C2` is dropped by template expansion. A rejected
+instance `R` that shares `A`'s helper only stays out of any family. A rejected instance whose
+task statement paraphrases `d0` and whose target is a training task's program still bridges
+that training task into `d0`'s family. A replay row `t` on a pending flag edge to `d1`, with
+no decision on that pair, is dropped.
 
 ### Results and binding
 
 `dev-family` writes one result for both sides, status only (instance and row IDs, reason
-classes, counts): `dev_family: "task-clusters-v1"`, the thresholds, the pool development and
-training files' SHA-256, every instance set's registry SHA-256 and build file SHA-256, the
-specification files' SHA-256, and per side `input_kind` and `input_sha256` (the rows metadata
-and the decoded replay index). It never writes a prompt, solution, signal or development
-task ID.
+classes, counts). It records `dev_family: "task-clusters-v1"`, the thresholds, the item
+mapping, the pool development and training files' SHA-256, every instance set's registry
+SHA-256 and build file SHA-256, the specification files' SHA-256, the owner drops, the pending
+flag block, the link-change summary and the evidence file's SHA-256. Per side it records
+`input_kind` and `input_sha256` (the rows metadata and the decoded replay index). It never
+writes a prompt, solution or development task ID.
 
 Each `--judged INSTANCES BUILD` pair must belong together. The build's `record.json` must name
 the instance set's registry (`instances_registry_sha256`), and every row's `spec_sha256` must
@@ -251,13 +327,16 @@ instance IDs therefore cannot be judged in place of the set the rows came from. 
 `--bridge-instances` prints a warning, and `mix --require-instance-registry SHA...` refuses a
 result whose graph did not hold each named set (judged or bridge).
 
-`mix --dev-family` refuses a result for another input, another rule or other thresholds, one
-that did not judge every mixed replay kind, or one whose development file differs from the
-file a contamination result checked; the agent-case and benchmark contamination results are
-still required. The mix record states both development checks and the registry of every
-instance set the result held. `manifest` describes builds, which come before the rule, so it
-states the rule as required before mixing; with `--dev-family` it also records that result's
-SHA-256, dropped counts and survivors.
+`mix --dev-family` refuses a result of the earlier schema or another item mapping, and one for
+another input, another rule or other thresholds. It also refuses one that did not judge every
+mixed replay kind, did not apply the pending flag edges, or used a development file other than
+the one a contamination result checked. With `--require-dropped-template` it refuses a result
+that did not drop those templates by owner ruling. The agent-case and benchmark contamination
+results are still required. The mix record states both development checks, the registry of
+every instance set the result held, and how many pending-flag candidates entered the mix.
+`manifest` describes builds, which come before the rule, so it states the rule as required
+before mixing. With `--dev-family` it also records that result's SHA-256, item mapping, owner
+drops, dropped counts and survivors.
 
 ```bash
 uv run --locked python -m tools.agent_sft_data dev-family \
@@ -265,14 +344,26 @@ uv run --locked python -m tools.agent_sft_data dev-family \
   --judged INSTANCES_A BUILD_A --judged INSTANCES_B BUILD_B \
   --bridge-instances SUPERSEDED --specs SPECS_1 SPECS_2 \
   --rows-meta ROWS_META --decoded REPLAY_INDEX --replay-record REPLAY_RECORD \
-  --out DEV_FAMILY.json
+  --pending-flag-manifest CLUSTER_MANIFEST --flag-decisions DECISIONS \
+  --drop-template TEMPLATE --drop-ruling RULING \
+  --evidence PRIVATE/EVIDENCE.json --out DEV_FAMILY.json
 ```
 
-Limits: the rule is static, so two programs that behave alike but share no signal are not
-linked. Because every instance of a template shares its specification text, one link usually
-puts the whole template in a development family. The graph holds the pool's development and
-training tasks only, never a sealed split, so a chain that passes through a held-out task is
-not seen.
+Limits:
+
+- The rule is static, so two programs that behave alike but share no signal are not linked.
+- Every instance of a template shares its specification text, so one link usually puts the
+  whole template in a development family.
+- Exposure code is compared with development tasks and with pool tasks in their families, not
+  with the family items of other synthetic instances. Shown code that equals another template's
+  reference target is excluded only when that code meets a development family's pool program
+  itself.
+- `clusters.py` filters no trivial programs beyond those that do not parse. A short helper that
+  equals a short development solution up to renaming is therefore an exposure hit.
+- A stripped task statement is short and can link two instances that name the same call and
+  values. The evidence file lists every such added link.
+- The graph holds the pool's development and training tasks only, never a sealed split, so a
+  chain that passes through a held-out task is not seen.
 
 ## Verification
 
@@ -292,12 +383,16 @@ not seen.
   receipt, cap, ledger, oracle-pin, control-gate, contamination-binding, dev-family-binding,
   held-out and synthetic-case refusals.
 - `tests/test_agent_dev_family.py`: the reference tests against copies of `dev_family_ids` and
-  `scan` (`tests/dev_family_reference.py`) on cross-product items, the link construction
-  against `find_edges` components, each status and reason, the bridge regressions (kept
-  instance and replay row reaching a development task through a rejected instance), a replay
-  row joined to a further development task, template expansion (also through a bridge's
-  shared-name edge), flagged instances dropped, the subcommand's result and refusals (including
-  a swapped instance set and build), and the reader on `generate` output.
+  `scan` (`tests/dev_family_reference.py`) on family items, the link construction against
+  `find_edges` components, each status and reason, the bridge regressions (kept instance and
+  replay row reaching a development task through a rejected instance), a replay row joined to
+  a further development task, template expansion (also through a bridge's direct signal),
+  flagged instances dropped, the two mapping regressions (templates joined only by a shared
+  helper stay apart; a development solution shown in a prompt is excluded), text and
+  shared-name exposure, the task-phrasing stripper, pending flag edges and their citations,
+  the owner drop, evidence categories (on `generate` output too, and a removed link without
+  one refused), the subcommand's result and refusals (including a swapped instance set and
+  build), and the reader on `generate` output.
 
 Run them with `uv run --locked pytest tests/test_agent_synth*.py tests/test_agent_dev_family.py`.
 
@@ -314,7 +409,12 @@ Run them with `uv run --locked pytest tests/test_agent_synth*.py tests/test_agen
    locate, budgets, truncations and condensed sandbox output.
 4. *What does a 1:1 mixture mean here?* Equal assistant-loss tokens on the agent and replay
    sides. Row counts are reported beside it.
-5. *Why drop a whole template when one instance matches a development task?* A template's
+5. *Why are buggy code and helpers not family items?* Each row trains one reply, the
+   reference target. A buggy original or a helper that many templates share says nothing
+   about which task the row teaches, so as a family link it joins unrelated templates.
+   The model still sees that code, so it is checked directly against development
+   solutions.
+6. *Why drop a whole template when one instance matches a development task?* A template's
    instances differ only in names, constants and bug kinds; they are one task family. A
    flagged or named-paraphrase match cannot be resolved without behaviour runs, so the whole
    family stays out.
