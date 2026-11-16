@@ -1085,8 +1085,11 @@ digest and its linux/amd64 manifest's). Run 1b's own digest was never recorded (
 Pod record names the tag), so these are the tag's digests at that read, not proof of what ran
 before; the runtime check (``RUN1C_RUNTIME``) is what ties a Pod to the recorded environment.
 The Pod create body names the tag (the provider documents its image field as an image
-reference with tag examples only); the readiness receipt accepts a Pod record naming the tag
-or the tag pinned to either digest (``run1c_image_references``)."""
+reference with tag examples only), so the pin is enforced just before the create request:
+``tools.posttrain_image check`` reads the tag's manifest index and passes only when the index
+and its linux/amd64 manifest are these digests, and the readiness receipt and the worker
+require that passing record (``posttrain_image.check_image_record``). The receipt accepts a
+Pod record naming the tag or the tag pinned to either digest (``run1c_image_references``)."""
 RUN1C_RUNTIME: dict[str, Any] = {
     "python": "3.12.3",
     "torch": "2.9.1+cu128",

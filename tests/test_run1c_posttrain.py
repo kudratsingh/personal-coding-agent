@@ -908,6 +908,22 @@ def receipt_evidence(
             "mismatched": [],
             "status": "passed",
         },
+        "image-check.json": {  # The Mac's registry read just before the create request.
+            "kind": "posttrain-image-check",
+            "reference": IMAGE,
+            "expected": {
+                "index_digest": posttrain_approved.RUN1C_IMAGE["index_digest"],
+                "linux_amd64_digest": posttrain_approved.RUN1C_IMAGE["linux_amd64_digest"],
+            },
+            "resolved": {
+                "media_type": "application/vnd.oci.image.index.v1+json",
+                "index_digest": posttrain_approved.RUN1C_IMAGE["index_digest"],
+                "linux_amd64_digest": posttrain_approved.RUN1C_IMAGE["linux_amd64_digest"],
+            },
+            "checked_at_unix": origin - 2.5,
+            "mismatched": [],
+            "status": "passed",
+        },
     }
     for name, change in changes.items():
         change(values[name])
@@ -1024,6 +1040,63 @@ def test_the_receipt_accepts_the_tag_or_the_tag_pinned_to_a_recorded_digest(
     connection = {"pod-connection.json": lambda value: value.update(image=image)}
     receipt = build_receipt(**receipt_evidence(tmp_path, bound, **connection), now=NOW)
     assert receipt["pod_image"] == image
+
+
+def _moved(value: dict[str, Any]) -> None:
+    value["resolved"]["index_digest"] = "sha256:" + "0" * 64
+    value["mismatched"] = ["index_digest"]
+    value["status"] = "failed"
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        (lambda value: value.clear(), "missing or malformed"),
+        (_moved, "did not name run 1c's pinned digests"),
+        (
+            lambda value: value["resolved"].update(linux_amd64_digest=None),
+            "did not name run 1c's pinned digests",
+        ),
+        (lambda value: value.update(reference=IMAGE + "-other"), "not for run 1c's tag"),
+        (
+            lambda value: value["expected"].update(index_digest="sha256:" + "1" * 64),
+            "expected other digests",
+        ),
+        (lambda value: value.update(checked_at_unix=value["checked_at_unix"] - 300), "300 s"),
+        (lambda value: value.update(checked_at_unix=value["checked_at_unix"] + 10), "300 s"),
+        (lambda value: value.update(checked_at_unix=True), "300 s"),
+    ],
+)
+def test_the_receipt_refuses_an_image_check_that_does_not_pin_the_tag_before_the_create(
+    tmp_path: Path,
+    bound: dict[str, Any],
+    change: Callable[[dict[str, Any]], None],
+    match: str,
+) -> None:
+    from test_posttrain_readiness import NOW
+
+    from tools.posttrain_readiness import build_receipt
+
+    evidence = receipt_evidence(tmp_path, bound, **{"image-check.json": change})
+    with pytest.raises(ValueError, match=match):
+        build_receipt(**evidence, now=NOW)
+
+
+def test_the_receipt_records_the_image_check_and_needs_it_for_run_1c(
+    tmp_path: Path, bound: dict[str, Any]
+) -> None:
+    from test_posttrain_readiness import NOW
+
+    from tools.posttrain_readiness import build_receipt
+
+    evidence = receipt_evidence(tmp_path, bound)
+    receipt = build_receipt(**evidence, now=NOW)
+    record = json.loads((tmp_path / "image-check.json").read_text())
+    assert receipt["image_check"] == record
+    assert receipt["evidence_sha256"]["image_check"] == file_sha256(tmp_path / "image-check.json")
+    (tmp_path / "image-check.json").unlink()
+    with pytest.raises(OSError):
+        build_receipt(**evidence, now=NOW)
 
 
 # The launch commit -------------------------------------------------------------------------------
@@ -1234,6 +1307,19 @@ def test_the_worker_refuses_a_receipt_without_a_matching_runtime(
             "expected another runtime",
         ),
         (lambda value: value["runtime_preflight"].update(status="failed"), "not run 1c's"),
+        (lambda value: value.pop("image_check"), "image check record is missing"),
+        (
+            lambda value: value["image_check"]["resolved"].update(
+                index_digest="sha256:" + "0" * 64
+            ),
+            "did not name run 1c's pinned digests",
+        ),
+        (
+            lambda value: value["image_check"].update(
+                checked_at_unix=value["watchdog_policy"]["billing_started_at_unix"] - 301
+            ),
+            "300 s before the create request",
+        ),
     ]
     for change, match in changes:
         edited = json.loads(json.dumps(receipt))

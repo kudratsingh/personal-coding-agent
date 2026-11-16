@@ -126,6 +126,7 @@ from scratchcoder.train.validation import assistant_loss, token_weighted_loss
 from tools import posttrain_binding, posttrain_ops
 from tools.gpu_pilot import check_termination_guarantee
 from tools.pilot_preflight import hardware_description
+from tools.posttrain_image import check_image_record
 from tools.r2_store import MILESTONE_RETRY_SECONDS, CheckpointUploader, Store, bounded_store
 from tools.rehearsal_binding import r2_credentials
 from tools.rehearsal_run import (
@@ -1567,6 +1568,10 @@ def check_readiness(
     if spec.run == RUN1C:
         check_launch_commit(receipt)  # The operator's launch commit, checked on the Pod.
         check_runtime_preflight(receipt, spec)  # The image's runtime, before the worker.
+        # The tag named the pinned digests just before the create request.
+        check_image_record(
+            receipt.get("image_check"), spec.raw["runtime"]["image"], billing_origin_unix=billing
+        )
     fit = launch_fit(spec, remaining_seconds=end - now)
     require_fit(fit["remaining_seconds"], fit["planning_seconds_needed"])
     return Launch(origin, end, identity.pod_id, fit)

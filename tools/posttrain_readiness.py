@@ -18,7 +18,10 @@ is written). Besides the pretraining rehearsal's owner gates and termination che
   the bootstrap's (``runtime-check.json``, next to the identity unless ``--runtime-check``
   names it) and the A40 preflight's, which must be the specification's ``runtime.expected``
   (``posttrain_run.check_runtime_preflight``), so a moved image tag stops here, before the
-  worker starts;
+  worker starts; and the Mac's image check (``image-check.json``, next to the identity unless
+  ``--image-check`` names it), which must have found the tag naming the specification's
+  pinned index and linux/amd64 digests in the 300 s before the create request
+  (``posttrain_image.check_image_record``);
 - a watchdog policy at least as strict as the ceiling-derived limits (mode ``posttrain``,
   wall and cost stop from ``posttrain_ops.ceiling_limits``, the 900 s transfer window), with
   run 2's ``awaiting_rewards`` idle extensions exactly the derived bounds (run 1: none);
@@ -63,6 +66,7 @@ from tools.posttrain_approved import (
     check_run2,
     run1c_image_references,
 )
+from tools.posttrain_image import check_image_record
 from tools.posttrain_run import (
     RUNTIME_CHECK_KIND,
     Specification,
@@ -147,6 +151,7 @@ def build_receipt(
     launch_commit: str | None = None,
     launch_check: Path | None = None,
     runtime_check: Path | None = None,
+    image_check: Path | None = None,
 ) -> dict[str, Any]:
     created_at = time.time() if now is None else now
     spec = Specification.load(specification)
@@ -187,8 +192,18 @@ def build_receipt(
             raise ValueError("run 1c needs --launch-commit and the Pod's launch-check.json")
         launch_record = _load(launch_check)
         runtime_check = runtime_check or identity.with_name("runtime-check.json")
-    elif launch_commit is not None or launch_check is not None or runtime_check is not None:
-        raise ValueError("--launch-commit, --launch-check and --runtime-check are run 1c's")
+        image_check = image_check or identity.with_name("image-check.json")
+        image_record = check_image_record(
+            _load(image_check),
+            spec.raw["runtime"]["image"],
+            billing_origin_unix=billing_origin_unix,
+        )
+    elif any(
+        value is not None for value in (launch_commit, launch_check, runtime_check, image_check)
+    ):
+        raise ValueError(
+            "--launch-commit, --launch-check, --runtime-check and --image-check are run 1c's"
+        )
     code = rehearsal_ops.check_revision(_load(revision))
     owner = _load(confirmations)
     guarantee = owner.get("termination_guarantee")
@@ -311,6 +326,9 @@ def build_receipt(
         assert runtime_check is not None
         receipt["runtime_preflight"] = runtime_record  # check_readiness recomputes it.
         receipt["evidence_sha256"]["runtime_check"] = file_sha256(runtime_check)
+        assert image_check is not None
+        receipt["image_check"] = image_record  # The tag's digests, read before the create.
+        receipt["evidence_sha256"]["image_check"] = file_sha256(image_check)
     for gate in posttrain_ops.OWNER_GATES:
         receipt[gate] = owner.get(gate)
     # Exactly the worker's own acceptance check, so a written receipt is one it accepts.
@@ -365,6 +383,11 @@ def main(argv: list[str]) -> int:
         type=Path,
         help="run 1c: the Pod's runtime-check.json (default: next to --identity)",
     )
+    parser.add_argument(
+        "--image-check",
+        type=Path,
+        help="run 1c: the image check made before the create (default: next to --identity)",
+    )
     args = parser.parse_args(argv)
     try:
         receipt = build_receipt(
@@ -392,6 +415,7 @@ def main(argv: list[str]) -> int:
                 else args.launch_check
             ),
             runtime_check=args.runtime_check,
+            image_check=args.image_check,
         )
     except (OSError, ValueError, TypeError, KeyError) as error:
         print(f"posttrain-readiness-receipt: {type(error).__name__}: {error}", file=sys.stderr)

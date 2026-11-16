@@ -91,6 +91,7 @@ def test_every_tool_command_parses_with_its_real_command_line(
         "tools.mac_window_check",
         "tools.benchmark_dispatch",
         "tools.posttrain_revision",
+        "tools.posttrain_image",
         "scratchcoder.cli",
     ):
         assert module in modules, module
@@ -170,6 +171,21 @@ def test_the_pod_body_is_run_1bs_under_run_1cs_name() -> None:
     assert body == {**run1b, "name": "posttrain-a40-s-1c"}
     assert "cp configs/runpod-pod-a40-s-posttrain-1c.json" in text()
     assert "posttrain-a40-s-1c" in text()
+
+
+def test_the_pod_is_created_only_after_the_image_check_passes() -> None:
+    (check,) = base.by("tools.posttrain_image", "check")
+    options = dict(zip(check[1::2], check[2::2], strict=True))
+    assert options["--specification"] == VALUES["SPEC"]
+    (create,) = [block for block in base.blocks() if "https://api.runpod.io/v2/pods" in block]
+    lines = create.splitlines()
+    (gate,) = [i for i, line in enumerate(lines) if "tools.posttrain_image check" in line]
+    (post,) = [i for i, line in enumerate(lines) if "-X POST" in line]
+    assert lines[gate].lstrip().startswith("elif ! uv run --locked python -m tools.posttrain_image")
+    assert "NOT creating a Pod" in lines[gate + 1]
+    assert lines[gate + 2].strip() == "else" and gate < post
+    assert any("image-check.json" in line and "$CTRL/" in line for line in lines[post:])
+    assert "`$CTRL/image-check.json` next to the identity" in text()
 
 
 def test_the_owner_steps_are_all_there() -> None:
